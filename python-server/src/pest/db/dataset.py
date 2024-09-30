@@ -5,6 +5,7 @@ Handles writes, closes and flushes within the dataset
 """
 
 import time
+import asyncio
 import os
 from typing import AsyncIterator
 from typing_extensions import Self
@@ -34,6 +35,7 @@ class Dataset:
     # reading
     read_pages: dict[int, bytes] = field(default_factory=dict)
     read_fds: dict[int, async_files.fileobj.FileObj] = field(default_factory=dict)
+    read_in_progress: set[int] = field(default_factory=set) # primitive lock
     terminating: bool = False
 
     # stats
@@ -92,8 +94,11 @@ class Dataset:
         self.write_fd = None
 
     async def fetch(self, page_idx: int) -> bytes:
-        # TODO locks on the assignments and advancements
+        while page_idx in self.read_in_progress:
+            await asyncio.sleep(0.1)
+        self.read_in_progress.add(page_idx)
         reader = self.read_fds.get(page_idx, None)
+        
         if reader is None:
             reader = await async_files.FileIO(self.path, 'rb')()
             await reader.seek(page_idx * page_size)
@@ -102,7 +107,7 @@ class Dataset:
                 raise ValueError()
             self.page_stats.inc_read_fd()
             self.read_fds[page_idx] = reader
-        logger.debug(f"disk read of {page_idx}")
+        # logger.debug(f"disk read of {page_idx}")
         data = await reader.read(page_size)
         if page_idx+1 not in self.read_fds:
             if self.terminating:
@@ -112,11 +117,13 @@ class Dataset:
             self.page_stats.dec_read_fd()
         self.page_stats.inc_read_page()
         self.read_pages[page_idx] = data
+        self.read_in_progress.remove(page_idx)
         return data
 
     async def read(self, start: int, end: int) -> AsyncIterator[bytes]:
         page_idx = start // page_size
         rel_start = start % page_size
+        exp_waiting = 0.1
         while end == 0 or page_idx * page_size < end:
             if end == 0:
                 if page_idx < self.write_idx:
@@ -126,14 +133,19 @@ class Dataset:
                         return
                     rel_end = len(self.write)
                     if rel_start == rel_end:
-                        raise NotImplementedError # TODO instead we need to block here
+                        logger.debug(f"waiting for {exp_waiting}")
+                        await asyncio.sleep(exp_waiting)
+                        exp_waiting *= 2
+                        continue
+                    else:
+                        exp_waiting = 0.1
             else:
                 rel_end = page_size if (page_idx+1) * page_size <= end else end % page_size
 
             if page_idx in self.read_pages:
                 source = self.read_pages[page_idx]
             elif page_idx == self.write_idx:
-                source = self.write
+                source = bytes(self.write)
             else:
                 source = await self.fetch(page_idx)
 
@@ -151,14 +163,16 @@ class Dataset:
     async def finalize(self):
         if self.write_fd is not None:
             logger.error(f"dataset at {self.path} was *not* closed => purging")
-            self.evict_disk()
+            await self.evict_disk()
         self.terminating = True
         for fd in self.read_fds.values():
             await fd.close()
 
     async def evict(self, command: EvictionCommand):
+        logger.debug(f"eviction with {command=}")
         if command == EvictionCommand.read_pages_soft:
             if self.last_read[0] == -1:
+                logger.debug(f"soft evicted no pages")
                 return
             else:
                 hits = 0
@@ -167,18 +181,25 @@ class Dataset:
                         page = self.read_pages.pop(i)
                         del page
                         hits += 1
+                logger.debug(f"soft evicted {hits} pages")
                 self.page_stats.dec_read_page(hits)
         elif command == EvictionCommand.read_pages_hard:
             hits = len(self.read_pages)
             self.read_pages = {}
+            logger.debug(f"evicted {hits} pages")
             self.page_stats.dec_read_page(hits)
         elif command == EvictionCommand.read_fds:
-            hits = len(self.read_fds)
-            # TODO lock?
-            for reader in self.read_fds.values():
-                await reader.close()
-            self.read_fds = {}
+            hits = 0
+            readers = list(self.read_fds.items())
+            for page_idx, reader in readers:
+                if page_idx in self.read_in_progress:
+                    logger.debug(f"skipped evicting reader {page_idx}")
+                    continue
+                logger.debug(f"evicting reader {page_idx}")
+                hits += 1
+                await self.read_fds.pop(page_idx).close()
             self.page_stats.dec_read_fd(hits)
+            logger.debug(f"evicted {hits} readers")
         elif command == EvictionCommand.write_fds:
             pass
         else:

@@ -46,8 +46,8 @@ class Database():
         for v in self.dss.values():
             await v.finalize()
 
-    async def save(self, key: str, position: int, data: bytes, is_close: bool) -> int:
-        logger.debug(f"save for {key} from {position}, {is_close=}")
+    async def write(self, key: str, position: int, data: bytes) -> int:
+        logger.debug(f"save for {key} from {position}")
         ds = self.dss[key]
         if ds.is_closed():
             logger.warning("already closed")
@@ -59,11 +59,14 @@ class Database():
             logger.warning("write from the future")
             return -1
         await ds.append_all(memoryview(data))
-        if is_close:
-            await ds.close()
         # TODO call evict check more granularly, in a background task
         await self.check_evict()
         return ds.abs_head()
+
+    async def close(self, key: str) -> None:
+        logger.debug(f"close for {key}")
+        ds = self.dss[key]
+        await ds.close()
 
     async def read(self, key: str, start: int, end: int) -> AsyncIterator[bytes]:
         ds = self.dss[key]
@@ -78,4 +81,5 @@ class Database():
             for e in commands:
                 await v.evict(e)
         if EvictionCommand.write_fds in commands:
-            raise NotImplementedError
+            logger.error("not clearing write fds")
+            # raise NotImplementedError

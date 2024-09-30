@@ -18,11 +18,11 @@ async def test_open_write_close():
 
         key = await db.newkey()
         data = b"1234"
-        await db.save(key, 0, data, False)
+        await db.write(key, 0, data)
         assert await read(2) == data[:2]
         assert await read(4) == data # this is served from the writer's buffer
 
-        await db.save(key, 4, b"", True) # cause a close
+        await db.close(key)
         assert await read(0) == data # served from reader pages
 
         # TODO simulate genuine pressure

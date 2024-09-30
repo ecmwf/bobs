@@ -20,8 +20,9 @@ def test_save_read():
             for i in range(N):
                 yield b"a"*L
 
-        save_r = client.put("/save", content=content())
-        key = save_r.json()['key']
+        key = client.put("/create").json()['key']
+        assert client.post(f"/write/{key}/0", content=content()).status_code == 200
+        assert client.post(f"/close/{key}").status_code == 200
 
         def get_n(n: int):
             res = b""

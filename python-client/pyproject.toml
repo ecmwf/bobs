@@ -1,0 +1,17 @@
+[project]
+name = "pestcli"
+version = "0.0.1"
+description = "Persistent Streaming Client"
+license = { text = "Apache License Version 2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "httpx",
+    "fire",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "mypy"]
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "DEBUG"

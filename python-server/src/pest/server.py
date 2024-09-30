@@ -35,17 +35,24 @@ ok_response = Response()
 async def status(request: Request) -> Response:
     return ok_response
 
-async def save(request: Request) -> Response:
-    # TODO optionally derive key, position, is_close from request
+async def create(request: Request) -> Response:
     db = request.state.db
     key = await db.newkey()
-    position = 0
-    is_close = True
-    async for chunk in request.stream():
-        position = await db.save(key, position, chunk, False)
-    if is_close:
-        await db.save(key, position, b'', True)
     return OrjsonResponse({'key': key})
+
+async def write(request: Request) -> Response:
+    db = request.state.db
+    key: str = request.path_params['key']
+    offset: int = request.path_params['offset']
+    async for chunk in request.stream():
+        offset = await db.write(key, offset, chunk)
+    return ok_response
+
+async def close(request: Request) -> Response:
+    db = request.state.db
+    key: str = request.path_params['key']
+    await db.close(key)
+    return ok_response
 
 async def read(request: Request) -> Response:
     db = request.state.db
@@ -62,7 +69,9 @@ app = Starlette(
     debug=Config.is_starlette_debug(), 
     routes = [
         Route('/status', status, methods=["GET", "HEAD"]),
-        Route('/save', save, methods=["PUT"]),
+        Route('/create', create, methods=["PUT"]), # TODO route/api for get writer offset
+        Route('/write/{key}/{offset:int}', write, methods=["POST"]),
+        Route('/close/{key}', close, methods=["POST"]),
         Route('/read/{key}/{start:int}/{end:int}', read, methods=["GET"]),
     ],
     lifespan=lifespan,

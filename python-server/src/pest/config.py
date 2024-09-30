@@ -18,7 +18,7 @@ class Config():
 
     @staticmethod
     def page_size() -> int:
-        return _config('db_pagesize', cast=int, default=1024)
+        return _config('db_pagesize', cast=int, default=1024*4) # TODO default to system setting?
 
     @staticmethod
     def dbhost() -> str:

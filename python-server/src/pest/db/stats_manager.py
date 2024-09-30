@@ -17,9 +17,9 @@ class StatsManager():
     read_fds: int = 0
 
     # TODO config
-    page_threshold_soft: int = 10
-    page_threshold_hard: int = 20
-    fds_threshold: int = 5
+    page_threshold_soft: int = 1024
+    page_threshold_hard: int = 2048
+    fds_threshold: int = 128
 
     # overhead methods in case we need atomics, locks, etc
     def inc_read_page(self):
