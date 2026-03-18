@@ -14,8 +14,8 @@ pub enum BobsError {
     #[error("offset mismatch: expected {expected}, got {got}")]
     OffsetMismatch { expected: u64, got: u64 },
 
-    #[error("reader already active on this spool")]
-    ReaderAlreadyActive,
+    #[error("size mismatch: expected {expected}, got {actual}")]
+    SizeMismatch { expected: u64, actual: u64 },
 
     #[error("writer is inactive")]
     WriterInactive,

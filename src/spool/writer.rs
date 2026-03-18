@@ -3,6 +3,10 @@ use crate::io::FileIO;
 use crate::spool::{Spool, SpoolState};
 
 impl<F: FileIO> Spool<F> {
+    /// Append data at the given offset. Writes are strictly sequential — the offset
+    /// must match total_bytes_written exactly. Data accumulates in the write buffer
+    /// and is flushed to disk + cache whenever a full page is ready. Each completed
+    /// page notifies waiting readers.
     pub async fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         let mut buf = self.write_buffer.lock().await;
 
@@ -10,7 +14,7 @@ impl<F: FileIO> Spool<F> {
             let meta = self.metadata.lock().await;
             match meta.state {
                 SpoolState::Writing | SpoolState::WriteLocked => {}
-                SpoolState::Closed => return Err(BobsError::SpoolClosed),
+                SpoolState::Complete => return Err(BobsError::SpoolClosed),
                 ref other => {
                     return Err(BobsError::InvalidState {
                         current: format!("{other:?}"),
@@ -19,6 +23,7 @@ impl<F: FileIO> Spool<F> {
                 }
             }
 
+            // Enforce sequential appends — no gaps or overwrites.
             if offset != meta.total_bytes_written {
                 return Err(BobsError::OffsetMismatch {
                     expected: meta.total_bytes_written,
@@ -31,8 +36,15 @@ impl<F: FileIO> Spool<F> {
             return Ok(());
         }
 
+        {
+            let mut crc = self.running_crc32c.lock().await;
+            *crc = crc32c::crc32c_append(*crc, data);
+        }
+
         buf.extend_from_slice(data);
 
+        // Flush complete pages: write to disk, cache, and notify readers.
+        // Partial remainder stays in the buffer until more data arrives (or complete).
         while buf.len() >= self.page_size {
             let page_bytes = buf.split_to(self.page_size).freeze();
 
@@ -98,12 +110,14 @@ mod tests {
             key: "test-key".to_string(),
             bob_id: "test-bob".to_string(),
             content_type: None,
+            content_encoding: None,
             state: SpoolState::Writing,
             write_locked: false,
             created_at: 0,
             last_write_at: 0,
             last_read_at: None,
             total_bytes_written: 0,
+            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,
@@ -189,7 +203,7 @@ mod tests {
 
         {
             let mut meta = spool.metadata.lock().await;
-            meta.state = SpoolState::Closed;
+            meta.state = SpoolState::Complete;
         }
 
         let result = spool.write(0, &[1, 2, 3]).await;

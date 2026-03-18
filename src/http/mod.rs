@@ -12,6 +12,7 @@ use axum::{Json, Router};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct AppState<F: FileIO> {
     pub manager: Arc<SpoolManager<F>>,
@@ -23,7 +24,7 @@ pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
         .route("/status", get(status).head(status_head))
         .route("/create", put(create_spool::<F>))
         .route("/write/{key}/{offset}", post(write_spool::<F>))
-        .route("/close/{key}", post(close_spool::<F>))
+        .route("/complete/{key}", post(complete_spool::<F>))
         .route("/read/{key}/{start}/{end}", get(read_spool::<F>))
         .route("/delete/{key}", delete(delete_spool::<F>))
 }
@@ -48,8 +49,14 @@ async fn status_head() -> impl IntoResponse {
 #[derive(Debug, Default, Deserialize)]
 struct CreateRequest {
     content_type: Option<String>,
+    content_encoding: Option<String>,
     #[serde(default)]
     write_locked: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompleteRequest {
+    expected_size: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,7 +76,7 @@ async fn create_spool<F: FileIO>(
     };
     let key = state
         .manager
-        .create_spool(req.content_type, req.write_locked)
+        .create_spool(req.content_type, req.content_encoding, req.write_locked)
         .await
         .map_err(ApiError)?;
     Ok((StatusCode::CREATED, Json(CreateResponse { key })).into_response())
@@ -97,18 +104,28 @@ async fn write_spool<F: FileIO>(
     Ok(StatusCode::OK.into_response())
 }
 
-async fn close_spool<F: FileIO>(
+async fn complete_spool<F: FileIO>(
     State(state): State<Arc<AppState<F>>>,
     Path(key): Path<String>,
+    body: Bytes,
 ) -> std::result::Result<Response, ApiError> {
+    let req = if body.is_empty() {
+        CompleteRequest::default()
+    } else {
+        serde_json::from_slice::<CompleteRequest>(&body)
+            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
+    };
+
     let spool = state
         .manager
         .get_spool(&key)
         .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
-    spool.close().await.map_err(ApiError)?;
+    spool.complete(req.expected_size).await.map_err(ApiError)?;
     Ok(StatusCode::OK.into_response())
 }
 
+/// RAII guard that decrements the spool's reader count on drop, ensuring cleanup
+/// sees the correct active reader count even if the stream is cancelled mid-flight.
 struct ReaderLease<F: FileIO> {
     spool: Arc<crate::spool::Spool<F>>,
 }
@@ -131,38 +148,82 @@ async fn read_spool<F: FileIO + 'static>(
     if !spool.is_readable().await {
         return Err(ApiError(BobsError::SpoolLocked));
     }
-    spool.acquire_reader().map_err(ApiError)?;
+    spool.acquire_reader();
 
     let lease = ReaderLease {
         spool: Arc::clone(&spool),
     };
     let page_size = spool.page_size as u64;
+    // end=0 means "follow" mode: stream until the writer closes the spool.
+    // end>0 means bounded read: return bytes in [start, end) and stop.
     let follow = end == 0;
+    let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
+    let (content_type, content_encoding, checksum_crc32c) = {
+        let meta = spool.metadata.lock().await;
+        (
+            meta.content_type.clone(),
+            meta.content_encoding.clone(),
+            meta.checksum_crc32c,
+        )
+    };
+
+    // Pre-fetch the first page before committing to a streaming response.
+    // If the timeout fires before any data arrives, return a 307 redirect
+    // so standard clients (curl -L, browsers) retry automatically.
+    let first_page_idx = start / page_size;
+    let first_page = match tokio::time::timeout(
+        long_poll_timeout,
+        spool.read_page(first_page_idx),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(ApiError(e)),
+        Err(_) => {
+            // Lease drops here, releasing the reader.
+            return Ok(long_poll_redirect(&key, start, end));
+        }
+    };
 
     let stream = stream! {
         let _lease = lease;
         let mut offset = start;
+        let mut prefetched = first_page;
 
         loop {
             if !follow && offset >= end {
                 break;
             }
 
+            // Map the current byte offset to a page-aligned read.
             let page_idx = offset / page_size;
             let page_start = page_idx * page_size;
             let page_end = page_start + page_size;
 
-            let maybe_page = match spool.read_page(page_idx).await {
-                Ok(v) => v,
-                Err(e) => {
-                    yield Err::<Bytes, BobsError>(e);
-                    break;
+            // First iteration uses the pre-fetched page; subsequent iterations
+            // long-poll via read_page with a timeout. Mid-stream timeouts just
+            // end the stream (the connection was recently active, not idle).
+            let maybe_page = if let Some(page) = prefetched.take() {
+                Some(page)
+            } else {
+                match tokio::time::timeout(
+                    long_poll_timeout,
+                    spool.read_page(page_idx),
+                ).await {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        yield Err::<Bytes, BobsError>(e);
+                        break;
+                    }
+                    Err(_) => break,
                 }
             };
             let Some(page) = maybe_page else {
                 break;
             };
 
+            // Slice the page to the requested byte range. The offset may not be
+            // page-aligned (partial first page) and the end may land mid-page.
             let slice_start = (offset - page_start) as usize;
             let logical_end = if follow { page_end } else { end.min(page_end) };
             let slice_end = ((logical_end - page_start) as usize).min(page.len());
@@ -176,9 +237,12 @@ async fn read_spool<F: FileIO + 'static>(
                 offset += chunk.len() as u64;
                 yield Ok::<Bytes, BobsError>(chunk);
             } else if follow {
+                // Page exists but has no data at our offset yet. Check if the
+                // writer is done; if so, we've consumed everything. Otherwise
+                // loop back and long-poll for more data.
                 let done = {
                     let meta = spool.metadata.lock().await;
-                    matches!(meta.state, crate::spool::SpoolState::Closed | crate::spool::SpoolState::Deleting)
+                    matches!(meta.state, crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting)
                         && offset >= meta.total_bytes_written
                 };
                 if done {
@@ -192,16 +256,47 @@ async fn read_spool<F: FileIO + 'static>(
     };
 
     let mut response = Body::from_stream(stream).into_response();
+    let content_type_header = HeaderValue::from_str(
+        content_type.as_deref().unwrap_or("application/octet-stream"),
+    )
+    .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
+        content_type_header,
     );
+    if let Some(enc) = &content_encoding {
+        let encoding_header = HeaderValue::from_str(enc)
+            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_ENCODING,
+            encoding_header,
+        );
+    }
+    if let Some(crc) = checksum_crc32c {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+        let checksum_header = HeaderValue::from_str(&encoded)
+            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
+        response.headers_mut().insert(
+            "X-Checksum-CRC32C",
+            checksum_header,
+        );
+    }
     response.headers_mut().insert(
         "X-Accel-Buffering",
         HeaderValue::from_static("no"),
     );
 
     Ok(response)
+}
+
+fn long_poll_redirect(key: &str, start: u64, end: u64) -> Response {
+    let location = format!("/read/{key}/{start}/{end}");
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [(axum::http::header::LOCATION, location)],
+    )
+        .into_response()
 }
 
 async fn delete_spool<F: FileIO>(
@@ -224,8 +319,9 @@ impl IntoResponse for ApiError {
         let status = match self.0 {
             BobsError::SpoolNotFound { .. } => StatusCode::NOT_FOUND,
             BobsError::OffsetMismatch { .. } => StatusCode::BAD_REQUEST,
+            BobsError::SizeMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::SpoolLocked => StatusCode::LOCKED,
-            BobsError::SpoolClosed | BobsError::ReaderAlreadyActive => StatusCode::CONFLICT,
+            BobsError::SpoolClosed => StatusCode::CONFLICT,
             BobsError::InvalidState { .. } => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -260,6 +356,7 @@ mod tests {
             reader_done_ttl_secs: 60,
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 30,
+            long_poll_timeout_ms: 25000,
             bob_id: "http-bob".into(),
         })
     }
@@ -348,13 +445,13 @@ mod tests {
         let resp = app.clone().oneshot(req).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let close_req = Request::builder()
+        let complete_req = Request::builder()
             .method("POST")
-            .uri(format!("/close/{key}"))
+            .uri(format!("/complete/{key}"))
             .body(Body::empty())
             .expect("request build");
-        let close_resp = app.clone().oneshot(close_req).await.expect("oneshot");
-        assert_eq!(close_resp.status(), StatusCode::OK);
+        let complete_resp = app.clone().oneshot(complete_req).await.expect("oneshot");
+        assert_eq!(complete_resp.status(), StatusCode::OK);
 
         let read_req = Request::builder()
             .method("GET")

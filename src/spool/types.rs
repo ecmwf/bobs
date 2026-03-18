@@ -6,9 +6,9 @@ use std::path::PathBuf;
 pub enum SpoolState {
     Creating,
     Writing,
-    WriteLocked, // write-lock mode: writes OK, reads blocked until Closed
-    Readable,    // closed and readable (after write-lock released)
-    Closed,      // writer closed, readable
+    WriteLocked, // write-lock mode: writes OK, reads blocked until Complete
+    Readable,    // after write-lock released
+    Complete,    // writer finished, all data readable
     Deleting,
 }
 
@@ -19,11 +19,11 @@ impl SpoolState {
             (self, target),
             (Creating, Writing)
             | (Creating, WriteLocked)
-            | (Writing, Closed)
+            | (Writing, Complete)
             | (Writing, Deleting)
-            | (WriteLocked, Closed)   // close releases write-lock
+            | (WriteLocked, Complete)   // complete releases write-lock
             | (WriteLocked, Deleting)
-            | (Closed, Deleting)
+            | (Complete, Deleting)
             | (Readable, Deleting)
         )
     }
@@ -42,7 +42,7 @@ impl SpoolState {
     pub fn is_readable(&self) -> bool {
         matches!(
             self,
-            SpoolState::Closed | SpoolState::Readable | SpoolState::Writing
+            SpoolState::Complete | SpoolState::Readable | SpoolState::Writing
         )
     }
 }
@@ -52,14 +52,16 @@ pub struct SpoolMetadata {
     pub key: String,
     pub bob_id: String,
     pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
     pub state: SpoolState,
     pub write_locked: bool,
     pub created_at: u64,    // unix timestamp secs
     pub last_write_at: u64, // unix timestamp secs
     pub last_read_at: Option<u64>,
     pub total_bytes_written: u64,
+    pub checksum_crc32c: Option<u32>,
     pub total_pages: u64,
-    pub final_page_size: Option<u64>, // size of last (partial) page after close
+    pub final_page_size: Option<u64>, // size of last (partial) page after complete
     pub data_path: PathBuf,
 }
 
@@ -70,21 +72,21 @@ mod tests {
     #[test]
     fn test_valid_transitions() {
         assert!(SpoolState::Creating.can_transition_to(&SpoolState::Writing));
-        assert!(SpoolState::Writing.can_transition_to(&SpoolState::Closed));
-        assert!(SpoolState::WriteLocked.can_transition_to(&SpoolState::Closed));
-        assert!(SpoolState::Closed.can_transition_to(&SpoolState::Deleting));
+        assert!(SpoolState::Writing.can_transition_to(&SpoolState::Complete));
+        assert!(SpoolState::WriteLocked.can_transition_to(&SpoolState::Complete));
+        assert!(SpoolState::Complete.can_transition_to(&SpoolState::Deleting));
     }
 
     #[test]
     fn test_invalid_transitions() {
-        assert!(!SpoolState::Closed.can_transition_to(&SpoolState::Writing));
+        assert!(!SpoolState::Complete.can_transition_to(&SpoolState::Writing));
         assert!(!SpoolState::Deleting.can_transition_to(&SpoolState::Writing));
         assert!(!SpoolState::Writing.can_transition_to(&SpoolState::Creating));
     }
 
     #[test]
     fn test_transition_to_returns_error_on_invalid() {
-        let result = SpoolState::Closed.transition_to(SpoolState::Writing);
+        let result = SpoolState::Complete.transition_to(SpoolState::Writing);
         assert!(result.is_err());
     }
 }

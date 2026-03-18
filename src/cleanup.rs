@@ -7,6 +7,10 @@ use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
+/// Periodic sweep that reclaims spools which are no longer needed.
+/// Deletion triggers: writer abandoned the spool, reader finished and TTL expired,
+/// or the spool was never read within the unread TTL. Spools with active readers
+/// are always protected.
 pub async fn run_cleanup_loop<F: FileIO>(manager: Arc<SpoolManager<F>>, config: Arc<Config>) {
     let mut interval = time::interval(Duration::from_secs(config.cleanup_sweep_interval_secs));
 
@@ -29,18 +33,21 @@ pub async fn run_cleanup_loop<F: FileIO>(manager: Arc<SpoolManager<F>>, config: 
                     meta.created_at,
                 )
             };
-            let reader_active = spool.reader_active.load(Ordering::SeqCst);
+            let readers_active = spool.reader_count.load(Ordering::SeqCst) > 0;
 
+            // Writer stopped sending data — probably crashed or disconnected.
             let writer_inactive = matches!(state, SpoolState::Writing | SpoolState::WriteLocked)
                 && now.saturating_sub(last_write_at) > config.writer_inactivity_timeout_secs;
 
-            let reader_done_expired = matches!(state, SpoolState::Closed)
-                && !reader_active
+            // Spool is closed, no active readers, and last read was long enough ago.
+            let reader_done_expired = matches!(state, SpoolState::Complete)
+                && !readers_active
                 && last_read_at
                     .map(|last| now.saturating_sub(last) > config.reader_done_ttl_secs)
                     .unwrap_or(false);
 
-            let unread_expired = matches!(state, SpoolState::Closed)
+            // Spool was closed but nobody ever read it.
+            let unread_expired = matches!(state, SpoolState::Complete)
                 && last_read_at.is_none()
                 && now.saturating_sub(created_at) > config.unread_ttl_secs;
 
@@ -87,6 +94,7 @@ mod tests {
             reader_done_ttl_secs: 1,
             unread_ttl_secs: 1,
             cleanup_sweep_interval_secs: 1,
+            long_poll_timeout_ms: 25000,
             bob_id: "bob-clean".into(),
         })
     }
@@ -107,7 +115,10 @@ mod tests {
         let manager = test_manager().await;
         let config = test_config();
 
-        let key = manager.create_spool(None, false).await.expect("create spool");
+        let key = manager
+            .create_spool(None, None, false)
+            .await
+            .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
         {
             let mut meta = spool.metadata.lock().await;
@@ -130,9 +141,12 @@ mod tests {
         let manager = test_manager().await;
         let config = test_config();
 
-        let key = manager.create_spool(None, false).await.expect("create spool");
+        let key = manager
+            .create_spool(None, None, false)
+            .await
+            .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
-        spool.close().await.expect("close spool");
+        spool.complete(None).await.expect("complete spool");
         {
             let mut meta = spool.metadata.lock().await;
             meta.last_read_at = Some(0);
@@ -153,9 +167,12 @@ mod tests {
         let manager = test_manager().await;
         let config = test_config();
 
-        let key = manager.create_spool(None, false).await.expect("create spool");
+        let key = manager
+            .create_spool(None, None, false)
+            .await
+            .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
-        spool.close().await.expect("close spool");
+        spool.complete(None).await.expect("complete spool");
         {
             let mut meta = spool.metadata.lock().await;
             meta.created_at = 0;
@@ -177,14 +194,17 @@ mod tests {
         let manager = test_manager().await;
         let config = test_config();
 
-        let key = manager.create_spool(None, false).await.expect("create spool");
+        let key = manager
+            .create_spool(None, None, false)
+            .await
+            .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
-        spool.close().await.expect("close spool");
+        spool.complete(None).await.expect("complete spool");
         {
             let mut meta = spool.metadata.lock().await;
             meta.last_read_at = Some(0);
         }
-        spool.reader_active.store(true, Ordering::SeqCst);
+        spool.reader_count.fetch_add(1, Ordering::SeqCst);
 
         let task = start_cleanup_task(manager.clone(), config);
         tokio::task::yield_now().await;

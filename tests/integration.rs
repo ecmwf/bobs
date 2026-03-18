@@ -40,6 +40,7 @@ async fn start_server() -> TestServer {
         reader_done_ttl_secs: 60,
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 30,
+        long_poll_timeout_ms: 25000,
         bob_id: "itest-bob".into(),
     });
 
@@ -102,12 +103,12 @@ async fn test_basic_lifecycle() {
         .expect("write send");
     assert_eq!(write_resp.status(), reqwest::StatusCode::OK);
 
-    let close_resp = client
-        .post(format!("{}/close/{}", server.base_url, key))
+    let complete_resp = client
+        .post(format!("{}/complete/{}", server.base_url, key))
         .send()
         .await
-        .expect("close send");
-    assert_eq!(close_resp.status(), reqwest::StatusCode::OK);
+        .expect("complete send");
+    assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
 
     let read_resp = client
         .get(format!(
@@ -174,12 +175,12 @@ async fn test_follow_mode() {
         offset += chunk.len() as u64;
     }
 
-    let close_resp = client
-        .post(format!("{}/close/{}", server.base_url, key))
+    let complete_resp = client
+        .post(format!("{}/complete/{}", server.base_url, key))
         .send()
         .await
-        .expect("close send");
-    assert_eq!(close_resp.status(), reqwest::StatusCode::OK);
+        .expect("complete send");
+    assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
 
     let read_bytes = tokio::time::timeout(std::time::Duration::from_secs(5), read_task)
         .await
@@ -215,12 +216,12 @@ async fn test_write_lock() {
         .expect("write send");
     assert_eq!(write_resp.status(), reqwest::StatusCode::OK);
 
-    let close_resp = client
-        .post(format!("{}/close/{}", server.base_url, key))
+    let complete_resp = client
+        .post(format!("{}/complete/{}", server.base_url, key))
         .send()
         .await
-        .expect("close send");
-    assert_eq!(close_resp.status(), reqwest::StatusCode::OK);
+        .expect("complete send");
+    assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
 
     let read_resp = client
         .get(format!("{}/read/{}/0/5000", server.base_url, key))
@@ -261,42 +262,32 @@ async fn test_error_cases() {
         .expect("bad offset write");
     assert_eq!(bad_offset.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    let key_for_reader = key.clone();
-    let base_url = server.base_url.clone();
-    let client_for_reader = client.clone();
-    let reader_task = tokio::spawn(async move {
-        let resp = client_for_reader
-            .get(format!("{}/read/{}/0/0", base_url, key_for_reader))
-            .send()
-            .await
-            .expect("first reader send");
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        drop(resp);
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let complete_resp = client
+        .post(format!("{}/complete/{}", server.base_url, key))
+        .send()
+        .await
+        .expect("complete send");
+    assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
+
+    let first_reader = client
+        .get(format!("{}/read/{}/0/10", server.base_url, key))
+        .send()
+        .await
+        .expect("first reader send");
+    assert_eq!(first_reader.status(), reqwest::StatusCode::OK);
 
     let second_reader = client
-        .get(format!("{}/read/{}/0/1", server.base_url, key))
+        .get(format!("{}/read/{}/0/10", server.base_url, key))
         .send()
         .await
         .expect("second reader send");
-    assert_eq!(second_reader.status(), reqwest::StatusCode::CONFLICT);
-
-    let close_resp = client
-        .post(format!("{}/close/{}", server.base_url, key))
-        .send()
-        .await
-        .expect("close send");
-    assert_eq!(close_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(second_reader.status(), reqwest::StatusCode::OK);
 
     let write_after_close = client
         .post(format!("{}/write/{}/10", server.base_url, key))
         .body(vec![8u8; 1])
         .send()
         .await
-        .expect("write after close");
+        .expect("write after complete");
     assert_eq!(write_after_close.status(), reqwest::StatusCode::CONFLICT);
-
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), reader_task).await;
 }

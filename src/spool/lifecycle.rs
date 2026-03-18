@@ -6,14 +6,18 @@ use bytes::BytesMut;
 use super::Spool;
 
 impl<F: FileIO> Spool<F> {
-    pub async fn close(&self) -> Result<()> {
+    /// Finalize the spool: flush any partial page in the write buffer to disk + cache,
+    /// fsync, and transition to Complete. Notifies all waiting readers so they can see
+    /// the final data and detect end-of-stream.
+    pub async fn complete(&self, expected_size: Option<u64>) -> Result<()> {
         {
             let meta = self.metadata.lock().await;
-            if matches!(meta.state, SpoolState::Closed | SpoolState::Deleting) {
+            if matches!(meta.state, SpoolState::Complete | SpoolState::Deleting) {
                 return Ok(());
             }
         }
 
+        // Drain the write buffer — this is the final (possibly partial) page.
         let partial_page = {
             let mut buf = self.write_buffer.lock().await;
             if buf.is_empty() {
@@ -61,9 +65,24 @@ impl<F: FileIO> Spool<F> {
             }
         }
 
+        let crc32c = *self.running_crc32c.lock().await;
+
         {
             let mut meta = self.metadata.lock().await;
-            meta.state = SpoolState::Closed;
+            if let Some(expected) = expected_size {
+                if meta.total_bytes_written != expected {
+                    return Err(BobsError::SizeMismatch {
+                        expected,
+                        actual: meta.total_bytes_written,
+                    });
+                }
+            }
+            meta.checksum_crc32c = Some(crc32c);
+        }
+
+        {
+            let mut meta = self.metadata.lock().await;
+            meta.state = SpoolState::Complete;
         }
 
         self.notify.notify_waiters();
@@ -86,7 +105,7 @@ impl<F: FileIO> Spool<F> {
         let meta = self.metadata.lock().await;
         match meta.state {
             SpoolState::Writing => !meta.write_locked,
-            SpoolState::Closed | SpoolState::Readable => true,
+            SpoolState::Complete | SpoolState::Readable => true,
             _ => false,
         }
     }
@@ -106,12 +125,14 @@ mod tests {
             key: "test-key".to_string(),
             bob_id: "test-bob".to_string(),
             content_type: None,
+            content_encoding: None,
             state: SpoolState::Writing,
             write_locked: false,
             created_at: 0,
             last_write_at: 0,
             last_read_at: None,
             total_bytes_written: 0,
+            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,
@@ -135,10 +156,10 @@ mod tests {
             meta.total_bytes_written = partial_data.len() as u64;
         }
 
-        spool.close().await.expect("close succeeds");
+        spool.complete(None).await.expect("complete succeeds");
 
         let meta = spool.metadata.lock().await;
-        assert_eq!(meta.state, SpoolState::Closed);
+        assert_eq!(meta.state, SpoolState::Complete);
         assert_eq!(meta.total_pages, 1);
         assert_eq!(meta.final_page_size, Some(1000));
         drop(meta);
@@ -157,7 +178,7 @@ mod tests {
         spool.set_write_locked(true).await;
         assert!(!spool.is_readable().await);
 
-        spool.close().await.expect("close succeeds");
+        spool.complete(None).await.expect("complete succeeds");
         assert!(spool.is_readable().await);
     }
 
@@ -166,10 +187,10 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
 
-        spool.close().await.expect("first close succeeds");
-        spool.close().await.expect("second close succeeds");
+        spool.complete(None).await.expect("first close succeeds");
+        spool.complete(None).await.expect("second close succeeds");
 
         let meta = spool.metadata.lock().await;
-        assert_eq!(meta.state, SpoolState::Closed);
+        assert_eq!(meta.state, SpoolState::Complete);
     }
 }

@@ -39,6 +39,11 @@ pub struct Config {
     /// Env: `BOBS_CLEANUP_SWEEP_INTERVAL_SECS`, Default: `30`
     pub cleanup_sweep_interval_secs: u64,
 
+    /// Long-poll timeout in milliseconds for streaming reads.
+    /// Prevents idle connections from being killed by firewalls/proxies.
+    /// Env: `BOBS_LONG_POLL_TIMEOUT_MS`, Default: `25000`
+    pub long_poll_timeout_ms: u64,
+
     /// Unique identifier for this BOBS instance (pod hostname in k8s).
     /// Env: `BOBS_BOB_ID`, Default: system hostname or `"unknown"`
     pub bob_id: String,
@@ -80,6 +85,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            long_poll_timeout_ms: env::var("BOBS_LONG_POLL_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25000),
             bob_id: env::var("BOBS_BOB_ID")
                 .unwrap_or_else(|_| env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())),
         }
@@ -108,6 +117,7 @@ mod tests {
         assert_eq!(config.reader_done_ttl_secs, 60);
         assert_eq!(config.unread_ttl_secs, 3600);
         assert_eq!(config.cleanup_sweep_interval_secs, 30);
+        assert_eq!(config.long_poll_timeout_ms, 25000);
         // bob_id should be either HOSTNAME or "unknown"
         assert!(!config.bob_id.is_empty());
     }
@@ -126,6 +136,7 @@ mod tests {
             env::set_var("BOBS_READER_DONE_TTL_SECS", "120");
             env::set_var("BOBS_UNREAD_TTL_SECS", "7200");
             env::set_var("BOBS_CLEANUP_SWEEP_INTERVAL_SECS", "60");
+            env::set_var("BOBS_LONG_POLL_TIMEOUT_MS", "15000");
             env::set_var("BOBS_BOB_ID", "test-pod-1");
         }
 
@@ -140,6 +151,7 @@ mod tests {
         assert_eq!(config.reader_done_ttl_secs, 120);
         assert_eq!(config.unread_ttl_secs, 7200);
         assert_eq!(config.cleanup_sweep_interval_secs, 60);
+        assert_eq!(config.long_poll_timeout_ms, 15000);
         assert_eq!(config.bob_id, "test-pod-1");
 
         // Clean up env vars
@@ -153,6 +165,7 @@ mod tests {
             env::remove_var("BOBS_READER_DONE_TTL_SECS");
             env::remove_var("BOBS_UNREAD_TTL_SECS");
             env::remove_var("BOBS_CLEANUP_SWEEP_INTERVAL_SECS");
+            env::remove_var("BOBS_LONG_POLL_TIMEOUT_MS");
             env::remove_var("BOBS_BOB_ID");
         }
     }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -19,6 +19,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 dashmap = "6"
 async-stream = "0.3"
+crc32c = "0.6"
+base64 = "0.22"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "stream"] }

@@ -55,6 +55,7 @@ impl<F: FileIO> SpoolManager<F> {
     pub async fn create_spool(
         &self,
         content_type: Option<String>,
+        content_encoding: Option<String>,
         write_locked: bool,
     ) -> Result<String> {
         let key = format!("{}-{}", self.bob_id, Uuid::new_v4());
@@ -72,6 +73,7 @@ impl<F: FileIO> SpoolManager<F> {
             key: key.clone(),
             bob_id: self.bob_id.clone(),
             content_type,
+            content_encoding,
             state: if write_locked {
                 SpoolState::WriteLocked
             } else {
@@ -82,6 +84,7 @@ impl<F: FileIO> SpoolManager<F> {
             last_write_at: now,
             last_read_at: None,
             total_bytes_written: 0,
+            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path,
@@ -189,7 +192,7 @@ impl<F: FileIO> SpoolManager<F> {
             };
 
             if matches!(meta.state, SpoolState::Creating | SpoolState::Deleting) {
-                meta.state = SpoolState::Closed;
+                meta.state = SpoolState::Complete;
             }
 
             let spool = Arc::new(
@@ -236,7 +239,7 @@ mod tests {
             .expect("manager init");
 
         let key = manager
-            .create_spool(Some("application/octet-stream".into()), false)
+            .create_spool(Some("application/octet-stream".into()), None, false)
             .await
             .expect("create spool");
         assert!(key.starts_with("bob-a-"));
@@ -257,7 +260,7 @@ mod tests {
             .expect("manager init");
 
         let key = manager
-            .create_spool(None, false)
+            .create_spool(None, None, false)
             .await
             .expect("create spool");
         let spool_dir = data_dir.join(&key);
@@ -285,7 +288,7 @@ mod tests {
             .expect("manager1 init");
 
             manager1
-                .create_spool(None, true)
+                .create_spool(None, None, true)
                 .await
                 .expect("create spool")
         };
