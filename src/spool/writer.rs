@@ -1,0 +1,198 @@
+use crate::error::{BobsError, Result};
+use crate::io::FileIO;
+use crate::spool::{Spool, SpoolState};
+
+impl<F: FileIO> Spool<F> {
+    pub async fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let mut buf = self.write_buffer.lock().await;
+
+        {
+            let meta = self.metadata.lock().await;
+            match meta.state {
+                SpoolState::Writing | SpoolState::WriteLocked => {}
+                SpoolState::Closed => return Err(BobsError::SpoolClosed),
+                ref other => {
+                    return Err(BobsError::InvalidState {
+                        current: format!("{other:?}"),
+                        attempted_action: "write".to_string(),
+                    });
+                }
+            }
+
+            if offset != meta.total_bytes_written {
+                return Err(BobsError::OffsetMismatch {
+                    expected: meta.total_bytes_written,
+                    got: offset,
+                });
+            }
+        }
+
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        buf.extend_from_slice(data);
+
+        while buf.len() >= self.page_size {
+            let page_bytes = buf.split_to(self.page_size).freeze();
+
+            let page_idx = {
+                let meta = self.metadata.lock().await;
+                meta.total_pages
+            };
+            let file_offset = page_idx * self.page_size as u64;
+
+            {
+                let handle_guard = self.file_handle.lock().await;
+                let Some(handle) = handle_guard.as_ref() else {
+                    return Err(BobsError::WriterInactive);
+                };
+                F::write_at(handle, file_offset, &page_bytes)
+                    .await
+                    .map_err(BobsError::IoError)?;
+            }
+
+            {
+                let mut cache = self.page_cache.lock().await;
+                cache.insert(page_idx, page_bytes);
+            }
+
+            {
+                let mut meta = self.metadata.lock().await;
+                meta.total_pages += 1;
+            }
+
+            self.notify.notify_waiters();
+        }
+
+        {
+            let mut meta = self.metadata.lock().await;
+            meta.total_bytes_written = meta.total_pages * self.page_size as u64 + buf.len() as u64;
+            meta.last_write_at = now_secs();
+        }
+
+        Ok(())
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{FileIO, TokioFileIO};
+    use crate::spool::SpoolMetadata;
+    use tempfile::tempdir;
+
+    async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
+        let path = dir.join("spool.dat");
+        let handle = TokioFileIO::create(&path)
+            .await
+            .expect("failed to create spool file");
+        let meta = SpoolMetadata {
+            key: "test-key".to_string(),
+            bob_id: "test-bob".to_string(),
+            content_type: None,
+            state: SpoolState::Writing,
+            write_locked: false,
+            created_at: 0,
+            last_write_at: 0,
+            last_read_at: None,
+            total_bytes_written: 0,
+            total_pages: 0,
+            final_page_size: None,
+            data_path: path,
+        };
+
+        Spool::new(meta, handle, page_size, 256).await
+    }
+
+    #[tokio::test]
+    async fn test_write_single_page() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+        let data = vec![0xABu8; 4096];
+
+        spool.write(0, &data).await.expect("write should succeed");
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.total_pages, 1);
+        assert_eq!(meta.total_bytes_written, 4096);
+        drop(meta);
+
+        let cache = spool.page_cache.lock().await;
+        assert!(cache.contains(0));
+    }
+
+    #[tokio::test]
+    async fn test_write_multiple_pages() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+        let data = vec![0xCDu8; 16384];
+
+        spool.write(0, &data).await.expect("write should succeed");
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.total_pages, 4);
+        assert_eq!(meta.total_bytes_written, 16384);
+    }
+
+    #[tokio::test]
+    async fn test_write_partial_page() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+        let data = vec![0xEFu8; 1000];
+
+        spool.write(0, &data).await.expect("write should succeed");
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.total_pages, 0);
+        assert_eq!(meta.total_bytes_written, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_write_offset_mismatch() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        let result = spool.write(100, &[0u8; 100]).await;
+        assert!(matches!(
+            result,
+            Err(BobsError::OffsetMismatch {
+                expected: 0,
+                got: 100
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_write_empty_is_noop() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        spool.write(0, &[]).await.expect("empty write should succeed");
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.total_pages, 0);
+        assert_eq!(meta.total_bytes_written, 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_after_close_fails() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        {
+            let mut meta = spool.metadata.lock().await;
+            meta.state = SpoolState::Closed;
+        }
+
+        let result = spool.write(0, &[1, 2, 3]).await;
+        assert!(matches!(result, Err(BobsError::SpoolClosed)));
+    }
+}

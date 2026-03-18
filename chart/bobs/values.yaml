@@ -1,0 +1,30 @@
+replicaCount: 1
+
+image:
+  repository: bobs
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 3000
+
+resources: {}
+
+env:
+  BOBS_LISTEN_ADDR: "0.0.0.0:3000"
+  BOBS_DATA_DIR: "/var/lib/bobs"
+  BOBS_PAGE_SIZE: "4096"
+  BOBS_PAGE_CACHE_CAPACITY: "256"
+  BOBS_WRITER_INACTIVITY_TIMEOUT_SECS: "300"
+  BOBS_READER_DONE_TTL_SECS: "60"
+  BOBS_UNREAD_TTL_SECS: "3600"
+  BOBS_CLEANUP_SWEEP_INTERVAL_SECS: "30"
+
+persistence:
+  enabled: true
+  size: 1Gi
+
+headlessService:
+  enabled: true
+  name: bobs-svc
