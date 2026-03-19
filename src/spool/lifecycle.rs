@@ -85,6 +85,13 @@ impl<F: FileIO> Spool<F> {
             meta.state = SpoolState::Complete;
         }
 
+        {
+            let meta = self.metadata.lock().await.clone();
+            if let Err(error) = self.persist_metadata(&meta) {
+                tracing::warn!(error = %error, "failed to persist metadata after complete");
+            }
+        }
+
         self.notify.notify_waiters();
 
         Ok(())
@@ -116,10 +123,22 @@ mod tests {
     use super::*;
     use crate::io::{FileIO, TokioFileIO};
     use crate::spool::types::SpoolMetadata;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
         let path = dir.join("spool.dat");
+        let db_path = dir.join("test.redb");
+        let db = Arc::new(redb::Database::create(&db_path).expect("create test db"));
+        {
+            let write_txn = db.begin_write().expect("begin write");
+            {
+                let _ = write_txn
+                    .open_table(crate::manager::SPOOL_TABLE)
+                    .expect("open table");
+            }
+            write_txn.commit().expect("commit");
+        }
         let handle = TokioFileIO::create(&path).await.expect("create spool file");
         let meta = SpoolMetadata {
             key: "test-key".to_string(),
@@ -138,7 +157,7 @@ mod tests {
             data_path: path,
         };
 
-        Spool::new(meta, handle, page_size, 256).await
+        Spool::new(meta, handle, page_size, 256, db).await
     }
 
     #[tokio::test]

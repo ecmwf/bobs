@@ -1,5 +1,6 @@
 use crate::io::FileIO;
 use bytes::BytesMut;
+use redb::Database;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
@@ -23,6 +24,7 @@ pub struct Spool<F: FileIO> {
     /// Accumulates incoming bytes until a full page is ready for flush.
     pub write_buffer: Arc<Mutex<BytesMut>>,
     pub file_handle: Arc<Mutex<Option<F::Handle>>>,
+    pub db: Arc<Database>,
     pub running_crc32c: Arc<Mutex<u32>>,
     /// Writer notifies after each completed page; readers long-poll on this.
     pub notify: Arc<Notify>,
@@ -41,6 +43,7 @@ impl<F: FileIO> Spool<F> {
         file_handle: F::Handle,
         page_size: usize,
         cache_capacity: usize,
+        db: Arc<Database>,
     ) -> Self {
         let data_path = metadata.data_path.clone();
 
@@ -49,6 +52,7 @@ impl<F: FileIO> Spool<F> {
             page_cache: Arc::new(Mutex::new(PageCache::new(cache_capacity))),
             write_buffer: Arc::new(Mutex::new(BytesMut::new())),
             file_handle: Arc::new(Mutex::new(Some(file_handle))),
+            db,
             running_crc32c: Arc::new(Mutex::new(0)),
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
@@ -57,6 +61,30 @@ impl<F: FileIO> Spool<F> {
             reader_count: Arc::new(AtomicUsize::new(0)),
             _phantom: PhantomData,
         }
+    }
+
+    pub fn persist_metadata(&self, metadata: &SpoolMetadata) -> crate::error::Result<()> {
+        use crate::error::BobsError;
+        use crate::manager::SPOOL_TABLE;
+
+        let payload = serde_json::to_vec(metadata)
+            .map_err(|e| BobsError::SerializationError(e.to_string()))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| BobsError::StorageError(e.into()))?;
+        {
+            let mut table = write_txn
+                .open_table(SPOOL_TABLE)
+                .map_err(|e| BobsError::StorageError(e.into()))?;
+            table
+                .insert(metadata.key.as_str(), payload.as_slice())
+                .map_err(|e| BobsError::StorageError(e.into()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| BobsError::StorageError(e.into()))?;
+        Ok(())
     }
 }
 

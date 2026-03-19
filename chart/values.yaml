@@ -1,5 +1,7 @@
 replicaCount: 1
 
+imagePullSecrets: []
+
 image:
   repository: bobs
   tag: latest
@@ -11,19 +13,32 @@ service:
 
 resources: {}
 
-env:
-  BOBS_LISTEN_ADDR: "0.0.0.0:3000"
-  BOBS_DATA_DIR: "/var/lib/bobs"
-  BOBS_PAGE_SIZE: "4096"
-  BOBS_MAX_CACHE_BYTES: "1048576"
-  BOBS_WRITER_INACTIVITY_TIMEOUT_SECS: "300"
-  BOBS_READER_DONE_TTL_SECS: "60"
-  BOBS_UNREAD_TTL_SECS: "3600"
-  BOBS_CLEANUP_SWEEP_INTERVAL_SECS: "30"
+config:
+  host: "0.0.0.0"
+  port: 3000
+  data_dir: "/var/lib/bobs"
+  page_size: 4096
+  max_cache_bytes: 1048576
+  writer_inactivity_timeout_secs: 300
+  reader_done_ttl_secs: 60
+  unread_ttl_secs: 3600
+  cleanup_sweep_interval_secs: 30
+  long_poll_timeout_ms: 25000
+  bob_id: "bobs"
+  host_prefix: ""
+  domain: ""
 
 persistence:
   enabled: true
-  size: 1Gi
+  size: 10Gi
+  storageClass: ""
+
+ingress:
+  enabled: false
+  className: nginx
+  host: ""
+  annotations: {}
+  tls: []
 
 headlessService:
   enabled: true

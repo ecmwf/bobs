@@ -1,0 +1,33 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: bobs
+
+build:
+  artifacts:
+    - image: eccr.ecmwf.int/polytope/bobs
+      context: .
+      docker:
+        dockerfile: ./Dockerfile
+        target: release
+
+  tagPolicy:
+    customTemplate:
+      template: '{{if .FIXED_TAG}}{{.FIXED_TAG}}{{else}}{{.PREFIX}}{{.GIT_TAG}}{{end}}'
+      components:
+        - name: FIXED_TAG
+          envTemplate:
+            template: '{{default "" .FIXED_TAG}}'
+        - name: PREFIX
+          envTemplate:
+            template: '{{default "" .PREFIX}}'
+        - name: GIT_TAG
+          gitCommit:
+            ignoreChanges: true
+
+  platforms:
+    - linux/amd64
+
+  local:
+    useDockerCLI: true
+    concurrency: 1

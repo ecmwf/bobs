@@ -43,6 +43,8 @@ async fn start_server() -> TestServer {
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
         bob_id: "itest-bob".into(),
+        host_prefix: String::new(),
+        domain: String::new(),
     });
 
     let manager = Arc::new(

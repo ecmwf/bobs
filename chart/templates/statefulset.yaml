@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: '{{ include "bobs.fullname" . }}'
+  labels:
+    app.kubernetes.io/name: '{{ include "bobs.name" . }}'
+    app.kubernetes.io/instance: '{{ .Release.Name }}'
+spec:
+  serviceName: '{{ .Values.headlessService.name }}'
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: '{{ include "bobs.name" . }}'
+      app.kubernetes.io/instance: '{{ .Release.Name }}'
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: '{{ include "bobs.name" . }}'
+        app.kubernetes.io/instance: '{{ .Release.Name }}'
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: bobs
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'
+          imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+          command: ["bobs"]
+          args: ["/etc/bobs/config.yaml"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.config.port }}
+              protocol: TCP
+          resources: {}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/bobs
+              readOnly: true
+            - name: data
+              mountPath: '{{ .Values.config.data_dir }}'
+      volumes:
+        - name: config
+          configMap:
+            name: '{{ include "bobs.fullname" . }}-config'
+      {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+      {{- end }}
+{{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+        {{- if and .Values.persistence.storageClass (ne .Values.persistence.storageClass "-") }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- else if eq .Values.persistence.storageClass "-" }}
+        storageClassName: ""
+        {{- end }}
+{{- end }}

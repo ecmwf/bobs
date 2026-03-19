@@ -62,6 +62,7 @@ struct CompleteRequest {
 #[derive(Debug, Serialize)]
 struct CreateResponse {
     key: String,
+    read_url: String,
 }
 
 async fn create_spool<F: FileIO>(
@@ -79,7 +80,16 @@ async fn create_spool<F: FileIO>(
         .create_spool(req.content_type, req.content_encoding, req.write_locked)
         .await
         .map_err(ApiError)?;
-    Ok((StatusCode::CREATED, Json(CreateResponse { key })).into_response())
+    let read_url = if state.config.host_prefix.is_empty() || state.config.domain.is_empty() {
+        format!("/{}/read/{}", state.config.bob_id, key)
+    } else {
+        let ordinal = state.config.bob_id.rsplit('-').next().unwrap_or("0");
+        format!(
+            "https://{}.{}/download-{}/read/{}",
+            state.config.host_prefix, state.config.domain, ordinal, key
+        )
+    };
+    Ok((StatusCode::CREATED, Json(CreateResponse { key, read_url })).into_response())
 }
 
 async fn write_spool<F: FileIO>(
@@ -419,6 +429,8 @@ mod tests {
             cleanup_sweep_interval_secs: 30,
             long_poll_timeout_ms: 25000,
             bob_id: "http-bob".into(),
+            host_prefix: String::new(),
+            domain: String::new(),
         })
     }
 

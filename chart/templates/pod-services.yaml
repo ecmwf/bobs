@@ -1,0 +1,19 @@
+{{- $fullName := include "bobs.fullname" . -}}
+{{- $port := .Values.service.port -}}
+{{- range $i, $e := until (int .Values.replicaCount) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: '{{ $fullName }}-{{ $i }}'
+  labels:
+    app.kubernetes.io/name: '{{ include "bobs.name" $ }}'
+    app.kubernetes.io/instance: '{{ $.Release.Name }}'
+spec:
+  ports:
+    - port: {{ $port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    statefulset.kubernetes.io/pod-name: '{{ $fullName }}-{{ $i }}'
+{{- end }}

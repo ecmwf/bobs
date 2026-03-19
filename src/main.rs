@@ -13,10 +13,16 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    let config = Arc::new(match std::env::args().nth(1) {
+    let mut config = match std::env::args().nth(1) {
         Some(path) => Config::from_file(&path).expect("failed to load config file"),
         None => Config::default(),
-    });
+    };
+    if config.bob_id == "unknown" || config.bob_id.is_empty() {
+        config.bob_id = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+    }
+    
+    let config = Arc::new(config);
+
     tracing::info!(bob_id = %config.bob_id, host = %config.host, port = %config.port, "BOBS starting");
 
     let manager = Arc::new(

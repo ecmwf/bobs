@@ -97,6 +97,8 @@ mod tests {
             cleanup_sweep_interval_secs: 1,
             long_poll_timeout_ms: 25000,
             bob_id: "bob-clean".into(),
+            host_prefix: String::new(),
+            domain: String::new(),
         })
     }
 

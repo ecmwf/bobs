@@ -86,6 +86,17 @@ mod tests {
 
     async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
         let path = dir.join("spool.dat");
+        let db_path = dir.join("test.redb");
+        let db = Arc::new(redb::Database::create(&db_path).expect("create test db"));
+        {
+            let write_txn = db.begin_write().expect("begin write");
+            {
+                let _ = write_txn
+                    .open_table(crate::manager::SPOOL_TABLE)
+                    .expect("open table");
+            }
+            write_txn.commit().expect("commit");
+        }
         let handle = TokioFileIO::create(&path)
             .await
             .expect("failed to create spool file");
@@ -106,7 +117,7 @@ mod tests {
             data_path: path,
         };
 
-        Spool::new(meta, handle, page_size, 256).await
+        Spool::new(meta, handle, page_size, 256, db).await
     }
 
     #[tokio::test]

@@ -15,6 +15,8 @@ pub struct Config {
     pub cleanup_sweep_interval_secs: u64,
     pub long_poll_timeout_ms: u64,
     pub bob_id: String,
+    pub host_prefix: String,
+    pub domain: String,
 }
 
 impl Default for Config {
@@ -31,6 +33,8 @@ impl Default for Config {
             cleanup_sweep_interval_secs: 30,
             long_poll_timeout_ms: 25000,
             bob_id: "unknown".to_string(),
+            host_prefix: String::new(),
+            domain: String::new(),
         }
     }
 }
