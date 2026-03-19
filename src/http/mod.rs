@@ -85,7 +85,7 @@ async fn create_spool<F: FileIO>(
     } else {
         let ordinal = state.config.bob_id.rsplit('-').next().unwrap_or("0");
         format!(
-            "https://{}.{}/download-{}/read/{}",
+            "https://{}.{}/download-{}/{}",
             state.config.host_prefix, state.config.domain, ordinal, key
         )
     };
@@ -330,7 +330,7 @@ async fn read_spool<F: FileIO + 'static>(
 }
 
 fn long_poll_redirect(key: &str) -> Response {
-    let location = format!("/read/{key}");
+    let location = format!("{key}");
     let mut response = (
         StatusCode::TEMPORARY_REDIRECT,
         [(axum::http::header::LOCATION, location)],
