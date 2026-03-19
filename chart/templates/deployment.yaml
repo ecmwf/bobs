@@ -33,8 +33,8 @@ spec:
               value: '{{ .Values.env.BOBS_DATA_DIR }}'
             - name: BOBS_PAGE_SIZE
               value: '{{ .Values.env.BOBS_PAGE_SIZE }}'
-            - name: BOBS_PAGE_CACHE_CAPACITY
-              value: '{{ .Values.env.BOBS_PAGE_CACHE_CAPACITY }}'
+            - name: BOBS_MAX_CACHE_BYTES
+              value: '{{ .Values.env.BOBS_MAX_CACHE_BYTES }}'
             - name: BOBS_WRITER_INACTIVITY_TIMEOUT_SECS
               value: '{{ .Values.env.BOBS_WRITER_INACTIVITY_TIMEOUT_SECS }}'
             - name: BOBS_READER_DONE_TTL_SECS

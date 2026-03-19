@@ -1,0 +1,5 @@
+[book]
+title = "BOBS Documentation"
+authors = ["ECMWF"]
+language = "en"
+src = "src"

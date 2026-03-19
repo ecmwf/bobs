@@ -1,9 +1,9 @@
 use axum::Router;
 use bobs::config::Config;
-use bobs::http::{AppState, router};
+use bobs::http::{router, AppState};
 use bobs::io::TokioFileIO;
 use bobs::manager::SpoolManager;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -32,10 +32,11 @@ async fn start_server() -> TestServer {
     let data_dir = tmp.path().join("data");
 
     let config = Arc::new(Config {
-        listen_addr: "127.0.0.1:0".into(),
+        host: "127.0.0.1".into(),
+        port: 0,
         data_dir: data_dir.clone(),
         page_size: 4096,
-        page_cache_capacity: 64,
+        max_cache_bytes: 262144,
         writer_inactivity_timeout_secs: 300,
         reader_done_ttl_secs: 60,
         unread_ttl_secs: 3600,
@@ -45,8 +46,14 @@ async fn start_server() -> TestServer {
     });
 
     let manager = Arc::new(
-        SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, config.bob_id.clone(), 4096, 64)
-            .expect("init manager"),
+        SpoolManager::<TokioFileIO>::new(
+            &db_path,
+            &data_dir,
+            config.bob_id.clone(),
+            4096,
+            config.max_cache_bytes,
+        )
+        .expect("init manager"),
     );
     manager.recover().await.expect("recover");
 
@@ -56,7 +63,9 @@ async fn start_server() -> TestServer {
     });
     let app: Router = router::<TokioFileIO>().with_state(state);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
     let addr = listener.local_addr().expect("listener addr");
     let (tx, rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -111,16 +120,12 @@ async fn test_basic_lifecycle() {
     assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
 
     let read_resp = client
-        .get(format!(
-            "{}/read/{}/0/{}",
-            server.base_url,
-            key,
-            bytes.len()
-        ))
+        .get(format!("{}/read/{}", server.base_url, key))
+        .header("Range", format!("bytes=0-{}", bytes.len() - 1))
         .send()
         .await
         .expect("read send");
-    assert_eq!(read_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(read_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     let read_bytes = read_resp.bytes().await.expect("read bytes");
     assert_eq!(read_bytes.as_ref(), bytes.as_slice());
 
@@ -132,7 +137,8 @@ async fn test_basic_lifecycle() {
     assert_eq!(del_resp.status(), reqwest::StatusCode::OK);
 
     let read_after_delete = client
-        .get(format!("{}/read/{}/0/1", server.base_url, key))
+        .get(format!("{}/read/{}", server.base_url, key))
+        .header("Range", "bytes=0-0")
         .send()
         .await
         .expect("read after delete");
@@ -146,9 +152,13 @@ async fn test_follow_mode() {
     let key = create_key(&client, &server.base_url, None).await;
 
     let read_client = client.clone();
-    let read_url = format!("{}/read/{}/0/0", server.base_url, key);
+    let read_url = format!("{}/read/{}", server.base_url, key);
     let read_task = tokio::spawn(async move {
-        let resp = read_client.get(read_url).send().await.expect("follow read send");
+        let resp = read_client
+            .get(read_url)
+            .send()
+            .await
+            .expect("follow read send");
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         resp.bytes().await.expect("follow read bytes")
     });
@@ -201,7 +211,8 @@ async fn test_write_lock() {
     .await;
 
     let locked_read = client
-        .get(format!("{}/read/{}/0/1", server.base_url, key))
+        .get(format!("{}/read/{}", server.base_url, key))
+        .header("Range", "bytes=0-0")
         .send()
         .await
         .expect("locked read send");
@@ -224,12 +235,16 @@ async fn test_write_lock() {
     assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
 
     let read_resp = client
-        .get(format!("{}/read/{}/0/5000", server.base_url, key))
+        .get(format!("{}/read/{}", server.base_url, key))
+        .header("Range", "bytes=0-4999")
         .send()
         .await
         .expect("read send");
-    assert_eq!(read_resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(read_resp.bytes().await.expect("read bytes").as_ref(), data.as_slice());
+    assert_eq!(read_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        read_resp.bytes().await.expect("read bytes").as_ref(),
+        data.as_slice()
+    );
 }
 
 #[tokio::test]
@@ -270,18 +285,20 @@ async fn test_error_cases() {
     assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
 
     let first_reader = client
-        .get(format!("{}/read/{}/0/10", server.base_url, key))
+        .get(format!("{}/read/{}", server.base_url, key))
+        .header("Range", "bytes=0-9")
         .send()
         .await
         .expect("first reader send");
-    assert_eq!(first_reader.status(), reqwest::StatusCode::OK);
+    assert_eq!(first_reader.status(), reqwest::StatusCode::PARTIAL_CONTENT);
 
     let second_reader = client
-        .get(format!("{}/read/{}/0/10", server.base_url, key))
+        .get(format!("{}/read/{}", server.base_url, key))
+        .header("Range", "bytes=0-9")
         .send()
         .await
         .expect("second reader send");
-    assert_eq!(second_reader.status(), reqwest::StatusCode::OK);
+    assert_eq!(second_reader.status(), reqwest::StatusCode::PARTIAL_CONTENT);
 
     let write_after_close = client
         .post(format!("{}/write/{}/10", server.base_url, key))

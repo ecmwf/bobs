@@ -2,8 +2,8 @@ use crate::config::Config;
 use crate::io::FileIO;
 use crate::manager::SpoolManager;
 use crate::spool::SpoolState;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
@@ -86,10 +86,11 @@ mod tests {
 
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
-            listen_addr: "127.0.0.1:0".into(),
+            host: "127.0.0.1".into(),
+            port: 0,
             data_dir: std::path::PathBuf::from("./data"),
             page_size: 4096,
-            page_cache_capacity: 16,
+            max_cache_bytes: 65536,
             writer_inactivity_timeout_secs: 1,
             reader_done_ttl_secs: 1,
             unread_ttl_secs: 1,
@@ -104,7 +105,7 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
         Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-clean".into(), 4096, 16)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-clean".into(), 4096, 65536)
                 .expect("manager init"),
         )
     }

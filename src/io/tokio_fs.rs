@@ -13,7 +13,9 @@ pub struct TokioFileIO;
 impl FileIO for TokioFileIO {
     type Handle = Arc<Mutex<File>>;
 
-    fn create(path: &Path) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+    fn create(
+        path: &Path,
+    ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
         let path = path.to_path_buf();
         async move {
             let file = tokio::fs::OpenOptions::new()
@@ -26,7 +28,9 @@ impl FileIO for TokioFileIO {
         }
     }
 
-    fn open(path: &Path) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+    fn open(
+        path: &Path,
+    ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
         let path = path.to_path_buf();
         async move {
             let file = tokio::fs::OpenOptions::new()
@@ -66,7 +70,9 @@ impl FileIO for TokioFileIO {
         }
     }
 
-    fn sync_data(handle: &Self::Handle) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+    fn sync_data(
+        handle: &Self::Handle,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
         let handle = Arc::clone(handle);
         async move {
             let file = handle.lock().await;
@@ -74,7 +80,9 @@ impl FileIO for TokioFileIO {
         }
     }
 
-    fn close(handle: Self::Handle) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+    fn close(
+        handle: Self::Handle,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
         async move {
             drop(handle);
             Ok(())
@@ -140,9 +148,7 @@ mod tests {
         assert_eq!(read, 10);
         assert_eq!(&buf, b"helloWORLD");
 
-        TokioFileIO::close(handle)
-            .await
-            .expect("failed to close");
+        TokioFileIO::close(handle).await.expect("failed to close");
     }
 
     #[tokio::test]
@@ -177,9 +183,7 @@ mod tests {
             .expect("failed to read beyond eof");
         assert_eq!(read, 0, "reading beyond EOF should return 0");
 
-        TokioFileIO::close(handle)
-            .await
-            .expect("failed to close");
+        TokioFileIO::close(handle).await.expect("failed to close");
     }
 
     #[tokio::test]
@@ -195,9 +199,7 @@ mod tests {
             .await
             .expect("failed to write");
 
-        TokioFileIO::close(handle)
-            .await
-            .expect("failed to close");
+        TokioFileIO::close(handle).await.expect("failed to close");
 
         // File should exist
         assert!(file_path.exists(), "file should exist after creation");

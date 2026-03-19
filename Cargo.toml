@@ -21,9 +21,9 @@ dashmap = "6"
 async-stream = "0.3"
 crc32c = "0.6"
 base64 = "0.22"
+serde_yml = "0.0.12"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tempfile = "3"
-serial_test = "3"
 tower = "0.5"

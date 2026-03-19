@@ -189,7 +189,10 @@ mod tests {
         let dir = tempdir().expect("failed to create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
 
-        spool.write(0, &[]).await.expect("empty write should succeed");
+        spool
+            .write(0, &[])
+            .await
+            .expect("empty write should succeed");
 
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 0);

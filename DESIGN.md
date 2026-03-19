@@ -25,7 +25,7 @@ GET/HEAD	/status	Health check
 PUT	/create	Allocates a new dataset, returns {key: "host-uuid4"}
 POST	/write/{key}/{offset}	Streams request body into dataset. Offset must match current head exactly (no gaps, no overwrites)
 POST	/close/{key}	Flushes remaining buffer, closes write FD. Makes dataset read-only
-GET	/read/{key}/{start}/{end}	Streams back bytes as application/octet-stream. end=0 = read all (follow mode)
+GET	/read/{key}	Streams back bytes as application/octet-stream via HTTP Range. No Range (or bytes=X-) = follow mode
 
 
 When a full dataset has been read, and the client has closed the connection and not returned within a configurable time, the spool is deleted.

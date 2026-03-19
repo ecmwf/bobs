@@ -29,9 +29,10 @@ impl<F: FileIO> SpoolManager<F> {
         data_dir: impl AsRef<Path>,
         bob_id: String,
         page_size: usize,
-        page_cache_capacity: usize,
+        max_cache_bytes: usize,
     ) -> Result<Self> {
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
+        let page_cache_capacity = max_cache_bytes / page_size;
 
         let db = Database::create(db_path).map_err(storage)?;
         {
@@ -97,20 +98,15 @@ impl<F: FileIO> SpoolManager<F> {
             let write_txn = self.db.begin_write().map_err(storage)?;
             {
                 let mut table = write_txn.open_table(SPOOL_TABLE).map_err(storage)?;
-                table.insert(key.as_str(), payload.as_slice()).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_slice())
+                    .map_err(storage)?;
             }
             write_txn.commit().map_err(storage)?;
         }
 
-        let spool = Arc::new(
-            Spool::new(
-                metadata,
-                handle,
-                self.page_size,
-                self.page_cache_capacity,
-            )
-            .await,
-        );
+        let spool =
+            Arc::new(Spool::new(metadata, handle, self.page_size, self.page_cache_capacity).await);
         self.spools.insert(key.clone(), spool);
 
         Ok(key)
@@ -121,7 +117,10 @@ impl<F: FileIO> SpoolManager<F> {
     }
 
     pub fn spool_keys(&self) -> Vec<String> {
-        self.spools.iter().map(|entry| entry.key().clone()).collect()
+        self.spools
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     pub async fn delete_spool(&self, key: &str) -> Result<()> {
@@ -195,9 +194,8 @@ impl<F: FileIO> SpoolManager<F> {
                 meta.state = SpoolState::Complete;
             }
 
-            let spool = Arc::new(
-                Spool::new(meta, handle, self.page_size, self.page_cache_capacity).await,
-            );
+            let spool =
+                Arc::new(Spool::new(meta, handle, self.page_size, self.page_cache_capacity).await);
             self.spools.insert(key, spool);
         }
 
@@ -235,8 +233,9 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-a".into(), 4096, 16)
-            .expect("manager init");
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-a".into(), 4096, 16 * 4096)
+                .expect("manager init");
 
         let key = manager
             .create_spool(Some("application/octet-stream".into()), None, false)
@@ -256,8 +255,9 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-b".into(), 4096, 16)
-            .expect("manager init");
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-b".into(), 4096, 16 * 4096)
+                .expect("manager init");
 
         let key = manager
             .create_spool(None, None, false)
@@ -283,7 +283,7 @@ mod tests {
                 &data_dir,
                 "bob-c".into(),
                 4096,
-                16,
+                16 * 4096,
             )
             .expect("manager1 init");
 
@@ -293,8 +293,9 @@ mod tests {
                 .expect("create spool")
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-c".into(), 4096, 16)
-            .expect("manager2 init");
+        let manager2 =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-c".into(), 4096, 16 * 4096)
+                .expect("manager2 init");
 
         manager2.recover().await.expect("recover should succeed");
         let spool = manager2.get_spool(&key).expect("recovered spool exists");

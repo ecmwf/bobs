@@ -25,7 +25,7 @@ pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
         .route("/create", put(create_spool::<F>))
         .route("/write/{key}/{offset}", post(write_spool::<F>))
         .route("/complete/{key}", post(complete_spool::<F>))
-        .route("/read/{key}/{start}/{end}", get(read_spool::<F>))
+        .route("/read/{key}", get(read_spool::<F>))
         .route("/delete/{key}", delete(delete_spool::<F>))
 }
 
@@ -138,8 +138,15 @@ impl<F: FileIO> Drop for ReaderLease<F> {
 
 async fn read_spool<F: FileIO + 'static>(
     State(state): State<Arc<AppState<F>>>,
-    Path((key, start, end)): Path<(String, u64, u64)>,
+    Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
+    let (start, range_end) = parse_range(headers.get(axum::http::header::RANGE));
+    let follow = range_end.is_none();
+    let end = range_end
+        .and_then(|inclusive| inclusive.checked_add(1))
+        .unwrap_or(0);
+
     let spool = state
         .manager
         .get_spool(&key)
@@ -154,16 +161,23 @@ async fn read_spool<F: FileIO + 'static>(
         spool: Arc::clone(&spool),
     };
     let page_size = spool.page_size as u64;
-    // end=0 means "follow" mode: stream until the writer closes the spool.
-    // end>0 means bounded read: return bytes in [start, end) and stop.
-    let follow = end == 0;
+
     let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
-    let (content_type, content_encoding, checksum_crc32c) = {
+    let (content_type, content_encoding, checksum_crc32c, complete_size) = {
         let meta = spool.metadata.lock().await;
+        let complete_size = if matches!(
+            meta.state,
+            crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting
+        ) {
+            Some(meta.total_bytes_written)
+        } else {
+            None
+        };
         (
             meta.content_type.clone(),
             meta.content_encoding.clone(),
             meta.checksum_crc32c,
+            complete_size,
         )
     };
 
@@ -171,19 +185,15 @@ async fn read_spool<F: FileIO + 'static>(
     // If the timeout fires before any data arrives, return a 307 redirect
     // so standard clients (curl -L, browsers) retry automatically.
     let first_page_idx = start / page_size;
-    let first_page = match tokio::time::timeout(
-        long_poll_timeout,
-        spool.read_page(first_page_idx),
-    )
-    .await
-    {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(ApiError(e)),
-        Err(_) => {
-            // Lease drops here, releasing the reader.
-            return Ok(long_poll_redirect(&key, start, end));
-        }
-    };
+    let first_page =
+        match tokio::time::timeout(long_poll_timeout, spool.read_page(first_page_idx)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(ApiError(e)),
+            Err(_) => {
+                // Lease drops here, releasing the reader.
+                return Ok(long_poll_redirect(&key));
+            }
+        };
 
     let stream = stream! {
         let _lease = lease;
@@ -256,47 +266,91 @@ async fn read_spool<F: FileIO + 'static>(
     };
 
     let mut response = Body::from_stream(stream).into_response();
+    *response.status_mut() = if follow {
+        StatusCode::OK
+    } else {
+        StatusCode::PARTIAL_CONTENT
+    };
+
     let content_type_header = HeaderValue::from_str(
-        content_type.as_deref().unwrap_or("application/octet-stream"),
+        content_type
+            .as_deref()
+            .unwrap_or("application/octet-stream"),
     )
     .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
-    response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        content_type_header,
-    );
+    response
+        .headers_mut()
+        .insert(axum::http::header::CONTENT_TYPE, content_type_header);
     if let Some(enc) = &content_encoding {
         let encoding_header = HeaderValue::from_str(enc)
             .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_ENCODING,
-            encoding_header,
-        );
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_ENCODING, encoding_header);
     }
     if let Some(crc) = checksum_crc32c {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
         let checksum_header = HeaderValue::from_str(&encoded)
             .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
-        response.headers_mut().insert(
-            "X-Checksum-CRC32C",
-            checksum_header,
-        );
+        response
+            .headers_mut()
+            .insert("X-Checksum-CRC32C", checksum_header);
     }
+    response
+        .headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
     response.headers_mut().insert(
-        "X-Accel-Buffering",
-        HeaderValue::from_static("no"),
+        axum::http::header::ACCEPT_RANGES,
+        HeaderValue::from_static("bytes"),
     );
+    if !follow {
+        let total = complete_size
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "*".to_string());
+        let content_range = format!("bytes {}-{}/{}", start, end.saturating_sub(1), total);
+        let content_range_header = HeaderValue::from_str(&content_range)
+            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_RANGE, content_range_header);
+    }
 
     Ok(response)
 }
 
-fn long_poll_redirect(key: &str, start: u64, end: u64) -> Response {
-    let location = format!("/read/{key}/{start}/{end}");
-    (
+fn long_poll_redirect(key: &str) -> Response {
+    let location = format!("/read/{key}");
+    let mut response = (
         StatusCode::TEMPORARY_REDIRECT,
         [(axum::http::header::LOCATION, location)],
     )
-        .into_response()
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::ACCEPT_RANGES,
+        HeaderValue::from_static("bytes"),
+    );
+    response
+}
+
+fn parse_range(header: Option<&HeaderValue>) -> (u64, Option<u64>) {
+    let Some(val) = header else {
+        return (0, None);
+    };
+    let s = val.to_str().unwrap_or("");
+    let s = s.strip_prefix("bytes=").unwrap_or(s);
+
+    if let Some((start_s, end_s)) = s.split_once('-') {
+        let start = start_s.parse::<u64>().unwrap_or(0);
+        let end = if end_s.is_empty() {
+            None
+        } else {
+            end_s.parse::<u64>().ok()
+        };
+        (start, end)
+    } else {
+        (0, None)
+    }
 }
 
 async fn delete_spool<F: FileIO>(
@@ -326,7 +380,13 @@ impl IntoResponse for ApiError {
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (status, Json(ErrorResponse { error: self.0.to_string() })).into_response()
+        (
+            status,
+            Json(ErrorResponse {
+                error: self.0.to_string(),
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -348,10 +408,11 @@ mod tests {
 
     fn test_config(dir: &std::path::Path) -> Arc<Config> {
         Arc::new(Config {
-            listen_addr: "127.0.0.1:0".into(),
+            host: "127.0.0.1".into(),
+            port: 0,
             data_dir: dir.to_path_buf(),
             page_size: 4096,
-            page_cache_capacity: 16,
+            max_cache_bytes: 65536,
             writer_inactivity_timeout_secs: 300,
             reader_done_ttl_secs: 60,
             unread_ttl_secs: 3600,
@@ -368,7 +429,7 @@ mod tests {
         let data_dir = root.join("data");
 
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "http-bob".into(), 4096, 16)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "http-bob".into(), 4096, 65536)
                 .expect("manager init"),
         );
         let state = Arc::new(AppState {
@@ -387,7 +448,12 @@ mod tests {
             .expect("request build");
         let resp = app.clone().oneshot(req).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = resp.into_body().collect().await.expect("collect body").to_bytes();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
         let v: Value = serde_json::from_slice(&body).expect("json parse");
         v["key"].as_str().expect("key string").to_string()
     }
@@ -455,13 +521,31 @@ mod tests {
 
         let read_req = Request::builder()
             .method("GET")
-            .uri(format!("/read/{key}/0/8192"))
+            .uri(format!("/read/{key}"))
+            .header("Range", "bytes=0-8191")
             .body(Body::empty())
             .expect("request build");
         let read_resp = app.oneshot(read_req).await.expect("oneshot");
-        assert_eq!(read_resp.status(), StatusCode::OK);
+        assert_eq!(read_resp.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
-            read_resp.headers().get("X-Accel-Buffering").and_then(|h| h.to_str().ok()),
+            read_resp
+                .headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .and_then(|h| h.to_str().ok()),
+            Some("bytes")
+        );
+        assert_eq!(
+            read_resp
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .and_then(|h| h.to_str().ok()),
+            Some("bytes 0-8191/8192")
+        );
+        assert_eq!(
+            read_resp
+                .headers()
+                .get("X-Accel-Buffering")
+                .and_then(|h| h.to_str().ok()),
             Some("no")
         );
     }
