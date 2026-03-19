@@ -39,9 +39,7 @@ async fn main() {
     });
     let app = router::<TokioFileIO>().with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind");
+    let listener = TcpListener::bind(&addr).await.expect("failed to bind");
     tracing::info!("listening on {}", addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown::shutdown_signal())
