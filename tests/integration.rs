@@ -42,16 +42,15 @@ async fn start_server() -> TestServer {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
-        bob_id: "itest-bob".into(),
-        host_prefix: String::new(),
-        domain: String::new(),
+        host_prefix: "test".into(),
+        domain: "example.com".into(),
+        route_name: "bobs".into(),
     });
 
     let manager = Arc::new(
         SpoolManager::<TokioFileIO>::new(
             &db_path,
             &data_dir,
-            config.bob_id.clone(),
             4096,
             config.max_cache_bytes,
         )
@@ -62,6 +61,8 @@ async fn start_server() -> TestServer {
     let state = Arc::new(AppState {
         manager,
         config: Arc::clone(&config),
+        hostname: "bobs-0".into(),
+        ordinal: "0".into(),
     });
     let app: Router = router::<TokioFileIO>().with_state(state);
 

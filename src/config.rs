@@ -14,9 +14,9 @@ pub struct Config {
     pub unread_ttl_secs: u64,
     pub cleanup_sweep_interval_secs: u64,
     pub long_poll_timeout_ms: u64,
-    pub bob_id: String,
     pub host_prefix: String,
     pub domain: String,
+    pub route_name: String,
 }
 
 impl Default for Config {
@@ -32,9 +32,9 @@ impl Default for Config {
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 30,
             long_poll_timeout_ms: 25000,
-            bob_id: "unknown".to_string(),
             host_prefix: String::new(),
             domain: String::new(),
+            route_name: String::new(),
         }
     }
 }
@@ -66,7 +66,6 @@ mod tests {
         assert_eq!(config.unread_ttl_secs, 3600);
         assert_eq!(config.cleanup_sweep_interval_secs, 30);
         assert_eq!(config.long_poll_timeout_ms, 25000);
-        assert_eq!(config.bob_id, "unknown");
     }
 
     #[test]
@@ -85,7 +84,8 @@ reader_done_ttl_secs: 22
 unread_ttl_secs: 33
 cleanup_sweep_interval_secs: 44
 long_poll_timeout_ms: 555
-bob_id: yaml-bob
+host_prefix: test-prefix
+domain: test.example.com
 "#,
         )
         .expect("write yaml");
@@ -101,17 +101,17 @@ bob_id: yaml-bob
         assert_eq!(cfg.unread_ttl_secs, 33);
         assert_eq!(cfg.cleanup_sweep_interval_secs, 44);
         assert_eq!(cfg.long_poll_timeout_ms, 555);
-        assert_eq!(cfg.bob_id, "yaml-bob");
+        assert_eq!(cfg.host_prefix, "test-prefix");
+        assert_eq!(cfg.domain, "test.example.com");
     }
 
     #[test]
     fn test_from_file_partial_yaml() {
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("partial.yaml");
-        std::fs::write(&path, "bob_id: partial-bob\npage_size: 8192\n").expect("write yaml");
+        std::fs::write(&path, "page_size: 8192\n").expect("write yaml");
 
         let cfg = Config::from_file(&path).expect("parse yaml");
-        assert_eq!(cfg.bob_id, "partial-bob");
         assert_eq!(cfg.page_size, 8192);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 3000);

@@ -24,9 +24,9 @@ config:
   unread_ttl_secs: 3600
   cleanup_sweep_interval_secs: 30
   long_poll_timeout_ms: 25000
-  bob_id: "bobs"
   host_prefix: ""
   domain: ""
+  route_name: "download"
 
 persistence:
   enabled: true

@@ -17,6 +17,6 @@ data:
     unread_ttl_secs: {{ .Values.config.unread_ttl_secs }}
     cleanup_sweep_interval_secs: {{ .Values.config.cleanup_sweep_interval_secs }}
     long_poll_timeout_ms: {{ .Values.config.long_poll_timeout_ms }}
-    bob_id: {{ .Values.config.bob_id | quote }}
-    host_prefix: {{ .Values.config.host_prefix | quote }}
-    domain: {{ .Values.config.domain | quote }}
+    host_prefix: {{ required "bobs.config.host_prefix must be set" .Values.config.host_prefix | quote }}
+    domain: {{ required "bobs.config.domain must be set" .Values.config.domain | quote }}
+    route_name: {{ required "bobs.config.route_name must be set" .Values.config.route_name | quote }}

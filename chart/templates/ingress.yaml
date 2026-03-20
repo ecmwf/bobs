@@ -1,5 +1,6 @@
 {{- if .Values.ingress.enabled -}}
 {{- $fullName := include "bobs.fullname" . -}}
+{{- $routeName := required "config.route_name must be set" .Values.config.route_name -}}
 {{- $port := .Values.service.port -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -9,7 +10,7 @@ metadata:
     app.kubernetes.io/name: '{{ include "bobs.name" . }}'
     app.kubernetes.io/instance: '{{ .Release.Name }}'
   annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/rewrite-target: /read/$1
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -22,7 +23,7 @@ spec:
     - host: {{ $.Values.ingress.host | quote }}
       http:
         paths:
-          - path: '/{{ $fullName }}-{{ $i }}(/|$)(.*)'
+          - path: '/{{ $routeName }}-{{ $i }}/(.*)'
             pathType: ImplementationSpecific
             backend:
               service:

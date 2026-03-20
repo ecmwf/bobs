@@ -17,6 +17,8 @@ use std::time::Duration;
 pub struct AppState<F: FileIO> {
     pub manager: Arc<SpoolManager<F>>,
     pub config: Arc<Config>,
+    pub hostname: String,
+    pub ordinal: String,
 }
 
 pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
@@ -32,13 +34,13 @@ pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     status: &'static str,
-    bob_id: String,
+    hostname: String,
 }
 
 async fn status<F: FileIO>(State(state): State<Arc<AppState<F>>>) -> impl IntoResponse {
     Json(StatusResponse {
         status: "ok",
-        bob_id: state.config.bob_id.clone(),
+        hostname: state.hostname.clone(),
     })
 }
 
@@ -75,20 +77,22 @@ async fn create_spool<F: FileIO>(
         serde_json::from_slice::<CreateRequest>(&body)
             .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
     };
+    tracing::info!(
+        content_type = ?req.content_type,
+        content_encoding = ?req.content_encoding,
+        write_locked = req.write_locked,
+        "create spool request"
+    );
     let key = state
         .manager
         .create_spool(req.content_type, req.content_encoding, req.write_locked)
         .await
         .map_err(ApiError)?;
-    let read_url = if state.config.host_prefix.is_empty() || state.config.domain.is_empty() {
-        format!("/{}/read/{}", state.config.bob_id, key)
-    } else {
-        let ordinal = state.config.bob_id.rsplit('-').next().unwrap_or("0");
-        format!(
-            "https://{}.{}/download-{}/{}",
-            state.config.host_prefix, state.config.domain, ordinal, key
-        )
-    };
+    tracing::info!(key = %key, "spool created");
+    let read_url = format!(
+        "https://{}.{}/{}-{}/read/{}",
+        state.config.host_prefix, state.config.domain, state.config.route_name, state.ordinal, key
+    );
     Ok((StatusCode::CREATED, Json(CreateResponse { key, read_url })).into_response())
 }
 
@@ -97,6 +101,7 @@ async fn write_spool<F: FileIO>(
     Path((key, offset)): Path<(String, u64)>,
     mut body: Body,
 ) -> std::result::Result<Response, ApiError> {
+    tracing::info!(key = %key, offset = offset, "write spool request");
     let spool = state
         .manager
         .get_spool(&key)
@@ -131,6 +136,7 @@ async fn complete_spool<F: FileIO>(
         .get_spool(&key)
         .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
     spool.complete(req.expected_size).await.map_err(ApiError)?;
+    tracing::info!(key = %key, expected_size = ?req.expected_size, "spool completed");
     Ok(StatusCode::OK.into_response())
 }
 
@@ -153,6 +159,7 @@ async fn read_spool<F: FileIO + 'static>(
 ) -> std::result::Result<Response, ApiError> {
     let (start, range_end) = parse_range(headers.get(axum::http::header::RANGE));
     let follow = range_end.is_none();
+    tracing::info!(key = %key, start = start, range_end = ?range_end, follow = follow, "read spool request");
     let end = range_end
         .and_then(|inclusive| inclusive.checked_add(1))
         .unwrap_or(0);
@@ -367,6 +374,7 @@ async fn delete_spool<F: FileIO>(
     State(state): State<Arc<AppState<F>>>,
     Path(key): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
+    tracing::info!(key = %key, "delete spool request");
     state.manager.delete_spool(&key).await.map_err(ApiError)?;
     Ok(StatusCode::OK.into_response())
 }
@@ -428,9 +436,9 @@ mod tests {
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 30,
             long_poll_timeout_ms: 25000,
-            bob_id: "http-bob".into(),
-            host_prefix: String::new(),
-            domain: String::new(),
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
         })
     }
 
@@ -441,12 +449,14 @@ mod tests {
         let data_dir = root.join("data");
 
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "http-bob".into(), 4096, 65536)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
                 .expect("manager init"),
         );
         let state = Arc::new(AppState {
             manager,
             config: test_config(&data_dir),
+            hostname: "bobs-0".into(),
+            ordinal: "0".into(),
         });
 
         router::<TokioFileIO>().with_state(state)

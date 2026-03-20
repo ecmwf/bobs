@@ -96,9 +96,9 @@ mod tests {
             unread_ttl_secs: 1,
             cleanup_sweep_interval_secs: 1,
             long_poll_timeout_ms: 25000,
-            bob_id: "bob-clean".into(),
-            host_prefix: String::new(),
-            domain: String::new(),
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
         })
     }
 
@@ -107,7 +107,7 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
         Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-clean".into(), 4096, 65536)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
                 .expect("manager init"),
         )
     }

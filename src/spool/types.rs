@@ -50,7 +50,6 @@ impl SpoolState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpoolMetadata {
     pub key: String,
-    pub bob_id: String,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
     pub state: SpoolState,

@@ -127,7 +127,6 @@ mod tests {
             .expect("failed to create spool file");
         let meta = SpoolMetadata {
             key: "test-key".to_string(),
-            bob_id: "test-bob".to_string(),
             content_type: None,
             content_encoding: None,
             state: SpoolState::Writing,

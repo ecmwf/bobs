@@ -19,7 +19,6 @@ pub struct SpoolManager<F: FileIO> {
     pub spools: DashMap<String, Arc<Spool<F>>>,
     pub db: Arc<Database>,
     pub data_dir: PathBuf,
-    pub bob_id: String,
     pub page_size: usize,
     pub page_cache_capacity: usize,
 }
@@ -28,7 +27,6 @@ impl<F: FileIO> SpoolManager<F> {
     pub fn new(
         db_path: impl AsRef<Path>,
         data_dir: impl AsRef<Path>,
-        bob_id: String,
         page_size: usize,
         max_cache_bytes: usize,
     ) -> Result<Self> {
@@ -48,7 +46,6 @@ impl<F: FileIO> SpoolManager<F> {
             spools: DashMap::new(),
             db,
             data_dir: data_dir.as_ref().to_path_buf(),
-            bob_id,
             page_size,
             page_cache_capacity,
         })
@@ -60,7 +57,7 @@ impl<F: FileIO> SpoolManager<F> {
         content_encoding: Option<String>,
         write_locked: bool,
     ) -> Result<String> {
-        let key = format!("{}-{}", self.bob_id, Uuid::new_v4());
+        let key = Uuid::new_v4().to_string();
         let spool_dir = self.data_dir.join(&key);
         let data_path = spool_dir.join("spool.dat");
 
@@ -73,7 +70,6 @@ impl<F: FileIO> SpoolManager<F> {
         let now = now_secs();
         let metadata = SpoolMetadata {
             key: key.clone(),
-            bob_id: self.bob_id.clone(),
             content_type,
             content_encoding,
             state: if write_locked {
@@ -160,9 +156,18 @@ impl<F: FileIO> SpoolManager<F> {
 
         let spool_dir = self.data_dir.join(key);
         match tokio::fs::remove_dir_all(&spool_dir).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(BobsError::IoError(e)),
+            Ok(()) => {
+                tracing::info!(key = %key, "spool deleted");
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(key = %key, "spool deleted (data already gone)");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(key = %key, error = %e, "failed to remove spool directory");
+                Err(BobsError::IoError(e))
+            }
         }
     }
 
@@ -180,27 +185,35 @@ impl<F: FileIO> SpoolManager<F> {
                 let raw = v.value();
                 match serde_json::from_slice::<SpoolMetadata>(raw) {
                     Ok(meta) => recovered.push((key, meta)),
-                    Err(_) => stale_keys.push(key),
+                    Err(e) => {
+                        tracing::warn!(key = %key, error = %e, "discarding spool with corrupt metadata");
+                        stale_keys.push(key);
+                    }
                 }
             }
         }
 
         let recovered_keys: HashSet<String> = recovered.iter().map(|(key, _)| key.clone()).collect();
 
+        tracing::info!(total = recovered.len(), stale = stale_keys.len(), "recovery: scanning spools");
+
         for (key, mut meta) in recovered {
             if !meta.data_path.exists() {
+                tracing::warn!(key = %key, "recovery: data file missing, discarding");
                 stale_keys.push(key);
                 continue;
             }
 
             match meta.state {
                 SpoolState::Creating => {
+                    tracing::info!(key = %key, "recovery: removing incomplete spool (Creating)");
                     stale_keys.push(key.clone());
                     let spool_dir = self.data_dir.join(&key);
                     let _ = tokio::fs::remove_dir_all(&spool_dir).await;
                     continue;
                 }
                 SpoolState::Deleting => {
+                    tracing::info!(key = %key, "recovery: removing incomplete spool (Deleting)");
                     stale_keys.push(key.clone());
                     let spool_dir = self.data_dir.join(&key);
                     let _ = tokio::fs::remove_dir_all(&spool_dir).await;
@@ -214,7 +227,8 @@ impl<F: FileIO> SpoolManager<F> {
 
             let handle = match F::open(&meta.data_path).await {
                 Ok(h) => h,
-                Err(_) => {
+                Err(e) => {
+                    tracing::warn!(key = %key, error = %e, "recovery: failed to open data file, discarding");
                     stale_keys.push(key);
                     continue;
                 }
@@ -322,6 +336,8 @@ impl<F: FileIO> SpoolManager<F> {
             self.spools.insert(key, spool);
         }
 
+        tracing::info!(recovered = self.spools.len(), stale = stale_keys.len(), "recovery: spools loaded");
+
         let stale_key_set: HashSet<String> = stale_keys.iter().cloned().collect();
         let mut entries = tokio::fs::read_dir(&self.data_dir)
             .await
@@ -383,14 +399,14 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-a".into(), 4096, 16 * 4096)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
                 .expect("manager init");
 
         let key = manager
             .create_spool(Some("application/octet-stream".into()), None, false)
             .await
             .expect("create spool");
-        assert!(key.starts_with("bob-a-"));
+        assert!(uuid::Uuid::parse_str(&key).is_ok(), "key should be a UUID");
 
         let spool = manager.get_spool(&key).expect("spool should exist");
         let meta = spool.metadata.lock().await;
@@ -405,7 +421,7 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-b".into(), 4096, 16 * 4096)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
                 .expect("manager init");
 
         let key = manager
@@ -430,7 +446,6 @@ mod tests {
             let manager1 = SpoolManager::<TokioFileIO>::new(
                 &db_path,
                 &data_dir,
-                "bob-c".into(),
                 4096,
                 16 * 4096,
             )
@@ -443,7 +458,7 @@ mod tests {
         };
 
         let manager2 =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-c".into(), 4096, 16 * 4096)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
                 .expect("manager2 init");
 
         manager2.recover().await.expect("recover should succeed");
@@ -460,7 +475,7 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-d".into(), 4096, 16 * 4096)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
                 .expect("manager init");
 
         let key = manager
@@ -494,7 +509,6 @@ mod tests {
             let manager = SpoolManager::<TokioFileIO>::new(
                 &db_path,
                 &data_dir,
-                "bob-e".into(),
                 4096,
                 16 * 4096,
             )
@@ -539,7 +553,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-e".into(), 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -560,7 +574,6 @@ mod tests {
             let manager = SpoolManager::<TokioFileIO>::new(
                 &db_path,
                 &data_dir,
-                "bob-f".into(),
                 4096,
                 16 * 4096,
             )
@@ -580,7 +593,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-f".into(), 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -595,10 +608,10 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, "bob-g".into(), 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
             .expect("manager init");
 
-        let key = "bob-g-creating".to_string();
+        let key = "fake-creating-key".to_string();
         let spool_dir = data_dir.join(&key);
         let data_path = spool_dir.join("spool.dat");
         std::fs::create_dir_all(&spool_dir).expect("create spool dir");
@@ -606,7 +619,6 @@ mod tests {
 
         let meta = SpoolMetadata {
             key: key.clone(),
-            bob_id: "bob-g".to_string(),
             content_type: None,
             content_encoding: None,
             state: SpoolState::Creating,
