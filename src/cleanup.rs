@@ -39,15 +39,15 @@ pub async fn run_cleanup_loop<F: FileIO>(manager: Arc<SpoolManager<F>>, config: 
             let writer_inactive = matches!(state, SpoolState::Writing | SpoolState::WriteLocked)
                 && now.saturating_sub(last_write_at) > config.writer_inactivity_timeout_secs;
 
-            // Spool is closed, no active readers, and last read was long enough ago.
-            let reader_done_expired = matches!(state, SpoolState::Complete)
+            // Spool is done (or readable), no active readers, and last read was long enough ago.
+            let reader_done_expired = matches!(state, SpoolState::Complete | SpoolState::Readable)
                 && !readers_active
                 && last_read_at
                     .map(|last| now.saturating_sub(last) > config.reader_done_ttl_secs)
                     .unwrap_or(false);
 
-            // Spool was closed but nobody ever read it.
-            let unread_expired = matches!(state, SpoolState::Complete)
+            // Spool is done (or readable) but nobody ever read it.
+            let unread_expired = matches!(state, SpoolState::Complete | SpoolState::Readable)
                 && last_read_at.is_none()
                 && now.saturating_sub(created_at) > config.unread_ttl_secs;
 

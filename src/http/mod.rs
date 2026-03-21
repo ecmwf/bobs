@@ -14,6 +14,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+enum ReadRequestRange {
+    Follow,
+    Bounded {
+        start: u64,
+        end_inclusive: Option<u64>,
+    },
+}
+
 pub struct AppState<F: FileIO> {
     pub manager: Arc<SpoolManager<F>>,
     pub config: Arc<Config>,
@@ -23,18 +31,26 @@ pub struct AppState<F: FileIO> {
 
 pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
     Router::new()
-        .route("/status", get(status).head(status_head))
-        .route("/create", put(create_spool::<F>))
-        .route("/write/{key}/{offset}", post(write_spool::<F>))
-        .route("/complete/{key}", post(complete_spool::<F>))
-        .route("/read/{key}", get(read_spool::<F>))
-        .route("/delete/{key}", delete(delete_spool::<F>))
+        .route("/api/v1/health", get(health::<F>))
+        .route("/api/v1/status", get(status).head(status_head))
+        .route("/api/v1/create", put(create_spool::<F>))
+        .route("/api/v1/write/{key}/{offset}", post(write_spool::<F>))
+        .route("/api/v1/complete/{key}", post(complete_spool::<F>))
+        .route("/api/v1/read/{key}", get(read_spool::<F>))
+        .route("/api/v1/delete/{key}", delete(delete_spool::<F>))
 }
 
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     status: &'static str,
     hostname: String,
+}
+
+async fn health<F: FileIO>(State(state): State<Arc<AppState<F>>>) -> impl IntoResponse {
+    Json(StatusResponse {
+        status: "ok",
+        hostname: state.hostname.clone(),
+    })
 }
 
 async fn status<F: FileIO>(State(state): State<Arc<AppState<F>>>) -> impl IntoResponse {
@@ -90,7 +106,7 @@ async fn create_spool<F: FileIO>(
         .map_err(ApiError)?;
     tracing::info!(key = %key, "spool created");
     let read_url = format!(
-        "https://{}.{}/{}-{}/read/{}",
+        "https://{}.{}/{}-{}/api/v1/read/{}",
         state.config.host_prefix, state.config.domain, state.config.route_name, state.ordinal, key
     );
     Ok((StatusCode::CREATED, Json(CreateResponse { key, read_url })).into_response())
@@ -157,12 +173,7 @@ async fn read_spool<F: FileIO + 'static>(
     Path(key): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
-    let (start, range_end) = parse_range(headers.get(axum::http::header::RANGE));
-    let follow = range_end.is_none();
-    tracing::info!(key = %key, start = start, range_end = ?range_end, follow = follow, "read spool request");
-    let end = range_end
-        .and_then(|inclusive| inclusive.checked_add(1))
-        .unwrap_or(0);
+    let request_range = parse_range(headers.get(axum::http::header::RANGE)).map_err(ApiError)?;
 
     let spool = state
         .manager
@@ -177,10 +188,9 @@ async fn read_spool<F: FileIO + 'static>(
     let lease = ReaderLease {
         spool: Arc::clone(&spool),
     };
-    let page_size = spool.page_size as u64;
-
     let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
-    let (content_type, content_encoding, checksum_crc32c, complete_size) = {
+    let page_size = spool.page_size as u64;
+    let (content_type, content_encoding, checksum_crc32c, complete_size, total_bytes_written) = {
         let meta = spool.metadata.lock().await;
         let complete_size = if matches!(
             meta.state,
@@ -195,8 +205,37 @@ async fn read_spool<F: FileIO + 'static>(
             meta.content_encoding.clone(),
             meta.checksum_crc32c,
             complete_size,
+            meta.total_bytes_written,
         )
     };
+    let (start, end, follow) = match request_range {
+        ReadRequestRange::Follow => (0, None, true),
+        ReadRequestRange::Bounded {
+            start,
+            end_inclusive,
+        } => {
+            let end = match end_inclusive {
+                Some(end_inclusive) => Some(
+                    end_inclusive
+                        .checked_add(1)
+                        .ok_or_else(|| ApiError(BobsError::InvalidRange("range end overflow".into())))?,
+                ),
+                None => Some(total_bytes_written),
+            };
+            (start, end, false)
+        }
+    };
+    tracing::info!(key = %key, start = start, end = ?end, follow = follow, "read spool request");
+
+    if let Some(end) = end {
+        if start > end {
+            return Err(ApiError(BobsError::InvalidRange("range start exceeds end".into())));
+        }
+    }
+
+    if !follow && start >= total_bytes_written {
+        return Err(ApiError(BobsError::InvalidRange("range start exceeds available bytes".into())));
+    }
 
     // Pre-fetch the first page before committing to a streaming response.
     // If the timeout fires before any data arrives, return a 307 redirect
@@ -218,8 +257,10 @@ async fn read_spool<F: FileIO + 'static>(
         let mut prefetched = first_page;
 
         loop {
-            if !follow && offset >= end {
-                break;
+            if let Some(end) = end {
+                if offset >= end {
+                    break;
+                }
             }
 
             // Map the current byte offset to a page-aligned read.
@@ -232,7 +273,7 @@ async fn read_spool<F: FileIO + 'static>(
             // end the stream (the connection was recently active, not idle).
             let maybe_page = if let Some(page) = prefetched.take() {
                 Some(page)
-            } else {
+            } else if follow {
                 match tokio::time::timeout(
                     long_poll_timeout,
                     spool.read_page(page_idx),
@@ -244,6 +285,14 @@ async fn read_spool<F: FileIO + 'static>(
                     }
                     Err(_) => break,
                 }
+            } else {
+                match spool.read_page(page_idx).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield Err::<Bytes, BobsError>(e);
+                        break;
+                    }
+                }
             };
             let Some(page) = maybe_page else {
                 break;
@@ -252,7 +301,7 @@ async fn read_spool<F: FileIO + 'static>(
             // Slice the page to the requested byte range. The offset may not be
             // page-aligned (partial first page) and the end may land mid-page.
             let slice_start = (offset - page_start) as usize;
-            let logical_end = if follow { page_end } else { end.min(page_end) };
+            let logical_end = end.unwrap_or(page_end).min(page_end);
             let slice_end = ((logical_end - page_start) as usize).min(page.len());
 
             if slice_start < slice_end {
@@ -325,7 +374,11 @@ async fn read_spool<F: FileIO + 'static>(
         let total = complete_size
             .map(|v| v.to_string())
             .unwrap_or_else(|| "*".to_string());
-        let content_range = format!("bytes {}-{}/{}", start, end.saturating_sub(1), total);
+        let last_byte = match end {
+            Some(e) => e.saturating_sub(1),
+            None => start,
+        };
+        let content_range = format!("bytes {}-{}/{}", start, last_byte, total);
         let content_range_header = HeaderValue::from_str(&content_range)
             .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
         response
@@ -337,7 +390,7 @@ async fn read_spool<F: FileIO + 'static>(
 }
 
 fn long_poll_redirect(key: &str) -> Response {
-    let location = format!("{key}");
+    let location = format!("/api/v1/read/{key}");
     let mut response = (
         StatusCode::TEMPORARY_REDIRECT,
         [(axum::http::header::LOCATION, location)],
@@ -350,24 +403,44 @@ fn long_poll_redirect(key: &str) -> Response {
     response
 }
 
-fn parse_range(header: Option<&HeaderValue>) -> (u64, Option<u64>) {
+fn parse_range(header: Option<&HeaderValue>) -> crate::error::Result<ReadRequestRange> {
     let Some(val) = header else {
-        return (0, None);
+        return Ok(ReadRequestRange::Follow);
     };
-    let s = val.to_str().unwrap_or("");
-    let s = s.strip_prefix("bytes=").unwrap_or(s);
-
-    if let Some((start_s, end_s)) = s.split_once('-') {
-        let start = start_s.parse::<u64>().unwrap_or(0);
-        let end = if end_s.is_empty() {
-            None
-        } else {
-            end_s.parse::<u64>().ok()
-        };
-        (start, end)
-    } else {
-        (0, None)
+    let raw = val
+        .to_str()
+        .map_err(|_| BobsError::InvalidRange("range header is not valid ASCII".into()))?;
+    let body = raw
+        .strip_prefix("bytes=")
+        .ok_or_else(|| BobsError::InvalidRange(format!("unsupported range unit: {raw}")))?;
+    let (start_s, end_s) = body
+        .split_once('-')
+        .ok_or_else(|| BobsError::InvalidRange(format!("malformed range: {raw}")))?;
+    if start_s.is_empty() {
+        return Err(BobsError::InvalidRange(format!("range start missing: {raw}")));
     }
+    let start = start_s
+        .parse::<u64>()
+        .map_err(|_| BobsError::InvalidRange(format!("range start is invalid: {raw}")))?;
+
+    if end_s.is_empty() {
+        return Ok(ReadRequestRange::Bounded {
+            start,
+            end_inclusive: None,
+        });
+    }
+
+    let end_inclusive = end_s
+        .parse::<u64>()
+        .map_err(|_| BobsError::InvalidRange(format!("range end is invalid: {raw}")))?;
+    if start > end_inclusive {
+        return Err(BobsError::InvalidRange(format!("range start exceeds end: {raw}")));
+    }
+
+    Ok(ReadRequestRange::Bounded {
+        start,
+        end_inclusive: Some(end_inclusive),
+    })
 }
 
 async fn delete_spool<F: FileIO>(
@@ -392,6 +465,7 @@ impl IntoResponse for ApiError {
             BobsError::SpoolNotFound { .. } => StatusCode::NOT_FOUND,
             BobsError::OffsetMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::SizeMismatch { .. } => StatusCode::BAD_REQUEST,
+            BobsError::InvalidRange(_) => StatusCode::BAD_REQUEST,
             BobsError::SpoolLocked => StatusCode::LOCKED,
             BobsError::SpoolClosed => StatusCode::CONFLICT,
             BobsError::InvalidState { .. } => StatusCode::CONFLICT,
@@ -418,8 +492,10 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::BobsError;
     use crate::io::TokioFileIO;
     use axum::http::Request;
+    use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use serde_json::Value;
     use tower::ServiceExt;
@@ -465,7 +541,7 @@ mod tests {
     async fn create_key(app: &Router) -> String {
         let req = Request::builder()
             .method("PUT")
-            .uri("/create")
+            .uri("/api/v1/create")
             .body(Body::empty())
             .expect("request build");
         let resp = app.clone().oneshot(req).await.expect("oneshot");
@@ -480,12 +556,117 @@ mod tests {
         v["key"].as_str().expect("key string").to_string()
     }
 
+    #[test]
+    fn test_api_error_spool_not_found() {
+        let err = ApiError(BobsError::SpoolNotFound {
+            key: "k".to_string(),
+        });
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_api_error_offset_mismatch() {
+        let err = ApiError(BobsError::OffsetMismatch {
+            expected: 0,
+            got: 10,
+        });
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_api_error_size_mismatch() {
+        let err = ApiError(BobsError::SizeMismatch {
+            expected: 100,
+            actual: 50,
+        });
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_api_error_spool_locked() {
+        let err = ApiError(BobsError::SpoolLocked);
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+    }
+
+    #[test]
+    fn test_api_error_spool_closed() {
+        let err = ApiError(BobsError::SpoolClosed);
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_api_error_invalid_state() {
+        let err = ApiError(BobsError::InvalidState {
+            current: "Complete".to_string(),
+            attempted_action: "write".to_string(),
+        });
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_api_error_io_error() {
+        let err = ApiError(BobsError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "disk full",
+        )));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_api_error_serialization_error() {
+        let err = ApiError(BobsError::SerializationError("bad json".to_string()));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_api_error_writer_inactive() {
+        let err = ApiError(BobsError::WriterInactive);
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_api_error_invalid_range() {
+        let err = ApiError(BobsError::InvalidRange("bad range".to_string()));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_health() {
+        let app = app().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .body(Body::empty())
+            .expect("request build");
+
+        let resp = app.clone().oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).expect("json parse");
+        assert_eq!(v["status"], "ok");
+    }
+
     #[tokio::test]
     async fn test_status() {
         let app = app().await;
         let req = Request::builder()
             .method("GET")
-            .uri("/status")
+            .uri("/api/v1/status")
             .body(Body::empty())
             .expect("request build");
 
@@ -500,7 +681,7 @@ mod tests {
 
         let req = Request::builder()
             .method("DELETE")
-            .uri(format!("/delete/{key}"))
+            .uri(format!("/api/v1/delete/{key}"))
             .body(Body::empty())
             .expect("request build");
         let resp = app.oneshot(req).await.expect("oneshot");
@@ -512,11 +693,146 @@ mod tests {
         let app = app().await;
         let req = Request::builder()
             .method("DELETE")
-            .uri("/delete/missing")
+            .uri("/api/v1/delete/missing")
             .body(Body::empty())
             .expect("request build");
         let resp = app.oneshot(req).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_parse_range_standard() {
+        let val = HeaderValue::from_static("bytes=0-1023");
+        assert!(matches!(
+            parse_range(Some(&val)).expect("range should parse"),
+            ReadRequestRange::Bounded {
+                start: 0,
+                end_inclusive: Some(1023)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_range_open_ended() {
+        let val = HeaderValue::from_static("bytes=500-");
+        assert!(matches!(
+            parse_range(Some(&val)).expect("range should parse"),
+            ReadRequestRange::Bounded {
+                start: 500,
+                end_inclusive: None
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_range_no_header() {
+        assert!(matches!(
+            parse_range(None).expect("range should parse"),
+            ReadRequestRange::Follow
+        ));
+    }
+
+    #[test]
+    fn test_parse_range_rejects_missing_bytes_prefix() {
+        let val = HeaderValue::from_static("0-999");
+        assert!(matches!(parse_range(Some(&val)), Err(BobsError::InvalidRange(_))));
+    }
+
+    #[test]
+    fn test_parse_range_rejects_malformed_start() {
+        let val = HeaderValue::from_static("bytes=abc-100");
+        assert!(matches!(parse_range(Some(&val)), Err(BobsError::InvalidRange(_))));
+    }
+
+    #[test]
+    fn test_parse_range_rejects_malformed_end() {
+        let val = HeaderValue::from_static("bytes=10-xyz");
+        assert!(matches!(parse_range(Some(&val)), Err(BobsError::InvalidRange(_))));
+    }
+
+    #[test]
+    fn test_parse_range_rejects_both_malformed() {
+        let val = HeaderValue::from_static("bytes=abc-def");
+        assert!(matches!(parse_range(Some(&val)), Err(BobsError::InvalidRange(_))));
+    }
+
+    #[test]
+    fn test_parse_range_rejects_empty_value() {
+        let val = HeaderValue::from_static("");
+        assert!(matches!(parse_range(Some(&val)), Err(BobsError::InvalidRange(_))));
+    }
+
+    #[test]
+    fn test_parse_range_rejects_descending_range() {
+        let val = HeaderValue::from_static("bytes=10-1");
+        assert!(matches!(parse_range(Some(&val)), Err(BobsError::InvalidRange(_))));
+    }
+
+    #[test]
+    fn test_long_poll_redirect_uses_api_path() {
+        let response = long_poll_redirect("abc123");
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/api/v1/read/abc123")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_range_returns_bad_request() {
+        let app = app().await;
+        let key = create_key(&app).await;
+
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(vec![7u8; 8]))
+            .expect("request build");
+        let write_resp = app.clone().oneshot(write_req).await.expect("oneshot");
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let read_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=abc-1")
+            .body(Body::empty())
+            .expect("request build");
+        let read_resp = app.oneshot(read_req).await.expect("oneshot");
+        assert_eq!(read_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_open_ended_range_is_bounded_not_follow_mode() {
+        let app = app().await;
+        let key = create_key(&app).await;
+        let data = vec![9u8; 8192];
+
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(data.clone()))
+            .expect("request build");
+        let write_resp = app.clone().oneshot(write_req).await.expect("oneshot");
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let read_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=4096-")
+            .body(Body::empty())
+            .expect("request build");
+        let read_resp = app.oneshot(read_req).await.expect("oneshot");
+        assert_eq!(read_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            read_resp
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .and_then(|h| h.to_str().ok()),
+            Some("bytes 4096-8191/*")
+        );
     }
 
     #[tokio::test]
@@ -527,7 +843,7 @@ mod tests {
         let data = vec![7u8; 8192];
         let req = Request::builder()
             .method("POST")
-            .uri(format!("/write/{key}/0"))
+            .uri(format!("/api/v1/write/{key}/0"))
             .body(Body::from(data.clone()))
             .expect("request build");
         let resp = app.clone().oneshot(req).await.expect("oneshot");
@@ -535,7 +851,7 @@ mod tests {
 
         let complete_req = Request::builder()
             .method("POST")
-            .uri(format!("/complete/{key}"))
+            .uri(format!("/api/v1/complete/{key}"))
             .body(Body::empty())
             .expect("request build");
         let complete_resp = app.clone().oneshot(complete_req).await.expect("oneshot");
@@ -543,7 +859,7 @@ mod tests {
 
         let read_req = Request::builder()
             .method("GET")
-            .uri(format!("/read/{key}"))
+            .uri(format!("/api/v1/read/{key}"))
             .header("Range", "bytes=0-8191")
             .body(Body::empty())
             .expect("request build");

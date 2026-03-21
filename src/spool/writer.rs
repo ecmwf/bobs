@@ -83,12 +83,8 @@ impl<F: FileIO> Spool<F> {
             meta.last_write_at = now_secs();
         }
 
-        {
-            let meta = self.metadata.lock().await.clone();
-            if let Err(error) = self.persist_metadata(&meta) {
-                tracing::warn!(error = %error, "failed to persist metadata after page flush");
-            }
-        }
+        let meta = self.metadata.lock().await.clone();
+        self.persist_metadata(&meta)?;
 
         Ok(())
     }
@@ -215,6 +211,21 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 0);
         assert_eq!(meta.total_bytes_written, 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_when_file_handle_none() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        {
+            let mut handle = spool.file_handle.lock().await;
+            *handle = None;
+        }
+
+        let data = vec![0xFFu8; 4096];
+        let result = spool.write(0, &data).await;
+        assert!(matches!(result, Err(BobsError::WriterInactive)));
     }
 
     #[tokio::test]

@@ -45,6 +45,59 @@ impl Config {
         serde_yml::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.page_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "page_size must be greater than 0",
+            ));
+        }
+
+        if self.max_cache_bytes < self.page_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_cache_bytes must be at least page_size",
+            ));
+        }
+
+        if self.cleanup_sweep_interval_secs == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cleanup_sweep_interval_secs must be greater than 0",
+            ));
+        }
+
+        if self.long_poll_timeout_ms == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "long_poll_timeout_ms must be greater than 0",
+            ));
+        }
+
+        if self.host_prefix.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host_prefix must be set in config",
+            ));
+        }
+
+        if self.domain.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "domain must be set in config",
+            ));
+        }
+
+        if self.route_name.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "route_name must be set in config",
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +156,70 @@ domain: test.example.com
         assert_eq!(cfg.long_poll_timeout_ms, 555);
         assert_eq!(cfg.host_prefix, "test-prefix");
         assert_eq!(cfg.domain, "test.example.com");
+    }
+
+    #[test]
+    fn test_from_file_missing() {
+        let result = Config::from_file("/nonexistent/path/bobs.yaml");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_from_file_invalid_yaml() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("bad.yaml");
+        std::fs::write(&path, "{{{{not: valid: yaml: [[[").expect("write bad yaml");
+
+        let result = Config::from_file(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_page_size() {
+        let mut config = Config::default();
+        config.page_size = 0;
+        config.host_prefix = "test".into();
+        config.domain = "example.com".into();
+        config.route_name = "bobs".into();
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_small_cache() {
+        let mut config = Config::default();
+        config.max_cache_bytes = 1024;
+        config.page_size = 4096;
+        config.host_prefix = "test".into();
+        config.domain = "example.com".into();
+        config.route_name = "bobs".into();
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_missing_routing_fields() {
+        let config = Config::default();
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_config() {
+        let config = Config {
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        config.validate().expect("validation should succeed");
     }
 
     #[test]

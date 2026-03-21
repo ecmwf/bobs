@@ -8,34 +8,36 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-    let config = match std::env::args().nth(1) {
-        Some(path) => Config::from_file(&path).expect("failed to load config file"),
-        None => Config::default(),
-    };
-
-    if config.host_prefix.is_empty() {
-        panic!("host_prefix must be set in config");
-    }
-    if config.domain.is_empty() {
-        panic!("domain must be set in config");
-    }
-    if config.route_name.is_empty() {
-        panic!("route_name must be set in config");
-    }
-
-    let hostname = std::env::var("HOSTNAME").expect("HOSTNAME environment variable must be set");
-    let ordinal = hostname
+fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
+    hostname
         .rsplit('-')
         .next()
-        .expect("HOSTNAME must contain '-' (e.g. bobs-0)")
-        .to_string();
+        .filter(|segment| !segment.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "HOSTNAME must contain '-' (e.g. bobs-0)",
+            )
+        })
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args();
+    let _program = args.next();
+    let config = match args.next() {
+        Some(path) => Config::from_file(&path)?,
+        None => Config::default(),
+    };
+    config.validate()?;
+
+    let hostname = std::env::var("HOSTNAME").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOSTNAME environment variable must be set",
+        )
+    })?;
+    let ordinal = parse_ordinal(&hostname)?;
 
     let config = Arc::new(config);
 
@@ -48,21 +50,18 @@ async fn main() {
         page_size = config.page_size,
         max_cache_bytes = config.max_cache_bytes,
         route_name = %config.route_name,
-        public_base = %format!("https://{}.{}/{}-{}", config.host_prefix, config.domain, config.route_name, ordinal),
+        public_base = %format!("https://{}.{}/{}-{}/api/v1", config.host_prefix, config.domain, config.route_name, ordinal),
         "BOBS starting",
     );
 
-    let manager = Arc::new(
-        SpoolManager::<TokioFileIO>::new(
-            config.data_dir.join("spools.redb"),
-            &config.data_dir,
-            config.page_size,
-            config.max_cache_bytes,
-        )
-        .expect("failed to initialize SpoolManager"),
-    );
+    let manager = Arc::new(SpoolManager::<TokioFileIO>::new(
+        config.data_dir.join("spools.redb"),
+        &config.data_dir,
+        config.page_size,
+        config.max_cache_bytes,
+    )?);
 
-    manager.recover().await.expect("failed to recover spools");
+    manager.recover().await?;
     let _cleanup = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
     let state = Arc::new(AppState {
@@ -73,10 +72,24 @@ async fn main() {
     });
     let app = router::<TokioFileIO>().with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await.expect("failed to bind");
+    let listener = TcpListener::bind(&addr).await?;
     tracing::info!("listening on {}", addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown::shutdown_signal())
-        .await
-        .expect("server error");
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+    if let Err(error) = run().await {
+        tracing::error!(error = %error, "BOBS failed to start");
+        std::process::exit(1);
+    }
 }

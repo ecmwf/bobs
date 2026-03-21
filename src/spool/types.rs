@@ -19,10 +19,14 @@ impl SpoolState {
             (self, target),
             (Creating, Writing)
             | (Creating, WriteLocked)
+            | (Writing, WriteLocked)
             | (Writing, Complete)
             | (Writing, Deleting)
+            | (WriteLocked, Readable)
             | (WriteLocked, Complete)   // complete releases write-lock
             | (WriteLocked, Deleting)
+            | (Readable, WriteLocked)
+            | (Readable, Complete)
             | (Complete, Deleting)
             | (Readable, Deleting)
         )
@@ -87,5 +91,30 @@ mod tests {
     fn test_transition_to_returns_error_on_invalid() {
         let result = SpoolState::Complete.transition_to(SpoolState::Writing);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transition_to_success() {
+        let result = SpoolState::Creating.transition_to(SpoolState::Writing);
+        assert_eq!(result.unwrap(), SpoolState::Writing);
+
+        let result = SpoolState::Writing.transition_to(SpoolState::Complete);
+        assert_eq!(result.unwrap(), SpoolState::Complete);
+
+        let result = SpoolState::WriteLocked.transition_to(SpoolState::Complete);
+        assert_eq!(result.unwrap(), SpoolState::Complete);
+
+        let result = SpoolState::Complete.transition_to(SpoolState::Deleting);
+        assert_eq!(result.unwrap(), SpoolState::Deleting);
+    }
+
+    #[test]
+    fn test_is_readable_per_state() {
+        assert!(!SpoolState::Creating.is_readable());
+        assert!(SpoolState::Writing.is_readable());
+        assert!(!SpoolState::WriteLocked.is_readable());
+        assert!(SpoolState::Readable.is_readable());
+        assert!(SpoolState::Complete.is_readable());
+        assert!(!SpoolState::Deleting.is_readable());
     }
 }

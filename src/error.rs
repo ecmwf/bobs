@@ -20,6 +20,9 @@ pub enum BobsError {
     #[error("writer is inactive")]
     WriterInactive,
 
+    #[error("invalid range header: {0}")]
+    InvalidRange(String),
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 

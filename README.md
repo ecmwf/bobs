@@ -16,13 +16,26 @@ Build the project using Cargo:
 cargo build --release
 ```
 
-Run the service with default configuration:
+Run the service with a config file and required environment:
 
 ```bash
-./target/release/bobs
+export HOSTNAME=bobs-0
+./target/release/bobs config.yaml
 ```
 
-Or provide a YAML config file:
+Required config fields:
+
+- `host_prefix`
+- `domain`
+- `route_name`
+
+Operational requirements:
+
+- `HOSTNAME` must be set and include a pod ordinal like `bobs-0`
+- `page_size` must be greater than `0`
+- `max_cache_bytes` must be at least `page_size`
+
+Example:
 
 ```bash
 ./target/release/bobs config.yaml
@@ -36,7 +49,7 @@ Follow this lifecycle to create, write, read, and delete a spool.
 The service returns a unique key for the new spool.
 
 ```bash
-curl -X PUT http://localhost:3000/create -d '{"content_type": "application/octet-stream"}'
+curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "application/octet-stream"}'
 # Response: {"key": "unique-spool-key"}
 ```
 
@@ -44,26 +57,26 @@ curl -X PUT http://localhost:3000/create -d '{"content_type": "application/octet
 Append data at a specific offset. Offset must match the current total bytes written.
 
 ```bash
-curl -X POST http://localhost:3000/write/unique-spool-key/0 --data-binary @file.dat
+curl -X POST http://localhost:3000/api/v1/write/unique-spool-key/0 --data-binary @file.dat
 ```
 
 ### 3. Complete the spool
 Finalize the spool to signal readers that no more data is coming. Optional size verification ensures integrity.
 
 ```bash
-curl -X POST http://localhost:3000/complete/unique-spool-key -d '{"expected_size": 1048576}'
+curl -X POST http://localhost:3000/api/v1/complete/unique-spool-key -d '{"expected_size": 1048576}'
 ```
 
 ### 4. Read data
 
 **Bounded read**: Request a specific byte range via a standard HTTP `Range` header.
 ```bash
-curl http://localhost:3000/read/unique-spool-key -H "Range: bytes=0-1048575"
+curl http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=0-1048575"
 ```
 
 **Follow mode**: Stream data as it's written (no `Range` header).
 ```bash
-curl http://localhost:3000/read/unique-spool-key
+curl http://localhost:3000/api/v1/read/unique-spool-key
 ```
 
 ### 5. Parallel reads
@@ -71,17 +84,17 @@ Multiple readers can consume different ranges simultaneously.
 
 ```bash
 # Terminal 1
-curl http://localhost:3000/read/unique-spool-key -H "Range: bytes=0-524287"
+curl http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=0-524287"
 
 # Terminal 2
-curl http://localhost:3000/read/unique-spool-key -H "Range: bytes=524288-1048575"
+curl http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=524288-1048575"
 ```
 
 ### 6. Verify checksum
 Every read response includes an S3-compatible CRC-32C checksum in the `X-Checksum-CRC32C` header.
 
 ```bash
-curl -I http://localhost:3000/read/unique-spool-key -H "Range: bytes=0-1048575"
+curl -I http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=0-1048575"
 # ...
 # X-Checksum-CRC32C: aB3dE==
 # ...
@@ -91,7 +104,13 @@ curl -I http://localhost:3000/read/unique-spool-key -H "Range: bytes=0-1048575"
 Manually remove a spool when finished.
 
 ```bash
-curl -X DELETE http://localhost:3000/delete/unique-spool-key
+curl -X DELETE http://localhost:3000/api/v1/delete/unique-spool-key
+```
+
+## Health endpoint
+
+```bash
+curl http://localhost:3000/api/v1/health
 ```
 
 ## Configuration

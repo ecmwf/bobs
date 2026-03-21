@@ -30,6 +30,18 @@ impl<F: FileIO> SpoolManager<F> {
         page_size: usize,
         max_cache_bytes: usize,
     ) -> Result<Self> {
+        if page_size == 0 {
+            return Err(BobsError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "page_size must be greater than 0",
+            )));
+        }
+        if max_cache_bytes < page_size {
+            return Err(BobsError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_cache_bytes must be at least page_size",
+            )));
+        }
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
         let page_cache_capacity = max_cache_bytes / page_size;
 
@@ -247,6 +259,7 @@ impl<F: FileIO> SpoolManager<F> {
 
             if file_size < expected_full_pages_bytes {
                 let actual_full_pages = file_size / self.page_size as u64;
+                let trailing_bytes = file_size % self.page_size as u64;
                 tracing::warn!(
                     key = %key,
                     expected_pages = meta.total_pages,
@@ -254,9 +267,13 @@ impl<F: FileIO> SpoolManager<F> {
                     file_size = file_size,
                     "disk file shorter than metadata, correcting"
                 );
-                meta.total_pages = actual_full_pages;
-                meta.total_bytes_written = actual_full_pages * self.page_size as u64;
-                meta.final_page_size = None;
+                meta.total_pages = actual_full_pages + u64::from(trailing_bytes > 0);
+                meta.total_bytes_written = file_size;
+                meta.final_page_size = if trailing_bytes > 0 {
+                    Some(trailing_bytes)
+                } else {
+                    None
+                };
                 meta.checksum_crc32c = None;
                 metadata_corrected = true;
             }
@@ -434,6 +451,24 @@ mod tests {
         manager.delete_spool(&key).await.expect("delete spool");
         assert!(manager.get_spool(&key).is_none());
         assert!(!spool_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_key() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+                .expect("manager init");
+
+        let result = manager.delete_spool("nonexistent-key").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            BobsError::SpoolNotFound { .. }
+        ));
     }
 
     #[tokio::test]
@@ -650,5 +685,66 @@ mod tests {
         let read_txn = manager.db.begin_read().expect("begin read");
         let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
         assert!(table.get(key.as_str()).expect("table get").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_preserves_partial_final_page() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+
+        let key = {
+            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+                .expect("manager init");
+
+            let key = manager
+                .create_spool(None, None, false)
+                .await
+                .expect("create spool");
+
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool
+                .write(0, &vec![0x44u8; 5000])
+                .await
+                .expect("write succeeds");
+            spool.complete(None).await.expect("complete succeeds");
+
+            let read_txn = manager.db.begin_read().expect("begin read");
+            let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
+            let entry = table
+                .get(key.as_str())
+                .expect("table get")
+                .expect("entry exists");
+            let mut meta: SpoolMetadata =
+                serde_json::from_slice(entry.value()).expect("deserialize metadata");
+            drop(table);
+            drop(read_txn);
+
+            meta.total_pages = 3;
+            meta.total_bytes_written = 3 * 4096;
+            meta.final_page_size = None;
+
+            let payload = serde_json::to_vec(&meta).expect("serialize metadata");
+            let write_txn = manager.db.begin_write().expect("begin write");
+            {
+                let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
+                table
+                    .insert(key.as_str(), payload.as_slice())
+                    .expect("insert corrected metadata");
+            }
+            write_txn.commit().expect("commit");
+
+            key
+        };
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.total_pages, 2);
+        assert_eq!(meta.total_bytes_written, 5000);
+        assert_eq!(meta.final_page_size, Some(904));
     }
 }

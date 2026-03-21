@@ -78,19 +78,11 @@ impl<F: FileIO> Spool<F> {
                 }
             }
             meta.checksum_crc32c = Some(crc32c);
-        }
-
-        {
-            let mut meta = self.metadata.lock().await;
             meta.state = SpoolState::Complete;
         }
 
-        {
-            let meta = self.metadata.lock().await.clone();
-            if let Err(error) = self.persist_metadata(&meta) {
-                tracing::warn!(error = %error, "failed to persist metadata after complete");
-            }
-        }
+        let meta = self.metadata.lock().await.clone();
+        self.persist_metadata(&meta)?;
 
         self.notify.notify_waiters();
 
@@ -104,7 +96,7 @@ impl<F: FileIO> Spool<F> {
         if locked && meta.state == SpoolState::Writing {
             meta.state = SpoolState::WriteLocked;
         } else if !locked && meta.state == SpoolState::WriteLocked {
-            meta.state = SpoolState::Writing;
+            meta.state = SpoolState::Readable;
         }
     }
 
@@ -197,6 +189,73 @@ mod tests {
         assert!(!spool.is_readable().await);
 
         spool.complete(None).await.expect("complete succeeds");
+        assert!(spool.is_readable().await);
+    }
+
+    #[tokio::test]
+    async fn test_complete_with_wrong_expected_size() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        let data = vec![0xBBu8; 2000];
+        spool.write(0, &data).await.expect("write succeeds");
+
+        let result = spool.complete(Some(9999)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BobsError::SizeMismatch { expected, actual } => {
+                assert_eq!(expected, 9999);
+                assert_eq!(actual, 2000);
+            }
+            other => panic!("expected SizeMismatch, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_with_correct_expected_size() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        let data = vec![0xCCu8; 500];
+        spool.write(0, &data).await.expect("write succeeds");
+
+        spool
+            .complete(Some(500))
+            .await
+            .expect("complete with correct size should succeed");
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.state, SpoolState::Complete);
+    }
+
+    #[tokio::test]
+    async fn test_set_write_locked_toggle() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        // Initially Writing + unlocked
+        {
+            let meta = spool.metadata.lock().await;
+            assert_eq!(meta.state, SpoolState::Writing);
+            assert!(!meta.write_locked);
+        }
+
+        // Lock it
+        spool.set_write_locked(true).await;
+        {
+            let meta = spool.metadata.lock().await;
+            assert_eq!(meta.state, SpoolState::WriteLocked);
+            assert!(meta.write_locked);
+        }
+        assert!(!spool.is_readable().await);
+
+        // Unlock it — should go back to Writing
+        spool.set_write_locked(false).await;
+        {
+            let meta = spool.metadata.lock().await;
+            assert_eq!(meta.state, SpoolState::Readable);
+            assert!(!meta.write_locked);
+        }
         assert!(spool.is_readable().await);
     }
 
