@@ -20,7 +20,7 @@ spec:
   {{- end }}
   rules:
     {{- range $i, $e := until (int $.Values.replicaCount) }}
-    - host: {{ $.Values.ingress.host | quote }}
+    - host: {{ printf "%s.%s" $.Values.config.host_prefix $.Values.config.domain | quote }}
       http:
         paths:
           - path: '/{{ $routeName }}-{{ $i }}/(.*)'

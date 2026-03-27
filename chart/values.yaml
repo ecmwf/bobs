@@ -36,7 +36,6 @@ persistence:
 ingress:
   enabled: false
   className: nginx
-  host: ""
   annotations: {}
   tls: []
 
