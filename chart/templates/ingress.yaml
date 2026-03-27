@@ -10,7 +10,9 @@ metadata:
     app.kubernetes.io/name: '{{ include "bobs.name" . }}'
     app.kubernetes.io/instance: '{{ .Release.Name }}'
   annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /read/$1
+    nginx.org/mergeable-ingress-type: minion
+    nginx.org/location-snippets: |
+      rewrite ^/{{ $routeName }}-\d+/(.*) /read/$1 break;
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -23,8 +25,8 @@ spec:
     - host: {{ printf "%s.%s" $.Values.config.host_prefix $.Values.config.domain | quote }}
       http:
         paths:
-          - path: '/{{ $routeName }}-{{ $i }}/(.*)'
-            pathType: ImplementationSpecific
+          - path: '/{{ $routeName }}-{{ $i }}'
+            pathType: Prefix
             backend:
               service:
                 name: '{{ $fullName }}-{{ $i }}'
