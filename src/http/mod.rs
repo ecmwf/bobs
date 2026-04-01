@@ -363,6 +363,12 @@ async fn read_spool<F: FileIO + 'static>(
             .headers_mut()
             .insert("X-Checksum-CRC32C", checksum_header);
     }
+    if let Some(size) = complete_size {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            HeaderValue::from(size),
+        );
+    }
     response
         .headers_mut()
         .insert("X-Accel-Buffering", HeaderValue::from_static("no"));

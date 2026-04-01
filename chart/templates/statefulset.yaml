@@ -22,10 +22,7 @@ spec:
         app.kubernetes.io/name: '{{ include "bobs.name" . }}'
         app.kubernetes.io/instance: '{{ .Release.Name }}'
     spec:
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "bobs.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: bobs
           image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'

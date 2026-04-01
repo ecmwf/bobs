@@ -27,3 +27,22 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/name: {{ include "bobs.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
+
+{{- define "bobs.imagePullSecrets" -}}
+{{- $secrets := list -}}
+{{- if .Values.global -}}
+  {{- range .Values.global.imagePullSecrets | default list -}}
+    {{- $secrets = append $secrets . -}}
+  {{- end -}}
+  {{- if .Values.global.imageCredentials -}}
+    {{- $secrets = append $secrets (dict "name" "polytope-registry-cred") -}}
+  {{- end -}}
+{{- end -}}
+{{- range .Values.imagePullSecrets | default list -}}
+  {{- $secrets = append $secrets . -}}
+{{- end -}}
+{{- if $secrets }}
+imagePullSecrets:
+  {{- toYaml $secrets | nindent 2 }}
+{{- end -}}
+{{- end -}}
