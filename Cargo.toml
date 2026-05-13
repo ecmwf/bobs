@@ -7,6 +7,8 @@ edition = "2021"
 axum = { version = "0.8", features = ["macros", "http2"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1", "http2"] }
+tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }

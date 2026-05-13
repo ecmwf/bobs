@@ -12,7 +12,8 @@ metadata:
   annotations:
     nginx.org/mergeable-ingress-type: minion
     nginx.org/location-snippets: |
-      rewrite ^/{{ $routeName }}-\d+/(.*) /read/$1 break;
+      rewrite ^/{{ $routeName }}-\d+/api/v1/read/([^/]+)$ /api/v1/read/$1 break;
+      rewrite ^/{{ $routeName }}-\d+/api/v1/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -21,10 +22,10 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   {{- end }}
   rules:
-    {{- range $i, $e := until (int $.Values.replicaCount) }}
     - host: {{ printf "%s.%s" $.Values.config.host_prefix $.Values.config.domain | quote }}
       http:
         paths:
+          {{- range $i, $e := until (int $.Values.replicaCount) }}
           - path: '/{{ $routeName }}-{{ $i }}'
             pathType: Prefix
             backend:
@@ -32,7 +33,7 @@ spec:
                 name: '{{ $fullName }}-{{ $i }}'
                 port:
                   number: {{ $port }}
-    {{- end }}
+          {{- end }}
   {{- if .Values.ingress.tls }}
   tls:
     {{- toYaml .Values.ingress.tls | nindent 4 }}

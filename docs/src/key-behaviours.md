@@ -15,7 +15,7 @@ A read request without a `Range` header enters follow mode from byte `0` (or fro
 A spool can be created with `write_locked: true`. In this state, any attempt to read results in a `423 Locked` error until the writer calls `/complete`. This is useful for preventing consumers from seeing any data until the entire payload is successfully buffered.
 
 ### 5. Parallel Reads
-BOBS supports a single consumer opening multiple concurrent connections for the same spool. Each connection can request independent byte ranges. The service tracks active readers to protect the spool from cleanup while data is still being transmitted.
+BOBS supports a single consumer opening multiple concurrent connections for the same spool. Each connection can request independent byte ranges. Read activity is tracked when bytes are actually served, so slow clients keep their spool alive while making progress but stalled connections do not protect a spool forever.
 
 ### 6. CRC-32C Integrity
 BOBS calculates a running CRC-32C checksum using hardware-accelerated instructions (where available) as data is written. Once a spool is complete, every read response includes the `X-Checksum-CRC32C` header containing the Base64-encoded checksum of the entire object. This allows clients to verify data integrity, which is especially important when reassembling parallel range reads.
@@ -24,11 +24,12 @@ BOBS calculates a running CRC-32C checksum using hardware-accelerated instructio
 Writes must be strictly sequential. The `offset` provided in the `/write` request must exactly match the total number of bytes currently stored in the spool. Random-access writes or overwrites are not supported.
 
 ### 8. Automatic Cleanup
-A background task periodically sweeps the spool manager and deletes spools based on four triggers:
+A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 - **Writer Inactivity**: The producer stopped writing without completing the spool.
-- **Reader Done TTL**: The spool is complete, and a configured time has passed since the last reader finished.
-- **Unread TTL**: The spool was completed but never accessed by a reader.
-- **Active Protection**: Spools with active readers are never cleaned up.
+- **Read Idle TTL**: The spool is readable but has not served bytes for `read_idle_ttl_secs`. For never-read spools, this timer starts when the spool becomes readable.
+- **Full Read TTL**: BOBS has served every byte of the object at least once, possibly across multiple range requests, and `full_read_complete_ttl_secs` has elapsed since the latest read activity.
+
+Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.
 
 ### 9. HTTP/2 Support
 The server supports both HTTP/1.1 and HTTP/2 (h2c cleartext). Using HTTP/2 is recommended for high-concurrency streaming to benefit from request multiplexing.

@@ -20,6 +20,8 @@ config:
   page_size: 4096
   max_cache_bytes: 1048576
   writer_inactivity_timeout_secs: 300
+  read_idle_ttl_secs: 600
+  full_read_complete_ttl_secs: 30
   reader_done_ttl_secs: 60
   unread_ttl_secs: 3600
   cleanup_sweep_interval_secs: 30

@@ -20,6 +20,7 @@ impl FileIO for TokioFileIO {
         async move {
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
+                .truncate(true)
                 .write(true)
                 .read(true)
                 .open(path)
@@ -80,13 +81,9 @@ impl FileIO for TokioFileIO {
         }
     }
 
-    fn close(
-        handle: Self::Handle,
-    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-        async move {
-            drop(handle);
-            Ok(())
-        }
+    async fn close(handle: Self::Handle) -> std::io::Result<()> {
+        drop(handle);
+        Ok(())
     }
 
     fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {

@@ -4,8 +4,12 @@ use bobs::http::{router, AppState};
 use bobs::io::TokioFileIO;
 use bobs::manager::SpoolManager;
 use bobs::shutdown;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
+use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
 fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
@@ -39,6 +43,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let ordinal = parse_ordinal(&hostname)?;
 
+    let internal_base_url_template = std::env::var("BOBS_INTERNAL_BASE_URL_TEMPLATE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "BOBS_INTERNAL_BASE_URL_TEMPLATE environment variable must be set and non-empty",
+            )
+        })?;
+    let internal_base_url = internal_base_url_template.replace("{ordinal}", &ordinal);
+
     let config = Arc::new(config);
 
     tracing::info!(
@@ -51,6 +66,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_cache_bytes = config.max_cache_bytes,
         route_name = %config.route_name,
         public_base = %format!("https://{}.{}/{}-{}/api/v1", config.host_prefix, config.domain, config.route_name, ordinal),
+        internal_base_url = %internal_base_url,
         "BOBS starting",
     );
 
@@ -69,14 +85,51 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         hostname: hostname.clone(),
         ordinal: ordinal.clone(),
+        internal_base_url,
     });
     let app = router::<TokioFileIO>().with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("listening on {}", addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown::shutdown_signal())
-        .await?;
+
+    // 16 MiB h2 windows — one body fits in a single window with no flow-control pauses.
+    const H2_WINDOW: u32 = 16 * 1024 * 1024;
+
+    let mut shutdown = std::pin::pin!(shutdown::shutdown_signal());
+    let mut tasks: JoinSet<()> = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = result?;
+                let io = TokioIo::new(stream);
+                let app = app.clone();
+                tasks.spawn(async move {
+                    let mut builder = Builder::new(TokioExecutor::new());
+                    builder
+                        .http2()
+                        .initial_stream_window_size(H2_WINDOW)
+                        .initial_connection_window_size(H2_WINDOW);
+                    let svc = hyper::service::service_fn(move |req| {
+                        let app = app.clone();
+                        async move { app.oneshot(req).await }
+                    });
+                    if let Err(err) = builder.serve_connection_with_upgrades(io, svc).await {
+                        tracing::warn!(error = %err, "connection error");
+                    }
+                });
+            }
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received, stopping accept loop");
+                break;
+            }
+            // Reap finished connection tasks to avoid unbounded JoinSet growth.
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+        }
+    }
+
+    // Drain in-flight connections before exiting.
+    while tasks.join_next().await.is_some() {}
 
     Ok(())
 }

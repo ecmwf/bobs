@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6097e0a5.js";
+            window.path_to_searchindex_js = "searchindex-d8141f5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-46f6bf3b.js"></script>
+        <script src="toc-fd9758cf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,7 +182,7 @@
 <p>BOBS provides a high-performance, temporary storage layer that:</p>
 <ul>
 <li>Allows producers to append data at local speeds.</li>
-<li>Enables multiple readers to consume data in parallel.</li>
+<li>Enables a single consumer to use parallel connections when needed.</li>
 <li>Supports byte-range requests and real-time streaming (follow mode).</li>
 <li>Automatically cleans up data based on lifecycle events and timeouts.</li>
 </ul>
@@ -204,8 +204,8 @@
 <p>Start the service with default settings (port 3000, <code>./data</code> for storage):</p>
 <pre><code class="language-bash">./target/release/bobs
 </code></pre>
-<p>Override configuration via environment variables:</p>
-<pre><code class="language-bash">BOBS_LISTEN_ADDR=127.0.0.1:8080 BOBS_DATA_DIR=/tmp/bobs ./target/release/bobs
+<p>Or provide a YAML config file:</p>
+<pre><code class="language-bash">./target/release/bobs config.yaml
 </code></pre>
 <h2 id="walkthrough"><a class="header" href="#walkthrough">Walkthrough</a></h2>
 <h3 id="1-create-a-spool"><a class="header" href="#1-create-a-spool">1. Create a Spool</a></h3>
@@ -230,11 +230,11 @@ curl -X POST http://localhost:3000/write/YOUR_KEY/1024 --data-binary @part2.dat
 </code></pre>
 <h3 id="4-read-data"><a class="header" href="#4-read-data">4. Read Data</a></h3>
 <p><strong>Streaming (Follow Mode)</strong>: If the writer is still active, you can follow the stream from the beginning.</p>
-<pre><code class="language-bash">curl -L http://localhost:3000/read/YOUR_KEY/0/0
+<pre><code class="language-bash">curl -L http://localhost:3000/read/YOUR_KEY
 </code></pre>
 <p><em>Note: The <code>-L</code> flag is important as BOBS uses 307 redirects for long-poll timeouts.</em></p>
-<p><strong>Range Request</strong>: Once complete (or for available pages), you can request specific ranges.</p>
-<pre><code class="language-bash">curl http://localhost:3000/read/YOUR_KEY/0/1024
+<p><strong>Range Request</strong>: Once complete (or for available pages), request specific bytes with the standard <code>Range</code> header.</p>
+<pre><code class="language-bash">curl http://localhost:3000/read/YOUR_KEY -H "Range: bytes=0-1023"
 </code></pre>
 <h3 id="5-delete"><a class="header" href="#5-delete">5. Delete</a></h3>
 <p>Remove the spool manually.</p>
@@ -254,18 +254,18 @@ curl -X POST http://localhost:3000/write/YOUR_KEY/1024 --data-binary @part2.dat
 <tr><td>PUT</td><td><code>/create</code></td><td>Create a new spool.</td></tr>
 <tr><td>POST</td><td><code>/write/{key}/{offset}</code></td><td>Append data to a spool.</td></tr>
 <tr><td>POST</td><td><code>/complete/{key}</code></td><td>Finalize a spool.</td></tr>
-<tr><td>GET</td><td><code>/read/{key}/{start}/{end}</code></td><td>Read or stream data.</td></tr>
+<tr><td>GET</td><td><code>/read/{key}</code></td><td>Read or stream data.</td></tr>
 <tr><td>DELETE</td><td><code>/delete/{key}</code></td><td>Delete a spool.</td></tr>
 </tbody>
 </table>
 </div>
 <hr>
 <h3 id="get-status"><a class="header" href="#get-status">GET /status</a></h3>
-<p>Returns the health status and the unique <code>bob_id</code> of the instance.</p>
+<p>Returns the health status and hostname of the instance.</p>
 <p><strong>Response (200 OK)</strong>:</p>
 <pre><code class="language-json">{
   "status": "ok",
-  "bob_id": "pod-a-123"
+  "hostname": "pod-a-123"
 }
 </code></pre>
 <hr>
@@ -315,21 +315,34 @@ curl -X POST http://localhost:3000/write/YOUR_KEY/1024 --data-binary @part2.dat
 <li><code>400 Bad Request</code>: Size mismatch between <code>expected_size</code> and actual bytes written.</li>
 </ul>
 <hr>
-<h3 end="" id="get-readkeystart"><a class="header" href="#get-readkeystart">GET /read/{key}/{start}/</a></h3>
-<p>Reads a range of data or follows a live stream.</p>
+<h3 key="" id="get-read"><a class="header" href="#get-read">GET /read/</a></h3>
+<p>Reads a bounded range or follows a live stream using the standard HTTP <code>Range</code> header.</p>
+<p>Range behavior:</p>
 <ul>
-<li><code>start</code>: Byte offset to start reading from.</li>
-<li><code>end</code>: Byte offset to end at. If <code>0</code>, enters <strong>follow mode</strong>.</li>
+<li>No <code>Range</code> header: follow mode from byte <code>0</code> (<code>200 OK</code>, streaming).</li>
+<li><code>Range: bytes=X-Y</code>: bounded read of bytes <code>[X, Y]</code> inclusive (<code>206 Partial Content</code>).</li>
+<li><code>Range: bytes=X-</code>: follow mode from byte <code>X</code> (<code>200 OK</code>, streaming).</li>
 </ul>
-<p><strong>Follow Mode (<code>end=0</code>)</strong>:
-The connection remains open. BOBS streams pages as they are flushed by the writer. If the writer is idle, the server may issue a <code>307 Temporary Redirect</code> to the same URL to refresh the long-poll.</p>
+<p>For follow mode, the connection remains open and BOBS streams pages as they are flushed by the writer. If the writer is idle, BOBS may issue a <code>307 Temporary Redirect</code> to the same <code>/read/{key}</code> URL for long-poll refresh.</p>
 <p><strong>Response Headers</strong>:</p>
 <ul>
+<li><code>Accept-Ranges: bytes</code>: Advertises byte-range support.</li>
+<li><code>Content-Range: bytes X-Y/*</code> for bounded reads (or <code>bytes X-Y/TOTAL</code> once complete).</li>
 <li><code>Content-Type</code>: As defined during creation.</li>
 <li><code>Content-Encoding</code>: As defined during creation (if provided).</li>
 <li><code>X-Checksum-CRC32C</code>: Base64-encoded CRC-32C of the <strong>full object</strong>. Only available after completion.</li>
 <li><code>X-Accel-Buffering</code>: <code>no</code> (disables proxy buffering).</li>
 </ul>
+<p>Examples:</p>
+<pre><code class="language-bash"># Bounded range
+curl http://localhost:3000/read/YOUR_KEY -H "Range: bytes=0-1023"
+
+# Follow from start
+curl -L http://localhost:3000/read/YOUR_KEY
+
+# Follow from offset
+curl -L http://localhost:3000/read/YOUR_KEY -H "Range: bytes=1048576-"
+</code></pre>
 <p><strong>Error Cases</strong>:</p>
 <ul>
 <li><code>423 Locked</code>: Spool was created with <code>write_locked: true</code> and is not yet complete.</li>
@@ -344,51 +357,84 @@ The connection remains open. BOBS streams pages as they are flushed by the write
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
-<p>BOBS is configured entirely through environment variables.</p>
+<p>BOBS is configured via a YAML file passed as a CLI argument. All fields have sensible defaults — a partial file is fine, missing fields use defaults.</p>
+<pre><code class="language-bash">./target/release/bobs config.yaml
+</code></pre>
+<p>Without a config file, BOBS runs with defaults:</p>
+<pre><code class="language-bash">./target/release/bobs
+</code></pre>
+<h2 id="fields"><a class="header" href="#fields">Fields</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+<tr><th>Field</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>BOBS_LISTEN_ADDR</code></td><td><code>0.0.0.0:3000</code></td><td>Address and port for the HTTP server.</td></tr>
-<tr><td><code>BOBS_DATA_DIR</code></td><td><code>./data</code></td><td>File system path for storing spool files.</td></tr>
-<tr><td><code>BOBS_PAGE_SIZE</code></td><td><code>4096</code></td><td>Size of internal data pages. Writes are buffered until a page is full.</td></tr>
-<tr><td><code>BOBS_PAGE_CACHE_CAPACITY</code></td><td><code>256</code></td><td>Number of pages to keep in the per-spool memory cache.</td></tr>
-<tr><td><code>BOBS_WRITER_INACTIVITY_TIMEOUT_SECS</code></td><td><code>300</code></td><td>Cleanup spool if the writer doesn’t send data for this long.</td></tr>
-<tr><td><code>BOBS_READER_DONE_TTL_SECS</code></td><td><code>60</code></td><td>TTL for a completed spool once the last reader disconnects.</td></tr>
-<tr><td><code>BOBS_UNREAD_TTL_SECS</code></td><td><code>3600</code></td><td>TTL for a completed spool that has never been read.</td></tr>
-<tr><td><code>BOBS_CLEANUP_SWEEP_INTERVAL_SECS</code></td><td><code>30</code></td><td>How often the background cleanup task runs.</td></tr>
-<tr><td><code>BOBS_LONG_POLL_TIMEOUT_MS</code></td><td><code>25000</code></td><td>Maximum time to wait for new data during a read before redirecting.</td></tr>
-<tr><td><code>BOBS_BOB_ID</code></td><td><code>hostname</code></td><td>Unique ID for the instance. Falls back to <code>HOSTNAME</code> env or <code>unknown</code>.</td></tr>
+<tr><td><code>host</code></td><td><code>0.0.0.0</code></td><td>Address for the HTTP server to bind to.</td></tr>
+<tr><td><code>port</code></td><td><code>3000</code></td><td>Port for the HTTP server to listen on.</td></tr>
+<tr><td><code>data_dir</code></td><td><code>./data</code></td><td>File system path for storing spool files.</td></tr>
+<tr><td><code>page_size</code></td><td><code>4096</code></td><td>Size of internal data pages in bytes. Writes are buffered until a page is full.</td></tr>
+<tr><td><code>max_cache_bytes</code></td><td><code>1048576</code></td><td>Max bytes to keep in the per-spool memory cache. Effective page count is <code>max_cache_bytes / page_size</code>.</td></tr>
+<tr><td><code>writer_inactivity_timeout_secs</code></td><td><code>300</code></td><td>Cleanup spool if the writer doesn’t send data for this long.</td></tr>
+<tr><td><code>read_idle_ttl_secs</code></td><td><code>600</code></td><td>TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served.</td></tr>
+<tr><td><code>full_read_complete_ttl_secs</code></td><td><code>30</code></td><td>Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served.</td></tr>
+<tr><td><code>reader_done_ttl_secs</code></td><td><code>60</code></td><td>Deprecated compatibility field. Parsed but no longer drives cleanup.</td></tr>
+<tr><td><code>unread_ttl_secs</code></td><td><code>3600</code></td><td>Deprecated compatibility field. Parsed but no longer drives cleanup.</td></tr>
+<tr><td><code>cleanup_sweep_interval_secs</code></td><td><code>30</code></td><td>How often the background cleanup task runs.</td></tr>
+<tr><td><code>long_poll_timeout_ms</code></td><td><code>25000</code></td><td>Maximum time in ms to wait for new data during a read before redirecting.</td></tr>
+<tr><td><code>host_prefix</code></td><td><code>""</code></td><td>External download host prefix used when generating read URLs.</td></tr>
+<tr><td><code>domain</code></td><td><code>""</code></td><td>External download domain used when generating read URLs.</td></tr>
+<tr><td><code>route_name</code></td><td><code>""</code></td><td>External download route prefix, for example <code>download</code>.</td></tr>
 </tbody>
 </table>
 </div>
+<h2 id="example"><a class="header" href="#example">Example</a></h2>
+<pre><code class="language-yaml">host: 0.0.0.0
+port: 3000
+data_dir: /data/bobs
+page_size: 4096
+max_cache_bytes: 1048576
+writer_inactivity_timeout_secs: 300
+read_idle_ttl_secs: 600
+full_read_complete_ttl_secs: 30
+reader_done_ttl_secs: 60      # deprecated compatibility field
+unread_ttl_secs: 3600         # deprecated compatibility field
+cleanup_sweep_interval_secs: 30
+long_poll_timeout_ms: 25000
+host_prefix: polytope-example
+domain: example.com
+route_name: download
+</code></pre>
+<p>Only the fields you want to override need to be present:</p>
+<pre><code class="language-yaml">data_dir: /mnt/ssd/bobs
+max_cache_bytes: 4194304
+read_idle_ttl_secs: 600
+</code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="key-behaviours"><a class="header" href="#key-behaviours">Key Behaviours</a></h1>
 <p>Understanding these internal behaviours is crucial for effectively using BOBS.</p>
 <h3 id="1-page-based-streaming"><a class="header" href="#1-page-based-streaming">1. Page-based Streaming</a></h3>
-<p>Data is organized into fixed-size pages (defined by <code>BOBS_PAGE_SIZE</code>). A page is only visible to readers once it is completely full and flushed to disk. The final partial page is flushed only when the writer calls <code>/complete</code>. This ensures readers always receive consistent, non-torn data.</p>
+<p>Data is organized into fixed-size pages (configured via <code>page_size</code>). A page is only visible to readers once it is completely full and flushed to disk. The final partial page is flushed only when the writer calls <code>/complete</code>. This ensures readers always receive consistent, non-torn data.</p>
 <h3 id="2-long-poll-with-timeout"><a class="header" href="#2-long-poll-with-timeout">2. Long-poll with Timeout</a></h3>
-<p>When a reader requests data that hasn’t been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure (like Kubernetes Ingress or Load Balancers), BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>BOBS_LONG_POLL_TIMEOUT_MS</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
+<p>When a reader requests data that hasn’t been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure (like Kubernetes Ingress or Load Balancers), BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>long_poll_timeout_ms</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
 <h3 id="3-follow-mode"><a class="header" href="#3-follow-mode">3. Follow Mode</a></h3>
-<p>By setting the <code>end</code> parameter to <code>0</code> in a read request, the reader enters follow mode. The server will keep the stream open and push new pages as they become available until the spool is finalized.</p>
+<p>A read request without a <code>Range</code> header enters follow mode from byte <code>0</code> (or from byte <code>X</code> with <code>Range: bytes=X-</code>). The server keeps the stream open and pushes new pages as they become available until the spool is finalized.</p>
 <h3 id="4-write-locked-mode"><a class="header" href="#4-write-locked-mode">4. Write-locked Mode</a></h3>
 <p>A spool can be created with <code>write_locked: true</code>. In this state, any attempt to read results in a <code>423 Locked</code> error until the writer calls <code>/complete</code>. This is useful for preventing consumers from seeing any data until the entire payload is successfully buffered.</p>
 <h3 id="5-parallel-reads"><a class="header" href="#5-parallel-reads">5. Parallel Reads</a></h3>
-<p>BOBS supports multiple concurrent readers for the same spool. Each reader can request independent byte ranges. The service tracks the number of active readers to protect the spool from being cleaned up while data is still being transmitted.</p>
+<p>BOBS supports a single consumer opening multiple concurrent connections for the same spool. Each connection can request independent byte ranges. Read activity is tracked when bytes are actually served, so slow clients keep their spool alive while making progress but stalled connections do not protect a spool forever.</p>
 <h3 id="6-crc-32c-integrity"><a class="header" href="#6-crc-32c-integrity">6. CRC-32C Integrity</a></h3>
 <p>BOBS calculates a running CRC-32C checksum using hardware-accelerated instructions (where available) as data is written. Once a spool is complete, every read response includes the <code>X-Checksum-CRC32C</code> header containing the Base64-encoded checksum of the entire object. This allows clients to verify data integrity, which is especially important when reassembling parallel range reads.</p>
 <h3 id="7-sequential-writes"><a class="header" href="#7-sequential-writes">7. Sequential Writes</a></h3>
 <p>Writes must be strictly sequential. The <code>offset</code> provided in the <code>/write</code> request must exactly match the total number of bytes currently stored in the spool. Random-access writes or overwrites are not supported.</p>
 <h3 id="8-automatic-cleanup"><a class="header" href="#8-automatic-cleanup">8. Automatic Cleanup</a></h3>
-<p>A background task periodically sweeps the spool manager and deletes spools based on four triggers:</p>
+<p>A background task periodically sweeps the spool manager and deletes spools based on three triggers:</p>
 <ul>
 <li><strong>Writer Inactivity</strong>: The producer stopped writing without completing the spool.</li>
-<li><strong>Reader Done TTL</strong>: The spool is complete, and a configured time has passed since the last reader finished.</li>
-<li><strong>Unread TTL</strong>: The spool was completed but never accessed by a reader.</li>
-<li><strong>Active Protection</strong>: Spools with active readers are never cleaned up.</li>
+<li><strong>Read Idle TTL</strong>: The spool is readable but has not served bytes for <code>read_idle_ttl_secs</code>. For never-read spools, this timer starts when the spool becomes readable.</li>
+<li><strong>Full Read TTL</strong>: BOBS has served every byte of the object at least once, possibly across multiple range requests, and <code>full_read_complete_ttl_secs</code> has elapsed since the latest read activity.</li>
 </ul>
+<p>Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.</p>
 <h3 id="9-http2-support"><a class="header" href="#9-http2-support">9. HTTP/2 Support</a></h3>
 <p>The server supports both HTTP/1.1 and HTTP/2 (h2c cleartext). Using HTTP/2 is recommended for high-concurrency streaming to benefit from request multiplexing.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -399,7 +445,7 @@ The connection remains open. BOBS streams pages as they are flushed by the write
 <li><strong>Spool</strong>: The core entity representing a data stream. It contains metadata, a page cache, a write buffer, and handles synchronization between the writer and readers.</li>
 <li><strong>FileIO</strong>: An abstraction for asynchronous disk I/O. The default implementation uses Tokio’s file system tasks, but it’s designed to support future high-performance backends like <code>io_uring</code>.</li>
 <li><strong>SpoolManager</strong>: A central registry (using <code>DashMap</code>) that tracks all active spools. It uses <code>redb</code> for lightweight persistence of metadata, allowing the service to recover state after a restart.</li>
-<li><strong>Page Cache</strong>: A per-spool LRU-like cache that minimizes disk reads for hot data being consumed immediately after it’s written.</li>
+<li><strong>Page Cache</strong>: A per-spool LRU-like cache that minimizes disk reads for hot data being consumed immediately after it’s written. Capacity is derived from <code>max_cache_bytes / page_size</code>.</li>
 </ul>
 <h3 id="data-flow"><a class="header" href="#data-flow">Data Flow</a></h3>
 <ol>
@@ -408,6 +454,65 @@ The connection remains open. BOBS streams pages as they are flushed by the write
 <li><strong>Read</strong>: Reader requests a range -&gt; check page cache -&gt; if miss, read from disk -&gt; stream bytes to the HTTP response.</li>
 <li><strong>Lifecycle</strong>: Spool moves from <code>Creating</code> -&gt; <code>Writing</code> (or <code>WriteLocked</code>) -&gt; <code>Complete</code> -&gt; <code>Deleting</code>.</li>
 </ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="write-routing"><a class="header" href="#write-routing">Write Routing</a></h1>
+<p>BOBS supports horizontal scaling of writes across a StatefulSet. Each pod owns the spools it created, and clients are directed to the owning pod for all body-path operations via the <code>write_url</code> returned at create time.</p>
+<hr>
+<h2 id="key-format"><a class="header" href="#key-format">Key Format</a></h2>
+<p>Every spool key is an opaque UUID, for example:</p>
+<pre><code>550e8400-e29b-41d4-a716-446655440000
+</code></pre>
+<p>Keys carry no ownership information. The owning pod is determined entirely by which pod handled the <code>/create</code> request — not by parsing the key.</p>
+<hr>
+<h2 id="create-flow"><a class="header" href="#create-flow">Create Flow</a></h2>
+<p>Clients send a <code>PUT /api/v1/create</code> request to the <strong>cluster Service</strong> (the ordinary round-robin load-balanced endpoint). Any pod may handle the create:</p>
+<pre><code>PUT /api/v1/create
+→ 201 Created
+{
+  "key":       "550e8400-e29b-41d4-a716-446655440000",
+  "read_url":  "https://example.com/download-2/api/v1/read/550e8400-e29b-41d4-a716-446655440000",
+  "write_url": "http://release-bobs-2:3000/api/v1"
+}
+</code></pre>
+<ul>
+<li><code>key</code> — the spool identifier; embed it in all subsequent requests.</li>
+<li><code>read_url</code> — the public URL through which consumers can stream the spool once writing begins.</li>
+<li><code>write_url</code> — the <strong>per-pod internal base URL</strong> of the owning pod. Clients must use this URL as the base for all write and complete calls.</li>
+</ul>
+<p>The handling pod generates a UUID key, writes the spool entry to its own local database, and returns its own <code>internal_base_url</code> as <code>write_url</code>. No network calls are made to other pods during create.</p>
+<hr>
+<h2 id="write-and-complete-flow"><a class="header" href="#write-and-complete-flow">Write and Complete Flow</a></h2>
+<p>After receiving the create response the client routes all body-path traffic directly to <code>write_url</code>:</p>
+<pre><code>POST {write_url}/write/{key}/{offset}
+POST {write_url}/complete/{key}
+</code></pre>
+<p>These requests bypass the cluster load balancer and land on the owning pod every time. Workers must use the <code>write_url</code> from the create response — it is the only correct destination for writes.</p>
+<hr>
+<h2 id="no-fallback-for-misrouted-writes"><a class="header" href="#no-fallback-for-misrouted-writes">No Fallback for Misrouted Writes</a></h2>
+<p>If a <code>/write</code> or <code>/complete</code> request arrives at a pod that does not own the spool, the spool will not be found and the pod returns <code>404 SpoolNotFound</code>. There is no 307 redirect path. Workers must use <code>write_url</code> correctly.</p>
+<hr>
+<h2 id="bobs_internal_base_url_template-environment-variable"><a class="header" href="#bobs_internal_base_url_template-environment-variable"><code>BOBS_INTERNAL_BASE_URL_TEMPLATE</code> Environment Variable</a></h2>
+<p>Each BOBS pod is configured with a single environment variable:</p>
+<pre><code>BOBS_INTERNAL_BASE_URL_TEMPLATE=http://release-bobs-{ordinal}:3000/api/v1
+</code></pre>
+<p>The literal placeholder <code>{ordinal}</code> (single braces) is <strong>not</strong> expanded by Helm — it is replaced at runtime by the BOBS process itself.</p>
+<p>On startup BOBS reads this variable, substitutes its own ordinal to derive <code>internal_base_url</code>, and fails fast with a clear error if the variable is absent or empty. It logs the resolved value:</p>
+<pre><code>INFO internal_base_url = http://release-bobs-2:3000/api/v1
+</code></pre>
+<p>The chart injects the variable automatically into the StatefulSet. No per-replica manual configuration is required.</p>
+<hr>
+<h2 id="pod-loss-mid-write"><a class="header" href="#pod-loss-mid-write">Pod Loss Mid-Write</a></h2>
+<p>If the owning pod dies while a write is in progress:</p>
+<ol>
+<li>The worker receives an HTTP error (connection refused or 5xx) on the next <code>/write</code> call.</li>
+<li>The worker abandons the in-flight spool and retries the entire request from <code>/create</code> (on a surviving pod).</li>
+<li>The orphaned spool on the dead pod’s PVC is left in <code>Writing</code> state.</li>
+<li>When the pod restarts, <code>recover()</code> reads only its own local database. It finds the spool still in <code>Writing</code> state with no active writer. The background cleanup task reaps it once the <strong>writer inactivity timeout</strong> (<code>writer_inactivity_timeout_secs</code>, default 300 s) expires.</li>
+</ol>
+<p>No manual intervention or cross-pod coordination is needed.</p>
+<hr>
+<h2 id="out-of-scope"><a class="header" href="#out-of-scope">Out of Scope</a></h2>
+<p><strong>Read-path HA</strong> is not covered by this feature. The <code>read_url</code> returned by <code>/create</code> routes through the per-pod ingress path; if the owning pod is unavailable, reads will fail until the pod recovers. Shared-storage or sidecar-based read HA is a planned follow-on.</p>
 
                     </main>
 

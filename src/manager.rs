@@ -5,14 +5,14 @@ use dashmap::DashMap;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 pub const SPOOL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("spools");
 
 fn storage<E: Into<redb::Error>>(e: E) -> BobsError {
-    BobsError::StorageError(e.into())
+    BobsError::from(e.into())
 }
 
 pub struct SpoolManager<F: FileIO> {
@@ -65,11 +65,11 @@ impl<F: FileIO> SpoolManager<F> {
 
     pub async fn create_spool(
         &self,
+        key: String,
         content_type: Option<String>,
         content_encoding: Option<String>,
         write_locked: bool,
-    ) -> Result<String> {
-        let key = Uuid::new_v4().to_string();
+    ) -> Result<()> {
         let spool_dir = self.data_dir.join(&key);
         let data_path = spool_dir.join("spool.dat");
 
@@ -93,6 +93,7 @@ impl<F: FileIO> SpoolManager<F> {
             created_at: now,
             last_write_at: now,
             last_read_at: None,
+            readable_at: None,
             total_bytes_written: 0,
             checksum_crc32c: None,
             total_pages: 0,
@@ -126,7 +127,7 @@ impl<F: FileIO> SpoolManager<F> {
         );
         self.spools.insert(key.clone(), spool);
 
-        Ok(key)
+        Ok(())
     }
 
     pub fn get_spool(&self, key: &str) -> Option<Arc<Spool<F>>> {
@@ -205,9 +206,14 @@ impl<F: FileIO> SpoolManager<F> {
             }
         }
 
-        let recovered_keys: HashSet<String> = recovered.iter().map(|(key, _)| key.clone()).collect();
+        let recovered_keys: HashSet<String> =
+            recovered.iter().map(|(key, _)| key.clone()).collect();
 
-        tracing::info!(total = recovered.len(), stale = stale_keys.len(), "recovery: scanning spools");
+        tracing::info!(
+            total = recovered.len(),
+            stale = stale_keys.len(),
+            "recovery: scanning spools"
+        );
 
         for (key, mut meta) in recovered {
             if !meta.data_path.exists() {
@@ -251,11 +257,21 @@ impl<F: FileIO> SpoolManager<F> {
                 .map(|m| m.len())
                 .unwrap_or(0);
 
-            let expected_full_pages_bytes = if meta.total_pages > 0 && meta.final_page_size.is_some() {
-                (meta.total_pages - 1) * self.page_size as u64 + meta.final_page_size.unwrap()
-            } else {
-                meta.total_pages * self.page_size as u64
+            let expected_full_pages_bytes = match meta.final_page_size {
+                Some(final_page_size) if meta.total_pages > 0 => {
+                    (meta.total_pages - 1) * self.page_size as u64 + final_page_size
+                }
+                _ => meta.total_pages * self.page_size as u64,
             };
+
+            // Backfill readable_at for spools that were persisted before this
+            // field existed. Grants a full idle-TTL grace period after upgrade.
+            if matches!(meta.state, SpoolState::Complete | SpoolState::Readable)
+                && meta.readable_at.is_none()
+            {
+                meta.readable_at = Some(now_secs());
+                metadata_corrected = true;
+            }
 
             if file_size < expected_full_pages_bytes {
                 let actual_full_pages = file_size / self.page_size as u64;
@@ -339,6 +355,10 @@ impl<F: FileIO> SpoolManager<F> {
                 crc
             };
 
+            // Capture fields needed for post-init before meta is moved.
+            let meta_state_for_init = meta.state.clone();
+            let meta_total_bytes_for_init = meta.total_bytes_written;
+
             let spool = Arc::new(
                 Spool::new(
                     meta,
@@ -350,10 +370,33 @@ impl<F: FileIO> SpoolManager<F> {
                 .await,
             );
             *spool.running_crc32c.lock().await = crc;
+
+            // Seed last_read_activity_at so recovered spools get a full
+            // read_idle_ttl_secs grace period before cleanup can fire.
+            spool
+                .last_read_activity_at
+                .store(now_secs(), Ordering::SeqCst);
+
+            // Re-initialize missing ranges for complete spools. No served
+            // ranges are known after restart, so coverage resets to
+            // [0, total_size). full_read_complete_ttl_secs won't trigger
+            // until the object is re-served — safe by design.
+            if matches!(meta_state_for_init, SpoolState::Complete) {
+                spool
+                    .missing_ranges
+                    .lock()
+                    .await
+                    .initialize(meta_total_bytes_for_init);
+            }
+
             self.spools.insert(key, spool);
         }
 
-        tracing::info!(recovered = self.spools.len(), stale = stale_keys.len(), "recovery: spools loaded");
+        tracing::info!(
+            recovered = self.spools.len(),
+            stale = stale_keys.len(),
+            "recovery: spools loaded"
+        );
 
         let stale_key_set: HashSet<String> = stale_keys.iter().cloned().collect();
         let mut entries = tokio::fs::read_dir(&self.data_dir)
@@ -415,15 +458,19 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
 
-        let key = manager
-            .create_spool(Some("application/octet-stream".into()), None, false)
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(
+                key.clone(),
+                Some("application/octet-stream".into()),
+                None,
+                false,
+            )
             .await
             .expect("create spool");
-        assert!(uuid::Uuid::parse_str(&key).is_ok(), "key should be a UUID");
 
         let spool = manager.get_spool(&key).expect("spool should exist");
         let meta = spool.metadata.lock().await;
@@ -437,12 +484,12 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
 
-        let key = manager
-            .create_spool(None, None, false)
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
             .await
             .expect("create spool");
         let spool_dir = data_dir.join(&key);
@@ -459,9 +506,8 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
 
         let result = manager.delete_spool("nonexistent-key").await;
         assert!(result.is_err());
@@ -478,23 +524,19 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager1 = SpoolManager::<TokioFileIO>::new(
-                &db_path,
-                &data_dir,
-                4096,
-                16 * 4096,
-            )
-            .expect("manager1 init");
+            let manager1 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+                .expect("manager1 init");
 
+            let key = uuid::Uuid::new_v4().to_string();
             manager1
-                .create_spool(None, None, true)
+                .create_spool(key.clone(), None, None, true)
                 .await
-                .expect("create spool")
+                .expect("create spool");
+            key
         };
 
-        let manager2 =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager2 init");
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager2 init");
 
         manager2.recover().await.expect("recover should succeed");
         let spool = manager2.get_spool(&key).expect("recovered spool exists");
@@ -509,12 +551,12 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
 
-        let key = manager
-            .create_spool(None, None, false)
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
             .await
             .expect("create spool");
 
@@ -541,16 +583,12 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(
-                &db_path,
-                &data_dir,
-                4096,
-                16 * 4096,
-            )
-            .expect("manager init");
+            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+                .expect("manager init");
 
-            let key = manager
-                .create_spool(None, None, false)
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
                 .await
                 .expect("create spool");
 
@@ -606,16 +644,12 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(
-                &db_path,
-                &data_dir,
-                4096,
-                16 * 4096,
-            )
-            .expect("manager init");
+            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+                .expect("manager init");
 
-            let key = manager
-                .create_spool(None, None, false)
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
                 .await
                 .expect("create spool");
 
@@ -661,6 +695,7 @@ mod tests {
             created_at: 0,
             last_write_at: 0,
             last_read_at: None,
+            readable_at: None,
             total_bytes_written: 0,
             checksum_crc32c: None,
             total_pages: 0,
@@ -687,6 +722,170 @@ mod tests {
         assert!(table.get(key.as_str()).expect("table get").is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // New tests — recovery seeds in-memory fields
+    // -----------------------------------------------------------------------
+
+    /// After recovery, `last_read_activity_at` must be nonzero so that the
+    /// recovered spool gets a full `read_idle_ttl_secs` grace period before
+    /// the cleanup loop can fire.
+    #[tokio::test]
+    async fn test_recovery_seeds_last_read_activity_at() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+
+        let key = {
+            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+                .expect("manager init");
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, true) // WriteLocked
+                .await
+                .expect("create spool");
+            key
+        };
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover should succeed");
+
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+        let activity = spool.last_read_activity_at.load(Ordering::SeqCst);
+        assert!(
+            activity > 0,
+            "last_read_activity_at must be seeded to nonzero on recovery, got {activity}"
+        );
+    }
+
+    /// After recovering a Complete spool, `missing_ranges` must be initialised
+    /// so that its `total_size` matches what was written and `gap_count() == 1`
+    /// (the entire object is an unserved gap until re-served after restart).
+    #[tokio::test]
+    async fn test_recovery_initializes_missing_ranges_for_complete_spool() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+
+        let key = {
+            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+                .expect("manager init");
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool
+                .write(0, &vec![0xABu8; 8192])
+                .await
+                .expect("write succeeds");
+            spool.complete(None).await.expect("complete succeeds");
+            key
+        };
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover should succeed");
+
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+        let mr = spool.missing_ranges.lock().await;
+        assert_eq!(
+            mr.total_size,
+            Some(8192),
+            "missing_ranges total_size must be Some(8192) after recovery"
+        );
+        assert_eq!(
+            mr.gap_count(),
+            1,
+            "missing_ranges must have exactly one gap [0, 8192) after recovery (no bytes re-served yet)"
+        );
+    }
+
+    /// When a spool's persisted metadata has `readable_at: null` (old format from
+    /// before the field was introduced), recovery must backfill it to `Some(now)`
+    /// and persist the corrected metadata so that the spool is not immediately
+    /// deleted by the idle-TTL rule.
+    #[tokio::test]
+    async fn test_recovery_sets_readable_at_for_old_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+
+        // Step 1: create and complete a spool normally (sets readable_at).
+        let key = {
+            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+                .expect("manager init");
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool
+                .write(0, &vec![0xCDu8; 4096])
+                .await
+                .expect("write succeeds");
+            spool.complete(None).await.expect("complete succeeds");
+            key
+        };
+
+        // Step 2: overwrite the persisted metadata with readable_at = None,
+        // simulating an old metadata record written before this field existed.
+        {
+            let db = Arc::new(redb::Database::create(&db_path).expect("open db"));
+            let read_txn = db.begin_read().expect("begin read");
+            let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
+            let entry = table
+                .get(key.as_str())
+                .expect("table get")
+                .expect("entry exists");
+            let mut meta: SpoolMetadata =
+                serde_json::from_slice(entry.value()).expect("deserialize");
+            drop(table);
+            drop(read_txn);
+
+            meta.readable_at = None; // simulate old format
+            let payload = serde_json::to_vec(&meta).expect("serialize");
+            let write_txn = db.begin_write().expect("begin write");
+            {
+                let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
+                table
+                    .insert(key.as_str(), payload.as_slice())
+                    .expect("insert");
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        // Step 3: recover and verify readable_at is backfilled.
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover should succeed");
+
+        // In-memory check.
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+        let meta = spool.metadata.lock().await;
+        assert!(
+            meta.readable_at.is_some(),
+            "readable_at must be backfilled to Some(_) during recovery"
+        );
+        drop(meta);
+
+        // Persisted check: the corrected value must be written back to redb.
+        let read_txn = manager2.db.begin_read().expect("begin read");
+        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
+        let entry = table
+            .get(key.as_str())
+            .expect("table get")
+            .expect("entry exists");
+        let persisted: SpoolMetadata =
+            serde_json::from_slice(entry.value()).expect("deserialize persisted");
+        assert!(
+            persisted.readable_at.is_some(),
+            "backfilled readable_at must be persisted to redb"
+        );
+    }
+
     #[tokio::test]
     async fn test_recovery_preserves_partial_final_page() {
         let dir = tempdir().expect("create tempdir");
@@ -697,8 +896,9 @@ mod tests {
             let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
                 .expect("manager init");
 
-            let key = manager
-                .create_spool(None, None, false)
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
                 .await
                 .expect("create spool");
 

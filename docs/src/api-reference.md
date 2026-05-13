@@ -17,13 +17,13 @@ BOBS exposes a RESTful API for managing spools.
 
 ### GET /status
 
-Returns the health status and the unique `bob_id` of the instance.
+Returns the health status and hostname of the instance.
 
 **Response (200 OK)**:
 ```json
 {
   "status": "ok",
-  "bob_id": "pod-a-123"
+  "hostname": "pod-a-123"
 }
 ```
 

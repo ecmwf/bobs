@@ -133,6 +133,7 @@ dependencies = [
  "dashmap",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "redb",
  "reqwest",
  "serde",
