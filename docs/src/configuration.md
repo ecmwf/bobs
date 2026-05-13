@@ -22,11 +22,15 @@ Without a config file, BOBS runs with defaults:
 | `page_size` | `4096` | Size of internal data pages in bytes. Writes are buffered until a page is full. |
 | `max_cache_bytes` | `1048576` | Max bytes to keep in the per-spool memory cache. Effective page count is `max_cache_bytes / page_size`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
-| `reader_done_ttl_secs` | `60` | TTL for a completed spool once the last reader disconnects. |
-| `unread_ttl_secs` | `3600` | TTL for a completed spool that has never been read. |
+| `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. |
+| `full_read_complete_ttl_secs` | `30` | Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served. |
+| `reader_done_ttl_secs` | `60` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
+| `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. |
 | `long_poll_timeout_ms` | `25000` | Maximum time in ms to wait for new data during a read before redirecting. |
-| `bob_id` | `unknown` | Unique ID for this instance. Set to the pod hostname in Kubernetes deployments. |
+| `host_prefix` | `""` | External download host prefix used when generating read URLs. |
+| `domain` | `""` | External download domain used when generating read URLs. |
+| `route_name` | `""` | External download route prefix, for example `download`. |
 
 ## Example
 
@@ -37,17 +41,21 @@ data_dir: /data/bobs
 page_size: 4096
 max_cache_bytes: 1048576
 writer_inactivity_timeout_secs: 300
-reader_done_ttl_secs: 60
-unread_ttl_secs: 3600
+read_idle_ttl_secs: 600
+full_read_complete_ttl_secs: 30
+reader_done_ttl_secs: 60      # deprecated compatibility field
+unread_ttl_secs: 3600         # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
-bob_id: bobs-1
+host_prefix: polytope-example
+domain: example.com
+route_name: download
 ```
 
 Only the fields you want to override need to be present:
 
 ```yaml
-bob_id: bobs-prod-3
 data_dir: /mnt/ssd/bobs
 max_cache_bytes: 4194304
+read_idle_ttl_secs: 600
 ```

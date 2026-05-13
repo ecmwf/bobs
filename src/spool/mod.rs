@@ -3,16 +3,19 @@ use bytes::BytesMut;
 use redb::Database;
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+pub mod coverage;
 pub mod lifecycle;
 pub mod page_cache;
 pub mod reader;
 pub mod types;
 pub mod writer;
+
+pub use coverage::MissingRanges;
 
 /// A spool buffers a single streaming response: one writer appends pages sequentially,
 /// multiple readers can consume byte ranges in parallel. Pages are flushed to disk when
@@ -32,8 +35,16 @@ pub struct Spool<F: FileIO> {
     pub cancel: CancellationToken,
     pub page_size: usize,
     pub data_path: PathBuf,
-    /// Number of active reader connections. Cleanup skips spools with readers > 0.
+    /// Number of active reader connections.
     pub reader_count: Arc<AtomicUsize>,
+    /// Tracks which byte ranges have not yet been served to any client.
+    /// Never persisted — reset to `[0, total_size)` on every restart.
+    pub missing_ranges: Arc<Mutex<MissingRanges>>,
+    /// Unix secs of the last byte-served event. 0 = never served since last restart.
+    /// Updated on the read hot-path with `Ordering::Relaxed`.
+    pub last_read_activity_at: Arc<AtomicU64>,
+    /// Unix secs when full-object coverage was first detected. 0 = not yet.
+    pub full_object_read_at: Arc<AtomicU64>,
     pub(crate) _phantom: PhantomData<F>,
 }
 
@@ -59,6 +70,9 @@ impl<F: FileIO> Spool<F> {
             page_size,
             data_path,
             reader_count: Arc::new(AtomicUsize::new(0)),
+            missing_ranges: Arc::new(Mutex::new(MissingRanges::new(1024))),
+            last_read_activity_at: Arc::new(AtomicU64::new(0)),
+            full_object_read_at: Arc::new(AtomicU64::new(0)),
             _phantom: PhantomData,
         }
     }
@@ -72,18 +86,18 @@ impl<F: FileIO> Spool<F> {
         let write_txn = self
             .db
             .begin_write()
-            .map_err(|e| BobsError::StorageError(e.into()))?;
+            .map_err(|e| BobsError::from(redb::Error::from(e)))?;
         {
             let mut table = write_txn
                 .open_table(SPOOL_TABLE)
-                .map_err(|e| BobsError::StorageError(e.into()))?;
+                .map_err(|e| BobsError::from(redb::Error::from(e)))?;
             table
                 .insert(metadata.key.as_str(), payload.as_slice())
-                .map_err(|e| BobsError::StorageError(e.into()))?;
+                .map_err(|e| BobsError::from(redb::Error::from(e)))?;
         }
         write_txn
             .commit()
-            .map_err(|e| BobsError::StorageError(e.into()))?;
+            .map_err(|e| BobsError::from(redb::Error::from(e)))?;
         Ok(())
     }
 }

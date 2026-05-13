@@ -61,6 +61,8 @@ pub struct SpoolMetadata {
     pub created_at: u64,    // unix timestamp secs
     pub last_write_at: u64, // unix timestamp secs
     pub last_read_at: Option<u64>,
+    #[serde(default)]
+    pub readable_at: Option<u64>, // unix secs; set when spool first becomes readable
     pub total_bytes_written: u64,
     pub checksum_crc32c: Option<u32>,
     pub total_pages: u64,

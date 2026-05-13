@@ -8,9 +8,19 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
 /// Periodic sweep that reclaims spools which are no longer needed.
-/// Deletion triggers: writer abandoned the spool, reader finished and TTL expired,
-/// or the spool was never read within the unread TTL. Spools with active readers
-/// are always protected.
+///
+/// Three independent triggers:
+/// - **Writer inactive**: writer has not written for `writer_inactivity_timeout_secs` while
+///   the spool is still in Writing or WriteLocked state.
+/// - **Full-read TTL**: every byte of the object has been served at least once and
+///   `full_read_complete_ttl_secs` has elapsed since the most recent read activity.
+/// - **Idle TTL**: spool is Complete/Readable and no bytes have been served for
+///   `read_idle_ttl_secs`. The idle timer is anchored on the last byte-served activity
+///   (`last_read_activity_at`), falling back to `readable_at` from metadata, or `now`
+///   (safe: won't delete on this sweep) if neither is known.
+///
+/// Note: `reader_count` is NOT used as an absolute guard. Stalled connections that serve
+/// no bytes will expire via the idle TTL like any other unserved spool.
 pub async fn run_cleanup_loop<F: FileIO>(manager: Arc<SpoolManager<F>>, config: Arc<Config>) {
     let mut interval = time::interval(Duration::from_secs(config.cleanup_sweep_interval_secs));
 
@@ -24,34 +34,42 @@ pub async fn run_cleanup_loop<F: FileIO>(manager: Arc<SpoolManager<F>>, config: 
                 continue;
             };
 
-            let (state, last_write_at, last_read_at, created_at) = {
+            let (state, last_write_at, readable_at) = {
                 let meta = spool.metadata.lock().await;
-                (
-                    meta.state.clone(),
-                    meta.last_write_at,
-                    meta.last_read_at,
-                    meta.created_at,
-                )
+                (meta.state.clone(), meta.last_write_at, meta.readable_at)
             };
-            let readers_active = spool.reader_count.load(Ordering::SeqCst) > 0;
 
-            // Writer stopped sending data — probably crashed or disconnected.
+            // --- Rule 1: Writer abandoned the spool (unchanged). ---
             let writer_inactive = matches!(state, SpoolState::Writing | SpoolState::WriteLocked)
                 && now.saturating_sub(last_write_at) > config.writer_inactivity_timeout_secs;
 
-            // Spool is done (or readable), no active readers, and last read was long enough ago.
-            let reader_done_expired = matches!(state, SpoolState::Complete | SpoolState::Readable)
-                && !readers_active
-                && last_read_at
-                    .map(|last| now.saturating_sub(last) > config.reader_done_ttl_secs)
-                    .unwrap_or(false);
+            let last_activity = spool.last_read_activity_at.load(Ordering::Relaxed);
 
-            // Spool is done (or readable) but nobody ever read it.
-            let unread_expired = matches!(state, SpoolState::Complete | SpoolState::Readable)
-                && last_read_at.is_none()
-                && now.saturating_sub(created_at) > config.unread_ttl_secs;
+            // --- Rule 2: Full-read short TTL. ---
+            // full_object_read_at > 0 means every byte has been served at least once.
+            // Subsequent byte-serving activity refreshes this anchor, so deletion only
+            // happens after full coverage and no further read activity.
+            let full_read_at = spool.full_object_read_at.load(Ordering::Relaxed);
+            let full_read_expired = full_read_at > 0 && {
+                let anchor = full_read_at.max(last_activity);
+                now.saturating_sub(anchor) > config.full_read_complete_ttl_secs
+            };
 
-            if writer_inactive || reader_done_expired || unread_expired {
+            // --- Rule 3: Idle TTL. ---
+            // Anchor: last byte-served activity, or (if never served) readable_at,
+            // or (if readable_at unknown, i.e. old metadata) now (safe: won't delete).
+            let idle_expired = matches!(state, SpoolState::Complete | SpoolState::Readable) && {
+                let anchor = if last_activity > 0 {
+                    last_activity
+                } else {
+                    // Never served since last restart. Use readable_at if we have it;
+                    // otherwise use 'now' (conservative — won't delete on this sweep).
+                    readable_at.unwrap_or(now)
+                };
+                now.saturating_sub(anchor) > config.read_idle_ttl_secs
+            };
+
+            if writer_inactive || full_read_expired || idle_expired {
                 to_delete.push(key);
             }
         }
@@ -92,6 +110,8 @@ mod tests {
             page_size: 4096,
             max_cache_bytes: 65536,
             writer_inactivity_timeout_secs: 1,
+            read_idle_ttl_secs: 1,
+            full_read_complete_ttl_secs: 1,
             reader_done_ttl_secs: 1,
             unread_ttl_secs: 1,
             cleanup_sweep_interval_secs: 1,
@@ -112,21 +132,28 @@ mod tests {
         )
     }
 
+    // -----------------------------------------------------------------------
+    // Rule 1: writer inactivity (unchanged semantics)
+    // -----------------------------------------------------------------------
+
+    /// A Writing spool whose writer has been silent for > writer_inactivity_timeout_secs
+    /// must be deleted by the cleanup sweep.
     #[tokio::test]
     async fn test_writer_inactivity_cleanup() {
         tokio::time::pause();
         let manager = test_manager().await;
         let config = test_config();
 
-        let key = manager
-            .create_spool(None, None, false)
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
         {
             let mut meta = spool.metadata.lock().await;
             meta.state = SpoolState::Writing;
-            meta.last_write_at = 0;
+            meta.last_write_at = 0; // epoch — long since stale
         }
 
         let task = start_cleanup_task(manager.clone(), config);
@@ -134,87 +161,388 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
-        assert!(manager.get_spool(&key).is_none());
+        assert!(
+            manager.get_spool(&key).is_none(),
+            "inactive writer should be cleaned up"
+        );
         task.abort();
     }
 
+    // -----------------------------------------------------------------------
+    // Rule 3: idle TTL — renamed/updated tests
+    // -----------------------------------------------------------------------
+
+    /// Idle TTL fires when `last_read_activity_at = 0` (never served) and
+    /// `readable_at` is an old timestamp. Renamed from test_reader_done_ttl_cleanup.
     #[tokio::test]
-    async fn test_reader_done_ttl_cleanup() {
+    async fn test_idle_ttl_after_read_activity() {
         tokio::time::pause();
         let manager = test_manager().await;
         let config = test_config();
 
-        let key = manager
-            .create_spool(None, None, false)
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
         spool.complete(None).await.expect("complete spool");
         {
             let mut meta = spool.metadata.lock().await;
-            meta.last_read_at = Some(0);
+            // Anchor idle TTL on a very old readable_at so the spool expires.
+            // last_read_activity_at stays 0 (never served), so readable_at is the anchor.
+            meta.readable_at = Some(0);
         }
+        // last_read_activity_at stays 0 — cleanup uses readable_at as anchor
 
         let task = start_cleanup_task(manager.clone(), config);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
-        assert!(manager.get_spool(&key).is_none());
+        assert!(
+            manager.get_spool(&key).is_none(),
+            "spool with expired readable_at and no activity should be cleaned up"
+        );
         task.abort();
     }
 
+    /// Idle TTL is anchored on `readable_at`, NOT `created_at`. A spool with a
+    /// recent `created_at` but an old `readable_at` must still be deleted.
+    /// Renamed/updated from test_unread_ttl_cleanup.
     #[tokio::test]
-    async fn test_unread_ttl_cleanup() {
+    async fn test_idle_ttl_anchors_on_readable_at() {
         tokio::time::pause();
         let manager = test_manager().await;
         let config = test_config();
 
-        let key = manager
-            .create_spool(None, None, false)
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
         spool.complete(None).await.expect("complete spool");
         {
             let mut meta = spool.metadata.lock().await;
-            meta.created_at = 0;
-            meta.last_read_at = None;
+            // readable_at is old (epoch), but created_at is recent.
+            // This proves the idle timer anchors on readable_at, not created_at.
+            meta.readable_at = Some(0); // very old — idle TTL has expired
+            meta.created_at = now_secs(); // recent — would NOT expire if this were the anchor
         }
+        // last_read_activity_at stays 0 (never served) — anchor falls back to readable_at
 
         let task = start_cleanup_task(manager.clone(), config);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
-        assert!(manager.get_spool(&key).is_none());
+        assert!(
+            manager.get_spool(&key).is_none(),
+            "idle TTL should anchor on readable_at (old), not created_at (recent)"
+        );
         task.abort();
     }
 
+    /// Recent byte-serving activity (last_read_activity_at = now) prevents idle cleanup.
+    /// Renamed from test_active_reader_not_deleted.
     #[tokio::test]
-    async fn test_active_reader_not_deleted() {
+    async fn test_recent_activity_prevents_idle_cleanup() {
         tokio::time::pause();
         let manager = test_manager().await;
         let config = test_config();
 
-        let key = manager
-            .create_spool(None, None, false)
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+        spool.complete(None).await.expect("complete spool");
+        // Simulate recent byte-serving activity — this refreshes the idle TTL anchor.
+        // With last_read_activity_at = now_secs(), the idle check: now - now ≈ 0 > 1 → false.
+        spool
+            .last_read_activity_at
+            .store(now_secs(), Ordering::SeqCst);
+
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_some(),
+            "spool with recent byte activity should not be deleted"
+        );
+        task.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // New tests — Rule 3: idle TTL edge cases
+    // -----------------------------------------------------------------------
+
+    /// When `readable_at = None` (old metadata without the field) and no activity has
+    /// been recorded, the cleanup loop must use `now` as the anchor — a conservative
+    /// choice that prevents premature deletion on first sweep after upgrade.
+    #[tokio::test]
+    async fn test_readable_at_none_uses_now_as_safe_anchor() {
+        tokio::time::pause();
+        let manager = test_manager().await;
+        let config = test_config();
+
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
         spool.complete(None).await.expect("complete spool");
         {
             let mut meta = spool.metadata.lock().await;
-            meta.last_read_at = Some(0);
+            // Simulate old metadata that predates the readable_at field.
+            meta.readable_at = None;
         }
+        // last_read_activity_at stays 0 — cleanup falls back to readable_at.unwrap_or(now).
+        // Since readable_at is None, anchor = now → delta ≈ 0 → spool NOT deleted.
+
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_some(),
+            "spool with readable_at=None must not be deleted (anchor falls back to now)"
+        );
+        task.abort();
+    }
+
+    /// A stalled reader (reader_count > 0 but zero bytes served) must NOT protect the
+    /// spool forever. With an old readable_at and no activity, it should be deleted.
+    #[tokio::test]
+    async fn test_stalled_reader_no_activity_idle_expires() {
+        tokio::time::pause();
+        let manager = test_manager().await;
+        let config = test_config();
+
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+        spool.complete(None).await.expect("complete spool");
+        {
+            let mut meta = spool.metadata.lock().await;
+            meta.readable_at = Some(0); // very old
+        }
+        // Simulate an open connection with no bytes served.
         spool.reader_count.fetch_add(1, Ordering::SeqCst);
+        // last_read_activity_at stays 0 — no bytes were actually served.
 
         let task = start_cleanup_task(manager.clone(), config);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
-        assert!(manager.get_spool(&key).is_some());
+        assert!(
+            manager.get_spool(&key).is_none(),
+            "stalled reader with no served bytes must not prevent idle cleanup"
+        );
+        task.abort();
+    }
+
+    /// When byte activity is recorded (last_read_activity_at = now), the idle anchor
+    /// shifts to the activity timestamp, preventing deletion even if readable_at is old.
+    #[tokio::test]
+    async fn test_active_reader_with_recent_bytes_refreshes_idle() {
+        tokio::time::pause();
+        let manager = test_manager().await;
+        let config = test_config();
+
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+        spool.complete(None).await.expect("complete spool");
+        {
+            let mut meta = spool.metadata.lock().await;
+            // readable_at is old — would normally trigger idle expiry.
+            meta.readable_at = Some(0);
+        }
+        // But last_read_activity_at is fresh — this refreshes the idle anchor.
+        // Anchor = last_read_activity_at = now_secs(); delta = now - now ≈ 0 < 1 → not deleted.
+        spool
+            .last_read_activity_at
+            .store(now_secs(), Ordering::SeqCst);
+
+        // Advance tokio time so the cleanup loop ticks multiple times.
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_some(),
+            "recent byte activity must refresh the idle anchor and prevent deletion"
+        );
+
+        // Now simulate that activity stopped (reset to 0) while readable_at stays old.
+        // The spool should eventually be cleaned up.
+        spool.last_read_activity_at.store(0, Ordering::SeqCst);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_none(),
+            "once activity stops and readable_at is old, idle TTL should fire"
+        );
+        task.abort();
+    }
+
+    /// A Writing spool must not be deleted by the idle TTL rule, which only applies
+    /// to Complete/Readable state.
+    #[tokio::test]
+    async fn test_writing_spool_not_deleted_by_idle() {
+        tokio::time::pause();
+        let manager = test_manager().await;
+        let config = test_config();
+
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+        {
+            let mut meta = spool.metadata.lock().await;
+            meta.state = SpoolState::Writing;
+            // Keep last_write_at fresh so writer_inactive doesn't fire.
+            meta.last_write_at = now_secs();
+            // Make readable_at old and activity zero — idle *would* fire if the rule
+            // applied to Writing state, but it must not.
+            meta.readable_at = Some(0);
+        }
+        // last_read_activity_at stays 0
+
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_some(),
+            "Writing spool must not be deleted by the idle TTL rule"
+        );
+        task.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // New tests — Rule 2: full-read short TTL
+    // -----------------------------------------------------------------------
+
+    /// Once every byte has been served (`full_object_read_at > 0`) and
+    /// `full_read_complete_ttl_secs` has elapsed, the spool must be deleted.
+    #[tokio::test]
+    async fn test_full_object_read_triggers_short_ttl() {
+        tokio::time::pause();
+        let manager = test_manager().await;
+        let config = test_config();
+
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+        spool.complete(None).await.expect("complete spool");
+        // Simulate that full-object read and the last byte-serving activity happened
+        // at a very old timestamp. The full-read short TTL should delete the spool.
+        spool.full_object_read_at.store(1, Ordering::SeqCst);
+        spool.last_read_activity_at.store(1, Ordering::SeqCst);
+
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_none(),
+            "spool should be deleted after full-read TTL expires"
+        );
+        task.abort();
+    }
+
+    /// Later read activity refreshes the full-read short TTL anchor.
+    #[tokio::test]
+    async fn test_full_object_read_short_ttl_refreshed_by_activity() {
+        tokio::time::pause();
+        let manager = test_manager().await;
+        let config = test_config();
+
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+        spool.complete(None).await.expect("complete spool");
+        // Full coverage was detected long ago, but bytes were served recently.
+        // The spool must survive until the short TTL elapses after the latest activity.
+        spool.full_object_read_at.store(1, Ordering::SeqCst);
+        spool
+            .last_read_activity_at
+            .store(now_secs(), Ordering::SeqCst);
+
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_some(),
+            "recent byte activity must refresh the full-read short TTL anchor"
+        );
+        task.abort();
+    }
+
+    /// The full-read short TTL must NOT fire before `full_read_complete_ttl_secs`
+    /// has elapsed since full coverage was first detected.
+    #[tokio::test]
+    async fn test_full_object_read_short_ttl_not_triggered_before_expiry() {
+        tokio::time::pause();
+        let manager = test_manager().await;
+        let config = test_config();
+
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+        spool.complete(None).await.expect("complete spool");
+        // full_object_read_at = now → delta from wall-clock now is ≈ 0 < 1s TTL → not expired.
+        spool
+            .full_object_read_at
+            .store(now_secs(), Ordering::SeqCst);
+        // Keep idle anchor fresh too.
+        spool
+            .last_read_activity_at
+            .store(now_secs(), Ordering::SeqCst);
+
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        // Advance only a fraction of the TTL (in tokio time; wall clock barely moves).
+        tokio::time::advance(Duration::from_millis(400)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_some(),
+            "full-read TTL must not fire before expiry"
+        );
         task.abort();
     }
 }

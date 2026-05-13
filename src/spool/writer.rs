@@ -130,6 +130,7 @@ mod tests {
             created_at: 0,
             last_write_at: 0,
             last_read_at: None,
+            readable_at: None,
             total_bytes_written: 0,
             checksum_crc32c: None,
             total_pages: 0,

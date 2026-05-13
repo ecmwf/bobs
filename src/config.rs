@@ -10,7 +10,17 @@ pub struct Config {
     pub page_size: usize,
     pub max_cache_bytes: usize,
     pub writer_inactivity_timeout_secs: u64,
+    /// Idle TTL (seconds) anchored on the time the spool became readable,
+    /// refreshed whenever bytes are actually served. Default: 600.
+    pub read_idle_ttl_secs: u64,
+    /// Short TTL (seconds) that fires once aggregate read coverage has reached
+    /// 100 % of the object's bytes. Default: 30.
+    pub full_read_complete_ttl_secs: u64,
+    /// Deprecated — kept for config-file backward compatibility only.
+    /// No longer drives cleanup logic; use `read_idle_ttl_secs` instead.
     pub reader_done_ttl_secs: u64,
+    /// Deprecated — kept for config-file backward compatibility only.
+    /// No longer drives cleanup logic; use `read_idle_ttl_secs` instead.
     pub unread_ttl_secs: u64,
     pub cleanup_sweep_interval_secs: u64,
     pub long_poll_timeout_ms: u64,
@@ -28,6 +38,8 @@ impl Default for Config {
             page_size: 4096,
             max_cache_bytes: 1048576,
             writer_inactivity_timeout_secs: 300,
+            read_idle_ttl_secs: 600,
+            full_read_complete_ttl_secs: 30,
             reader_done_ttl_secs: 60,
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 30,
@@ -75,6 +87,20 @@ impl Config {
             ));
         }
 
+        if self.read_idle_ttl_secs == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "read_idle_ttl_secs must be greater than 0",
+            ));
+        }
+
+        if self.full_read_complete_ttl_secs == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "full_read_complete_ttl_secs must be greater than 0",
+            ));
+        }
+
         if self.host_prefix.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -115,6 +141,8 @@ mod tests {
         assert_eq!(config.page_size, 4096);
         assert_eq!(config.max_cache_bytes, 1048576);
         assert_eq!(config.writer_inactivity_timeout_secs, 300);
+        assert_eq!(config.read_idle_ttl_secs, 600);
+        assert_eq!(config.full_read_complete_ttl_secs, 30);
         assert_eq!(config.reader_done_ttl_secs, 60);
         assert_eq!(config.unread_ttl_secs, 3600);
         assert_eq!(config.cleanup_sweep_interval_secs, 30);
@@ -133,6 +161,8 @@ data_dir: /tmp/yaml-data
 page_size: 8192
 max_cache_bytes: 131072
 writer_inactivity_timeout_secs: 11
+read_idle_ttl_secs: 120
+full_read_complete_ttl_secs: 15
 reader_done_ttl_secs: 22
 unread_ttl_secs: 33
 cleanup_sweep_interval_secs: 44
@@ -150,6 +180,8 @@ domain: test.example.com
         assert_eq!(cfg.page_size, 8192);
         assert_eq!(cfg.max_cache_bytes, 131072);
         assert_eq!(cfg.writer_inactivity_timeout_secs, 11);
+        assert_eq!(cfg.read_idle_ttl_secs, 120);
+        assert_eq!(cfg.full_read_complete_ttl_secs, 15);
         assert_eq!(cfg.reader_done_ttl_secs, 22);
         assert_eq!(cfg.unread_ttl_secs, 33);
         assert_eq!(cfg.cleanup_sweep_interval_secs, 44);
@@ -180,11 +212,13 @@ domain: test.example.com
 
     #[test]
     fn test_validate_rejects_zero_page_size() {
-        let mut config = Config::default();
-        config.page_size = 0;
-        config.host_prefix = "test".into();
-        config.domain = "example.com".into();
-        config.route_name = "bobs".into();
+        let config = Config {
+            page_size: 0,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
 
         let err = config.validate().expect_err("validation should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -192,12 +226,14 @@ domain: test.example.com
 
     #[test]
     fn test_validate_rejects_small_cache() {
-        let mut config = Config::default();
-        config.max_cache_bytes = 1024;
-        config.page_size = 4096;
-        config.host_prefix = "test".into();
-        config.domain = "example.com".into();
-        config.route_name = "bobs".into();
+        let config = Config {
+            max_cache_bytes: 1024,
+            page_size: 4096,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
 
         let err = config.validate().expect_err("validation should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -220,6 +256,59 @@ domain: test.example.com
         };
 
         config.validate().expect("validation should succeed");
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_read_idle_ttl() {
+        let config = Config {
+            read_idle_ttl_secs: 0,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_full_read_complete_ttl() {
+        let config = Config {
+            full_read_complete_ttl_secs: 0,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_from_file_yaml_old_keys_parse_without_new_keys() {
+        // Old YAML without the new keys should parse successfully, using defaults.
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("old.yaml");
+        std::fs::write(
+            &path,
+            r#"reader_done_ttl_secs: 99
+unread_ttl_secs: 888
+host_prefix: x
+domain: y
+route_name: z
+"#,
+        )
+        .expect("write yaml");
+
+        let cfg = Config::from_file(&path).expect("parse yaml");
+        // New fields get defaults.
+        assert_eq!(cfg.read_idle_ttl_secs, 600);
+        assert_eq!(cfg.full_read_complete_ttl_secs, 30);
+        // Old fields still parsed.
+        assert_eq!(cfg.reader_done_ttl_secs, 99);
+        assert_eq!(cfg.unread_ttl_secs, 888);
     }
 
     #[test]

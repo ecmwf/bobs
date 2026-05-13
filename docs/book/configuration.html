@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6097e0a5.js";
+            window.path_to_searchindex_js = "searchindex-d8141f5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-46f6bf3b.js"></script>
+        <script src="toc-fd9758cf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -175,26 +175,59 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
-<p>BOBS is configured entirely through environment variables.</p>
+<p>BOBS is configured via a YAML file passed as a CLI argument. All fields have sensible defaults — a partial file is fine, missing fields use defaults.</p>
+<pre><code class="language-bash">./target/release/bobs config.yaml
+</code></pre>
+<p>Without a config file, BOBS runs with defaults:</p>
+<pre><code class="language-bash">./target/release/bobs
+</code></pre>
+<h2 id="fields"><a class="header" href="#fields">Fields</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+<tr><th>Field</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>BOBS_LISTEN_ADDR</code></td><td><code>0.0.0.0:3000</code></td><td>Address and port for the HTTP server.</td></tr>
-<tr><td><code>BOBS_DATA_DIR</code></td><td><code>./data</code></td><td>File system path for storing spool files.</td></tr>
-<tr><td><code>BOBS_PAGE_SIZE</code></td><td><code>4096</code></td><td>Size of internal data pages. Writes are buffered until a page is full.</td></tr>
-<tr><td><code>BOBS_PAGE_CACHE_CAPACITY</code></td><td><code>256</code></td><td>Number of pages to keep in the per-spool memory cache.</td></tr>
-<tr><td><code>BOBS_WRITER_INACTIVITY_TIMEOUT_SECS</code></td><td><code>300</code></td><td>Cleanup spool if the writer doesn’t send data for this long.</td></tr>
-<tr><td><code>BOBS_READER_DONE_TTL_SECS</code></td><td><code>60</code></td><td>TTL for a completed spool once the last reader disconnects.</td></tr>
-<tr><td><code>BOBS_UNREAD_TTL_SECS</code></td><td><code>3600</code></td><td>TTL for a completed spool that has never been read.</td></tr>
-<tr><td><code>BOBS_CLEANUP_SWEEP_INTERVAL_SECS</code></td><td><code>30</code></td><td>How often the background cleanup task runs.</td></tr>
-<tr><td><code>BOBS_LONG_POLL_TIMEOUT_MS</code></td><td><code>25000</code></td><td>Maximum time to wait for new data during a read before redirecting.</td></tr>
-<tr><td><code>BOBS_BOB_ID</code></td><td><code>hostname</code></td><td>Unique ID for the instance. Falls back to <code>HOSTNAME</code> env or <code>unknown</code>.</td></tr>
+<tr><td><code>host</code></td><td><code>0.0.0.0</code></td><td>Address for the HTTP server to bind to.</td></tr>
+<tr><td><code>port</code></td><td><code>3000</code></td><td>Port for the HTTP server to listen on.</td></tr>
+<tr><td><code>data_dir</code></td><td><code>./data</code></td><td>File system path for storing spool files.</td></tr>
+<tr><td><code>page_size</code></td><td><code>4096</code></td><td>Size of internal data pages in bytes. Writes are buffered until a page is full.</td></tr>
+<tr><td><code>max_cache_bytes</code></td><td><code>1048576</code></td><td>Max bytes to keep in the per-spool memory cache. Effective page count is <code>max_cache_bytes / page_size</code>.</td></tr>
+<tr><td><code>writer_inactivity_timeout_secs</code></td><td><code>300</code></td><td>Cleanup spool if the writer doesn’t send data for this long.</td></tr>
+<tr><td><code>read_idle_ttl_secs</code></td><td><code>600</code></td><td>TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served.</td></tr>
+<tr><td><code>full_read_complete_ttl_secs</code></td><td><code>30</code></td><td>Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served.</td></tr>
+<tr><td><code>reader_done_ttl_secs</code></td><td><code>60</code></td><td>Deprecated compatibility field. Parsed but no longer drives cleanup.</td></tr>
+<tr><td><code>unread_ttl_secs</code></td><td><code>3600</code></td><td>Deprecated compatibility field. Parsed but no longer drives cleanup.</td></tr>
+<tr><td><code>cleanup_sweep_interval_secs</code></td><td><code>30</code></td><td>How often the background cleanup task runs.</td></tr>
+<tr><td><code>long_poll_timeout_ms</code></td><td><code>25000</code></td><td>Maximum time in ms to wait for new data during a read before redirecting.</td></tr>
+<tr><td><code>host_prefix</code></td><td><code>""</code></td><td>External download host prefix used when generating read URLs.</td></tr>
+<tr><td><code>domain</code></td><td><code>""</code></td><td>External download domain used when generating read URLs.</td></tr>
+<tr><td><code>route_name</code></td><td><code>""</code></td><td>External download route prefix, for example <code>download</code>.</td></tr>
 </tbody>
 </table>
 </div>
+<h2 id="example"><a class="header" href="#example">Example</a></h2>
+<pre><code class="language-yaml">host: 0.0.0.0
+port: 3000
+data_dir: /data/bobs
+page_size: 4096
+max_cache_bytes: 1048576
+writer_inactivity_timeout_secs: 300
+read_idle_ttl_secs: 600
+full_read_complete_ttl_secs: 30
+reader_done_ttl_secs: 60      # deprecated compatibility field
+unread_ttl_secs: 3600         # deprecated compatibility field
+cleanup_sweep_interval_secs: 30
+long_poll_timeout_ms: 25000
+host_prefix: polytope-example
+domain: example.com
+route_name: download
+</code></pre>
+<p>Only the fields you want to override need to be present:</p>
+<pre><code class="language-yaml">data_dir: /mnt/ssd/bobs
+max_cache_bytes: 4194304
+read_idle_ttl_secs: 600
+</code></pre>
 
                     </main>
 

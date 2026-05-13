@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6097e0a5.js";
+            window.path_to_searchindex_js = "searchindex-d8141f5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-46f6bf3b.js"></script>
+        <script src="toc-fd9758cf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -177,27 +177,27 @@
                         <h1 id="key-behaviours"><a class="header" href="#key-behaviours">Key Behaviours</a></h1>
 <p>Understanding these internal behaviours is crucial for effectively using BOBS.</p>
 <h3 id="1-page-based-streaming"><a class="header" href="#1-page-based-streaming">1. Page-based Streaming</a></h3>
-<p>Data is organized into fixed-size pages (defined by <code>BOBS_PAGE_SIZE</code>). A page is only visible to readers once it is completely full and flushed to disk. The final partial page is flushed only when the writer calls <code>/complete</code>. This ensures readers always receive consistent, non-torn data.</p>
+<p>Data is organized into fixed-size pages (configured via <code>page_size</code>). A page is only visible to readers once it is completely full and flushed to disk. The final partial page is flushed only when the writer calls <code>/complete</code>. This ensures readers always receive consistent, non-torn data.</p>
 <h3 id="2-long-poll-with-timeout"><a class="header" href="#2-long-poll-with-timeout">2. Long-poll with Timeout</a></h3>
-<p>When a reader requests data that hasn’t been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure (like Kubernetes Ingress or Load Balancers), BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>BOBS_LONG_POLL_TIMEOUT_MS</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
+<p>When a reader requests data that hasn’t been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure (like Kubernetes Ingress or Load Balancers), BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>long_poll_timeout_ms</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
 <h3 id="3-follow-mode"><a class="header" href="#3-follow-mode">3. Follow Mode</a></h3>
-<p>By setting the <code>end</code> parameter to <code>0</code> in a read request, the reader enters follow mode. The server will keep the stream open and push new pages as they become available until the spool is finalized.</p>
+<p>A read request without a <code>Range</code> header enters follow mode from byte <code>0</code> (or from byte <code>X</code> with <code>Range: bytes=X-</code>). The server keeps the stream open and pushes new pages as they become available until the spool is finalized.</p>
 <h3 id="4-write-locked-mode"><a class="header" href="#4-write-locked-mode">4. Write-locked Mode</a></h3>
 <p>A spool can be created with <code>write_locked: true</code>. In this state, any attempt to read results in a <code>423 Locked</code> error until the writer calls <code>/complete</code>. This is useful for preventing consumers from seeing any data until the entire payload is successfully buffered.</p>
 <h3 id="5-parallel-reads"><a class="header" href="#5-parallel-reads">5. Parallel Reads</a></h3>
-<p>BOBS supports multiple concurrent readers for the same spool. Each reader can request independent byte ranges. The service tracks the number of active readers to protect the spool from being cleaned up while data is still being transmitted.</p>
+<p>BOBS supports a single consumer opening multiple concurrent connections for the same spool. Each connection can request independent byte ranges. Read activity is tracked when bytes are actually served, so slow clients keep their spool alive while making progress but stalled connections do not protect a spool forever.</p>
 <h3 id="6-crc-32c-integrity"><a class="header" href="#6-crc-32c-integrity">6. CRC-32C Integrity</a></h3>
 <p>BOBS calculates a running CRC-32C checksum using hardware-accelerated instructions (where available) as data is written. Once a spool is complete, every read response includes the <code>X-Checksum-CRC32C</code> header containing the Base64-encoded checksum of the entire object. This allows clients to verify data integrity, which is especially important when reassembling parallel range reads.</p>
 <h3 id="7-sequential-writes"><a class="header" href="#7-sequential-writes">7. Sequential Writes</a></h3>
 <p>Writes must be strictly sequential. The <code>offset</code> provided in the <code>/write</code> request must exactly match the total number of bytes currently stored in the spool. Random-access writes or overwrites are not supported.</p>
 <h3 id="8-automatic-cleanup"><a class="header" href="#8-automatic-cleanup">8. Automatic Cleanup</a></h3>
-<p>A background task periodically sweeps the spool manager and deletes spools based on four triggers:</p>
+<p>A background task periodically sweeps the spool manager and deletes spools based on three triggers:</p>
 <ul>
 <li><strong>Writer Inactivity</strong>: The producer stopped writing without completing the spool.</li>
-<li><strong>Reader Done TTL</strong>: The spool is complete, and a configured time has passed since the last reader finished.</li>
-<li><strong>Unread TTL</strong>: The spool was completed but never accessed by a reader.</li>
-<li><strong>Active Protection</strong>: Spools with active readers are never cleaned up.</li>
+<li><strong>Read Idle TTL</strong>: The spool is readable but has not served bytes for <code>read_idle_ttl_secs</code>. For never-read spools, this timer starts when the spool becomes readable.</li>
+<li><strong>Full Read TTL</strong>: BOBS has served every byte of the object at least once, possibly across multiple range requests, and <code>full_read_complete_ttl_secs</code> has elapsed since the latest read activity.</li>
 </ul>
+<p>Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.</p>
 <h3 id="9-http2-support"><a class="header" href="#9-http2-support">9. HTTP/2 Support</a></h3>
 <p>The server supports both HTTP/1.1 and HTTP/2 (h2c cleartext). Using HTTP/2 is recommended for high-concurrency streaming to benefit from request multiplexing.</p>
 

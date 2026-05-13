@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6097e0a5.js";
+            window.path_to_searchindex_js = "searchindex-d8141f5c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-46f6bf3b.js"></script>
+        <script src="toc-fd9758cf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -184,8 +184,8 @@
 <p>Start the service with default settings (port 3000, <code>./data</code> for storage):</p>
 <pre><code class="language-bash">./target/release/bobs
 </code></pre>
-<p>Override configuration via environment variables:</p>
-<pre><code class="language-bash">BOBS_LISTEN_ADDR=127.0.0.1:8080 BOBS_DATA_DIR=/tmp/bobs ./target/release/bobs
+<p>Or provide a YAML config file:</p>
+<pre><code class="language-bash">./target/release/bobs config.yaml
 </code></pre>
 <h2 id="walkthrough"><a class="header" href="#walkthrough">Walkthrough</a></h2>
 <h3 id="1-create-a-spool"><a class="header" href="#1-create-a-spool">1. Create a Spool</a></h3>
@@ -210,11 +210,11 @@ curl -X POST http://localhost:3000/write/YOUR_KEY/1024 --data-binary @part2.dat
 </code></pre>
 <h3 id="4-read-data"><a class="header" href="#4-read-data">4. Read Data</a></h3>
 <p><strong>Streaming (Follow Mode)</strong>: If the writer is still active, you can follow the stream from the beginning.</p>
-<pre><code class="language-bash">curl -L http://localhost:3000/read/YOUR_KEY/0/0
+<pre><code class="language-bash">curl -L http://localhost:3000/read/YOUR_KEY
 </code></pre>
 <p><em>Note: The <code>-L</code> flag is important as BOBS uses 307 redirects for long-poll timeouts.</em></p>
-<p><strong>Range Request</strong>: Once complete (or for available pages), you can request specific ranges.</p>
-<pre><code class="language-bash">curl http://localhost:3000/read/YOUR_KEY/0/1024
+<p><strong>Range Request</strong>: Once complete (or for available pages), request specific bytes with the standard <code>Range</code> header.</p>
+<pre><code class="language-bash">curl http://localhost:3000/read/YOUR_KEY -H "Range: bytes=0-1023"
 </code></pre>
 <h3 id="5-delete"><a class="header" href="#5-delete">5. Delete</a></h3>
 <p>Remove the spool manually.</p>

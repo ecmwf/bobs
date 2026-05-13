@@ -13,7 +13,11 @@ data:
     page_size: {{ .Values.config.page_size }}
     max_cache_bytes: {{ int .Values.config.max_cache_bytes }}
     writer_inactivity_timeout_secs: {{ .Values.config.writer_inactivity_timeout_secs }}
+    read_idle_ttl_secs: {{ .Values.config.read_idle_ttl_secs }}
+    full_read_complete_ttl_secs: {{ .Values.config.full_read_complete_ttl_secs }}
+    # deprecated — no longer drives cleanup; kept for backward compatibility
     reader_done_ttl_secs: {{ .Values.config.reader_done_ttl_secs }}
+    # deprecated — no longer drives cleanup; kept for backward compatibility
     unread_ttl_secs: {{ .Values.config.unread_ttl_secs }}
     cleanup_sweep_interval_secs: {{ .Values.config.cleanup_sweep_interval_secs }}
     long_poll_timeout_ms: {{ .Values.config.long_poll_timeout_ms }}

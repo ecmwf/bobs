@@ -2,8 +2,17 @@ use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::spool::types::SpoolState;
 use bytes::BytesMut;
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::Spool;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 impl<F: FileIO> Spool<F> {
     /// Finalize the spool: flush any partial page in the write buffer to disk + cache,
@@ -79,25 +88,58 @@ impl<F: FileIO> Spool<F> {
             }
             meta.checksum_crc32c = Some(crc32c);
             meta.state = SpoolState::Complete;
+            meta.readable_at.get_or_insert_with(now_secs);
         }
 
-        let meta = self.metadata.lock().await.clone();
+        let (meta, total_size) = {
+            let m = self.metadata.lock().await.clone();
+            let sz = m.total_bytes_written;
+            (m, sz)
+        };
         self.persist_metadata(&meta)?;
+
+        // Initialize coverage tracking and detect immediate full-coverage
+        // (zero-byte objects or objects whose bytes were all served pre-complete).
+        {
+            let mut mr = self.missing_ranges.lock().await;
+            mr.initialize(total_size);
+            if mr.is_complete() {
+                self.full_object_read_at
+                    .compare_exchange(0, now_secs(), Ordering::SeqCst, Ordering::SeqCst)
+                    .ok();
+            }
+        }
 
         self.notify.notify_waiters();
 
         Ok(())
     }
 
-    pub async fn set_write_locked(&self, locked: bool) {
-        let mut meta = self.metadata.lock().await;
-        meta.write_locked = locked;
+    pub async fn set_write_locked(&self, locked: bool) -> Result<()> {
+        let updated = {
+            let mut meta = self.metadata.lock().await;
+            let old_state = meta.state.clone();
+            let old_locked = meta.write_locked;
 
-        if locked && meta.state == SpoolState::Writing {
-            meta.state = SpoolState::WriteLocked;
-        } else if !locked && meta.state == SpoolState::WriteLocked {
-            meta.state = SpoolState::Readable;
+            meta.write_locked = locked;
+            if locked && meta.state == SpoolState::Writing {
+                meta.state = SpoolState::WriteLocked;
+            } else if !locked && meta.state == SpoolState::WriteLocked {
+                meta.state = SpoolState::Readable;
+                meta.readable_at.get_or_insert_with(now_secs);
+            }
+
+            if meta.state != old_state || meta.write_locked != old_locked {
+                Some(meta.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(meta) = updated {
+            self.persist_metadata(&meta)?;
         }
+        Ok(())
     }
 
     pub async fn is_readable(&self) -> bool {
@@ -141,6 +183,7 @@ mod tests {
             created_at: 0,
             last_write_at: 0,
             last_read_at: None,
+            readable_at: None,
             total_bytes_written: 0,
             checksum_crc32c: None,
             total_pages: 0,
@@ -185,7 +228,10 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
 
-        spool.set_write_locked(true).await;
+        spool
+            .set_write_locked(true)
+            .await
+            .expect("set write locked");
         assert!(!spool.is_readable().await);
 
         spool.complete(None).await.expect("complete succeeds");
@@ -241,7 +287,10 @@ mod tests {
         }
 
         // Lock it
-        spool.set_write_locked(true).await;
+        spool
+            .set_write_locked(true)
+            .await
+            .expect("set write locked");
         {
             let meta = spool.metadata.lock().await;
             assert_eq!(meta.state, SpoolState::WriteLocked);
@@ -249,14 +298,32 @@ mod tests {
         }
         assert!(!spool.is_readable().await);
 
-        // Unlock it — should go back to Writing
-        spool.set_write_locked(false).await;
+        // Unlock it — this releases the spool for reading.
+        spool
+            .set_write_locked(false)
+            .await
+            .expect("release write lock");
         {
             let meta = spool.metadata.lock().await;
             assert_eq!(meta.state, SpoolState::Readable);
             assert!(!meta.write_locked);
+            assert!(meta.readable_at.is_some());
         }
         assert!(spool.is_readable().await);
+
+        let read_txn = spool.db.begin_read().expect("begin read");
+        let table = read_txn
+            .open_table(crate::manager::SPOOL_TABLE)
+            .expect("open table");
+        let entry = table
+            .get("test-key")
+            .expect("table get")
+            .expect("metadata entry");
+        let persisted: SpoolMetadata =
+            serde_json::from_slice(entry.value()).expect("deserialize metadata");
+        assert_eq!(persisted.state, SpoolState::Readable);
+        assert!(!persisted.write_locked);
+        assert!(persisted.readable_at.is_some());
     }
 
     #[tokio::test]
