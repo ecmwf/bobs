@@ -116,7 +116,7 @@ async fn create_spool<F: FileIO>(
         .map_err(ApiError)?;
     tracing::info!(key = %key, "spool created");
     let read_url = format!(
-        "https://{}.{}/{}-{}/api/v1/read/{}",
+        "https://{}.{}/{}-{}/{}",
         state.config.host_prefix, state.config.domain, state.config.route_name, state.ordinal, key
     );
     let write_url = state.internal_base_url.clone();
@@ -1074,6 +1074,9 @@ mod tests {
             .expect("collect body")
             .to_bytes();
         let v: Value = serde_json::from_slice(&body).expect("json parse");
+        let key = v["key"].as_str().expect("key present");
+        let read_url = v["read_url"].as_str().expect("read_url present");
+        assert_eq!(read_url, format!("https://test.example.com/bobs-0/{key}"));
         let write_url = v["write_url"].as_str().expect("write_url present");
         assert!(!write_url.is_empty(), "write_url must be non-empty");
     }
