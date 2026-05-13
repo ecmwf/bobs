@@ -12,6 +12,7 @@ metadata:
   annotations:
     nginx.org/mergeable-ingress-type: minion
     nginx.org/location-snippets: |
+      rewrite ^/{{ $routeName }}-\d+/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
       rewrite ^/{{ $routeName }}-\d+/api/v1/read/([^/]+)$ /api/v1/read/$1 break;
       rewrite ^/{{ $routeName }}-\d+/api/v1/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
     {{- with .Values.ingress.annotations }}

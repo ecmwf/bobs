@@ -25,13 +25,13 @@ PUT /api/v1/create
 → 201 Created
 {
   "key":       "550e8400-e29b-41d4-a716-446655440000",
-  "read_url":  "https://example.com/download-2/api/v1/read/550e8400-e29b-41d4-a716-446655440000",
+  "read_url":  "https://example.com/download-2/550e8400-e29b-41d4-a716-446655440000",
   "write_url": "http://release-bobs-2:3000/api/v1"
 }
 ```
 
 - `key` — the spool identifier; embed it in all subsequent requests.
-- `read_url` — the public URL through which consumers can stream the spool once writing begins.
+- `read_url` — the public URL through which consumers can stream the spool once writing begins. It is an opaque download link; the BOBS internal `/api/v1/read/{key}` endpoint is not part of this public URL.
 - `write_url` — the **per-pod internal base URL** of the owning pod. Clients must use this URL as the base for all write and complete calls.
 
 The handling pod generates a UUID key, writes the spool entry to its own local database, and returns its own `internal_base_url` as `write_url`. No network calls are made to other pods during create.

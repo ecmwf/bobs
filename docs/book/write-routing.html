@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d8141f5c.js";
+            window.path_to_searchindex_js = "searchindex-1c6f0b4e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-fd9758cf.js"></script>
@@ -189,13 +189,13 @@
 → 201 Created
 {
   "key":       "550e8400-e29b-41d4-a716-446655440000",
-  "read_url":  "https://example.com/download-2/api/v1/read/550e8400-e29b-41d4-a716-446655440000",
+  "read_url":  "https://example.com/download-2/550e8400-e29b-41d4-a716-446655440000",
   "write_url": "http://release-bobs-2:3000/api/v1"
 }
 </code></pre>
 <ul>
 <li><code>key</code> — the spool identifier; embed it in all subsequent requests.</li>
-<li><code>read_url</code> — the public URL through which consumers can stream the spool once writing begins.</li>
+<li><code>read_url</code> — the public URL through which consumers can stream the spool once writing begins. It is an opaque download link; the BOBS internal <code>/api/v1/read/{key}</code> endpoint is not part of this public URL.</li>
 <li><code>write_url</code> — the <strong>per-pod internal base URL</strong> of the owning pod. Clients must use this URL as the base for all write and complete calls.</li>
 </ul>
 <p>The handling pod generates a UUID key, writes the spool entry to its own local database, and returns its own <code>internal_base_url</code> as <code>write_url</code>. No network calls are made to other pods during create.</p>
