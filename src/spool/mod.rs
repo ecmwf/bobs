@@ -22,6 +22,7 @@ pub use coverage::MissingRanges;
 /// full (page_size bytes) and cached in memory for fast reads. The writer signals readers
 /// via `notify` after each completed page; readers long-poll until data is available.
 pub struct Spool<F: FileIO> {
+    pub key: String,
     pub metadata: Arc<Mutex<SpoolMetadata>>,
     pub page_cache: Arc<Mutex<PageCache>>,
     /// Accumulates incoming bytes until a full page is ready for flush.
@@ -53,14 +54,16 @@ impl<F: FileIO> Spool<F> {
         metadata: SpoolMetadata,
         file_handle: F::Handle,
         page_size: usize,
-        cache_capacity: usize,
+        page_cache: Arc<Mutex<PageCache>>,
         db: Arc<Database>,
     ) -> Self {
         let data_path = metadata.data_path.clone();
+        let key = metadata.key.clone();
 
         Self {
+            key,
             metadata: Arc::new(Mutex::new(metadata)),
-            page_cache: Arc::new(Mutex::new(PageCache::new(cache_capacity))),
+            page_cache,
             write_buffer: Arc::new(Mutex::new(BytesMut::new())),
             file_handle: Arc::new(Mutex::new(Some(file_handle))),
             db,

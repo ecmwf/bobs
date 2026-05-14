@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c0ea6e57.js";
+            window.path_to_searchindex_js = "searchindex-6910c41b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-953381c0.js"></script>
@@ -178,7 +178,7 @@
 <p>Understanding these internal behaviours is crucial for effectively using BOBS.</p>
 <h3 id="1-page-based-streaming"><a class="header" href="#1-page-based-streaming">1. Page-based Streaming</a></h3>
 <p>Data is organized into fixed-size pages (configured via <code>page_size</code>, default <code>4096</code>). A successful <code>/write</code> has already accepted the bytes into <code>spool.dat</code> before it returns, including any trailing partial page. Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in <code>spool.dat</code> but are not visible to readers until more writes complete the page or the writer calls <code>/complete</code> to finalize the spool. This ensures readers always receive consistent, non-torn data.</p>
-<p>Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput now that writes no longer commit byte-derived metadata on the hot path, but they also delay reader visibility until that larger page is full. They also reduce the effective cache page count unless <code>max_cache_bytes</code> is increased alongside <code>page_size</code>. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.</p>
+<p>Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput now that writes no longer commit byte-derived metadata on the hot path, but they also delay reader visibility until that larger page is full. They also consume more of the global cache budget per cached page, so cache reach can fall unless <code>max_cache_bytes</code> is increased alongside <code>page_size</code>. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching entirely; if a full page is larger than the cache cap, that page simply bypasses the cache and reads fall back to disk. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.</p>
 <h3 id="2-long-poll-with-timeout"><a class="header" href="#2-long-poll-with-timeout">2. Long-poll with Timeout</a></h3>
 <p>When a reader requests data that hasn’t been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure (like Kubernetes Ingress or Load Balancers), BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>long_poll_timeout_ms</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
 <h3 id="3-follow-mode"><a class="header" href="#3-follow-mode">3. Follow Mode</a></h3>

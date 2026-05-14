@@ -2,4 +2,4 @@
 .env
 .sisyphus/evidence/
 .sisyphus/boulder.json
-skaffold.env
+skaffold.env.weave/

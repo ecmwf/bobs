@@ -66,13 +66,6 @@ impl Config {
             ));
         }
 
-        if self.max_cache_bytes < self.page_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "max_cache_bytes must be at least page_size",
-            ));
-        }
-
         if self.cleanup_sweep_interval_secs == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -225,7 +218,7 @@ domain: test.example.com
     }
 
     #[test]
-    fn test_validate_rejects_small_cache() {
+    fn test_validate_accepts_cache_smaller_than_page_size() {
         let config = Config {
             max_cache_bytes: 1024,
             page_size: 4096,
@@ -235,8 +228,21 @@ domain: test.example.com
             ..Config::default()
         };
 
-        let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        config.validate().expect("validation should succeed");
+    }
+
+    #[test]
+    fn test_validate_accepts_zero_cache_bytes() {
+        let config = Config {
+            max_cache_bytes: 0,
+            page_size: 4096,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        config.validate().expect("validation should succeed");
     }
 
     #[test]

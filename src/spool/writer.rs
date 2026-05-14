@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::spool::{Spool, SpoolState};
@@ -5,10 +7,10 @@ use crate::spool::{Spool, SpoolState};
 impl<F: FileIO> Spool<F> {
     /// Append data at the given offset. Writes are strictly sequential — the offset
     /// must match total_bytes_written exactly. Every accepted non-empty body is
-    /// appended to spool.dat before any in-memory state advances. Data also
-    /// accumulates in the write buffer and full pages are published to the cache;
-    /// each completed page notifies waiting readers.
-    pub async fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+    /// appended to spool.dat before any in-memory state advances. Full pages are
+    /// published to the cache from the owned input bytes where possible; the write
+    /// buffer is only used to assemble pages that span multiple write calls.
+    pub async fn write(&self, offset: u64, data: Bytes) -> Result<()> {
         let mut buf = self.write_buffer.lock().await;
 
         {
@@ -42,7 +44,7 @@ impl<F: FileIO> Spool<F> {
             let Some(handle) = handle_guard.as_ref() else {
                 return Err(BobsError::WriterInactive);
             };
-            let written = F::write_at(handle, offset, data)
+            let written = F::write_at(handle, offset, data.clone())
                 .await
                 .map_err(BobsError::IoError)?;
             if written != data.len() {
@@ -55,33 +57,36 @@ impl<F: FileIO> Spool<F> {
 
         {
             let mut crc = self.running_crc32c.lock().await;
-            *crc = crc32c::crc32c_append(*crc, data);
+            *crc = crc32c::crc32c_append(*crc, &data);
         }
 
-        buf.extend_from_slice(data);
+        let mut cursor = 0;
 
-        // Publish complete pages to the cache and notify readers. The bytes have
-        // already been appended to disk at the caller's requested offset above.
-        // Partial remainder stays in the buffer until more data arrives (or complete).
-        while buf.len() >= self.page_size {
-            let page_bytes = buf.split_to(self.page_size).freeze();
+        // If a previous call left a partial page, copy only enough incoming bytes
+        // to finish that page. Complete pages wholly contained in `data` are
+        // published below as zero-copy Bytes slices.
+        if !buf.is_empty() {
+            let needed = self.page_size - buf.len();
+            let take = needed.min(data.len());
+            buf.extend_from_slice(&data[..take]);
+            cursor += take;
 
-            let page_idx = {
-                let meta = self.metadata.lock().await;
-                meta.total_pages
-            };
-
-            {
-                let mut cache = self.page_cache.lock().await;
-                cache.insert(page_idx, page_bytes);
+            if buf.len() == self.page_size {
+                let page_bytes = buf.split_to(self.page_size).freeze();
+                self.publish_page(page_bytes).await;
             }
+        }
 
-            {
-                let mut meta = self.metadata.lock().await;
-                meta.total_pages += 1;
-            }
+        // Publish full pages from the incoming owned buffer without cloning their
+        // contents. Only cross-call partial pages use `write_buffer` assembly.
+        while cursor + self.page_size <= data.len() {
+            let page_bytes = data.slice(cursor..cursor + self.page_size);
+            cursor += self.page_size;
+            self.publish_page(page_bytes).await;
+        }
 
-            self.notify.notify_waiters();
+        if cursor < data.len() {
+            buf.extend_from_slice(&data[cursor..]);
         }
 
         {
@@ -91,6 +96,25 @@ impl<F: FileIO> Spool<F> {
         }
 
         Ok(())
+    }
+
+    async fn publish_page(&self, page_bytes: Bytes) {
+        let page_idx = {
+            let meta = self.metadata.lock().await;
+            meta.total_pages
+        };
+
+        {
+            let mut cache = self.page_cache.lock().await;
+            cache.insert(&self.key, page_idx, page_bytes);
+        }
+
+        {
+            let mut meta = self.metadata.lock().await;
+            meta.total_pages += 1;
+        }
+
+        self.notify.notify_waiters();
     }
 }
 
@@ -155,7 +179,16 @@ mod tests {
             write_txn.commit().expect("commit");
         }
 
-        Spool::new(meta, handle, page_size, 256, db).await
+        Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            db,
+        )
+        .await
     }
 
     fn persisted_metadata(spool: &Spool<TokioFileIO>) -> SpoolMetadata {
@@ -178,7 +211,10 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
         let data = vec![0xABu8; 4096];
 
-        spool.write(0, &data).await.expect("write should succeed");
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&data))
+            .await
+            .expect("write should succeed");
 
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 1);
@@ -186,7 +222,7 @@ mod tests {
         drop(meta);
 
         let cache = spool.page_cache.lock().await;
-        assert!(cache.contains(0));
+        assert!(cache.contains(&spool.key, 0));
     }
 
     #[tokio::test]
@@ -195,7 +231,10 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
         let data = vec![0xCDu8; 16384];
 
-        spool.write(0, &data).await.expect("write should succeed");
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&data))
+            .await
+            .expect("write should succeed");
 
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 4);
@@ -208,7 +247,10 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
         let data = vec![0xEFu8; 1000];
 
-        spool.write(0, &data).await.expect("write should succeed");
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&data))
+            .await
+            .expect("write should succeed");
 
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 0);
@@ -223,7 +265,7 @@ mod tests {
         let second = vec![0x22u8; 3096];
 
         spool
-            .write(0, &first)
+            .write(0, bytes::Bytes::copy_from_slice(&first))
             .await
             .expect("partial write should succeed");
 
@@ -239,7 +281,7 @@ mod tests {
         assert_eq!(persisted.last_write_at, 0);
 
         spool
-            .write(first.len() as u64, &second)
+            .write(first.len() as u64, bytes::Bytes::copy_from_slice(&second))
             .await
             .expect("remainder write should succeed");
 
@@ -254,7 +296,9 @@ mod tests {
         let dir = tempdir().expect("failed to create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
 
-        let result = spool.write(100, &[0u8; 100]).await;
+        let result = spool
+            .write(100, bytes::Bytes::copy_from_slice(&[0u8; 100]))
+            .await;
         assert!(matches!(
             result,
             Err(BobsError::OffsetMismatch {
@@ -265,12 +309,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_producer_cannot_rewind_after_accepted_partial_write() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+        let first = bytes::Bytes::from_static(b"abc");
+
+        spool
+            .write(0, first)
+            .await
+            .expect("initial partial write should be accepted");
+
+        let result = spool.write(0, bytes::Bytes::from_static(b"rewind")).await;
+        assert!(matches!(
+            result,
+            Err(BobsError::OffsetMismatch {
+                expected: 3,
+                got: 0
+            })
+        ));
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.total_bytes_written, 3);
+        assert_eq!(meta.total_pages, 0, "partial page remains unpublished");
+    }
+
+    #[tokio::test]
     async fn test_write_empty_is_noop() {
         let dir = tempdir().expect("failed to create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
 
         spool
-            .write(0, &[])
+            .write(0, bytes::Bytes::new())
             .await
             .expect("empty write should succeed");
 
@@ -290,7 +359,7 @@ mod tests {
         }
 
         let data = vec![0xFFu8; 4096];
-        let result = spool.write(0, &data).await;
+        let result = spool.write(0, bytes::Bytes::copy_from_slice(&data)).await;
         assert!(matches!(result, Err(BobsError::WriterInactive)));
     }
 
@@ -304,7 +373,9 @@ mod tests {
             meta.state = SpoolState::Complete;
         }
 
-        let result = spool.write(0, &[1, 2, 3]).await;
+        let result = spool
+            .write(0, bytes::Bytes::copy_from_slice(&[1, 2, 3]))
+            .await;
         assert!(matches!(result, Err(BobsError::SpoolClosed)));
     }
 }

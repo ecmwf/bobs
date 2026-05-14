@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c0ea6e57.js";
+            window.path_to_searchindex_js = "searchindex-6910c41b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-953381c0.js"></script>
@@ -270,8 +270,8 @@ docker run --rm bobs:bench bobs-benchmark --help
 host: 127.0.0.1
 port: 3000
 data_dir: /tmp/bobs-bench-data
-page_size: 1048576
-max_cache_bytes: 268435456
+page_size: 4096
+max_cache_bytes: 1048576
 host_prefix: bobs
 route_name: download
 domain: 127.0.0.1:3000
@@ -310,8 +310,8 @@ cargo run --release --bin bobs-benchmark -- \
   --delete-after-read
 </code></pre>
 <h2 id="page-size-comparison"><a class="header" href="#page-size-comparison">Page size comparison</a></h2>
-<p>Keep the runtime default at <code>4096</code> unless benchmark evidence says otherwise. Wider pages can reduce per-page overhead and may improve throughput, especially after removal of write-hot-path metadata commits. They also delay reader visibility until a full page is available and reduce the effective cache page count unless <code>max_cache_bytes</code> is increased.</p>
-<p>Compare at least the default, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The example below keeps roughly 256 pages in cache for each run by setting <code>max_cache_bytes = page_size * 256</code>.</p>
+<p>Keep the runtime default at <code>4096</code> unless benchmark evidence says otherwise. Wider pages can reduce per-page overhead and may improve throughput, especially after removal of write-hot-path metadata commits. They also delay reader visibility until a full page is available and consume more of the global cache budget per cached page, so cache reach may fall unless <code>max_cache_bytes</code> is increased. <code>page_size</code> may be larger than <code>max_cache_bytes</code>; oversized pages simply bypass the cache.</p>
+<p>Compare at least the default, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The example below uses a global cache budget sized to hold roughly 256 pages for each run, if the workload and eviction order allow.</p>
 <p>Start one BOBS server per page size, run the matching benchmark, then stop the server before moving to the next size:</p>
 <pre><code class="language-bash"># 4 KiB default-page run
 cat &gt;/tmp/bobs-bench-4096.yaml &lt;&lt;'YAML'
@@ -610,7 +610,7 @@ curl -L http://localhost:3000/read/YOUR_KEY -H "Range: bytes=1048576-"
 <tr><td><code>port</code></td><td><code>3000</code></td><td>Port for the HTTP server to listen on.</td></tr>
 <tr><td><code>data_dir</code></td><td><code>./data</code></td><td>File system path for storing spool files.</td></tr>
 <tr><td><code>page_size</code></td><td><code>4096</code></td><td>Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when <code>/complete</code> finalizes a trailing partial page.</td></tr>
-<tr><td><code>max_cache_bytes</code></td><td><code>1048576</code></td><td>Max bytes to keep in the per-spool memory cache. Effective page count is <code>max_cache_bytes / page_size</code>. Increase this when testing larger pages if you want to preserve the number of cached pages.</td></tr>
+<tr><td><code>max_cache_bytes</code></td><td><code>1048576</code></td><td>Global byte budget for the in-memory page cache across all spools. Set to <code>0</code> to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk.</td></tr>
 <tr><td><code>writer_inactivity_timeout_secs</code></td><td><code>300</code></td><td>Cleanup spool if the writer doesn’t send data for this long.</td></tr>
 <tr><td><code>read_idle_ttl_secs</code></td><td><code>600</code></td><td>TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served.</td></tr>
 <tr><td><code>full_read_complete_ttl_secs</code></td><td><code>30</code></td><td>Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served.</td></tr>
@@ -629,7 +629,7 @@ curl -L http://localhost:3000/read/YOUR_KEY -H "Range: bytes=1048576-"
 port: 3000
 data_dir: /data/bobs
 page_size: 4096
-max_cache_bytes: 1048576
+max_cache_bytes: 1048576          # global page-cache byte budget; set to 0 to disable caching
 writer_inactivity_timeout_secs: 300
 read_idle_ttl_secs: 600
 full_read_complete_ttl_secs: 30
@@ -651,16 +651,17 @@ read_idle_ttl_secs: 600
 <p>Larger pages such as <code>1048576</code> (1 MiB), <code>4194304</code> (4 MiB), and <code>16777216</code> (16 MiB) may improve write/read throughput by reducing per-page overhead, but they change streaming behaviour:</p>
 <ul>
 <li>readers do not see in-progress bytes until a full page is available, so wider pages can increase reader-visible latency;</li>
-<li><code>max_cache_bytes / page_size</code> determines the effective cached page count, so wider pages reduce cache reach unless <code>max_cache_bytes</code> is increased;</li>
+<li>larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless <code>max_cache_bytes</code> is increased;</li>
 <li>benchmark representative object sizes and write chunk sizes before changing production defaults.</li>
 </ul>
+<p><code>page_size</code> does not need to be less than or equal to <code>max_cache_bytes</code>. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work.</p>
 <p>See the standalone benchmark guide for page-size comparison commands.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="key-behaviours"><a class="header" href="#key-behaviours">Key Behaviours</a></h1>
 <p>Understanding these internal behaviours is crucial for effectively using BOBS.</p>
 <h3 id="1-page-based-streaming"><a class="header" href="#1-page-based-streaming">1. Page-based Streaming</a></h3>
 <p>Data is organized into fixed-size pages (configured via <code>page_size</code>, default <code>4096</code>). A successful <code>/write</code> has already accepted the bytes into <code>spool.dat</code> before it returns, including any trailing partial page. Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in <code>spool.dat</code> but are not visible to readers until more writes complete the page or the writer calls <code>/complete</code> to finalize the spool. This ensures readers always receive consistent, non-torn data.</p>
-<p>Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput now that writes no longer commit byte-derived metadata on the hot path, but they also delay reader visibility until that larger page is full. They also reduce the effective cache page count unless <code>max_cache_bytes</code> is increased alongside <code>page_size</code>. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.</p>
+<p>Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput now that writes no longer commit byte-derived metadata on the hot path, but they also delay reader visibility until that larger page is full. They also consume more of the global cache budget per cached page, so cache reach can fall unless <code>max_cache_bytes</code> is increased alongside <code>page_size</code>. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching entirely; if a full page is larger than the cache cap, that page simply bypasses the cache and reads fall back to disk. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.</p>
 <h3 id="2-long-poll-with-timeout"><a class="header" href="#2-long-poll-with-timeout">2. Long-poll with Timeout</a></h3>
 <p>When a reader requests data that hasn’t been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure (like Kubernetes Ingress or Load Balancers), BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>long_poll_timeout_ms</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
 <h3 id="3-follow-mode"><a class="header" href="#3-follow-mode">3. Follow Mode</a></h3>
@@ -691,10 +692,10 @@ read_idle_ttl_secs: 600
 <p>BOBS is built on a high-performance, asynchronous foundation.</p>
 <h3 id="internal-components"><a class="header" href="#internal-components">Internal Components</a></h3>
 <ul>
-<li><strong>Spool</strong>: The core entity representing a data stream. It contains metadata, a page cache, a write buffer, and handles synchronization between the writer and readers.</li>
-<li><strong>FileIO</strong>: An abstraction for asynchronous disk I/O. The default implementation uses Tokio’s file system tasks, but it’s designed to support future high-performance backends like <code>io_uring</code>.</li>
+<li><strong>Spool</strong>: The core entity representing a data stream. It contains metadata, a write buffer, and handles synchronization between the writer and readers.</li>
+<li><strong>FileIO</strong>: An abstraction for asynchronous disk I/O. The default high-performance implementation, <code>TokioFileIO</code>, is currently Unix-only: it stores an <code>Arc&lt;std::fs::File&gt;</code>, opens files through <code>std::fs::OpenOptions</code> on Tokio blocking tasks, and performs reads and writes with Unix positional file APIs (<code>FileExt::read_at</code> / <code>write_at</code>, <code>pread</code>/<code>pwrite</code> style) so concurrent operations do not share a file cursor. Writes loop until the owned <code>Bytes</code> buffer has been fully accepted, and <code>/complete</code> durability is preserved with <code>File::sync_data</code> on a blocking task. Non-Unix builds are compile-gated until an explicit positional backend is added for those platforms.</li>
 <li><strong>SpoolManager</strong>: A central registry (using <code>DashMap</code>) that tracks all active spools. It uses <code>redb</code> for lightweight persistence of lifecycle metadata, allowing the service to recover state after a BOBS process restart.</li>
-<li><strong>Page Cache</strong>: A per-spool LRU-like cache that minimizes disk reads for hot data being consumed immediately after it’s written. Capacity is derived from <code>max_cache_bytes / page_size</code>.</li>
+<li><strong>Page Cache</strong>: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it’s written. Entries are keyed by <code>(spool_key, page_idx)</code>, and <code>max_cache_bytes</code> is the total cache budget across all spools. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching; pages larger than the byte cap are valid but bypass the cache.</li>
 </ul>
 <h3 id="data-flow"><a class="header" href="#data-flow">Data Flow</a></h3>
 <ol>

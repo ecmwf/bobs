@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c0ea6e57.js";
+            window.path_to_searchindex_js = "searchindex-6910c41b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-953381c0.js"></script>
@@ -192,7 +192,7 @@
 <tr><td><code>port</code></td><td><code>3000</code></td><td>Port for the HTTP server to listen on.</td></tr>
 <tr><td><code>data_dir</code></td><td><code>./data</code></td><td>File system path for storing spool files.</td></tr>
 <tr><td><code>page_size</code></td><td><code>4096</code></td><td>Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when <code>/complete</code> finalizes a trailing partial page.</td></tr>
-<tr><td><code>max_cache_bytes</code></td><td><code>1048576</code></td><td>Max bytes to keep in the per-spool memory cache. Effective page count is <code>max_cache_bytes / page_size</code>. Increase this when testing larger pages if you want to preserve the number of cached pages.</td></tr>
+<tr><td><code>max_cache_bytes</code></td><td><code>1048576</code></td><td>Global byte budget for the in-memory page cache across all spools. Set to <code>0</code> to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk.</td></tr>
 <tr><td><code>writer_inactivity_timeout_secs</code></td><td><code>300</code></td><td>Cleanup spool if the writer doesn’t send data for this long.</td></tr>
 <tr><td><code>read_idle_ttl_secs</code></td><td><code>600</code></td><td>TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served.</td></tr>
 <tr><td><code>full_read_complete_ttl_secs</code></td><td><code>30</code></td><td>Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served.</td></tr>
@@ -211,7 +211,7 @@
 port: 3000
 data_dir: /data/bobs
 page_size: 4096
-max_cache_bytes: 1048576
+max_cache_bytes: 1048576          # global page-cache byte budget; set to 0 to disable caching
 writer_inactivity_timeout_secs: 300
 read_idle_ttl_secs: 600
 full_read_complete_ttl_secs: 30
@@ -233,9 +233,10 @@ read_idle_ttl_secs: 600
 <p>Larger pages such as <code>1048576</code> (1 MiB), <code>4194304</code> (4 MiB), and <code>16777216</code> (16 MiB) may improve write/read throughput by reducing per-page overhead, but they change streaming behaviour:</p>
 <ul>
 <li>readers do not see in-progress bytes until a full page is available, so wider pages can increase reader-visible latency;</li>
-<li><code>max_cache_bytes / page_size</code> determines the effective cached page count, so wider pages reduce cache reach unless <code>max_cache_bytes</code> is increased;</li>
+<li>larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless <code>max_cache_bytes</code> is increased;</li>
 <li>benchmark representative object sizes and write chunk sizes before changing production defaults.</li>
 </ul>
+<p><code>page_size</code> does not need to be less than or equal to <code>max_cache_bytes</code>. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work.</p>
 <p>See the standalone benchmark guide for page-size comparison commands.</p>
 
                     </main>

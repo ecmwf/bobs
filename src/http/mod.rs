@@ -162,12 +162,14 @@ async fn write_spool<F: FileIO>(
                 cursor += take;
 
                 if pending.len() == write_batch_size {
-                    spool
-                        .write(write_offset, &pending)
-                        .await
-                        .map_err(ApiError)?;
-                    write_offset += pending.len() as u64;
-                    pending.clear();
+                    let batch = std::mem::replace(
+                        &mut pending,
+                        bytes::BytesMut::with_capacity(write_batch_size),
+                    )
+                    .freeze();
+                    let batch_len = batch.len();
+                    spool.write(write_offset, batch).await.map_err(ApiError)?;
+                    write_offset += batch_len as u64;
                 }
             }
         }
@@ -175,7 +177,7 @@ async fn write_spool<F: FileIO>(
 
     if !pending.is_empty() {
         spool
-            .write(write_offset, &pending)
+            .write(write_offset, pending.freeze())
             .await
             .map_err(ApiError)?;
     }
@@ -208,6 +210,10 @@ async fn complete_spool<F: FileIO>(
 /// sees the correct active reader count even if the stream is cancelled mid-flight.
 struct ReaderLease<F: FileIO> {
     spool: Arc<crate::spool::Spool<F>>,
+}
+
+fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
+    page.slice(slice_start..slice_end)
 }
 
 impl<F: FileIO> Drop for ReaderLease<F> {
@@ -378,7 +384,7 @@ async fn read_spool<F: FileIO + 'static>(
             let slice_end = ((logical_end - page_start) as usize).min(page.len());
 
             if slice_start < slice_end {
-                let chunk = Bytes::copy_from_slice(&page[slice_start..slice_end]);
+                let chunk = read_page_chunk(&page, slice_start, slice_end);
                 let chunk_start = offset;
                 offset += chunk.len() as u64;
                 let chunk_end = offset;
@@ -707,6 +713,135 @@ mod tests {
     // -----------------------------------------------------------------------
     // Shared test helpers
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_page_chunk_uses_zero_copy_slice() {
+        let page = Bytes::from((0u8..64).collect::<Vec<_>>());
+        let slice_start = 7;
+        let slice_end = 23;
+
+        let chunk = read_page_chunk(&page, slice_start, slice_end);
+
+        assert_eq!(&chunk[..], &page[slice_start..slice_end]);
+        assert_eq!(
+            chunk.as_ptr(),
+            unsafe { page.as_ptr().add(slice_start) },
+            "chunk should point into the cached page allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_spool_range_yields_zero_copy_cached_page_slice() {
+        let (app, state) = app_with_state().await;
+        let data = (0..4096).map(|v| (v % 251) as u8).collect::<Vec<_>>();
+        let key = write_and_complete(&app, data).await;
+        let spool = state.manager.get_spool(&key).expect("spool must exist");
+        let page = spool
+            .read_page(0)
+            .await
+            .expect("page read should succeed")
+            .expect("page should exist");
+        let slice_start = 7usize;
+        let slice_end = 23usize;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", format!("bytes={}-{}", slice_start, slice_end - 1))
+            .body(Body::empty())
+            .expect("build range read request");
+        let resp = app.clone().oneshot(req).await.expect("range read oneshot");
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+
+        let mut body = resp.into_body();
+        let frame = body
+            .frame()
+            .await
+            .expect("body should yield a frame")
+            .expect("frame should be ok");
+        let chunk = frame.into_data().expect("frame should contain data");
+
+        assert_eq!(&chunk[..], &page[slice_start..slice_end]);
+        assert_eq!(
+            chunk.as_ptr(),
+            unsafe { page.as_ptr().add(slice_start) },
+            "yielded chunk should point into the cached page allocation"
+        );
+        assert!(body.frame().await.is_none(), "range should yield one chunk");
+    }
+
+    #[tokio::test]
+    async fn read_range_hides_trailing_partial_until_complete_then_serves_it() {
+        let app = app().await;
+        let key = create_key(&app).await;
+        let data = vec![0xA5u8; 777];
+
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(data.clone()))
+            .expect("build write request");
+        let write_resp = app.clone().oneshot(write_req).await.expect("write oneshot");
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let hidden_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=0-776")
+            .body(Body::empty())
+            .expect("build pre-complete read request");
+        let hidden_resp = app
+            .clone()
+            .oneshot(hidden_req)
+            .await
+            .expect("pre-complete read oneshot");
+        assert_eq!(
+            hidden_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "bounded reads must not expose a trailing partial page before /complete"
+        );
+
+        let complete_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("build complete request");
+        let complete_resp = app
+            .clone()
+            .oneshot(complete_req)
+            .await
+            .expect("complete oneshot");
+        assert_eq!(complete_resp.status(), StatusCode::OK);
+
+        let visible_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=0-776")
+            .body(Body::empty())
+            .expect("build post-complete read request");
+        let visible_resp = app
+            .clone()
+            .oneshot(visible_req)
+            .await
+            .expect("post-complete read oneshot");
+        assert_eq!(visible_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            visible_resp
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .expect("content-length")
+                .to_str()
+                .expect("content-length string"),
+            data.len().to_string()
+        );
+        let body = visible_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        assert_eq!(&body[..], data.as_slice());
+    }
 
     /// Write `data` at offset 0 and mark the spool complete. Returns the key.
     async fn write_and_complete(app: &Router, data: Vec<u8>) -> String {

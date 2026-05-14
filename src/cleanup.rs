@@ -221,7 +221,10 @@ mod tests {
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
-            spool.write(0, &[0xAA; 4096]).await.expect("write page");
+            spool
+                .write(0, bytes::Bytes::copy_from_slice(&[0xAA; 4096]))
+                .await
+                .expect("write page");
 
             rewrite_persisted_metadata(&manager, &key, |meta| {
                 meta.state = SpoolState::Writing;
@@ -272,7 +275,10 @@ mod tests {
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
-            spool.write(0, &[0xBB; 4096]).await.expect("write page");
+            spool
+                .write(0, bytes::Bytes::copy_from_slice(&[0xBB; 4096]))
+                .await
+                .expect("write page");
             rewrite_persisted_metadata(&manager, &key, |meta| meta.last_write_at = 0);
         }
 
@@ -288,7 +294,7 @@ mod tests {
             meta.last_write_at = 1;
         }
         spool
-            .write(4096, &[0xCC; 4096])
+            .write(4096, bytes::Bytes::copy_from_slice(&[0xCC; 4096]))
             .await
             .expect("post-recovery write succeeds");
         assert!(

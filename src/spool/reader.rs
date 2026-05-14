@@ -25,7 +25,7 @@ impl<F: FileIO> Spool<F> {
             // 1. Check in-memory page cache (recently written pages).
             {
                 let cache = self.page_cache.lock().await;
-                if let Some(page) = cache.get(page_idx) {
+                if let Some(page) = cache.get(&self.key, page_idx) {
                     return Ok(Some(page));
                 }
             }
@@ -43,17 +43,15 @@ impl<F: FileIO> Spool<F> {
                         self.page_size
                     };
                     let file_offset = page_idx * self.page_size as u64;
-                    let mut disk_buf = vec![0u8; page_len];
                     let handle_guard = self.file_handle.lock().await;
                     let Some(handle) = handle_guard.as_ref() else {
                         return Err(BobsError::WriterInactive);
                     };
 
-                    let n = F::read_at(handle, file_offset, &mut disk_buf)
+                    let disk_buf = F::read_at(handle, file_offset, page_len)
                         .await
                         .map_err(BobsError::IoError)?;
-                    disk_buf.truncate(n);
-                    return Ok(Some(Bytes::from(disk_buf)));
+                    return Ok(Some(disk_buf));
                 }
             }
 
@@ -93,6 +91,14 @@ mod tests {
     use crate::spool::SpoolMetadata;
 
     async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
+        make_spool_with_cache_bytes(dir, page_size, page_size * 256).await
+    }
+
+    async fn make_spool_with_cache_bytes(
+        dir: &std::path::Path,
+        page_size: usize,
+        cache_bytes: usize,
+    ) -> Spool<TokioFileIO> {
         let path = dir.join("spool.dat");
         let db_path = dir.join("test.redb");
         let db = Arc::new(redb::Database::create(&db_path).expect("create test db"));
@@ -125,7 +131,16 @@ mod tests {
             data_path: path,
         };
 
-        Spool::new(meta, handle, page_size, 256, db).await
+        Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                cache_bytes,
+            ))),
+            db,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -134,9 +149,10 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = Bytes::from(vec![0xABu8; 4096]);
+        let cached_ptr = data.as_ptr();
         {
             let mut cache = spool.page_cache.lock().await;
-            cache.insert(0, data.clone());
+            cache.insert(&spool.key, 0, data.clone());
         }
         {
             let mut meta = spool.metadata.lock().await;
@@ -144,7 +160,43 @@ mod tests {
         }
 
         let got = spool.read_page(0).await.expect("read should succeed");
-        assert_eq!(got, Some(data));
+        let got = got.expect("cached page should exist");
+        assert_eq!(got, data);
+        assert_eq!(
+            got.as_ptr(),
+            cached_ptr,
+            "cached full pages must be returned as shared Bytes, not copied"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_disk_page_after_cache_eviction() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let page_size = 4096;
+        let spool = make_spool_with_cache_bytes(dir.path(), page_size, page_size).await;
+        let page0 = Bytes::from(vec![0xA0u8; page_size]);
+        let page1 = Bytes::from(vec![0xB1u8; page_size]);
+
+        spool
+            .write(0, page0.clone())
+            .await
+            .expect("first page write should succeed");
+        spool
+            .write(page_size as u64, page1)
+            .await
+            .expect("second page write should succeed");
+
+        {
+            let cache = spool.page_cache.lock().await;
+            assert!(
+                !cache.contains(&spool.key, 0),
+                "first page should have been evicted by the byte-capped FIFO cache"
+            );
+            assert!(cache.contains(&spool.key, 1));
+        }
+
+        let got = spool.read_page(0).await.expect("read should succeed");
+        assert_eq!(got, Some(page0), "evicted page must be read from disk");
     }
 
     #[tokio::test]
@@ -158,7 +210,7 @@ mod tests {
             let handle = handle_guard
                 .as_ref()
                 .expect("file handle should be active for disk read test");
-            TokioFileIO::write_at(handle, 0, &data)
+            TokioFileIO::write_at(handle, 0, Bytes::copy_from_slice(&data))
                 .await
                 .expect("failed to write test data to disk");
             TokioFileIO::sync_data(handle)
@@ -185,7 +237,7 @@ mod tests {
             let handle = handle_guard
                 .as_ref()
                 .expect("file handle should be active for disk read test");
-            TokioFileIO::write_at(handle, 0, &data)
+            TokioFileIO::write_at(handle, 0, Bytes::copy_from_slice(&data))
                 .await
                 .expect("failed to write recovered full page to disk");
             TokioFileIO::sync_data(handle)
@@ -215,7 +267,7 @@ mod tests {
             let handle = handle_guard
                 .as_ref()
                 .expect("file handle should be active for disk read test");
-            TokioFileIO::write_at(handle, 0, &partial)
+            TokioFileIO::write_at(handle, 0, Bytes::copy_from_slice(&partial))
                 .await
                 .expect("failed to write recovered partial to disk");
             TokioFileIO::sync_data(handle)
@@ -249,7 +301,7 @@ mod tests {
             let handle = handle_guard
                 .as_ref()
                 .expect("file handle should be active for disk read test");
-            TokioFileIO::write_at(handle, 0, &partial)
+            TokioFileIO::write_at(handle, 0, Bytes::copy_from_slice(&partial))
                 .await
                 .expect("failed to write recovered partial to disk");
             TokioFileIO::sync_data(handle)
@@ -281,7 +333,7 @@ mod tests {
         let data = Bytes::from(vec![0xCDu8; 4096]);
         {
             let mut cache = spool.page_cache.lock().await;
-            cache.insert(0, data.clone());
+            cache.insert(&spool.key, 0, data.clone());
         }
         {
             let mut meta = spool.metadata.lock().await;
@@ -340,7 +392,7 @@ mod tests {
         let full_page = Bytes::from(vec![0xABu8; 4096]);
         {
             let mut cache = spool.page_cache.lock().await;
-            cache.insert(0, full_page.clone());
+            cache.insert(&spool.key, 0, full_page.clone());
         }
         {
             let mut meta = spool.metadata.lock().await;

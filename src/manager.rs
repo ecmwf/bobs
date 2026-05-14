@@ -1,6 +1,6 @@
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
-use crate::spool::{Spool, SpoolMetadata, SpoolState};
+use crate::spool::{PageCache, Spool, SpoolMetadata, SpoolState};
 use dashmap::DashMap;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::collections::HashSet;
@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 pub const SPOOL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("spools");
 
@@ -20,7 +21,8 @@ pub struct SpoolManager<F: FileIO> {
     pub db: Arc<Database>,
     pub data_dir: PathBuf,
     pub page_size: usize,
-    pub page_cache_capacity: usize,
+    pub max_cache_bytes: usize,
+    pub page_cache: Arc<Mutex<PageCache>>,
 }
 
 impl<F: FileIO> SpoolManager<F> {
@@ -36,14 +38,8 @@ impl<F: FileIO> SpoolManager<F> {
                 "page_size must be greater than 0",
             )));
         }
-        if max_cache_bytes < page_size {
-            return Err(BobsError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "max_cache_bytes must be at least page_size",
-            )));
-        }
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
-        let page_cache_capacity = max_cache_bytes / page_size;
+        let page_cache = Arc::new(Mutex::new(PageCache::new(max_cache_bytes)));
 
         let db = Arc::new(Database::create(db_path).map_err(storage)?);
         {
@@ -59,7 +55,8 @@ impl<F: FileIO> SpoolManager<F> {
             db,
             data_dir: data_dir.as_ref().to_path_buf(),
             page_size,
-            page_cache_capacity,
+            max_cache_bytes,
+            page_cache,
         })
     }
 
@@ -120,7 +117,7 @@ impl<F: FileIO> SpoolManager<F> {
                 metadata,
                 handle,
                 self.page_size,
-                self.page_cache_capacity,
+                Arc::clone(&self.page_cache),
                 Arc::clone(&self.db),
             )
             .await,
@@ -157,6 +154,7 @@ impl<F: FileIO> SpoolManager<F> {
         spool.cancel.cancel();
 
         self.spools.remove(key);
+        self.page_cache.lock().await.remove_spool(key);
 
         {
             let write_txn = self.db.begin_write().map_err(storage)?;
@@ -341,7 +339,7 @@ impl<F: FileIO> SpoolManager<F> {
                     meta,
                     handle,
                     self.page_size,
-                    self.page_cache_capacity,
+                    Arc::clone(&self.page_cache),
                     Arc::clone(&self.db),
                 )
                 .await,
@@ -446,22 +444,22 @@ async fn crc32c_for_logical_size<F: FileIO>(handle: &F::Handle, logical_size: u6
     let mut crc = 0u32;
     let mut offset = 0u64;
     let mut remaining = logical_size;
-    let mut buf = vec![0u8; 64 * 1024];
+    const CHUNK_LEN: u64 = 64 * 1024;
 
     while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        let n = F::read_at(handle, offset, &mut buf[..want])
+        let want = remaining.min(CHUNK_LEN) as usize;
+        let buf = F::read_at(handle, offset, want)
             .await
             .map_err(BobsError::IoError)?;
-        if n == 0 {
+        if buf.is_empty() {
             return Err(BobsError::IoError(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!("expected {logical_size} bytes while reconstructing CRC, got {offset}"),
             )));
         }
-        crc = crc32c::crc32c_append(crc, &buf[..n]);
-        offset += n as u64;
-        remaining -= n as u64;
+        crc = crc32c::crc32c_append(crc, &buf);
+        offset += buf.len() as u64;
+        remaining -= buf.len() as u64;
     }
 
     Ok(crc)
@@ -472,24 +470,26 @@ async fn read_exact_logical_range<F: FileIO>(
     offset: u64,
     len: usize,
 ) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; len];
-    let mut filled = 0usize;
+    let mut out = Vec::with_capacity(len);
     let handle_guard = file_handle.lock().await;
     let Some(handle) = handle_guard.as_ref() else {
         return Err(BobsError::WriterInactive);
     };
 
-    while filled < len {
-        let n = F::read_at(handle, offset + filled as u64, &mut out[filled..])
+    while out.len() < len {
+        let buf = F::read_at(handle, offset + out.len() as u64, len - out.len())
             .await
             .map_err(BobsError::IoError)?;
-        if n == 0 {
+        if buf.is_empty() {
             return Err(BobsError::IoError(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("expected {len} bytes while loading trailing partial page, got {filled}"),
+                format!(
+                    "expected {len} bytes while loading trailing partial page, got {}",
+                    out.len()
+                ),
             )));
         }
-        filled += n;
+        out.extend_from_slice(&buf);
     }
 
     Ok(out)
@@ -513,6 +513,140 @@ mod tests {
         let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
         let entry = table.get(key).expect("table get").expect("entry exists");
         serde_json::from_slice(entry.value()).expect("deserialize metadata")
+    }
+
+    #[tokio::test]
+    async fn test_new_accepts_cache_smaller_than_page_size() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 1024)
+            .expect("manager init");
+
+        assert_eq!(manager.page_size, 4096);
+        assert_eq!(manager.max_cache_bytes, 1024);
+        assert_eq!(manager.page_cache.lock().await.max_bytes(), 1024);
+    }
+
+    #[tokio::test]
+    async fn test_new_accepts_zero_cache_bytes() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 0).expect("manager init");
+
+        assert_eq!(manager.max_cache_bytes, 0);
+        assert_eq!(manager.page_cache.lock().await.max_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_manager_shares_one_global_page_cache_and_delete_drops_entries() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 8192)
+            .expect("manager init");
+
+        manager
+            .create_spool("a".to_string(), None, None, false)
+            .await
+            .expect("create spool a");
+        manager
+            .create_spool("b".to_string(), None, None, false)
+            .await
+            .expect("create spool b");
+
+        let spool_a = manager.get_spool("a").expect("spool a");
+        let spool_b = manager.get_spool("b").expect("spool b");
+        assert!(Arc::ptr_eq(&manager.page_cache, &spool_a.page_cache));
+        assert!(Arc::ptr_eq(&manager.page_cache, &spool_b.page_cache));
+
+        {
+            let mut cache = manager.page_cache.lock().await;
+            cache.insert("a", 0, bytes::Bytes::from_static(b"aaaa"));
+            assert!(cache.current_bytes() <= cache.max_bytes());
+            cache.insert("b", 0, bytes::Bytes::from_static(b"bbbb"));
+            assert!(cache.current_bytes() <= cache.max_bytes());
+            assert_eq!(cache.current_bytes(), 8);
+        }
+
+        manager.delete_spool("a").await.expect("delete spool a");
+
+        let cache = manager.page_cache.lock().await;
+        assert!(!cache.contains("a", 0));
+        assert!(cache.contains("b", 0));
+        assert_eq!(cache.current_bytes(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_writes_from_different_spools_compete_under_one_cache_cap() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4, 8).expect("manager init");
+
+        manager
+            .create_spool("a".to_string(), None, None, false)
+            .await
+            .expect("create spool a");
+        manager
+            .create_spool("b".to_string(), None, None, false)
+            .await
+            .expect("create spool b");
+
+        let spool_a = manager.get_spool("a").expect("spool a");
+        let spool_b = manager.get_spool("b").expect("spool b");
+
+        spool_a
+            .write(0, bytes::Bytes::from_static(b"aaaa"))
+            .await
+            .expect("write a page 0");
+        {
+            let cache = manager.page_cache.lock().await;
+            assert!(cache.current_bytes() <= cache.max_bytes());
+            assert!(cache.contains("a", 0));
+        }
+
+        spool_b
+            .write(0, bytes::Bytes::from_static(b"bbbb"))
+            .await
+            .expect("write b page 0");
+        {
+            let cache = manager.page_cache.lock().await;
+            assert!(cache.current_bytes() <= cache.max_bytes());
+            assert!(cache.contains("a", 0));
+            assert!(cache.contains("b", 0));
+            assert_eq!(cache.current_bytes(), 8);
+        }
+
+        spool_b
+            .write(4, bytes::Bytes::from_static(b"cccc"))
+            .await
+            .expect("write b page 1");
+        let cache = manager.page_cache.lock().await;
+        assert!(cache.current_bytes() <= cache.max_bytes());
+        assert!(
+            !cache.contains("a", 0),
+            "write by spool b should evict global oldest from spool a"
+        );
+        assert!(cache.contains("b", 0));
+        assert!(cache.contains("b", 1));
+        assert_eq!(cache.current_bytes(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_new_rejects_zero_page_size() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+
+        let result = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 0, 1024);
+
+        assert!(matches!(result, Err(BobsError::IoError(_))));
     }
 
     #[tokio::test]
@@ -625,7 +759,10 @@ mod tests {
 
         let spool = manager.get_spool(&key).expect("spool exists");
         let data = vec![0x5Au8; 8192 + 123];
-        spool.write(0, &data).await.expect("write succeeds");
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&data))
+            .await
+            .expect("write succeeds");
 
         let in_memory = spool.metadata.lock().await.clone();
         assert_eq!(in_memory.total_bytes_written, data.len() as u64);
@@ -667,7 +804,10 @@ mod tests {
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
-            spool.write(0, &data).await.expect("write ack succeeds");
+            spool
+                .write(0, bytes::Bytes::copy_from_slice(&data))
+                .await
+                .expect("write ack succeeds");
 
             let persisted = persisted_metadata(&manager, &key);
             assert_eq!(persisted.total_bytes_written, 0);
@@ -736,7 +876,10 @@ mod tests {
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
-            spool.write(0, &first).await.expect("write succeeds");
+            spool
+                .write(0, bytes::Bytes::copy_from_slice(&first))
+                .await
+                .expect("write succeeds");
             let crc = *spool.running_crc32c.lock().await;
             assert_eq!(crc, crc32c::crc32c(&first));
             (key, crc)
@@ -749,7 +892,7 @@ mod tests {
         assert_eq!(*spool.running_crc32c.lock().await, crc_before_restart);
 
         spool
-            .write(first.len() as u64, &second)
+            .write(first.len() as u64, bytes::Bytes::copy_from_slice(&second))
             .await
             .expect("append after restart succeeds");
         assert_eq!(*spool.running_crc32c.lock().await, crc32c::crc32c(&all));
@@ -777,7 +920,10 @@ mod tests {
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
-            spool.write(0, &data).await.expect("write succeeds");
+            spool
+                .write(0, bytes::Bytes::copy_from_slice(&data))
+                .await
+                .expect("write succeeds");
             spool
                 .complete(Some(data.len() as u64))
                 .await
@@ -837,7 +983,7 @@ mod tests {
 
             let spool = manager.get_spool(&key).expect("spool exists");
             spool
-                .write(0, &vec![0x11u8; 8192])
+                .write(0, bytes::Bytes::from(vec![0x11u8; 8192]))
                 .await
                 .expect("write succeeds");
 
@@ -904,7 +1050,7 @@ mod tests {
 
             let spool = manager.get_spool(&key).expect("spool exists");
             spool
-                .write(0, &vec![0x22u8; 4096])
+                .write(0, bytes::Bytes::from(vec![0x22u8; 4096]))
                 .await
                 .expect("write succeeds");
 
@@ -1026,7 +1172,7 @@ mod tests {
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
             spool
-                .write(0, &vec![0xABu8; 8192])
+                .write(0, bytes::Bytes::from(vec![0xABu8; 8192]))
                 .await
                 .expect("write succeeds");
             spool.complete(None).await.expect("complete succeeds");
@@ -1072,7 +1218,7 @@ mod tests {
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
             spool
-                .write(0, &vec![0xCDu8; 4096])
+                .write(0, bytes::Bytes::from(vec![0xCDu8; 4096]))
                 .await
                 .expect("write succeeds");
             spool.complete(None).await.expect("complete succeeds");
@@ -1152,7 +1298,7 @@ mod tests {
 
             let spool = manager.get_spool(&key).expect("spool exists");
             spool
-                .write(0, &vec![0x44u8; 5000])
+                .write(0, bytes::Bytes::from(vec![0x44u8; 5000]))
                 .await
                 .expect("write succeeds");
             spool.complete(None).await.expect("complete succeeds");
@@ -1285,7 +1431,10 @@ mod tests {
 
         let completion = vec![0x33u8; page_size - trailing.len()];
         spool
-            .write(disk_bytes.len() as u64, &completion)
+            .write(
+                disk_bytes.len() as u64,
+                bytes::Bytes::copy_from_slice(&completion),
+            )
             .await
             .expect("write completing recovered page succeeds");
 
@@ -1297,5 +1446,81 @@ mod tests {
             &on_disk[page_size..page_size * 2],
             completed_page.as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_does_not_prepopulate_page_cache() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096usize;
+        let data = vec![0x7Bu8; page_size * 2];
+
+        let key = {
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
+                    .expect("manager init");
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool
+                .write(0, bytes::Bytes::copy_from_slice(&data))
+                .await
+                .expect("write succeeds");
+            spool.complete(None).await.expect("complete succeeds");
+            key
+        };
+
+        let manager2 =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
+                .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+        assert!(
+            Arc::ptr_eq(&manager2.page_cache, &spool.page_cache),
+            "recovered spool must use the manager's shared cache"
+        );
+        assert_eq!(
+            manager2.page_cache.lock().await.len(),
+            0,
+            "recovery must not seed cache with pages reconstructed/read from spool.dat"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_removes_cache_entries_when_directory_already_missing() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 8192)
+            .expect("manager init");
+
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false)
+            .await
+            .expect("create spool");
+        {
+            let mut cache = manager.page_cache.lock().await;
+            cache.insert(&key, 0, bytes::Bytes::from_static(b"cached"));
+            assert!(cache.contains(&key, 0));
+        }
+
+        let spool_dir = data_dir.join(&key);
+        tokio::fs::remove_dir_all(&spool_dir)
+            .await
+            .expect("remove spool dir before delete");
+
+        manager
+            .delete_spool(&key)
+            .await
+            .expect("delete succeeds despite missing directory");
+
+        assert!(manager.get_spool(&key).is_none());
+        assert!(!manager.page_cache.lock().await.contains(&key, 0));
     }
 }

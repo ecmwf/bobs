@@ -4,10 +4,10 @@ BOBS is built on a high-performance, asynchronous foundation.
 
 ### Internal Components
 
-- **Spool**: The core entity representing a data stream. It contains metadata, a page cache, a write buffer, and handles synchronization between the writer and readers.
-- **FileIO**: An abstraction for asynchronous disk I/O. The default implementation uses Tokio's file system tasks, but it's designed to support future high-performance backends like `io_uring`.
+- **Spool**: The core entity representing a data stream. It contains metadata, a write buffer, and handles synchronization between the writer and readers.
+- **FileIO**: An abstraction for asynchronous disk I/O. The default high-performance implementation, `TokioFileIO`, is currently Unix-only: it stores an `Arc<std::fs::File>`, opens files through `std::fs::OpenOptions` on Tokio blocking tasks, and performs reads and writes with Unix positional file APIs (`FileExt::read_at` / `write_at`, `pread`/`pwrite` style) so concurrent operations do not share a file cursor. Writes loop until the owned `Bytes` buffer has been fully accepted, and `/complete` durability is preserved with `File::sync_data` on a blocking task. Non-Unix builds are compile-gated until an explicit positional backend is added for those platforms.
 - **SpoolManager**: A central registry (using `DashMap`) that tracks all active spools. It uses `redb` for lightweight persistence of lifecycle metadata, allowing the service to recover state after a BOBS process restart.
-- **Page Cache**: A per-spool LRU-like cache that minimizes disk reads for hot data being consumed immediately after it's written. Capacity is derived from `max_cache_bytes / page_size`.
+- **Page Cache**: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it's written. Entries are keyed by `(spool_key, page_idx)`, and `max_cache_bytes` is the total cache budget across all spools. Setting `max_cache_bytes` to `0` disables caching; pages larger than the byte cap are valid but bypass the cache.
 
 ### Data Flow
 

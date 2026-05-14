@@ -7,6 +7,7 @@ use bobs::io::TokioFileIO;
 use bobs::manager::SpoolManager;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -15,6 +16,7 @@ use tokio::task::JoinHandle;
 
 struct TestServer {
     base_url: String,
+    manager: Arc<SpoolManager<TokioFileIO>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<()>>,
     cleanup_handle: Option<JoinHandle<()>>,
@@ -149,6 +151,7 @@ async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path
 
     TestServer {
         base_url: format!("http://{}", addr),
+        manager,
         shutdown_tx: Some(tx),
         handle: Some(handle),
         cleanup_handle,
@@ -662,6 +665,212 @@ async fn test_open_ended_range_reads_current_eof_without_following() {
     );
     let body = response.bytes().await.expect("read bytes");
     assert_eq!(body.as_ref(), &data[4096..]);
+}
+
+#[tokio::test]
+async fn test_in_flight_writer_completes_while_parallel_readers_follow_and_read_ranges() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let key = create_key(&client, &server.base_url, None).await;
+
+    let page_size = 4096usize;
+    let total_pages = 8usize;
+    let all_data: Vec<u8> = (0..(page_size * total_pages))
+        .map(|i| (i % 251) as u8)
+        .collect();
+
+    let mut follow_tasks = Vec::new();
+    for _ in 0..3 {
+        let read_client = client.clone();
+        let read_url = format!("{}/api/v1/read/{}", server.base_url, key);
+        let expected = all_data.clone();
+        follow_tasks.push(tokio::spawn(async move {
+            let resp = read_client
+                .get(read_url)
+                .send()
+                .await
+                .expect("follow read send");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            let body = resp.bytes().await.expect("follow read bytes");
+            assert_eq!(body.as_ref(), expected.as_slice());
+        }));
+    }
+
+    // Let follow readers enter read_page(0) before the writer starts publishing.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    for page_idx in 0..2usize {
+        let offset = page_idx * page_size;
+        let resp = client
+            .post(format!(
+                "{}/api/v1/write/{}/{}",
+                server.base_url, key, offset
+            ))
+            .body(all_data[offset..offset + page_size].to_vec())
+            .send()
+            .await
+            .expect("initial write send");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    let mut range_tasks = Vec::new();
+    for reader_idx in 0..6usize {
+        let read_client = client.clone();
+        let read_url = format!("{}/api/v1/read/{}", server.base_url, key);
+        let range_start = (reader_idx % 2) * page_size;
+        let range_end = range_start + page_size - 1;
+        let expected = all_data[range_start..=range_end].to_vec();
+        range_tasks.push(tokio::spawn(async move {
+            let resp = read_client
+                .get(read_url)
+                .header("Range", format!("bytes={range_start}-{range_end}"))
+                .send()
+                .await
+                .expect("range read send");
+            assert_eq!(resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+            let body = resp.bytes().await.expect("range read bytes");
+            assert_eq!(body.as_ref(), expected.as_slice());
+        }));
+    }
+
+    let write_client = client.clone();
+    let write_base_url = server.base_url.clone();
+    let write_key = key.clone();
+    let write_data = all_data.clone();
+    let writer_task = tokio::spawn(async move {
+        for page_idx in 2..total_pages {
+            let offset = page_idx * page_size;
+            let resp = write_client
+                .post(format!(
+                    "{write_base_url}/api/v1/write/{write_key}/{offset}"
+                ))
+                .body(write_data[offset..offset + page_size].to_vec())
+                .send()
+                .await
+                .expect("continued write send");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+
+        let complete_resp = write_client
+            .post(format!("{write_base_url}/api/v1/complete/{write_key}"))
+            .json(&json!({ "expected_size": write_data.len() }))
+            .send()
+            .await
+            .expect("complete send");
+        assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), writer_task)
+        .await
+        .expect("writer and complete should not wait behind active readers")
+        .expect("writer task join");
+
+    for task in range_tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("range reader timeout")
+            .expect("range reader join");
+    }
+    for task in follow_tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("follow reader timeout")
+            .expect("follow reader join");
+    }
+}
+
+#[tokio::test]
+async fn test_many_active_spools_share_global_cache_cap() {
+    let page_size = 1024usize;
+    let max_cache_bytes = page_size * 3;
+    let config = Arc::new(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        data_dir: std::path::PathBuf::from("./data"),
+        page_size,
+        max_cache_bytes,
+        writer_inactivity_timeout_secs: 300,
+        read_idle_ttl_secs: 600,
+        full_read_complete_ttl_secs: 30,
+        reader_done_ttl_secs: 60,
+        unread_ttl_secs: 3600,
+        cleanup_sweep_interval_secs: 30,
+        long_poll_timeout_ms: 25000,
+        host_prefix: "test".into(),
+        domain: "example.com".into(),
+        route_name: "bobs".into(),
+    });
+    let server = start_server_with_config(config).await;
+    let client = reqwest::Client::new();
+
+    let spool_count = 12usize;
+    let pages_per_spool = 6usize;
+    let mut keys = Vec::new();
+    for _ in 0..spool_count {
+        keys.push(create_key(&client, &server.base_url, None).await);
+    }
+
+    let stop_monitor = Arc::new(AtomicBool::new(false));
+    let monitor_done = Arc::clone(&stop_monitor);
+    let monitor_manager = Arc::clone(&server.manager);
+    let monitor = tokio::spawn(async move {
+        while !monitor_done.load(Ordering::Relaxed) {
+            let cache = monitor_manager.page_cache.lock().await;
+            assert!(
+                cache.current_bytes() <= cache.max_bytes(),
+                "cache exceeded global cap while writes were active: {} > {}",
+                cache.current_bytes(),
+                cache.max_bytes()
+            );
+            drop(cache);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    });
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(spool_count));
+    let mut write_tasks = Vec::new();
+    for (spool_idx, key) in keys.into_iter().enumerate() {
+        let write_client = client.clone();
+        let write_base_url = server.base_url.clone();
+        let write_barrier = Arc::clone(&barrier);
+        write_tasks.push(tokio::spawn(async move {
+            let data: Vec<u8> = (0..(page_size * pages_per_spool))
+                .map(|i| ((spool_idx + i) % 251) as u8)
+                .collect();
+            write_barrier.wait().await;
+            let resp = write_client
+                .post(format!("{write_base_url}/api/v1/write/{key}/0"))
+                .body(data)
+                .send()
+                .await
+                .expect("many-spool write send");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        }));
+    }
+
+    for task in write_tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("many-spool write timeout")
+            .expect("many-spool write join");
+    }
+
+    stop_monitor.store(true, Ordering::Relaxed);
+    monitor.await.expect("cache monitor join");
+
+    let cache = server.manager.page_cache.lock().await;
+    assert_eq!(cache.max_bytes(), max_cache_bytes);
+    assert!(
+        spool_count * pages_per_spool * page_size > max_cache_bytes,
+        "test must write more full pages than the cache cap"
+    );
+    assert!(
+        cache.current_bytes() <= max_cache_bytes,
+        "shared page cache must remain within global cap after many active spool writes: {} > {}",
+        cache.current_bytes(),
+        max_cache_bytes
+    );
 }
 
 // ---------------------------------------------------------------------------

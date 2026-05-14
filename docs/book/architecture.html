@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c0ea6e57.js";
+            window.path_to_searchindex_js = "searchindex-6910c41b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-953381c0.js"></script>
@@ -178,10 +178,10 @@
 <p>BOBS is built on a high-performance, asynchronous foundation.</p>
 <h3 id="internal-components"><a class="header" href="#internal-components">Internal Components</a></h3>
 <ul>
-<li><strong>Spool</strong>: The core entity representing a data stream. It contains metadata, a page cache, a write buffer, and handles synchronization between the writer and readers.</li>
-<li><strong>FileIO</strong>: An abstraction for asynchronous disk I/O. The default implementation uses Tokio’s file system tasks, but it’s designed to support future high-performance backends like <code>io_uring</code>.</li>
+<li><strong>Spool</strong>: The core entity representing a data stream. It contains metadata, a write buffer, and handles synchronization between the writer and readers.</li>
+<li><strong>FileIO</strong>: An abstraction for asynchronous disk I/O. The default high-performance implementation, <code>TokioFileIO</code>, is currently Unix-only: it stores an <code>Arc&lt;std::fs::File&gt;</code>, opens files through <code>std::fs::OpenOptions</code> on Tokio blocking tasks, and performs reads and writes with Unix positional file APIs (<code>FileExt::read_at</code> / <code>write_at</code>, <code>pread</code>/<code>pwrite</code> style) so concurrent operations do not share a file cursor. Writes loop until the owned <code>Bytes</code> buffer has been fully accepted, and <code>/complete</code> durability is preserved with <code>File::sync_data</code> on a blocking task. Non-Unix builds are compile-gated until an explicit positional backend is added for those platforms.</li>
 <li><strong>SpoolManager</strong>: A central registry (using <code>DashMap</code>) that tracks all active spools. It uses <code>redb</code> for lightweight persistence of lifecycle metadata, allowing the service to recover state after a BOBS process restart.</li>
-<li><strong>Page Cache</strong>: A per-spool LRU-like cache that minimizes disk reads for hot data being consumed immediately after it’s written. Capacity is derived from <code>max_cache_bytes / page_size</code>.</li>
+<li><strong>Page Cache</strong>: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it’s written. Entries are keyed by <code>(spool_key, page_idx)</code>, and <code>max_cache_bytes</code> is the total cache budget across all spools. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching; pages larger than the byte cap are valid but bypass the cache.</li>
 </ul>
 <h3 id="data-flow"><a class="header" href="#data-flow">Data Flow</a></h3>
 <ol>

@@ -52,7 +52,7 @@ impl<F: FileIO> Spool<F> {
 
             {
                 let mut cache = self.page_cache.lock().await;
-                cache.insert(page_idx, page_data);
+                cache.insert(&self.key, page_idx, page_data);
             }
         }
 
@@ -147,6 +147,7 @@ mod tests {
     use crate::io::{FileIO, TokioFileIO};
     use crate::manager::SpoolManager;
     use crate::spool::types::SpoolMetadata;
+    use bytes::Bytes;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
@@ -175,7 +176,7 @@ mod tests {
         fn write_at(
             handle: &Self::Handle,
             offset: u64,
-            data: &[u8],
+            data: Bytes,
         ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
             COUNTING_WRITE_AT_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
             TokioFileIO::write_at(handle, offset, data)
@@ -184,15 +185,71 @@ mod tests {
         fn read_at(
             handle: &Self::Handle,
             offset: u64,
-            buf: &mut [u8],
-        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
-            TokioFileIO::read_at(handle, offset, buf)
+            len: usize,
+        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+            TokioFileIO::read_at(handle, offset, len)
         }
 
         fn sync_data(
             handle: &Self::Handle,
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
             TokioFileIO::sync_data(handle)
+        }
+
+        fn close(
+            handle: Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::close(handle)
+        }
+
+        fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::remove(path)
+        }
+    }
+
+    #[derive(Clone)]
+    struct SyncFailingFileIO;
+
+    impl FileIO for SyncFailingFileIO {
+        type Handle = <TokioFileIO as FileIO>::Handle;
+
+        fn create(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::create(path)
+        }
+
+        fn open(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::open(path)
+        }
+
+        fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: Bytes,
+        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
+            TokioFileIO::write_at(handle, offset, data)
+        }
+
+        fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+            TokioFileIO::read_at(handle, offset, len)
+        }
+
+        fn sync_data(
+            _handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            async move {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected sync failure",
+                ))
+            }
         }
 
         fn close(
@@ -236,8 +293,105 @@ mod tests {
             final_page_size: None,
             data_path: path,
         };
+        let payload = serde_json::to_vec(&meta).expect("serialize initial metadata");
+        {
+            let write_txn = db.begin_write().expect("begin write");
+            {
+                let mut table = write_txn
+                    .open_table(crate::manager::SPOOL_TABLE)
+                    .expect("open table");
+                table
+                    .insert(meta.key.as_str(), payload.as_slice())
+                    .expect("insert initial metadata");
+            }
+            write_txn.commit().expect("commit");
+        }
 
-        Spool::new(meta, handle, page_size, 256, db).await
+        Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            db,
+        )
+        .await
+    }
+
+    fn persisted_metadata<F: FileIO>(spool: &Spool<F>) -> SpoolMetadata {
+        let read_txn = spool.db.begin_read().expect("begin read");
+        let table = read_txn
+            .open_table(crate::manager::SPOOL_TABLE)
+            .expect("open table");
+        let raw = table
+            .get(spool.key.as_str())
+            .expect("read metadata")
+            .expect("metadata exists")
+            .value()
+            .to_vec();
+        serde_json::from_slice(&raw).expect("deserialize metadata")
+    }
+
+    async fn make_sync_failing_spool(
+        dir: &std::path::Path,
+        page_size: usize,
+    ) -> Spool<SyncFailingFileIO> {
+        let path = dir.join("spool.dat");
+        let db_path = dir.join("test-sync-failing.redb");
+        let db = Arc::new(redb::Database::create(&db_path).expect("create test db"));
+        {
+            let write_txn = db.begin_write().expect("begin write");
+            {
+                let _ = write_txn
+                    .open_table(crate::manager::SPOOL_TABLE)
+                    .expect("open table");
+            }
+            write_txn.commit().expect("commit");
+        }
+        let handle = SyncFailingFileIO::create(&path)
+            .await
+            .expect("create spool file");
+        let meta = SpoolMetadata {
+            key: "test-key".to_string(),
+            content_type: None,
+            content_encoding: None,
+            state: SpoolState::Writing,
+            write_locked: false,
+            created_at: 0,
+            last_write_at: 0,
+            last_read_at: None,
+            readable_at: None,
+            total_bytes_written: 0,
+            checksum_crc32c: None,
+            total_pages: 0,
+            final_page_size: None,
+            data_path: path,
+        };
+        let payload = serde_json::to_vec(&meta).expect("serialize initial metadata");
+        {
+            let write_txn = db.begin_write().expect("begin write");
+            {
+                let mut table = write_txn
+                    .open_table(crate::manager::SPOOL_TABLE)
+                    .expect("open table");
+                table
+                    .insert(meta.key.as_str(), payload.as_slice())
+                    .expect("insert initial metadata");
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            db,
+        )
+        .await
     }
 
     async fn make_counting_spool(dir: &std::path::Path, page_size: usize) -> Spool<CountingFileIO> {
@@ -272,8 +426,30 @@ mod tests {
             final_page_size: None,
             data_path: path,
         };
+        let payload = serde_json::to_vec(&meta).expect("serialize initial metadata");
+        {
+            let write_txn = db.begin_write().expect("begin write");
+            {
+                let mut table = write_txn
+                    .open_table(crate::manager::SPOOL_TABLE)
+                    .expect("open table");
+                table
+                    .insert(meta.key.as_str(), payload.as_slice())
+                    .expect("insert initial metadata");
+            }
+            write_txn.commit().expect("commit");
+        }
 
-        Spool::new(meta, handle, page_size, 256, db).await
+        Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            db,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -300,7 +476,7 @@ mod tests {
         drop(meta);
 
         let cache = spool.page_cache.lock().await;
-        let page = cache.get(0).expect("partial page cached");
+        let page = cache.get(&spool.key, 0).expect("partial page cached");
         assert_eq!(page.len(), 1000);
         assert_eq!(page.as_ref(), partial_data.as_slice());
     }
@@ -312,7 +488,10 @@ mod tests {
 
         COUNTING_WRITE_AT_CALLS.store(0, AtomicOrdering::SeqCst);
         let partial_data = vec![0xABu8; 1000];
-        spool.write(0, &partial_data).await.expect("write succeeds");
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&partial_data))
+            .await
+            .expect("write succeeds");
         assert_eq!(
             COUNTING_WRITE_AT_CALLS.load(AtomicOrdering::SeqCst),
             1,
@@ -338,6 +517,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_complete_syncs_then_persists_final_partial_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        let partial_data = vec![0xD5u8; 777];
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&partial_data))
+            .await
+            .expect("write succeeds");
+
+        let before = persisted_metadata(&spool);
+        assert_eq!(before.state, SpoolState::Writing);
+        assert_eq!(before.total_pages, 0);
+        assert_eq!(before.final_page_size, None);
+
+        spool
+            .complete(Some(partial_data.len() as u64))
+            .await
+            .expect("complete succeeds");
+
+        let cached = {
+            let cache = spool.page_cache.lock().await;
+            cache.get(&spool.key, 0).expect("final partial page cached")
+        };
+        assert_eq!(cached.as_ref(), partial_data.as_slice());
+
+        let persisted = persisted_metadata(&spool);
+        assert_eq!(persisted.state, SpoolState::Complete);
+        assert_eq!(persisted.total_bytes_written, partial_data.len() as u64);
+        assert_eq!(persisted.total_pages, 1);
+        assert_eq!(persisted.final_page_size, Some(partial_data.len() as u64));
+        assert_eq!(
+            persisted.checksum_crc32c,
+            Some(crc32c::crc32c(&partial_data))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complete_does_not_persist_final_metadata_if_sync_data_fails() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_sync_failing_spool(dir.path(), 4096).await;
+        let partial_data = vec![0xE6u8; 333];
+
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&partial_data))
+            .await
+            .expect("write succeeds");
+
+        let result = spool.complete(Some(partial_data.len() as u64)).await;
+        assert!(matches!(result, Err(BobsError::IoError(_))));
+
+        let cached = {
+            let cache = spool.page_cache.lock().await;
+            cache
+                .get(&spool.key, 0)
+                .expect("final partial page is published before sync")
+        };
+        assert_eq!(cached.as_ref(), partial_data.as_slice());
+
+        let persisted = persisted_metadata(&spool);
+        assert_eq!(persisted.state, SpoolState::Writing);
+        assert_eq!(persisted.total_pages, 0);
+        assert_eq!(persisted.final_page_size, None);
+        assert_eq!(persisted.checksum_crc32c, None);
+    }
+
+    #[tokio::test]
     async fn test_complete_with_partial_page_survives_restart() {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("spools.redb");
@@ -355,7 +601,10 @@ mod tests {
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
-            spool.write(0, &data).await.expect("write succeeds");
+            spool
+                .write(0, bytes::Bytes::copy_from_slice(&data))
+                .await
+                .expect("write succeeds");
             spool
                 .complete(Some(data.len() as u64))
                 .await
@@ -416,7 +665,10 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = vec![0xBBu8; 2000];
-        spool.write(0, &data).await.expect("write succeeds");
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&data))
+            .await
+            .expect("write succeeds");
 
         let result = spool.complete(Some(9999)).await;
         assert!(result.is_err());
@@ -435,7 +687,10 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = vec![0xCCu8; 500];
-        spool.write(0, &data).await.expect("write succeeds");
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&data))
+            .await
+            .expect("write succeeds");
 
         spool
             .complete(Some(500))

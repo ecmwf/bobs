@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c0ea6e57.js";
+            window.path_to_searchindex_js = "searchindex-6910c41b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-953381c0.js"></script>
@@ -203,8 +203,8 @@ docker run --rm bobs:bench bobs-benchmark --help
 host: 127.0.0.1
 port: 3000
 data_dir: /tmp/bobs-bench-data
-page_size: 1048576
-max_cache_bytes: 268435456
+page_size: 4096
+max_cache_bytes: 1048576
 host_prefix: bobs
 route_name: download
 domain: 127.0.0.1:3000
@@ -243,8 +243,8 @@ cargo run --release --bin bobs-benchmark -- \
   --delete-after-read
 </code></pre>
 <h2 id="page-size-comparison"><a class="header" href="#page-size-comparison">Page size comparison</a></h2>
-<p>Keep the runtime default at <code>4096</code> unless benchmark evidence says otherwise. Wider pages can reduce per-page overhead and may improve throughput, especially after removal of write-hot-path metadata commits. They also delay reader visibility until a full page is available and reduce the effective cache page count unless <code>max_cache_bytes</code> is increased.</p>
-<p>Compare at least the default, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The example below keeps roughly 256 pages in cache for each run by setting <code>max_cache_bytes = page_size * 256</code>.</p>
+<p>Keep the runtime default at <code>4096</code> unless benchmark evidence says otherwise. Wider pages can reduce per-page overhead and may improve throughput, especially after removal of write-hot-path metadata commits. They also delay reader visibility until a full page is available and consume more of the global cache budget per cached page, so cache reach may fall unless <code>max_cache_bytes</code> is increased. <code>page_size</code> may be larger than <code>max_cache_bytes</code>; oversized pages simply bypass the cache.</p>
+<p>Compare at least the default, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The example below uses a global cache budget sized to hold roughly 256 pages for each run, if the workload and eviction order allow.</p>
 <p>Start one BOBS server per page size, run the matching benchmark, then stop the server before moving to the next size:</p>
 <pre><code class="language-bash"># 4 KiB default-page run
 cat &gt;/tmp/bobs-bench-4096.yaml &lt;&lt;'YAML'
