@@ -113,6 +113,10 @@ curl -X DELETE http://localhost:3000/api/v1/delete/unique-spool-key
 curl http://localhost:3000/api/v1/health
 ```
 
+## Standalone benchmark
+
+For direct BOBS throughput validation, see the mdBook page: `docs/src/standalone-benchmark.md`.
+
 ## Configuration
 
 BOBS is configured via a YAML file passed as a CLI argument. All fields have sensible defaults — a partial file is fine, missing fields use defaults.
