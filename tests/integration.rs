@@ -6,6 +6,7 @@ use bobs::http::{router, AppState};
 use bobs::io::TokioFileIO;
 use bobs::manager::SpoolManager;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -15,9 +16,35 @@ use tokio::task::JoinHandle;
 struct TestServer {
     base_url: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
     cleanup_handle: Option<JoinHandle<()>>,
-    _tmp: TempDir,
+    _tmp: Option<TempDir>,
+}
+
+impl TestServer {
+    async fn stop(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let mut handle = handle;
+            tokio::select! {
+                join_result = &mut handle => {
+                    let _ = join_result;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    // Graceful shutdown can wait for idle keep-alive clients;
+                    // aborting still simulates a process stop for restart tests.
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
+        }
+        if let Some(handle) = self.cleanup_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 impl Drop for TestServer {
@@ -25,7 +52,9 @@ impl Drop for TestServer {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        self.handle.abort();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
         if let Some(h) = self.cleanup_handle.take() {
             h.abort();
         }
@@ -61,8 +90,19 @@ async fn start_server() -> TestServer {
 /// expected TTL duration.
 async fn start_server_with_config(config: Arc<Config>) -> TestServer {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let db_path = tmp.path().join("spools.redb");
-    let data_dir = tmp.path().join("data");
+    let mut server = start_server_with_storage_root(Arc::clone(&config), tmp.path()).await;
+    server._tmp = Some(tmp);
+    server
+}
+
+/// Start a real TCP HTTP server using caller-owned storage.
+///
+/// This helper is used by restart tests: the caller owns `storage_root`, so the
+/// first server can be stopped and a second server can recover from the same
+/// redb database and data directory.
+async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path) -> TestServer {
+    let db_path = storage_root.join("spools.redb");
+    let data_dir = storage_root.join("data");
 
     let config = Arc::new(Config {
         data_dir: data_dir.clone(),
@@ -110,9 +150,9 @@ async fn start_server_with_config(config: Arc<Config>) -> TestServer {
     TestServer {
         base_url: format!("http://{}", addr),
         shutdown_tx: Some(tx),
-        handle,
+        handle: Some(handle),
         cleanup_handle,
-        _tmp: tmp,
+        _tmp: None,
     }
 }
 
@@ -126,6 +166,95 @@ async fn create_key(client: &reqwest::Client, base_url: &str, body: Option<Value
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let v: Value = resp.json().await.expect("create json");
     v["key"].as_str().expect("key str").to_string()
+}
+
+async fn assert_http_restart_continues_from_acknowledged_offset(
+    first_write: Vec<u8>,
+    second_write: Vec<u8>,
+) {
+    let storage_root = tempfile::tempdir().expect("create caller-owned storage root");
+    let config = Arc::new(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        data_dir: std::path::PathBuf::from("./data"),
+        page_size: 4096,
+        max_cache_bytes: 262144,
+        writer_inactivity_timeout_secs: 300,
+        read_idle_ttl_secs: 600,
+        full_read_complete_ttl_secs: 30,
+        reader_done_ttl_secs: 60,
+        unread_ttl_secs: 3600,
+        cleanup_sweep_interval_secs: 30,
+        long_poll_timeout_ms: 25000,
+        host_prefix: "test".into(),
+        domain: "example.com".into(),
+        route_name: "bobs".into(),
+    });
+
+    let client = reqwest::Client::new();
+    let first_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let key = create_key(&client, &first_server.base_url, None).await;
+
+    let write_resp = client
+        .post(format!("{}/api/v1/write/{}/0", first_server.base_url, key))
+        .body(first_write.clone())
+        .send()
+        .await
+        .expect("first write send");
+    assert_eq!(write_resp.status(), reqwest::StatusCode::OK);
+    drop(write_resp);
+
+    // Stop without calling /complete. A 200 OK from /write is the producer's
+    // acknowledgement; after restart it must be safe to continue at that offset.
+    first_server.stop().await;
+
+    let second_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let acknowledged_offset = first_write.len() as u64;
+    let continue_resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/write/{}/{}",
+            second_server.base_url, key, acknowledged_offset
+        ))
+        .body(second_write.clone())
+        .send()
+        .await
+        .expect("continued write send");
+    assert_eq!(continue_resp.status(), reqwest::StatusCode::OK);
+
+    let expected_len = first_write.len() + second_write.len();
+    let complete_resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/complete/{}",
+            second_server.base_url, key
+        ))
+        .json(&json!({ "expected_size": expected_len }))
+        .send()
+        .await
+        .expect("complete send");
+    assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
+
+    let read_resp = reqwest::Client::new()
+        .get(format!("{}/api/v1/read/{}", second_server.base_url, key))
+        .header("Range", format!("bytes=0-{}", expected_len - 1))
+        .send()
+        .await
+        .expect("read send");
+    assert_eq!(read_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+
+    let mut expected = first_write;
+    expected.extend_from_slice(&second_write);
+    let actual = read_resp.bytes().await.expect("read bytes");
+    assert_eq!(actual.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn test_http_restart_after_acknowledged_partial_page_write_allows_continue() {
+    let first_write: Vec<u8> = (0..(4096 + 123)).map(|i| (i % 251) as u8).collect();
+    let second_write: Vec<u8> = (0..5000).map(|i| (255 - (i % 251)) as u8).collect();
+
+    assert_http_restart_continues_from_acknowledged_offset(first_write, second_write).await;
 }
 
 #[tokio::test]

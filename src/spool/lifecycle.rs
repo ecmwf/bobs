@@ -15,9 +15,9 @@ fn now_secs() -> u64 {
 }
 
 impl<F: FileIO> Spool<F> {
-    /// Finalize the spool: flush any partial page in the write buffer to disk + cache,
-    /// fsync, and transition to Complete. Notifies all waiting readers so they can see
-    /// the final data and detect end-of-stream.
+    /// Finalize the spool: publish any trailing partial page already appended to
+    /// disk, fsync, and transition to Complete. Notifies all waiting readers so
+    /// they can see the final data and detect end-of-stream.
     pub async fn complete(&self, expected_size: Option<u64>) -> Result<()> {
         {
             let meta = self.metadata.lock().await;
@@ -27,6 +27,10 @@ impl<F: FileIO> Spool<F> {
         }
 
         // Drain the write buffer — this is the final (possibly partial) page.
+        // Spool::write has already appended these bytes to spool.dat; completion
+        // only publishes page metadata/cache so readers can observe the partial
+        // final page. Do not rewrite the page here: the disk append is the source
+        // of persistence.
         let partial_page = {
             let mut buf = self.write_buffer.lock().await;
             if buf.is_empty() {
@@ -38,32 +42,17 @@ impl<F: FileIO> Spool<F> {
 
         if let Some(page_data) = partial_page {
             let partial_size = page_data.len() as u64;
-
             let page_idx = {
-                let meta = self.metadata.lock().await;
-                meta.total_pages
+                let mut meta = self.metadata.lock().await;
+                let page_idx = meta.total_pages;
+                meta.total_pages += 1;
+                meta.final_page_size = Some(partial_size);
+                page_idx
             };
-            let file_offset = page_idx * self.page_size as u64;
-
-            {
-                let handle_guard = self.file_handle.lock().await;
-                let Some(handle) = handle_guard.as_ref() else {
-                    return Err(BobsError::WriterInactive);
-                };
-                F::write_at(handle, file_offset, &page_data)
-                    .await
-                    .map_err(BobsError::IoError)?;
-            }
 
             {
                 let mut cache = self.page_cache.lock().await;
                 cache.insert(page_idx, page_data);
-            }
-
-            {
-                let mut meta = self.metadata.lock().await;
-                meta.total_pages += 1;
-                meta.final_page_size = Some(partial_size);
             }
         }
 
@@ -156,9 +145,66 @@ impl<F: FileIO> Spool<F> {
 mod tests {
     use super::*;
     use crate::io::{FileIO, TokioFileIO};
+    use crate::manager::SpoolManager;
     use crate::spool::types::SpoolMetadata;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct CountingFileIO;
+
+    static COUNTING_WRITE_AT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    impl FileIO for CountingFileIO {
+        type Handle = <TokioFileIO as FileIO>::Handle;
+
+        fn create(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::create(path)
+        }
+
+        fn open(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::open(path)
+        }
+
+        fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: &[u8],
+        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
+            COUNTING_WRITE_AT_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+            TokioFileIO::write_at(handle, offset, data)
+        }
+
+        fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
+            TokioFileIO::read_at(handle, offset, buf)
+        }
+
+        fn sync_data(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_data(handle)
+        }
+
+        fn close(
+            handle: Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::close(handle)
+        }
+
+        fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::remove(path)
+        }
+    }
 
     async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
         let path = dir.join("spool.dat");
@@ -174,6 +220,42 @@ mod tests {
             write_txn.commit().expect("commit");
         }
         let handle = TokioFileIO::create(&path).await.expect("create spool file");
+        let meta = SpoolMetadata {
+            key: "test-key".to_string(),
+            content_type: None,
+            content_encoding: None,
+            state: SpoolState::Writing,
+            write_locked: false,
+            created_at: 0,
+            last_write_at: 0,
+            last_read_at: None,
+            readable_at: None,
+            total_bytes_written: 0,
+            checksum_crc32c: None,
+            total_pages: 0,
+            final_page_size: None,
+            data_path: path,
+        };
+
+        Spool::new(meta, handle, page_size, 256, db).await
+    }
+
+    async fn make_counting_spool(dir: &std::path::Path, page_size: usize) -> Spool<CountingFileIO> {
+        let path = dir.join("spool.dat");
+        let db_path = dir.join("test-counting.redb");
+        let db = Arc::new(redb::Database::create(&db_path).expect("create test db"));
+        {
+            let write_txn = db.begin_write().expect("begin write");
+            {
+                let _ = write_txn
+                    .open_table(crate::manager::SPOOL_TABLE)
+                    .expect("open table");
+            }
+            write_txn.commit().expect("commit");
+        }
+        let handle = CountingFileIO::create(&path)
+            .await
+            .expect("create spool file");
         let meta = SpoolMetadata {
             key: "test-key".to_string(),
             content_type: None,
@@ -221,6 +303,96 @@ mod tests {
         let page = cache.get(0).expect("partial page cached");
         assert_eq!(page.len(), 1000);
         assert_eq!(page.as_ref(), partial_data.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_complete_publishes_partial_page_without_rewriting_it() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_counting_spool(dir.path(), 4096).await;
+
+        COUNTING_WRITE_AT_CALLS.store(0, AtomicOrdering::SeqCst);
+        let partial_data = vec![0xABu8; 1000];
+        spool.write(0, &partial_data).await.expect("write succeeds");
+        assert_eq!(
+            COUNTING_WRITE_AT_CALLS.load(AtomicOrdering::SeqCst),
+            1,
+            "initial write should append trailing partial bytes to disk"
+        );
+
+        spool.complete(None).await.expect("complete succeeds");
+
+        assert_eq!(
+            COUNTING_WRITE_AT_CALLS.load(AtomicOrdering::SeqCst),
+            1,
+            "complete must not rewrite the trailing partial page"
+        );
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.state, SpoolState::Complete);
+        assert_eq!(meta.total_pages, 1);
+        assert_eq!(meta.final_page_size, Some(1000));
+        drop(meta);
+
+        let got = spool.read_page(0).await.expect("read partial final page");
+        assert_eq!(got.as_deref(), Some(partial_data.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn test_complete_with_partial_page_survives_restart() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096;
+        let key = "partial-restart".to_string();
+        let data = vec![0x5Au8; page_size + 904];
+
+        {
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
+                    .expect("manager init");
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool.write(0, &data).await.expect("write succeeds");
+            spool
+                .complete(Some(data.len() as u64))
+                .await
+                .expect("complete succeeds");
+        }
+
+        let manager2 =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
+                .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.state, SpoolState::Complete);
+        assert_eq!(meta.total_bytes_written, data.len() as u64);
+        assert_eq!(meta.total_pages, 2);
+        assert_eq!(meta.final_page_size, Some(904));
+        assert_eq!(meta.checksum_crc32c, Some(crc32c::crc32c(&data)));
+        drop(meta);
+
+        let first = spool
+            .read_page(0)
+            .await
+            .expect("read first page")
+            .expect("first page present");
+        let final_partial = spool
+            .read_page(1)
+            .await
+            .expect("read final page")
+            .expect("final page present");
+        let end = spool.read_page(2).await.expect("read end marker");
+        assert!(end.is_none());
+
+        let mut read_back = Vec::new();
+        read_back.extend_from_slice(&first);
+        read_back.extend_from_slice(&final_partial);
+        assert_eq!(read_back, data);
     }
 
     #[tokio::test]

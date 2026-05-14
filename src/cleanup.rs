@@ -100,6 +100,8 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::io::TokioFileIO;
+    use crate::manager::SPOOL_TABLE;
+    use crate::spool::SpoolMetadata;
     use tempfile::tempdir;
 
     fn test_config() -> Arc<Config> {
@@ -130,6 +132,36 @@ mod tests {
             SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
                 .expect("manager init"),
         )
+    }
+
+    fn rewrite_persisted_metadata<F: FileIO>(
+        manager: &SpoolManager<F>,
+        key: &str,
+        mutate: impl FnOnce(&mut SpoolMetadata),
+    ) {
+        let read_txn = manager.db.begin_read().expect("begin read");
+        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
+        let raw = table
+            .get(key)
+            .expect("read metadata")
+            .expect("metadata exists")
+            .value()
+            .to_vec();
+        drop(table);
+        drop(read_txn);
+
+        let mut meta: SpoolMetadata = serde_json::from_slice(&raw).expect("deserialize metadata");
+        mutate(&mut meta);
+        let payload = serde_json::to_vec(&meta).expect("serialize metadata");
+
+        let write_txn = manager.db.begin_write().expect("begin write");
+        {
+            let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
+            table
+                .insert(key, payload.as_slice())
+                .expect("rewrite metadata");
+        }
+        write_txn.commit().expect("commit metadata rewrite");
     }
 
     // -----------------------------------------------------------------------
@@ -164,6 +196,114 @@ mod tests {
         assert!(
             manager.get_spool(&key).is_none(),
             "inactive writer should be cleaned up"
+        );
+        task.abort();
+    }
+
+    /// Recovery must seed in-progress spools with a fresh in-memory last_write_at.
+    /// Persisted metadata is only final lifecycle state; its write timestamp may be
+    /// stale, so cleanup must not delete a recovered writer on the first sweep solely
+    /// because the redb timestamp is old.
+    #[tokio::test]
+    async fn test_recovered_in_progress_stale_last_write_survives_first_cleanup() {
+        tokio::time::pause();
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let config = test_config();
+        let key = uuid::Uuid::new_v4().to_string();
+
+        {
+            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+                .expect("manager init");
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool.write(0, &[0xAA; 4096]).await.expect("write page");
+
+            rewrite_persisted_metadata(&manager, &key, |meta| {
+                meta.state = SpoolState::Writing;
+                meta.last_write_at = 0;
+            });
+        }
+
+        let manager = Arc::new(
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+                .expect("manager init after restart"),
+        );
+        manager.recover().await.expect("recover");
+        let spool = manager.get_spool(&key).expect("recovered spool exists");
+        assert!(
+            spool.metadata.lock().await.last_write_at > 0,
+            "recovery must replace stale persisted last_write_at with a fresh in-memory value"
+        );
+
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_some(),
+            "freshly recovered in-progress spool must survive the first cleanup sweep"
+        );
+        task.abort();
+    }
+
+    /// Accepted post-recovery writes must refresh the same in-memory last_write_at
+    /// anchor used by writer-inactivity cleanup, independent of stale persisted
+    /// metadata.
+    #[tokio::test]
+    async fn test_post_recovery_write_refreshes_last_write_anchor() {
+        tokio::time::pause();
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let config = test_config();
+        let key = uuid::Uuid::new_v4().to_string();
+
+        {
+            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+                .expect("manager init");
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool.write(0, &[0xBB; 4096]).await.expect("write page");
+            rewrite_persisted_metadata(&manager, &key, |meta| meta.last_write_at = 0);
+        }
+
+        let manager = Arc::new(
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+                .expect("manager init after restart"),
+        );
+        manager.recover().await.expect("recover");
+        let spool = manager.get_spool(&key).expect("recovered spool exists");
+
+        {
+            let mut meta = spool.metadata.lock().await;
+            meta.last_write_at = 1;
+        }
+        spool
+            .write(4096, &[0xCC; 4096])
+            .await
+            .expect("post-recovery write succeeds");
+        assert!(
+            spool.metadata.lock().await.last_write_at > 1,
+            "accepted write must refresh in-memory last_write_at"
+        );
+
+        let task = start_cleanup_task(manager.clone(), config);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            manager.get_spool(&key).is_some(),
+            "recent post-recovery write must prevent writer-inactivity cleanup"
         );
         task.abort();
     }

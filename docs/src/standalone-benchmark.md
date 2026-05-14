@@ -10,6 +10,8 @@ The `bobs-benchmark` binary drives complete BOBS object lifecycles directly over
 
 Use it to validate BOBS itself before adding Polytope, ingress, or other clients to the path. Start local, then repeat the same workload from a container or Kubernetes pod.
 
+Persistence expectations for this benchmark match the BOBS contract: before `/complete`, recovery is required across a BOBS process restart, not across a node or storage crash. During `Writing` or `WriteLocked`, `spool.dat` is the source of truth and persisted `redb` byte metadata is advisory; `/write` must append accepted bytes to `spool.dat` through the kernel/file handle before returning, but does not force them to stable storage with `sync_data()`. Full pages become reader-visible as they are completed; trailing partial-page bytes may already be in `spool.dat` but remain invisible until more writes complete the page or `/complete` finalizes the spool. `/complete` is the durability boundary and keeps `sync_data()` before committing completion metadata.
+
 > Plain HTTP only: this first benchmark implementation accepts `http://` BOBS endpoints. `https://` support requires an approved dependency or feature change.
 
 ## Build
@@ -86,6 +88,86 @@ cargo run --release --bin bobs-benchmark -- \
   --object-bytes 1048576 \
   --delete-after-read
 ```
+
+## Page size comparison
+
+Keep the runtime default at `4096` unless benchmark evidence says otherwise. Wider pages can reduce per-page overhead and may improve throughput, especially after removal of write-hot-path metadata commits. They also delay reader visibility until a full page is available and reduce the effective cache page count unless `max_cache_bytes` is increased.
+
+Compare at least the default, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The example below keeps roughly 256 pages in cache for each run by setting `max_cache_bytes = page_size * 256`.
+
+Start one BOBS server per page size, run the matching benchmark, then stop the server before moving to the next size:
+
+```bash
+# 4 KiB default-page run
+cat >/tmp/bobs-bench-4096.yaml <<'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data-4096
+page_size: 4096
+max_cache_bytes: 1048576
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+rm -rf /tmp/bobs-bench-data-4096
+HOSTNAME=bobs-0 BOBS_INTERNAL_BASE_URL_TEMPLATE=http://127.0.0.1:3000/api/v1 \
+  cargo run --release --bin bobs -- /tmp/bobs-bench-4096.yaml
+```
+
+In another terminal:
+
+```bash
+cargo run --release --bin bobs-benchmark -- \
+  --base-url http://127.0.0.1:3000 \
+  --objects 32 \
+  --object-bytes 67108864 \
+  --write-body-chunk-bytes 1048576 \
+  --read-body-chunk-bytes 1048576 \
+  --start-delay-ms 2000 \
+  --summary-json /tmp/bobs-summary-page-4096.json
+```
+
+Repeat with wider page configs and matching labels:
+
+```bash
+# 1 MiB pages
+cat >/tmp/bobs-bench-1m.yaml <<'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data-1m
+page_size: 1048576
+max_cache_bytes: 268435456
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+
+# 4 MiB pages
+cat >/tmp/bobs-bench-4m.yaml <<'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data-4m
+page_size: 4194304
+max_cache_bytes: 1073741824
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+
+# 16 MiB pages
+cat >/tmp/bobs-bench-16m.yaml <<'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data-16m
+page_size: 16777216
+max_cache_bytes: 4294967296
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+```
+
+For each config, start BOBS with that file and run the same benchmark command, changing only the summary path, for example `/tmp/bobs-summary-page-1m.json`, `/tmp/bobs-summary-page-4m.json`, or `/tmp/bobs-summary-page-16m.json`. Compare `write_active_mib_s`, `read_active_mib_s`, `wall_mib_s`, and `wait-to-read`/read timing percentiles from the `SUMMARY` output. If reader-latency percentiles regress, a throughput improvement may not be worth the wider page.
 
 ## Container validation
 

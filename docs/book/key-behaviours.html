@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1c6f0b4e.js";
+            window.path_to_searchindex_js = "searchindex-c0ea6e57.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-fd9758cf.js"></script>
+        <script src="toc-953381c0.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -177,20 +177,24 @@
                         <h1 id="key-behaviours"><a class="header" href="#key-behaviours">Key Behaviours</a></h1>
 <p>Understanding these internal behaviours is crucial for effectively using BOBS.</p>
 <h3 id="1-page-based-streaming"><a class="header" href="#1-page-based-streaming">1. Page-based Streaming</a></h3>
-<p>Data is organized into fixed-size pages (configured via <code>page_size</code>). A page is only visible to readers once it is completely full and flushed to disk. The final partial page is flushed only when the writer calls <code>/complete</code>. This ensures readers always receive consistent, non-torn data.</p>
+<p>Data is organized into fixed-size pages (configured via <code>page_size</code>, default <code>4096</code>). A successful <code>/write</code> has already accepted the bytes into <code>spool.dat</code> before it returns, including any trailing partial page. Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in <code>spool.dat</code> but are not visible to readers until more writes complete the page or the writer calls <code>/complete</code> to finalize the spool. This ensures readers always receive consistent, non-torn data.</p>
+<p>Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput now that writes no longer commit byte-derived metadata on the hot path, but they also delay reader visibility until that larger page is full. They also reduce the effective cache page count unless <code>max_cache_bytes</code> is increased alongside <code>page_size</code>. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.</p>
 <h3 id="2-long-poll-with-timeout"><a class="header" href="#2-long-poll-with-timeout">2. Long-poll with Timeout</a></h3>
 <p>When a reader requests data that hasn’t been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure (like Kubernetes Ingress or Load Balancers), BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>long_poll_timeout_ms</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
 <h3 id="3-follow-mode"><a class="header" href="#3-follow-mode">3. Follow Mode</a></h3>
 <p>A read request without a <code>Range</code> header enters follow mode from byte <code>0</code> (or from byte <code>X</code> with <code>Range: bytes=X-</code>). The server keeps the stream open and pushes new pages as they become available until the spool is finalized.</p>
 <h3 id="4-write-locked-mode"><a class="header" href="#4-write-locked-mode">4. Write-locked Mode</a></h3>
-<p>A spool can be created with <code>write_locked: true</code>. In this state, any attempt to read results in a <code>423 Locked</code> error until the writer calls <code>/complete</code>. This is useful for preventing consumers from seeing any data until the entire payload is successfully buffered.</p>
+<p>A spool can be created with <code>write_locked: true</code>. In this state, any attempt to read results in a <code>423 Locked</code> error until the writer calls <code>/complete</code> or otherwise makes the spool readable. This is useful for preventing consumers from seeing any data until the payload is ready for consumption.</p>
+<p>The write-locked/readable state is lifecycle metadata and is committed to <code>redb</code> when it changes. If BOBS restarts while the spool is still <code>WriteLocked</code> or <code>Writing</code>, byte-derived metadata in <code>redb</code> may be stale; recovery must inspect <code>spool.dat</code> to determine the current length, page counts, final page size, and running checksum.</p>
 <h3 id="5-parallel-reads"><a class="header" href="#5-parallel-reads">5. Parallel Reads</a></h3>
 <p>BOBS supports a single consumer opening multiple concurrent connections for the same spool. Each connection can request independent byte ranges. Read activity is tracked when bytes are actually served, so slow clients keep their spool alive while making progress but stalled connections do not protect a spool forever.</p>
 <h3 id="6-crc-32c-integrity"><a class="header" href="#6-crc-32c-integrity">6. CRC-32C Integrity</a></h3>
 <p>BOBS calculates a running CRC-32C checksum using hardware-accelerated instructions (where available) as data is written. Once a spool is complete, every read response includes the <code>X-Checksum-CRC32C</code> header containing the Base64-encoded checksum of the entire object. This allows clients to verify data integrity, which is especially important when reassembling parallel range reads.</p>
 <h3 id="7-sequential-writes"><a class="header" href="#7-sequential-writes">7. Sequential Writes</a></h3>
 <p>Writes must be strictly sequential. The <code>offset</code> provided in the <code>/write</code> request must exactly match the total number of bytes currently stored in the spool. Random-access writes or overwrites are not supported.</p>
-<h3 id="8-automatic-cleanup"><a class="header" href="#8-automatic-cleanup">8. Automatic Cleanup</a></h3>
+<p>A successful <code>/write</code> means BOBS accepted the bytes into <code>spool.dat</code> through the kernel/file handle before returning. It does not mean the data has been forced to stable storage with <code>sync_data()</code>: the in-progress spool contract is designed for BOBS process restart, where <code>spool.dat</code> can be reread, not for a node or storage crash before completion. <code>/complete</code> remains the durability boundary and keeps <code>sync_data()</code> before marking the spool complete in <code>redb</code>.</p>
+<h3 id="8-recovery-and-cleanup"><a class="header" href="#8-recovery-and-cleanup">8. Recovery and Cleanup</a></h3>
+<p>On restart, <code>redb</code> determines which spools exist and their lifecycle state: created, readable/write-locked, complete, or deleting. For in-progress <code>Writing</code> and <code>WriteLocked</code> spools, <code>spool.dat</code> is authoritative for byte state. Any persisted <code>total_bytes_written</code>, <code>total_pages</code>, <code>final_page_size</code>, or <code>checksum_crc32c</code> for those states is advisory only and recovery recomputes it from the file.</p>
 <p>A background task periodically sweeps the spool manager and deletes spools based on three triggers:</p>
 <ul>
 <li><strong>Writer Inactivity</strong>: The producer stopped writing without completing the spool.</li>

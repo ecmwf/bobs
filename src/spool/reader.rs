@@ -34,8 +34,16 @@ impl<F: FileIO> Spool<F> {
             {
                 let meta = self.metadata.lock().await;
                 if page_idx < meta.total_pages {
+                    let is_final_partial =
+                        matches!(meta.state, SpoolState::Complete | SpoolState::Deleting)
+                            && page_idx + 1 == meta.total_pages;
+                    let page_len = if is_final_partial {
+                        meta.final_page_size.unwrap_or(self.page_size as u64) as usize
+                    } else {
+                        self.page_size
+                    };
                     let file_offset = page_idx * self.page_size as u64;
-                    let mut disk_buf = vec![0u8; self.page_size];
+                    let mut disk_buf = vec![0u8; page_len];
                     let handle_guard = self.file_handle.lock().await;
                     let Some(handle) = handle_guard.as_ref() else {
                         return Err(BobsError::WriterInactive);
@@ -164,6 +172,100 @@ mod tests {
 
         let got = spool.read_page(0).await.expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(data)));
+    }
+
+    #[tokio::test]
+    async fn test_read_recovered_full_page_from_disk() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        let data = vec![0x42u8; 4096];
+        {
+            let handle_guard = spool.file_handle.lock().await;
+            let handle = handle_guard
+                .as_ref()
+                .expect("file handle should be active for disk read test");
+            TokioFileIO::write_at(handle, 0, &data)
+                .await
+                .expect("failed to write recovered full page to disk");
+            TokioFileIO::sync_data(handle)
+                .await
+                .expect("failed to sync test data");
+        }
+        {
+            let mut meta = spool.metadata.lock().await;
+            meta.total_bytes_written = data.len() as u64;
+            meta.total_pages = 1;
+            meta.final_page_size = None;
+            meta.state = SpoolState::Writing;
+        }
+
+        let got = spool.read_page(0).await.expect("read should succeed");
+        assert_eq!(got, Some(Bytes::from(data)));
+    }
+
+    #[tokio::test]
+    async fn test_recovered_trailing_partial_not_returned_before_complete() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        let partial = vec![0x55u8; 1000];
+        {
+            let handle_guard = spool.file_handle.lock().await;
+            let handle = handle_guard
+                .as_ref()
+                .expect("file handle should be active for disk read test");
+            TokioFileIO::write_at(handle, 0, &partial)
+                .await
+                .expect("failed to write recovered partial to disk");
+            TokioFileIO::sync_data(handle)
+                .await
+                .expect("failed to sync test data");
+        }
+        {
+            let mut meta = spool.metadata.lock().await;
+            meta.total_bytes_written = partial.len() as u64;
+            meta.total_pages = 0;
+            meta.final_page_size = None;
+            meta.state = SpoolState::Writing;
+        }
+
+        let result =
+            tokio::time::timeout(tokio::time::Duration::from_millis(50), spool.read_page(0)).await;
+        assert!(
+            result.is_err(),
+            "recovered trailing partial must long-poll before complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovered_trailing_partial_returned_after_complete() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        let partial = vec![0x66u8; 1000];
+        {
+            let handle_guard = spool.file_handle.lock().await;
+            let handle = handle_guard
+                .as_ref()
+                .expect("file handle should be active for disk read test");
+            TokioFileIO::write_at(handle, 0, &partial)
+                .await
+                .expect("failed to write recovered partial to disk");
+            TokioFileIO::sync_data(handle)
+                .await
+                .expect("failed to sync test data");
+        }
+        {
+            let mut meta = spool.metadata.lock().await;
+            meta.total_bytes_written = partial.len() as u64;
+            meta.total_pages = 1;
+            meta.final_page_size = Some(partial.len() as u64);
+            meta.state = SpoolState::Complete;
+        }
+
+        let got = spool.read_page(0).await.expect("read should succeed");
+        assert_eq!(got, Some(Bytes::from(partial)));
     }
 
     #[tokio::test]

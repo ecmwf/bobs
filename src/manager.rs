@@ -256,13 +256,7 @@ impl<F: FileIO> SpoolManager<F> {
             let file_size = std::fs::metadata(&meta.data_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
-
-            let expected_full_pages_bytes = match meta.final_page_size {
-                Some(final_page_size) if meta.total_pages > 0 => {
-                    (meta.total_pages - 1) * self.page_size as u64 + final_page_size
-                }
-                _ => meta.total_pages * self.page_size as u64,
-            };
+            let mut trailing_partial_len = 0;
 
             // Backfill readable_at for spools that were persisted before this
             // field existed. Grants a full idle-TTL grace period after upgrade.
@@ -273,25 +267,46 @@ impl<F: FileIO> SpoolManager<F> {
                 metadata_corrected = true;
             }
 
-            if file_size < expected_full_pages_bytes {
-                let actual_full_pages = file_size / self.page_size as u64;
-                let trailing_bytes = file_size % self.page_size as u64;
-                tracing::warn!(
-                    key = %key,
-                    expected_pages = meta.total_pages,
-                    actual_pages = actual_full_pages,
-                    file_size = file_size,
-                    "disk file shorter than metadata, correcting"
-                );
-                meta.total_pages = actual_full_pages + u64::from(trailing_bytes > 0);
-                meta.total_bytes_written = file_size;
-                meta.final_page_size = if trailing_bytes > 0 {
-                    Some(trailing_bytes)
-                } else {
-                    None
+            if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
+                let progress = in_progress_progress_from_file(file_size, self.page_size);
+                trailing_partial_len = progress.trailing_partial_len;
+
+                if meta.total_bytes_written != progress.total_bytes_written
+                    || meta.total_pages != progress.total_pages
+                    || meta.final_page_size.is_some()
+                    || meta.checksum_crc32c.is_some()
+                {
+                    tracing::warn!(
+                        key = %key,
+                        file_size = file_size,
+                        total_pages = progress.total_pages,
+                        trailing_partial_len = trailing_partial_len,
+                        "recovery: deriving in-progress spool metadata from disk"
+                    );
+                    meta.total_bytes_written = progress.total_bytes_written;
+                    meta.total_pages = progress.total_pages;
+                    meta.final_page_size = None;
+                    meta.checksum_crc32c = None;
+                }
+            } else {
+                let expected_full_pages_bytes = match meta.final_page_size {
+                    Some(final_page_size) if meta.total_pages > 0 => {
+                        (meta.total_pages - 1) * self.page_size as u64 + final_page_size
+                    }
+                    _ => meta.total_pages * self.page_size as u64,
                 };
-                meta.checksum_crc32c = None;
-                metadata_corrected = true;
+
+                if file_size < expected_full_pages_bytes {
+                    tracing::warn!(
+                        key = %key,
+                        expected_pages = meta.total_pages,
+                        expected_bytes = expected_full_pages_bytes,
+                        file_size = file_size,
+                        "recovery: completed spool data file shorter than persisted logical size, discarding"
+                    );
+                    stale_keys.push(key);
+                    continue;
+                }
             }
 
             if metadata_corrected {
@@ -307,52 +322,14 @@ impl<F: FileIO> SpoolManager<F> {
                 write_txn.commit().map_err(storage)?;
             }
 
-            let crc = if meta.state == SpoolState::Complete {
+            let crc = if matches!(meta.state, SpoolState::Complete | SpoolState::Readable) {
                 if let Some(checksum) = meta.checksum_crc32c {
                     checksum
                 } else {
-                    let mut crc: u32 = 0;
-                    if meta.total_pages > 0 {
-                        for page_idx in 0..meta.total_pages {
-                            let offset = page_idx * self.page_size as u64;
-                            let read_size = if page_idx == meta.total_pages - 1 {
-                                meta.final_page_size
-                                    .map(|size| size as usize)
-                                    .unwrap_or(self.page_size)
-                            } else {
-                                self.page_size
-                            };
-                            let mut buf = vec![0u8; read_size];
-                            let n = F::read_at(&handle, offset, &mut buf)
-                                .await
-                                .map_err(BobsError::IoError)?;
-                            buf.truncate(n);
-                            crc = crc32c::crc32c_append(crc, &buf);
-                        }
-                    }
-                    crc
+                    crc32c_for_logical_size::<F>(&handle, meta.total_bytes_written).await?
                 }
             } else {
-                let mut crc: u32 = 0;
-                if meta.total_pages > 0 {
-                    for page_idx in 0..meta.total_pages {
-                        let offset = page_idx * self.page_size as u64;
-                        let read_size = if page_idx == meta.total_pages - 1 {
-                            meta.final_page_size
-                                .map(|size| size as usize)
-                                .unwrap_or(self.page_size)
-                        } else {
-                            self.page_size
-                        };
-                        let mut buf = vec![0u8; read_size];
-                        let n = F::read_at(&handle, offset, &mut buf)
-                            .await
-                            .map_err(BobsError::IoError)?;
-                        buf.truncate(n);
-                        crc = crc32c::crc32c_append(crc, &buf);
-                    }
-                }
-                crc
+                crc32c_for_logical_size::<F>(&handle, file_size).await?
             };
 
             // Capture fields needed for post-init before meta is moved.
@@ -370,6 +347,16 @@ impl<F: FileIO> SpoolManager<F> {
                 .await,
             );
             *spool.running_crc32c.lock().await = crc;
+
+            if trailing_partial_len > 0 {
+                let partial = read_exact_logical_range::<F>(
+                    &spool.file_handle,
+                    meta_total_bytes_for_init - trailing_partial_len,
+                    trailing_partial_len as usize,
+                )
+                .await?;
+                spool.write_buffer.lock().await.extend_from_slice(&partial);
+            }
 
             // Seed last_read_activity_at so recovered spools get a full
             // read_idle_ttl_secs grace period before cleanup can fire.
@@ -439,6 +426,75 @@ impl<F: FileIO> SpoolManager<F> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InProgressProgress {
+    total_bytes_written: u64,
+    total_pages: u64,
+    trailing_partial_len: u64,
+}
+
+fn in_progress_progress_from_file(file_size: u64, page_size: usize) -> InProgressProgress {
+    let page_size = page_size as u64;
+    InProgressProgress {
+        total_bytes_written: file_size,
+        total_pages: file_size / page_size,
+        trailing_partial_len: file_size % page_size,
+    }
+}
+
+async fn crc32c_for_logical_size<F: FileIO>(handle: &F::Handle, logical_size: u64) -> Result<u32> {
+    let mut crc = 0u32;
+    let mut offset = 0u64;
+    let mut remaining = logical_size;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = F::read_at(handle, offset, &mut buf[..want])
+            .await
+            .map_err(BobsError::IoError)?;
+        if n == 0 {
+            return Err(BobsError::IoError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("expected {logical_size} bytes while reconstructing CRC, got {offset}"),
+            )));
+        }
+        crc = crc32c::crc32c_append(crc, &buf[..n]);
+        offset += n as u64;
+        remaining -= n as u64;
+    }
+
+    Ok(crc)
+}
+
+async fn read_exact_logical_range<F: FileIO>(
+    file_handle: &Arc<tokio::sync::Mutex<Option<F::Handle>>>,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; len];
+    let mut filled = 0usize;
+    let handle_guard = file_handle.lock().await;
+    let Some(handle) = handle_guard.as_ref() else {
+        return Err(BobsError::WriterInactive);
+    };
+
+    while filled < len {
+        let n = F::read_at(handle, offset + filled as u64, &mut out[filled..])
+            .await
+            .map_err(BobsError::IoError)?;
+        if n == 0 {
+            return Err(BobsError::IoError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("expected {len} bytes while loading trailing partial page, got {filled}"),
+            )));
+        }
+        filled += n;
+    }
+
+    Ok(out)
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -451,6 +507,13 @@ mod tests {
     use super::*;
     use crate::io::TokioFileIO;
     use tempfile::tempdir;
+
+    fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {
+        let read_txn = manager.db.begin_read().expect("begin read");
+        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
+        let entry = table.get(key).expect("table get").expect("entry exists");
+        serde_json::from_slice(entry.value()).expect("deserialize metadata")
+    }
 
     #[tokio::test]
     async fn test_create_and_get() {
@@ -546,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metadata_persists_total_pages_after_write() {
+    async fn test_write_ack_leaves_redb_offsets_stale_until_complete() {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
@@ -561,19 +624,199 @@ mod tests {
             .expect("create spool");
 
         let spool = manager.get_spool(&key).expect("spool exists");
-        let data = vec![0x5Au8; 8192];
+        let data = vec![0x5Au8; 8192 + 123];
         spool.write(0, &data).await.expect("write succeeds");
 
-        let read_txn = manager.db.begin_read().expect("begin read");
-        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-        let entry = table
-            .get(key.as_str())
-            .expect("table get")
-            .expect("entry exists");
-        let raw = entry.value();
+        let in_memory = spool.metadata.lock().await.clone();
+        assert_eq!(in_memory.total_bytes_written, data.len() as u64);
+        assert_eq!(in_memory.total_pages, 2);
+        assert_eq!(in_memory.checksum_crc32c, None);
 
-        let persisted: SpoolMetadata = serde_json::from_slice(raw).expect("deserialize metadata");
-        assert_eq!(persisted.total_pages, 2);
+        let persisted = persisted_metadata(&manager, &key);
+        assert_eq!(persisted.total_bytes_written, 0);
+        assert_eq!(persisted.total_pages, 0);
+        assert_eq!(persisted.final_page_size, None);
+        assert_eq!(persisted.checksum_crc32c, None);
+        assert_eq!(persisted.state, SpoolState::Writing);
+
+        spool.complete(None).await.expect("complete succeeds");
+
+        let persisted = persisted_metadata(&manager, &key);
+        assert_eq!(persisted.total_bytes_written, data.len() as u64);
+        assert_eq!(persisted.total_pages, 3);
+        assert_eq!(persisted.final_page_size, Some(123));
+        assert_eq!(persisted.checksum_crc32c, Some(crc32c::crc32c(&data)));
+        assert_eq!(persisted.state, SpoolState::Complete);
+    }
+
+    #[tokio::test]
+    async fn test_ack_then_restart_recovers_consistent_in_progress_state_without_redb_update() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096usize;
+        let data = vec![0xA5u8; page_size * 2 + 777];
+
+        let key = {
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+                    .expect("manager init");
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool.write(0, &data).await.expect("write ack succeeds");
+
+            let persisted = persisted_metadata(&manager, &key);
+            assert_eq!(persisted.total_bytes_written, 0);
+            assert_eq!(persisted.total_pages, 0);
+            key
+        };
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+        let meta = spool.metadata.lock().await.clone();
+        assert_eq!(meta.state, SpoolState::Writing);
+        assert_eq!(meta.total_bytes_written, data.len() as u64);
+        assert_eq!(meta.total_pages, 2);
+        assert_eq!(meta.final_page_size, None);
+        assert_eq!(meta.checksum_crc32c, None);
+
+        let trailing = spool.write_buffer.lock().await.clone();
+        assert_eq!(trailing.as_ref(), &data[page_size * 2..]);
+        assert_eq!(
+            spool
+                .read_page(0)
+                .await
+                .expect("read page 0")
+                .unwrap()
+                .as_ref(),
+            &data[..page_size]
+        );
+        assert_eq!(
+            spool
+                .read_page(1)
+                .await
+                .expect("read page 1")
+                .unwrap()
+                .as_ref(),
+            &data[page_size..page_size * 2]
+        );
+
+        let persisted = persisted_metadata(&manager2, &key);
+        assert_eq!(persisted.total_bytes_written, 0);
+        assert_eq!(persisted.total_pages, 0);
+        assert_eq!(persisted.final_page_size, None);
+        assert_eq!(persisted.checksum_crc32c, None);
+    }
+
+    #[tokio::test]
+    async fn test_crc_equivalence_across_restart_and_append() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096usize;
+        let first = vec![0x10u8; page_size + 321];
+        let second = vec![0x20u8; page_size + 17];
+        let mut all = first.clone();
+        all.extend_from_slice(&second);
+
+        let (key, crc_before_restart) = {
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+                    .expect("manager init");
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool.write(0, &first).await.expect("write succeeds");
+            let crc = *spool.running_crc32c.lock().await;
+            assert_eq!(crc, crc32c::crc32c(&first));
+            (key, crc)
+        };
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+        assert_eq!(*spool.running_crc32c.lock().await, crc_before_restart);
+
+        spool
+            .write(first.len() as u64, &second)
+            .await
+            .expect("append after restart succeeds");
+        assert_eq!(*spool.running_crc32c.lock().await, crc32c::crc32c(&all));
+
+        spool.complete(None).await.expect("complete succeeds");
+        let persisted = persisted_metadata(&manager2, &key);
+        assert_eq!(persisted.checksum_crc32c, Some(crc32c::crc32c(&all)));
+    }
+
+    #[tokio::test]
+    async fn test_complete_durability_survives_restart_with_final_metadata_and_pages() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096usize;
+        let data = vec![0x3Cu8; page_size * 2 + 19];
+
+        let key = {
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+                    .expect("manager init");
+            let key = uuid::Uuid::new_v4().to_string();
+            manager
+                .create_spool(key.clone(), None, None, false)
+                .await
+                .expect("create spool");
+            let spool = manager.get_spool(&key).expect("spool exists");
+            spool.write(0, &data).await.expect("write succeeds");
+            spool
+                .complete(Some(data.len() as u64))
+                .await
+                .expect("complete succeeds");
+
+            let persisted = persisted_metadata(&manager, &key);
+            assert_eq!(persisted.state, SpoolState::Complete);
+            assert_eq!(persisted.total_bytes_written, data.len() as u64);
+            assert_eq!(persisted.total_pages, 3);
+            assert_eq!(persisted.final_page_size, Some(19));
+            assert_eq!(persisted.checksum_crc32c, Some(crc32c::crc32c(&data)));
+            key
+        };
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+        let spool = manager2.get_spool(&key).expect("recovered spool exists");
+
+        let meta = spool.metadata.lock().await.clone();
+        assert_eq!(meta.state, SpoolState::Complete);
+        assert_eq!(meta.total_bytes_written, data.len() as u64);
+        assert_eq!(meta.total_pages, 3);
+        assert_eq!(meta.final_page_size, Some(19));
+        assert_eq!(meta.checksum_crc32c, Some(crc32c::crc32c(&data)));
+
+        assert_eq!(
+            spool.read_page(0).await.expect("page 0").unwrap().as_ref(),
+            &data[..page_size]
+        );
+        assert_eq!(
+            spool.read_page(1).await.expect("page 1").unwrap().as_ref(),
+            &data[page_size..page_size * 2]
+        );
+        assert_eq!(
+            spool.read_page(2).await.expect("page 2").unwrap().as_ref(),
+            &data[page_size * 2..]
+        );
+        assert!(spool.read_page(3).await.expect("end of spool").is_none());
     }
 
     #[tokio::test]
@@ -635,6 +878,12 @@ mod tests {
         assert_eq!(meta.total_pages, 2);
         assert_eq!(meta.total_bytes_written, 8192);
         assert!(meta.final_page_size.is_none());
+        drop(meta);
+
+        let persisted = persisted_metadata(&manager2, &key);
+        assert_eq!(persisted.total_pages, 5);
+        assert_eq!(persisted.total_bytes_written, 5 * 4096);
+        assert_eq!(persisted.final_page_size, None);
     }
 
     #[tokio::test]
@@ -812,7 +1061,7 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        // Step 1: create and complete a spool normally (sets readable_at).
+        // Persist metadata for a completed spool with the current readable_at field.
         let key = {
             let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
                 .expect("manager init");
@@ -830,8 +1079,7 @@ mod tests {
             key
         };
 
-        // Step 2: overwrite the persisted metadata with readable_at = None,
-        // simulating an old metadata record written before this field existed.
+        // Rewrite persisted metadata to match records created before readable_at existed.
         {
             let db = Arc::new(redb::Database::create(&db_path).expect("open db"));
             let read_txn = db.begin_read().expect("begin read");
@@ -857,7 +1105,7 @@ mod tests {
             write_txn.commit().expect("commit");
         }
 
-        // Step 3: recover and verify readable_at is backfilled.
+        // Recovery backfills readable_at for both memory state and persisted metadata.
         let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
             .expect("manager2 init");
         manager2.recover().await.expect("recover should succeed");
@@ -887,7 +1135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recovery_preserves_partial_final_page() {
+    async fn test_recovery_discards_complete_spool_when_file_shorter_than_metadata() {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
@@ -941,10 +1189,113 @@ mod tests {
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
+        assert!(
+            manager2.get_spool(&key).is_none(),
+            "complete spool whose file is shorter than persisted logical size must not be recovered"
+        );
+
+        let read_txn = manager2.db.begin_read().expect("begin read");
+        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
+        assert!(
+            table.get(key.as_str()).expect("table get").is_none(),
+            "discarded corrupt spool metadata must be removed from redb"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_reconstructs_in_progress_partial_from_disk() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096usize;
+
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+            .expect("manager init");
+        let key = uuid::Uuid::new_v4().to_string();
+        let spool_dir = data_dir.join(&key);
+        let data_path = spool_dir.join("spool.dat");
+        std::fs::create_dir_all(&spool_dir).expect("create spool dir");
+
+        let mut disk_bytes = vec![0x11u8; page_size];
+        let trailing = vec![0x22u8; 904];
+        disk_bytes.extend_from_slice(&trailing);
+        std::fs::write(&data_path, &disk_bytes).expect("write spool file");
+
+        let meta = SpoolMetadata {
+            key: key.clone(),
+            content_type: None,
+            content_encoding: None,
+            state: SpoolState::Writing,
+            write_locked: false,
+            created_at: 0,
+            last_write_at: 0,
+            last_read_at: None,
+            readable_at: None,
+            total_bytes_written: 0,
+            checksum_crc32c: None,
+            total_pages: 0,
+            final_page_size: None,
+            data_path: data_path.clone(),
+        };
+        let payload = serde_json::to_vec(&meta).expect("serialize metadata");
+        let write_txn = manager.db.begin_write().expect("begin write");
+        {
+            let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
+            table
+                .insert(key.as_str(), payload.as_slice())
+                .expect("insert metadata");
+        }
+        write_txn.commit().expect("commit");
+        drop(manager);
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+
         let spool = manager2.get_spool(&key).expect("recovered spool exists");
         let meta = spool.metadata.lock().await;
-        assert_eq!(meta.total_pages, 2);
-        assert_eq!(meta.total_bytes_written, 5000);
-        assert_eq!(meta.final_page_size, Some(904));
+        assert_eq!(meta.total_bytes_written, disk_bytes.len() as u64);
+        assert_eq!(meta.total_pages, 1);
+        assert_eq!(meta.final_page_size, None);
+        assert_eq!(meta.checksum_crc32c, None);
+        drop(meta);
+
+        let buffer = spool.write_buffer.lock().await;
+        assert_eq!(buffer.len(), trailing.len());
+        assert_eq!(buffer.as_ref(), trailing.as_slice());
+        drop(buffer);
+
+        let crc = *spool.running_crc32c.lock().await;
+        assert_eq!(crc, crc32c::crc32c(&disk_bytes));
+
+        let read_txn = manager2.db.begin_read().expect("begin read");
+        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
+        let entry = table
+            .get(key.as_str())
+            .expect("table get")
+            .expect("entry exists");
+        let persisted: SpoolMetadata =
+            serde_json::from_slice(entry.value()).expect("deserialize persisted metadata");
+        assert_eq!(persisted.total_bytes_written, 0);
+        assert_eq!(persisted.total_pages, 0);
+        assert_eq!(persisted.final_page_size, None);
+        assert_eq!(persisted.last_write_at, 0);
+        drop(table);
+        drop(read_txn);
+
+        let completion = vec![0x33u8; page_size - trailing.len()];
+        spool
+            .write(disk_bytes.len() as u64, &completion)
+            .await
+            .expect("write completing recovered page succeeds");
+
+        let mut completed_page = vec![0u8; page_size];
+        completed_page[..trailing.len()].copy_from_slice(&trailing);
+        completed_page[trailing.len()..].copy_from_slice(&completion);
+        let on_disk = std::fs::read(&data_path).expect("read spool file");
+        assert_eq!(
+            &on_disk[page_size..page_size * 2],
+            completed_page.as_slice()
+        );
     }
 }

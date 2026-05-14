@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1c6f0b4e.js";
+            window.path_to_searchindex_js = "searchindex-c0ea6e57.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-fd9758cf.js"></script>
+        <script src="toc-953381c0.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -180,16 +180,26 @@
 <ul>
 <li><strong>Spool</strong>: The core entity representing a data stream. It contains metadata, a page cache, a write buffer, and handles synchronization between the writer and readers.</li>
 <li><strong>FileIO</strong>: An abstraction for asynchronous disk I/O. The default implementation uses Tokio’s file system tasks, but it’s designed to support future high-performance backends like <code>io_uring</code>.</li>
-<li><strong>SpoolManager</strong>: A central registry (using <code>DashMap</code>) that tracks all active spools. It uses <code>redb</code> for lightweight persistence of metadata, allowing the service to recover state after a restart.</li>
+<li><strong>SpoolManager</strong>: A central registry (using <code>DashMap</code>) that tracks all active spools. It uses <code>redb</code> for lightweight persistence of lifecycle metadata, allowing the service to recover state after a BOBS process restart.</li>
 <li><strong>Page Cache</strong>: A per-spool LRU-like cache that minimizes disk reads for hot data being consumed immediately after it’s written. Capacity is derived from <code>max_cache_bytes / page_size</code>.</li>
 </ul>
 <h3 id="data-flow"><a class="header" href="#data-flow">Data Flow</a></h3>
 <ol>
-<li><strong>Write</strong>: Data arrives via POST -&gt; written to a memory buffer -&gt; once a page is full, it’s pushed to the page cache and queued for disk write.</li>
-<li><strong>Notification</strong>: Once a page is flushed, any parked reader requests are notified.</li>
-<li><strong>Read</strong>: Reader requests a range -&gt; check page cache -&gt; if miss, read from disk -&gt; stream bytes to the HTTP response.</li>
+<li><strong>Write</strong>: Data arrives via POST -&gt; accepted bytes are appended to <code>spool.dat</code> through the kernel/file handle before <code>/write</code> returns. In-memory state tracks page assembly, but it is not the source of truth for accepted bytes.</li>
+<li><strong>Page visibility</strong>: Once enough accepted bytes form a complete page, that page becomes reader-visible, is added to the page cache, and any parked reader requests are notified.</li>
+<li><strong>Read</strong>: Reader requests a visible range -&gt; check page cache -&gt; if miss, read from <code>spool.dat</code> -&gt; stream bytes to the HTTP response. Trailing partial-page bytes may already be present in <code>spool.dat</code>, but they are not reader-visible until they become a complete page or <code>/complete</code> finalizes the spool.</li>
 <li><strong>Lifecycle</strong>: Spool moves from <code>Creating</code> -&gt; <code>Writing</code> (or <code>WriteLocked</code>) -&gt; <code>Complete</code> -&gt; <code>Deleting</code>.</li>
 </ol>
+<h3 id="persistence-contract"><a class="header" href="#persistence-contract">Persistence Contract</a></h3>
+<p>BOBS persists two things with different authority:</p>
+<ul>
+<li><code>redb</code> stores lifecycle metadata. Metadata is committed when a spool is created, completed, deleted, and when it transitions between write-locked and readable states.</li>
+<li><code>spool.dat</code> stores the bytes. For in-progress <code>Writing</code> and <code>WriteLocked</code> spools, <code>spool.dat</code> is the source of truth after a BOBS process restart.</li>
+</ul>
+<p>Ordinary writes deliberately do not update a <code>redb</code> high-water mark, and completed pages do not commit per-page metadata. Adding a mandatory per-write or per-page checkpoint would put <code>redb</code> back on the write hot path, which this design avoids.</p>
+<p>While a spool is still <code>Writing</code> or <code>WriteLocked</code>, persisted byte-derived metadata such as <code>total_bytes_written</code>, <code>total_pages</code>, <code>final_page_size</code>, and <code>checksum_crc32c</code> is advisory and may be stale. Recovery must derive those values from <code>spool.dat</code> rather than trusting <code>redb</code>: the logical accepted length comes from the data file length, page counts and partial-page state are reconstructed from that length, and the running CRC is recomputed by scanning the file bytes.</p>
+<p>The durability invariant is recovery from a BOBS process restart, not survival of a node or storage crash before <code>/complete</code>. A successful <code>/write</code> therefore requires the bytes to have been accepted by the kernel/file handle before the handler returns, but it does not require <code>sync_data()</code>. <code>/complete</code> is the durability boundary for a finished object and must keep <code>sync_data()</code> before committing the completed lifecycle metadata.</p>
+<p>If startup recovery time later becomes an operational concern, BOBS may add optional coarse-grained checkpoints. Such checkpoints must be an optimization only: they may be written periodically or at lifecycle transitions, but never per write or per completed page, and recovery correctness must not depend on them being present or current.</p>
 
                     </main>
 

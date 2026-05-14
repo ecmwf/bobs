@@ -142,11 +142,11 @@ async fn write_spool<F: FileIO>(
         .get_spool(&key)
         .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
 
-    // Batch incoming body frames into page-sized writes. `spool.write` does a
-    // redb metadata commit per call, so writing each HTTP/2 DATA frame directly
-    // would be expensive; buffering the whole request body would make memory
-    // scale with the client chunk size. Page-sized batches keep the write path
-    // bounded while preserving BOBS's page-at-a-time persistence model.
+    // Batch incoming body frames into page-sized writes. Each `spool.write`
+    // appends accepted bytes to spool.dat before acknowledging them; batching
+    // avoids excessive small writes without buffering the whole request body.
+    // Page-sized batches keep the write path bounded while preserving BOBS's
+    // page-at-a-time reader notification model.
     let write_batch_size = state.config.page_size;
     let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
     let mut write_offset = offset;
@@ -238,15 +238,28 @@ async fn read_spool<F: FileIO + 'static>(
     };
     let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
     let page_size = spool.page_size as u64;
-    let (content_type, content_encoding, checksum_crc32c, complete_size, total_bytes_written) = {
+    let (
+        content_type,
+        content_encoding,
+        checksum_crc32c,
+        complete_size,
+        total_bytes_written,
+        servable_bytes,
+    ) = {
         let meta = spool.metadata.lock().await;
-        let complete_size = if matches!(
+        let is_complete = matches!(
             meta.state,
             crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting
-        ) {
+        );
+        let complete_size = if is_complete {
             Some(meta.total_bytes_written)
         } else {
             None
+        };
+        let servable_bytes = if is_complete {
+            meta.total_bytes_written
+        } else {
+            meta.total_pages * page_size
         };
         (
             meta.content_type.clone(),
@@ -254,6 +267,7 @@ async fn read_spool<F: FileIO + 'static>(
             meta.checksum_crc32c,
             complete_size,
             meta.total_bytes_written,
+            servable_bytes,
         )
     };
     let (start, end, follow) = match request_range {
@@ -265,12 +279,18 @@ async fn read_spool<F: FileIO + 'static>(
             start,
             end_inclusive,
         } => {
-            let end = match end_inclusive {
-                Some(end_inclusive) => Some(end_inclusive.checked_add(1).ok_or_else(|| {
+            let requested_end = match end_inclusive {
+                Some(end_inclusive) => end_inclusive.checked_add(1).ok_or_else(|| {
                     ApiError(BobsError::InvalidRange("range end overflow".into()))
-                })?),
-                None => Some(total_bytes_written),
+                })?,
+                None => total_bytes_written,
             };
+            // Bounded range responses must only advertise bytes that this
+            // response can actually serve. For in-progress spools, recovered or
+            // freshly written trailing partial bytes contribute to offset
+            // validation (`total_bytes_written`) but are not servable until the
+            // page is completed or the spool is completed.
+            let end = Some(requested_end.min(servable_bytes));
             (start, end, false)
         }
     };
@@ -284,9 +304,9 @@ async fn read_spool<F: FileIO + 'static>(
         }
     }
 
-    if !follow && start >= total_bytes_written {
+    if !follow && start >= servable_bytes {
         return Err(ApiError(BobsError::InvalidRange(
-            "range start exceeds available bytes".into(),
+            "range start exceeds servable bytes".into(),
         )));
     }
 
@@ -1055,6 +1075,74 @@ mod tests {
                 .and_then(|h| h.to_str().ok()),
             Some("bytes 4096-8191/*")
         );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_range_does_not_advertise_unservable_trailing_partial() {
+        let app = app().await;
+        let key = create_key(&app).await;
+        let data = vec![9u8; 5000];
+
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(data))
+            .expect("request build");
+        let write_resp = app.clone().oneshot(write_req).await.expect("oneshot");
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let read_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=0-4999")
+            .body(Body::empty())
+            .expect("request build");
+        let read_resp = app.clone().oneshot(read_req).await.expect("oneshot");
+        assert_eq!(read_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            read_resp
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|h| h.to_str().ok()),
+            Some("4096")
+        );
+        assert_eq!(
+            read_resp
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .and_then(|h| h.to_str().ok()),
+            Some("bytes 0-4095/*")
+        );
+        let body = read_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("drain response body")
+            .to_bytes();
+        assert_eq!(body.len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn test_bounded_range_rejects_only_unservable_trailing_partial() {
+        let app = app().await;
+        let key = create_key(&app).await;
+
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(vec![7u8; 1000]))
+            .expect("request build");
+        let write_resp = app.clone().oneshot(write_req).await.expect("oneshot");
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let read_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=0-999")
+            .body(Body::empty())
+            .expect("request build");
+        let read_resp = app.oneshot(read_req).await.expect("oneshot");
+        assert_eq!(read_resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
