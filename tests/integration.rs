@@ -3,8 +3,13 @@ use base64::Engine;
 use bobs::cleanup::start_cleanup_task;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
-use bobs::io::TokioFileIO;
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+use bobs::io::UringFileIO;
+use bobs::io::{DefaultFileIO, TokioFileIO};
 use bobs::manager::SpoolManager;
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+use bobs::metadata::UringSidecarMetadataStore;
+use bobs::metadata::{DefaultMetadataStore, SyncSidecarMetadataStore};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +21,7 @@ use tokio::task::JoinHandle;
 
 struct TestServer {
     base_url: String,
-    manager: Arc<SpoolManager<TokioFileIO>>,
+    manager: Arc<SpoolManager<DefaultFileIO, DefaultMetadataStore>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<()>>,
     cleanup_handle: Option<JoinHandle<()>>,
@@ -49,6 +54,20 @@ impl TestServer {
     }
 }
 
+#[test]
+fn test_helpers_can_name_explicit_backend_managers() {
+    fn accepts_manager<F, M>()
+    where
+        F: bobs::io::FileIO,
+        M: bobs::metadata::MetadataStore + Clone + Send + Sync + 'static,
+    {
+    }
+
+    accepts_manager::<TokioFileIO, SyncSidecarMetadataStore>();
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    accepts_manager::<UringFileIO, UringSidecarMetadataStore>();
+}
+
 impl Drop for TestServer {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
@@ -77,6 +96,7 @@ async fn start_server() -> TestServer {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -101,9 +121,8 @@ async fn start_server_with_config(config: Arc<Config>) -> TestServer {
 ///
 /// This helper is used by restart tests: the caller owns `storage_root`, so the
 /// first server can be stopped and a second server can recover from the same
-/// redb database and data directory.
+/// sidecar metadata and data directory.
 async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path) -> TestServer {
-    let db_path = storage_root.join("spools.redb");
     let data_dir = storage_root.join("data");
 
     let config = Arc::new(Config {
@@ -112,8 +131,8 @@ async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path
     });
 
     let manager = Arc::new(
-        SpoolManager::<TokioFileIO>::new(
-            &db_path,
+        SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+            DefaultMetadataStore::new(&data_dir),
             &data_dir,
             config.page_size,
             config.max_cache_bytes,
@@ -129,7 +148,8 @@ async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
     });
-    let app: Router = router::<TokioFileIO>().with_state(Arc::clone(&state));
+    let app: Router =
+        router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -189,6 +209,7 @@ async fn assert_http_restart_continues_from_acknowledged_offset(
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -253,11 +274,151 @@ async fn assert_http_restart_continues_from_acknowledged_offset(
 }
 
 #[tokio::test]
-async fn test_http_restart_after_acknowledged_partial_page_write_allows_continue() {
+async fn test_http_restart_after_acknowledged_full_pages_write_allows_continue() {
+    let first_write: Vec<u8> = (0..(4096 * 2)).map(|i| (i % 251) as u8).collect();
+    let second_write: Vec<u8> = (0..4096).map(|i| (255 - (i % 251)) as u8).collect();
+
+    assert_http_restart_continues_from_acknowledged_offset(first_write, second_write).await;
+}
+
+#[tokio::test]
+async fn test_http_restart_after_acknowledged_trailing_partial_page_write_allows_continue() {
     let first_write: Vec<u8> = (0..(4096 + 123)).map(|i| (i % 251) as u8).collect();
     let second_write: Vec<u8> = (0..5000).map(|i| (255 - (i % 251)) as u8).collect();
 
     assert_http_restart_continues_from_acknowledged_offset(first_write, second_write).await;
+}
+
+#[tokio::test]
+async fn test_http_restart_persists_write_locked_and_readable_metadata_sidecar() {
+    let storage_root = tempfile::tempdir().expect("create caller-owned storage root");
+    let config = Arc::new(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        data_dir: std::path::PathBuf::from("./data"),
+        page_size: 4096,
+        max_cache_bytes: 262144,
+        writer_inactivity_timeout_secs: 300,
+        read_idle_ttl_secs: 600,
+        full_read_complete_ttl_secs: 30,
+        reader_done_ttl_secs: 60,
+        unread_ttl_secs: 3600,
+        cleanup_sweep_interval_secs: 30,
+        long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
+        host_prefix: "test".into(),
+        domain: "example.com".into(),
+        route_name: "bobs".into(),
+    });
+    let client = reqwest::Client::new();
+
+    let first_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let key = create_key(
+        &client,
+        &first_server.base_url,
+        Some(json!({
+            "write_locked": true,
+            "content_type": "application/x-bobs-test",
+            "content_encoding": "gzip"
+        })),
+    )
+    .await;
+    let meta_path = storage_root
+        .path()
+        .join("data")
+        .join(&key)
+        .join("meta.json");
+    assert!(meta_path.exists(), "create must persist sidecar metadata");
+
+    let locked_read = client
+        .get(format!("{}/api/v1/read/{}", first_server.base_url, key))
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .expect("locked read send");
+    assert_eq!(locked_read.status(), reqwest::StatusCode::LOCKED);
+    first_server.stop().await;
+
+    let second_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let locked_read_after_restart = client
+        .get(format!("{}/api/v1/read/{}", second_server.base_url, key))
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .expect("locked read after restart send");
+    assert_eq!(
+        locked_read_after_restart.status(),
+        reqwest::StatusCode::LOCKED
+    );
+
+    let data = vec![0x5Au8; 5000];
+    let write_resp = client
+        .post(format!("{}/api/v1/write/{}/0", second_server.base_url, key))
+        .body(data.clone())
+        .send()
+        .await
+        .expect("write send");
+    assert_eq!(write_resp.status(), reqwest::StatusCode::OK);
+    let complete_resp = client
+        .post(format!(
+            "{}/api/v1/complete/{}",
+            second_server.base_url, key
+        ))
+        .json(&json!({ "expected_size": data.len() }))
+        .send()
+        .await
+        .expect("complete send");
+    assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
+    second_server.stop().await;
+
+    let third_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let read_resp = client
+        .get(format!("{}/api/v1/read/{}", third_server.base_url, key))
+        .header("Range", format!("bytes=0-{}", data.len() - 1))
+        .send()
+        .await
+        .expect("read after complete restart send");
+    assert_eq!(read_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        read_resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok()),
+        Some("application/x-bobs-test")
+    );
+    assert_eq!(
+        read_resp
+            .headers()
+            .get("content-encoding")
+            .and_then(|h| h.to_str().ok()),
+        Some("gzip")
+    );
+    assert_eq!(
+        read_resp.bytes().await.expect("read bytes").as_ref(),
+        data.as_slice()
+    );
+}
+
+#[tokio::test]
+async fn test_http_delete_removes_sidecar_metadata_file() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let key = create_key(&client, &server.base_url, None).await;
+    let spool_dir = server.manager.data_dir.join(&key);
+    let meta_path = spool_dir.join("meta.json");
+    assert!(meta_path.exists(), "create should write sidecar metadata");
+
+    let resp = client
+        .delete(format!("{}/api/v1/delete/{}", server.base_url, key))
+        .send()
+        .await
+        .expect("delete send");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(!meta_path.exists(), "delete should remove sidecar metadata");
+    assert!(!spool_dir.exists(), "delete should remove spool directory");
 }
 
 #[tokio::test]
@@ -797,6 +958,7 @@ async fn test_many_active_spools_share_global_cache_cap() {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -957,6 +1119,7 @@ fn config_short_full_read_ttl() -> Arc<Config> {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -978,6 +1141,7 @@ fn config_short_idle_ttl() -> Arc<Config> {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -1113,6 +1277,7 @@ async fn test_idle_ttl_not_anchored_on_created_at() {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -1192,6 +1357,7 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -1235,8 +1401,19 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
     );
 
     // --- No more reads: idle TTL will now fire ---
-    // Wait > read_idle_ttl_secs (2 s) + several cleanup sweeps (interval = 1 s).
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    // Cleanup sweeps are scheduled independently from the test, so poll until
+    // the spool is gone instead of assuming a fixed sleep aligns with a sweep.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        if server.manager.get_spool(&key).is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "spool must be deleted once reads stop for > read_idle_ttl_secs"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 
     let after = reqwest::Client::new()
         .get(format!("{}/api/v1/read/{}", server.base_url, key))
@@ -1244,9 +1421,5 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
         .send()
         .await
         .expect("post-idle read");
-    assert_eq!(
-        after.status(),
-        reqwest::StatusCode::NOT_FOUND,
-        "spool must be deleted once reads stop for > read_idle_ttl_secs"
-    );
+    assert_eq!(after.status(), reqwest::StatusCode::NOT_FOUND);
 }

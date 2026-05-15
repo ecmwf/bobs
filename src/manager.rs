@@ -1,8 +1,8 @@
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
+use crate::metadata::{legacy_redb, MetadataStore, SyncSidecarMetadataStore};
 use crate::spool::{PageCache, Spool, SpoolMetadata, SpoolState};
 use dashmap::DashMap;
-use redb::{Database, ReadableTable, TableDefinition};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -10,24 +10,39 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-pub const SPOOL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("spools");
-
-fn storage<E: Into<redb::Error>>(e: E) -> BobsError {
-    BobsError::from(e.into())
-}
-
-pub struct SpoolManager<F: FileIO> {
-    pub spools: DashMap<String, Arc<Spool<F>>>,
-    pub db: Arc<Database>,
+pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
+    pub spools: DashMap<String, Arc<Spool<F, M>>>,
+    pub metadata_store: M,
     pub data_dir: PathBuf,
     pub page_size: usize,
     pub max_cache_bytes: usize,
     pub page_cache: Arc<Mutex<PageCache>>,
 }
 
-impl<F: FileIO> SpoolManager<F> {
+impl<F: FileIO> SpoolManager<F, SyncSidecarMetadataStore> {
     pub fn new(
         db_path: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        page_size: usize,
+        max_cache_bytes: usize,
+    ) -> Result<Self> {
+        legacy_redb::migrate_from_redb(db_path, data_dir.as_ref())?;
+        Self::with_metadata_store(
+            SyncSidecarMetadataStore::new(data_dir.as_ref()),
+            data_dir,
+            page_size,
+            max_cache_bytes,
+        )
+    }
+}
+
+impl<F, M> SpoolManager<F, M>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
+    pub fn with_metadata_store(
+        metadata_store: M,
         data_dir: impl AsRef<Path>,
         page_size: usize,
         max_cache_bytes: usize,
@@ -41,18 +56,9 @@ impl<F: FileIO> SpoolManager<F> {
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
         let page_cache = Arc::new(Mutex::new(PageCache::new(max_cache_bytes)));
 
-        let db = Arc::new(Database::create(db_path).map_err(storage)?);
-        {
-            let write_txn = db.begin_write().map_err(storage)?;
-            {
-                let _ = write_txn.open_table(SPOOL_TABLE).map_err(storage)?;
-            }
-            write_txn.commit().map_err(storage)?;
-        }
-
         Ok(Self {
             spools: DashMap::new(),
-            db,
+            metadata_store,
             data_dir: data_dir.as_ref().to_path_buf(),
             page_size,
             max_cache_bytes,
@@ -98,19 +104,7 @@ impl<F: FileIO> SpoolManager<F> {
             data_path,
         };
 
-        let payload = serde_json::to_vec(&metadata)
-            .map_err(|e| BobsError::SerializationError(e.to_string()))?;
-
-        {
-            let write_txn = self.db.begin_write().map_err(storage)?;
-            {
-                let mut table = write_txn.open_table(SPOOL_TABLE).map_err(storage)?;
-                table
-                    .insert(key.as_str(), payload.as_slice())
-                    .map_err(storage)?;
-            }
-            write_txn.commit().map_err(storage)?;
-        }
+        self.metadata_store.write(&metadata).await?;
 
         let spool = Arc::new(
             Spool::new(
@@ -118,7 +112,7 @@ impl<F: FileIO> SpoolManager<F> {
                 handle,
                 self.page_size,
                 Arc::clone(&self.page_cache),
-                Arc::clone(&self.db),
+                self.metadata_store.clone(),
             )
             .await,
         );
@@ -127,7 +121,7 @@ impl<F: FileIO> SpoolManager<F> {
         Ok(())
     }
 
-    pub fn get_spool(&self, key: &str) -> Option<Arc<Spool<F>>> {
+    pub fn get_spool(&self, key: &str) -> Option<Arc<Spool<F, M>>> {
         self.spools.get(key).map(|entry| Arc::clone(entry.value()))
     }
 
@@ -156,14 +150,9 @@ impl<F: FileIO> SpoolManager<F> {
         self.spools.remove(key);
         self.page_cache.lock().await.remove_spool(key);
 
-        {
-            let write_txn = self.db.begin_write().map_err(storage)?;
-            {
-                let mut table = write_txn.open_table(SPOOL_TABLE).map_err(storage)?;
-                table.remove(key).map_err(storage)?;
-            }
-            write_txn.commit().map_err(storage)?;
-        }
+        let deleting_meta = { spool.metadata.lock().await.clone() };
+        self.metadata_store.write(&deleting_meta).await?;
+        self.metadata_store.delete(key).await?;
 
         let spool_dir = self.data_dir.join(key);
         match tokio::fs::remove_dir_all(&spool_dir).await {
@@ -186,20 +175,12 @@ impl<F: FileIO> SpoolManager<F> {
         let mut recovered: Vec<(String, SpoolMetadata)> = Vec::new();
         let mut stale_keys: Vec<String> = Vec::new();
 
-        {
-            let read_txn = self.db.begin_read().map_err(storage)?;
-            let table = read_txn.open_table(SPOOL_TABLE).map_err(storage)?;
-
-            for entry in table.iter().map_err(storage)? {
-                let (k, v) = entry.map_err(storage)?;
-                let key = k.value().to_string();
-                let raw = v.value();
-                match serde_json::from_slice::<SpoolMetadata>(raw) {
-                    Ok(meta) => recovered.push((key, meta)),
-                    Err(e) => {
-                        tracing::warn!(key = %key, error = %e, "discarding spool with corrupt metadata");
-                        stale_keys.push(key);
-                    }
+        for meta in self.metadata_store.list()? {
+            match meta {
+                Ok(meta) => recovered.push((meta.key.clone(), meta)),
+                Err(error) => {
+                    tracing::warn!(error = %error, "recovery: corrupt sidecar metadata, discarding affected spool directories");
+                    stale_keys.extend(self.corrupt_sidecar_keys().await?);
                 }
             }
         }
@@ -308,16 +289,7 @@ impl<F: FileIO> SpoolManager<F> {
             }
 
             if metadata_corrected {
-                let payload = serde_json::to_vec(&meta)
-                    .map_err(|e| BobsError::SerializationError(e.to_string()))?;
-                let write_txn = self.db.begin_write().map_err(storage)?;
-                {
-                    let mut table = write_txn.open_table(SPOOL_TABLE).map_err(storage)?;
-                    table
-                        .insert(key.as_str(), payload.as_slice())
-                        .map_err(storage)?;
-                }
-                write_txn.commit().map_err(storage)?;
+                self.metadata_store.write(&meta).await?;
             }
 
             let crc = if matches!(meta.state, SpoolState::Complete | SpoolState::Readable) {
@@ -340,7 +312,7 @@ impl<F: FileIO> SpoolManager<F> {
                     handle,
                     self.page_size,
                     Arc::clone(&self.page_cache),
-                    Arc::clone(&self.db),
+                    self.metadata_store.clone(),
                 )
                 .await,
             );
@@ -383,6 +355,19 @@ impl<F: FileIO> SpoolManager<F> {
             "recovery: spools loaded"
         );
 
+        stale_keys.sort();
+        stale_keys.dedup();
+
+        for key in &stale_keys {
+            self.metadata_store.delete(key).await?;
+            let spool_dir = self.data_dir.join(key);
+            match tokio::fs::remove_dir_all(&spool_dir).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(BobsError::IoError(error)),
+            }
+        }
+
         let stale_key_set: HashSet<String> = stale_keys.iter().cloned().collect();
         let mut entries = tokio::fs::read_dir(&self.data_dir)
             .await
@@ -409,18 +394,33 @@ impl<F: FileIO> SpoolManager<F> {
             }
         }
 
-        if !stale_keys.is_empty() {
-            let write_txn = self.db.begin_write().map_err(storage)?;
-            {
-                let mut table = write_txn.open_table(SPOOL_TABLE).map_err(storage)?;
-                for key in stale_keys {
-                    table.remove(key.as_str()).map_err(storage)?;
-                }
-            }
-            write_txn.commit().map_err(storage)?;
-        }
-
         Ok(())
+    }
+
+    async fn corrupt_sidecar_keys(&self) -> Result<Vec<String>> {
+        let mut corrupt = Vec::new();
+        let mut entries = tokio::fs::read_dir(&self.data_dir)
+            .await
+            .map_err(BobsError::IoError)?;
+        while let Some(entry) = entries.next_entry().await.map_err(BobsError::IoError)? {
+            if !entry
+                .file_type()
+                .await
+                .map_err(BobsError::IoError)?
+                .is_dir()
+            {
+                continue;
+            }
+            let key = entry.file_name().to_string_lossy().to_string();
+            if !entry.path().join("meta.json").exists() {
+                continue;
+            }
+            if let Err(error) = self.metadata_store.read(&key).await {
+                tracing::warn!(key = %key, error = %error, "recovery: discarding corrupt metadata sidecar");
+                corrupt.push(key);
+            }
+        }
+        Ok(corrupt)
     }
 }
 
@@ -506,19 +506,182 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::io::TokioFileIO;
+    use crate::metadata::legacy_redb;
+    use std::fs;
     use tempfile::tempdir;
 
-    fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {
-        let read_txn = manager.db.begin_read().expect("begin read");
-        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-        let entry = table.get(key).expect("table get").expect("entry exists");
-        serde_json::from_slice(entry.value()).expect("deserialize metadata")
+    async fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {
+        manager
+            .metadata_store
+            .read(key)
+            .await
+            .expect("read metadata")
+            .expect("entry exists")
+    }
+
+    fn sidecar_fixture_metadata(
+        data_dir: &Path,
+        key: &str,
+        state: SpoolState,
+        logical_size: u64,
+    ) -> SpoolMetadata {
+        let page_size = 4096u64;
+        let total_pages = if logical_size == 0 {
+            0
+        } else {
+            logical_size.div_ceil(page_size)
+        };
+        let final_page_size = if total_pages == 0 || logical_size % page_size == 0 {
+            None
+        } else {
+            Some(logical_size % page_size)
+        };
+        SpoolMetadata {
+            key: key.to_string(),
+            content_type: None,
+            content_encoding: None,
+            state,
+            write_locked: false,
+            created_at: 11,
+            last_write_at: 12,
+            last_read_at: None,
+            readable_at: Some(13),
+            total_bytes_written: logical_size,
+            checksum_crc32c: None,
+            total_pages,
+            final_page_size,
+            data_path: data_dir.join(key).join("spool.dat"),
+        }
+    }
+
+    async fn write_sidecar_fixture(
+        manager: &SpoolManager<TokioFileIO>,
+        mut metadata: SpoolMetadata,
+        data: &[u8],
+    ) {
+        let spool_dir = manager.data_dir.join(&metadata.key);
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .expect("create spool dir");
+        tokio::fs::write(&metadata.data_path, data)
+            .await
+            .expect("write spool data");
+        if matches!(metadata.state, SpoolState::Complete | SpoolState::Readable) {
+            metadata.checksum_crc32c = Some(crc32c::crc32c(data));
+        }
+        manager
+            .metadata_store
+            .write(&metadata)
+            .await
+            .expect("write sidecar metadata");
+    }
+
+    fn migration_fixture_metadata(key: &str, generation: u64, data_dir: &Path) -> SpoolMetadata {
+        SpoolMetadata {
+            key: key.to_string(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_encoding: None,
+            state: SpoolState::Complete,
+            write_locked: false,
+            created_at: 100 + generation,
+            last_write_at: 200 + generation,
+            last_read_at: Some(250 + generation),
+            readable_at: Some(300 + generation),
+            total_bytes_written: generation * 8192,
+            checksum_crc32c: Some((0xabc0 + generation) as u32),
+            total_pages: generation,
+            final_page_size: Some(4096),
+            data_path: data_dir.join(key).join("spool.dat"),
+        }
+    }
+
+    fn assert_migrated_sidecars(
+        data_dir: &Path,
+        rows: &[legacy_redb::LegacyRedbRow],
+        expected_count: usize,
+    ) {
+        let mut actual_keys = Vec::new();
+        for entry in fs::read_dir(data_dir).expect("read data dir") {
+            let entry = entry.expect("read data dir entry");
+            if entry.file_type().expect("entry file type").is_dir() {
+                actual_keys.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+        actual_keys.sort();
+        actual_keys.dedup();
+        assert_eq!(
+            actual_keys.len(),
+            expected_count,
+            "migration must not create duplicate or missing sidecar directories"
+        );
+
+        for row in rows {
+            let meta_path = data_dir.join(&row.key).join("meta.json");
+            let bytes = fs::read(&meta_path).expect("read migrated meta.json");
+            assert_eq!(
+                bytes, row.bytes,
+                "migrated meta.json bytes must match legacy redb row for {}",
+                row.key
+            );
+            let recovered: SpoolMetadata =
+                serde_json::from_slice(&bytes).expect("deserialize migrated sidecar");
+            let legacy: SpoolMetadata =
+                serde_json::from_slice(&row.bytes).expect("deserialize legacy row");
+            assert_eq!(
+                serde_json::to_value(recovered).expect("serialize recovered"),
+                serde_json::to_value(legacy).expect("serialize legacy")
+            );
+        }
+    }
+
+    #[test]
+    fn migration_from_redb_is_idempotent_with_existing_sidecars_and_tmp_files() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let metadata = vec![
+            migration_fixture_metadata("existing", 1, &data_dir),
+            migration_fixture_metadata("tmp-leftover", 2, &data_dir),
+            migration_fixture_metadata("new", 3, &data_dir),
+        ];
+        let rows = legacy_redb::create_legacy_db(&db_path, &metadata).expect("create legacy db");
+
+        let existing_row = rows
+            .iter()
+            .find(|row| row.key == "existing")
+            .expect("existing row");
+        let existing_dir = data_dir.join("existing");
+        fs::create_dir_all(&existing_dir).expect("create existing sidecar dir");
+        fs::write(existing_dir.join("meta.json"), &existing_row.bytes)
+            .expect("write existing sidecar");
+
+        let tmp_row = rows
+            .iter()
+            .find(|row| row.key == "tmp-leftover")
+            .expect("tmp row");
+        let tmp_dir = data_dir.join("tmp-leftover");
+        fs::create_dir_all(&tmp_dir).expect("create tmp sidecar dir");
+        fs::write(tmp_dir.join("meta.json.tmp"), &tmp_row.bytes).expect("write leftover tmp");
+
+        legacy_redb::migrate_from_redb(&db_path, &data_dir).expect("first migration");
+        assert_migrated_sidecars(&data_dir, &rows, rows.len());
+        assert!(
+            !tmp_dir.join("meta.json.tmp").exists(),
+            "leftover tmp must be removed"
+        );
+        assert!(
+            !db_path.exists(),
+            "legacy db removed only after sidecars are durable"
+        );
+
+        legacy_redb::migrate_from_redb(&db_path, &data_dir).expect("repeat migration no-op");
+        assert_migrated_sidecars(&data_dir, &rows, rows.len());
     }
 
     #[tokio::test]
     async fn test_new_accepts_cache_smaller_than_page_size() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 1024)
@@ -532,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_accepts_zero_cache_bytes() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let manager =
@@ -545,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn test_manager_shares_one_global_page_cache_and_delete_drops_entries() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 8192)
             .expect("manager init");
@@ -584,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn test_writes_from_different_spools_compete_under_one_cache_cap() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let manager =
             SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4, 8).expect("manager init");
@@ -641,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_rejects_zero_page_size() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let result = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 0, 1024);
@@ -652,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_and_get() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
@@ -678,7 +841,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
@@ -700,7 +863,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_nonexistent_key() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
@@ -717,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn test_recovery() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let key = {
@@ -743,9 +906,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_ack_leaves_redb_offsets_stale_until_complete() {
+    async fn test_write_ack_leaves_sidecar_offsets_stale_until_complete() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
@@ -769,7 +932,7 @@ mod tests {
         assert_eq!(in_memory.total_pages, 2);
         assert_eq!(in_memory.checksum_crc32c, None);
 
-        let persisted = persisted_metadata(&manager, &key);
+        let persisted = persisted_metadata(&manager, &key).await;
         assert_eq!(persisted.total_bytes_written, 0);
         assert_eq!(persisted.total_pages, 0);
         assert_eq!(persisted.final_page_size, None);
@@ -778,7 +941,7 @@ mod tests {
 
         spool.complete(None).await.expect("complete succeeds");
 
-        let persisted = persisted_metadata(&manager, &key);
+        let persisted = persisted_metadata(&manager, &key).await;
         assert_eq!(persisted.total_bytes_written, data.len() as u64);
         assert_eq!(persisted.total_pages, 3);
         assert_eq!(persisted.final_page_size, Some(123));
@@ -787,9 +950,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ack_then_restart_recovers_consistent_in_progress_state_without_redb_update() {
+    async fn test_ack_then_restart_recovers_consistent_in_progress_state_without_sidecar_update() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let page_size = 4096usize;
         let data = vec![0xA5u8; page_size * 2 + 777];
@@ -809,7 +972,7 @@ mod tests {
                 .await
                 .expect("write ack succeeds");
 
-            let persisted = persisted_metadata(&manager, &key);
+            let persisted = persisted_metadata(&manager, &key).await;
             assert_eq!(persisted.total_bytes_written, 0);
             assert_eq!(persisted.total_pages, 0);
             key
@@ -848,7 +1011,7 @@ mod tests {
             &data[page_size..page_size * 2]
         );
 
-        let persisted = persisted_metadata(&manager2, &key);
+        let persisted = persisted_metadata(&manager2, &key).await;
         assert_eq!(persisted.total_bytes_written, 0);
         assert_eq!(persisted.total_pages, 0);
         assert_eq!(persisted.final_page_size, None);
@@ -858,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn test_crc_equivalence_across_restart_and_append() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let page_size = 4096usize;
         let first = vec![0x10u8; page_size + 321];
@@ -898,14 +1061,14 @@ mod tests {
         assert_eq!(*spool.running_crc32c.lock().await, crc32c::crc32c(&all));
 
         spool.complete(None).await.expect("complete succeeds");
-        let persisted = persisted_metadata(&manager2, &key);
+        let persisted = persisted_metadata(&manager2, &key).await;
         assert_eq!(persisted.checksum_crc32c, Some(crc32c::crc32c(&all)));
     }
 
     #[tokio::test]
     async fn test_complete_durability_survives_restart_with_final_metadata_and_pages() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let page_size = 4096usize;
         let data = vec![0x3Cu8; page_size * 2 + 19];
@@ -929,7 +1092,7 @@ mod tests {
                 .await
                 .expect("complete succeeds");
 
-            let persisted = persisted_metadata(&manager, &key);
+            let persisted = persisted_metadata(&manager, &key).await;
             assert_eq!(persisted.state, SpoolState::Complete);
             assert_eq!(persisted.total_bytes_written, data.len() as u64);
             assert_eq!(persisted.total_pages, 3);
@@ -966,76 +1129,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recovery_corrects_metadata_on_disk_mismatch() {
-        let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
-        let data_dir = dir.path().join("data");
-
-        let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
-
-            let key = uuid::Uuid::new_v4().to_string();
-            manager
-                .create_spool(key.clone(), None, None, false)
-                .await
-                .expect("create spool");
-
-            let spool = manager.get_spool(&key).expect("spool exists");
-            spool
-                .write(0, bytes::Bytes::from(vec![0x11u8; 8192]))
-                .await
-                .expect("write succeeds");
-
-            let read_txn = manager.db.begin_read().expect("begin read");
-            let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-            let entry = table
-                .get(key.as_str())
-                .expect("table get")
-                .expect("entry exists");
-            let mut meta: SpoolMetadata =
-                serde_json::from_slice(entry.value()).expect("deserialize metadata");
-            drop(table);
-            drop(read_txn);
-
-            meta.total_pages = 5;
-            meta.total_bytes_written = 5 * 4096;
-            meta.final_page_size = None;
-
-            let payload = serde_json::to_vec(&meta).expect("serialize metadata");
-            let write_txn = manager.db.begin_write().expect("begin write");
-            {
-                let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
-                table
-                    .insert(key.as_str(), payload.as_slice())
-                    .expect("insert corrected metadata");
-            }
-            write_txn.commit().expect("commit");
-
-            key
-        };
-
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-            .expect("manager2 init");
-        manager2.recover().await.expect("recover succeeds");
-
-        let spool = manager2.get_spool(&key).expect("recovered spool exists");
-        let meta = spool.metadata.lock().await;
-        assert_eq!(meta.total_pages, 2);
-        assert_eq!(meta.total_bytes_written, 8192);
-        assert!(meta.final_page_size.is_none());
-        drop(meta);
-
-        let persisted = persisted_metadata(&manager2, &key);
-        assert_eq!(persisted.total_pages, 5);
-        assert_eq!(persisted.total_bytes_written, 5 * 4096);
-        assert_eq!(persisted.final_page_size, None);
-    }
-
-    #[tokio::test]
     async fn test_recovery_preserves_writing_state() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let key = {
@@ -1066,57 +1162,6 @@ mod tests {
         assert_eq!(meta.state, SpoolState::Writing);
     }
 
-    #[tokio::test]
-    async fn test_recovery_cleans_up_creating_state() {
-        let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
-        let data_dir = dir.path().join("data");
-
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-            .expect("manager init");
-
-        let key = "fake-creating-key".to_string();
-        let spool_dir = data_dir.join(&key);
-        let data_path = spool_dir.join("spool.dat");
-        std::fs::create_dir_all(&spool_dir).expect("create spool dir");
-        std::fs::write(&data_path, vec![0x33u8; 16]).expect("create spool file");
-
-        let meta = SpoolMetadata {
-            key: key.clone(),
-            content_type: None,
-            content_encoding: None,
-            state: SpoolState::Creating,
-            write_locked: false,
-            created_at: 0,
-            last_write_at: 0,
-            last_read_at: None,
-            readable_at: None,
-            total_bytes_written: 0,
-            checksum_crc32c: None,
-            total_pages: 0,
-            final_page_size: None,
-            data_path,
-        };
-        let payload = serde_json::to_vec(&meta).expect("serialize metadata");
-        let write_txn = manager.db.begin_write().expect("begin write");
-        {
-            let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
-            table
-                .insert(key.as_str(), payload.as_slice())
-                .expect("insert creating metadata");
-        }
-        write_txn.commit().expect("commit");
-
-        manager.recover().await.expect("recover succeeds");
-
-        assert!(manager.get_spool(&key).is_none());
-        assert!(!spool_dir.exists());
-
-        let read_txn = manager.db.begin_read().expect("begin read");
-        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-        assert!(table.get(key.as_str()).expect("table get").is_none());
-    }
-
     // -----------------------------------------------------------------------
     // New tests — recovery seeds in-memory fields
     // -----------------------------------------------------------------------
@@ -1127,7 +1172,7 @@ mod tests {
     #[tokio::test]
     async fn test_recovery_seeds_last_read_activity_at() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let key = {
@@ -1159,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn test_recovery_initializes_missing_ranges_for_complete_spool() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
         let key = {
@@ -1201,257 +1246,156 @@ mod tests {
     /// before the field was introduced), recovery must backfill it to `Some(now)`
     /// and persist the corrected metadata so that the spool is not immediately
     /// deleted by the idle-TTL rule.
-    #[tokio::test]
-    async fn test_recovery_sets_readable_at_for_old_metadata() {
-        let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
-        let data_dir = dir.path().join("data");
-
-        // Persist metadata for a completed spool with the current readable_at field.
-        let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
-            let key = uuid::Uuid::new_v4().to_string();
-            manager
-                .create_spool(key.clone(), None, None, false)
-                .await
-                .expect("create spool");
-            let spool = manager.get_spool(&key).expect("spool exists");
-            spool
-                .write(0, bytes::Bytes::from(vec![0xCDu8; 4096]))
-                .await
-                .expect("write succeeds");
-            spool.complete(None).await.expect("complete succeeds");
-            key
-        };
-
-        // Rewrite persisted metadata to match records created before readable_at existed.
-        {
-            let db = Arc::new(redb::Database::create(&db_path).expect("open db"));
-            let read_txn = db.begin_read().expect("begin read");
-            let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-            let entry = table
-                .get(key.as_str())
-                .expect("table get")
-                .expect("entry exists");
-            let mut meta: SpoolMetadata =
-                serde_json::from_slice(entry.value()).expect("deserialize");
-            drop(table);
-            drop(read_txn);
-
-            meta.readable_at = None; // simulate old format
-            let payload = serde_json::to_vec(&meta).expect("serialize");
-            let write_txn = db.begin_write().expect("begin write");
-            {
-                let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
-                table
-                    .insert(key.as_str(), payload.as_slice())
-                    .expect("insert");
-            }
-            write_txn.commit().expect("commit");
-        }
-
-        // Recovery backfills readable_at for both memory state and persisted metadata.
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-            .expect("manager2 init");
-        manager2.recover().await.expect("recover should succeed");
-
-        // In-memory check.
-        let spool = manager2.get_spool(&key).expect("recovered spool exists");
-        let meta = spool.metadata.lock().await;
-        assert!(
-            meta.readable_at.is_some(),
-            "readable_at must be backfilled to Some(_) during recovery"
-        );
-        drop(meta);
-
-        // Persisted check: the corrected value must be written back to redb.
-        let read_txn = manager2.db.begin_read().expect("begin read");
-        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-        let entry = table
-            .get(key.as_str())
-            .expect("table get")
-            .expect("entry exists");
-        let persisted: SpoolMetadata =
-            serde_json::from_slice(entry.value()).expect("deserialize persisted");
-        assert!(
-            persisted.readable_at.is_some(),
-            "backfilled readable_at must be persisted to redb"
-        );
-    }
 
     #[tokio::test]
-    async fn test_recovery_discards_complete_spool_when_file_shorter_than_metadata() {
+    async fn test_recovery_backfills_readable_at_in_sidecar() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
-
-        let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
-
-            let key = uuid::Uuid::new_v4().to_string();
-            manager
-                .create_spool(key.clone(), None, None, false)
-                .await
-                .expect("create spool");
-
-            let spool = manager.get_spool(&key).expect("spool exists");
-            spool
-                .write(0, bytes::Bytes::from(vec![0x44u8; 5000]))
-                .await
-                .expect("write succeeds");
-            spool.complete(None).await.expect("complete succeeds");
-
-            let read_txn = manager.db.begin_read().expect("begin read");
-            let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-            let entry = table
-                .get(key.as_str())
-                .expect("table get")
-                .expect("entry exists");
-            let mut meta: SpoolMetadata =
-                serde_json::from_slice(entry.value()).expect("deserialize metadata");
-            drop(table);
-            drop(read_txn);
-
-            meta.total_pages = 3;
-            meta.total_bytes_written = 3 * 4096;
-            meta.final_page_size = None;
-
-            let payload = serde_json::to_vec(&meta).expect("serialize metadata");
-            let write_txn = manager.db.begin_write().expect("begin write");
-            {
-                let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
-                table
-                    .insert(key.as_str(), payload.as_slice())
-                    .expect("insert corrected metadata");
-            }
-            write_txn.commit().expect("commit");
-
-            key
-        };
-
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-            .expect("manager2 init");
-        manager2.recover().await.expect("recover succeeds");
-
-        assert!(
-            manager2.get_spool(&key).is_none(),
-            "complete spool whose file is shorter than persisted logical size must not be recovered"
-        );
-
-        let read_txn = manager2.db.begin_read().expect("begin read");
-        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-        assert!(
-            table.get(key.as_str()).expect("table get").is_none(),
-            "discarded corrupt spool metadata must be removed from redb"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_recovery_reconstructs_in_progress_partial_from_disk() {
-        let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
-        let data_dir = dir.path().join("data");
-        let page_size = 4096usize;
-
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
             .expect("manager init");
         let key = uuid::Uuid::new_v4().to_string();
-        let spool_dir = data_dir.join(&key);
-        let data_path = spool_dir.join("spool.dat");
-        std::fs::create_dir_all(&spool_dir).expect("create spool dir");
+        let data = vec![0x44; 4096];
+        let mut metadata =
+            sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, data.len() as u64);
+        metadata.readable_at = None;
+        write_sidecar_fixture(&manager, metadata, &data).await;
 
-        let mut disk_bytes = vec![0x11u8; page_size];
-        let trailing = vec![0x22u8; 904];
-        disk_bytes.extend_from_slice(&trailing);
-        std::fs::write(&data_path, &disk_bytes).expect("write spool file");
-
-        let meta = SpoolMetadata {
-            key: key.clone(),
-            content_type: None,
-            content_encoding: None,
-            state: SpoolState::Writing,
-            write_locked: false,
-            created_at: 0,
-            last_write_at: 0,
-            last_read_at: None,
-            readable_at: None,
-            total_bytes_written: 0,
-            checksum_crc32c: None,
-            total_pages: 0,
-            final_page_size: None,
-            data_path: data_path.clone(),
-        };
-        let payload = serde_json::to_vec(&meta).expect("serialize metadata");
-        let write_txn = manager.db.begin_write().expect("begin write");
-        {
-            let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
-            table
-                .insert(key.as_str(), payload.as_slice())
-                .expect("insert metadata");
-        }
-        write_txn.commit().expect("commit");
-        drop(manager);
-
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
-        let spool = manager2.get_spool(&key).expect("recovered spool exists");
-        let meta = spool.metadata.lock().await;
-        assert_eq!(meta.total_bytes_written, disk_bytes.len() as u64);
-        assert_eq!(meta.total_pages, 1);
-        assert_eq!(meta.final_page_size, None);
-        assert_eq!(meta.checksum_crc32c, None);
-        drop(meta);
-
-        let buffer = spool.write_buffer.lock().await;
-        assert_eq!(buffer.len(), trailing.len());
-        assert_eq!(buffer.as_ref(), trailing.as_slice());
-        drop(buffer);
-
-        let crc = *spool.running_crc32c.lock().await;
-        assert_eq!(crc, crc32c::crc32c(&disk_bytes));
-
-        let read_txn = manager2.db.begin_read().expect("begin read");
-        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-        let entry = table
-            .get(key.as_str())
-            .expect("table get")
-            .expect("entry exists");
-        let persisted: SpoolMetadata =
-            serde_json::from_slice(entry.value()).expect("deserialize persisted metadata");
-        assert_eq!(persisted.total_bytes_written, 0);
-        assert_eq!(persisted.total_pages, 0);
-        assert_eq!(persisted.final_page_size, None);
-        assert_eq!(persisted.last_write_at, 0);
-        drop(table);
-        drop(read_txn);
-
-        let completion = vec![0x33u8; page_size - trailing.len()];
-        spool
-            .write(
-                disk_bytes.len() as u64,
-                bytes::Bytes::copy_from_slice(&completion),
-            )
+        let recovered = manager2.get_spool(&key).expect("spool recovered");
+        assert!(recovered.metadata.lock().await.readable_at.is_some());
+        assert!(persisted_metadata(&manager2, &key)
             .await
-            .expect("write completing recovered page succeeds");
+            .readable_at
+            .is_some());
+    }
 
-        let mut completed_page = vec![0u8; page_size];
-        completed_page[..trailing.len()].copy_from_slice(&trailing);
-        completed_page[trailing.len()..].copy_from_slice(&completion);
-        let on_disk = std::fs::read(&data_path).expect("read spool file");
-        assert_eq!(
-            &on_disk[page_size..page_size * 2],
-            completed_page.as_slice()
-        );
+    #[tokio::test]
+    async fn test_recovery_removes_creating_deleting_and_orphan_sidecar_dirs() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("legacy-metadata.db");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
+        let creating = "creating-spool";
+        let deleting = "deleting-spool";
+        write_sidecar_fixture(
+            &manager,
+            sidecar_fixture_metadata(&data_dir, creating, SpoolState::Creating, 0),
+            b"",
+        )
+        .await;
+        write_sidecar_fixture(
+            &manager,
+            sidecar_fixture_metadata(&data_dir, deleting, SpoolState::Deleting, 0),
+            b"",
+        )
+        .await;
+        let orphan_dir = data_dir.join("orphan-no-sidecar");
+        tokio::fs::create_dir_all(&orphan_dir)
+            .await
+            .expect("create orphan dir");
+        tokio::fs::write(orphan_dir.join("spool.dat"), b"orphan")
+            .await
+            .expect("write orphan data");
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+
+        assert!(!data_dir.join(creating).exists());
+        assert!(!data_dir.join(deleting).exists());
+        assert!(!orphan_dir.exists());
+        assert!(manager2.spool_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_discards_complete_sidecar_when_data_file_too_short() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("legacy-metadata.db");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
+        let key = uuid::Uuid::new_v4().to_string();
+        write_sidecar_fixture(
+            &manager,
+            sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, 8192),
+            &[0x55; 4096],
+        )
+        .await;
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+
+        assert!(manager2.get_spool(&key).is_none());
+        assert!(!data_dir.join(&key).exists());
+        assert!(manager2
+            .metadata_store
+            .read(&key)
+            .await
+            .expect("read sidecar")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_discards_missing_data_file_sidecar() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("legacy-metadata.db");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
+        let key = uuid::Uuid::new_v4().to_string();
+        let metadata = sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, 4096);
+        tokio::fs::create_dir_all(data_dir.join(&key))
+            .await
+            .expect("create spool dir");
+        manager
+            .metadata_store
+            .write(&metadata)
+            .await
+            .expect("write sidecar");
+
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager2 init");
+        manager2.recover().await.expect("recover succeeds");
+
+        assert!(manager2.get_spool(&key).is_none());
+        assert!(!data_dir.join(&key).exists());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_discards_corrupt_metadata_sidecar() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("legacy-metadata.db");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let spool_dir = data_dir.join(&key);
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .expect("create spool dir");
+        tokio::fs::write(spool_dir.join("meta.json"), b"{not valid json")
+            .await
+            .expect("write corrupt sidecar");
+        tokio::fs::write(spool_dir.join("spool.dat"), b"data")
+            .await
+            .expect("write data");
+
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
+        manager.recover().await.expect("recover succeeds");
+
+        assert!(manager.get_spool(&key).is_none());
+        assert!(!spool_dir.exists());
     }
 
     #[tokio::test]
     async fn test_recovery_does_not_prepopulate_page_cache() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let page_size = 4096usize;
         let data = vec![0x7Bu8; page_size * 2];
@@ -1494,7 +1438,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_removes_cache_entries_when_directory_already_missing() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 8192)
             .expect("manager init");

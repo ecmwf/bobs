@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6910c41b.js";
+            window.path_to_searchindex_js = "searchindex-22639d04.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-953381c0.js"></script>
@@ -251,21 +251,25 @@ curl -X POST http://localhost:3000/write/YOUR_KEY/1024 --data-binary @part2.dat
 <li>optionally delete it.</li>
 </ol>
 <p>Use it to validate BOBS itself before adding Polytope, ingress, or other clients to the path. Start local, then repeat the same workload from a container or Kubernetes pod.</p>
-<p>Persistence expectations for this benchmark match the BOBS contract: before <code>/complete</code>, recovery is required across a BOBS process restart, not across a node or storage crash. During <code>Writing</code> or <code>WriteLocked</code>, <code>spool.dat</code> is the source of truth and persisted <code>redb</code> byte metadata is advisory; <code>/write</code> must append accepted bytes to <code>spool.dat</code> through the kernel/file handle before returning, but does not force them to stable storage with <code>sync_data()</code>. Full pages become reader-visible as they are completed; trailing partial-page bytes may already be in <code>spool.dat</code> but remain invisible until more writes complete the page or <code>/complete</code> finalizes the spool. <code>/complete</code> is the durability boundary and keeps <code>sync_data()</code> before committing completion metadata.</p>
+<p>Persistence expectations for this benchmark match the BOBS contract: each object is stored as <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code> plus <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code>. Before <code>/complete</code>, recovery is required across a BOBS restart by reconstructing in-progress byte state from <code>spool.dat</code>, not across a node or storage crash. <code>/write</code> must append accepted bytes to <code>spool.dat</code> through the kernel/file handle before returning, but does not force them to stable storage with <code>sync_data()</code>. Full pages become reader-visible as they are completed; trailing partial-page bytes may already be in <code>spool.dat</code> but remain invisible until more writes complete the page or <code>/complete</code> finalizes the spool. <code>/complete</code> is the durability boundary: BOBS syncs <code>spool.dat</code> data before committing final metadata to <code>meta.json</code> with the sidecar atomic commit protocol.</p>
 <blockquote>
 <p>Plain HTTP only: this first benchmark implementation accepts <code>http://</code> BOBS endpoints. <code>https://</code> support requires an approved dependency or feature change.</p>
 </blockquote>
 <h2 id="build-1"><a class="header" href="#build-1">Build</a></h2>
-<p>Local binary:</p>
+<p>Default Linux <code>io_uring</code> binary. This build uses sharded rings:</p>
 <pre><code class="language-bash">cargo build --release --bin bobs --bin bobs-benchmark
+</code></pre>
+<p>Fallback binary, for non-Linux development, Linux kernels older than 5.11, or runtimes that block <code>io_uring_setup</code> entirely:</p>
+<pre><code class="language-bash">cargo build --release --bin bobs --bin bobs-benchmark --features tokio-fileio-fallback
 </code></pre>
 <p>Container image, after the image has been built with the benchmark binary included:</p>
 <pre><code class="language-bash">docker build --target release -t bobs:bench .
 docker run --rm bobs:bench bobs-benchmark --help
 </code></pre>
+<p>The Dockerfile builds the default Linux backend. Build a fallback image by passing the fallback feature in a dedicated build stage or by building the binaries outside Docker with <code>--features tokio-fileio-fallback</code> and packaging those artifacts.</p>
 <h2 id="local-first-validation"><a class="header" href="#local-first-validation">Local-first validation</a></h2>
 <p>Run a local BOBS server first. This keeps network and Kubernetes scheduling effects out of the initial measurement.</p>
-<p>Create a temporary config:</p>
+<p>Create a temporary config. The Linux <code>io_uring_shards</code> field is omitted here so BOBS resolves it to <code>max(1, num_cpus / 4)</code>. CPU pinning is not enabled by default.</p>
 <pre><code class="language-bash">cat &gt;/tmp/bobs-bench.yaml &lt;&lt;'YAML'
 host: 127.0.0.1
 port: 3000
@@ -277,11 +281,17 @@ route_name: download
 domain: 127.0.0.1:3000
 YAML
 </code></pre>
-<p>Start BOBS in one terminal:</p>
+<p>Start BOBS in one terminal with the default Linux <code>io_uring</code> backend:</p>
 <pre><code class="language-bash">rm -rf /tmp/bobs-bench-data
 HOSTNAME=bobs-0 \
 BOBS_INTERNAL_BASE_URL_TEMPLATE=http://127.0.0.1:3000/api/v1 \
 cargo run --release --bin bobs -- /tmp/bobs-bench.yaml
+</code></pre>
+<p>Or start the fallback backend:</p>
+<pre><code class="language-bash">rm -rf /tmp/bobs-bench-data
+HOSTNAME=bobs-0 \
+BOBS_INTERNAL_BASE_URL_TEMPLATE=http://127.0.0.1:3000/api/v1 \
+cargo run --release --bin bobs --features tokio-fileio-fallback -- /tmp/bobs-bench.yaml
 </code></pre>
 <p>Run the benchmark in another terminal:</p>
 <pre><code class="language-bash">cargo run --release --bin bobs-benchmark -- \
@@ -377,7 +387,20 @@ YAML
 </code></pre>
 <p>For each config, start BOBS with that file and run the same benchmark command, changing only the summary path, for example <code>/tmp/bobs-summary-page-1m.json</code>, <code>/tmp/bobs-summary-page-4m.json</code>, or <code>/tmp/bobs-summary-page-16m.json</code>. Compare <code>write_active_mib_s</code>, <code>read_active_mib_s</code>, <code>wall_mib_s</code>, and <code>wait-to-read</code>/read timing percentiles from the <code>SUMMARY</code> output. If reader-latency percentiles regress, a throughput improvement may not be worth the wider page.</p>
 <h2 id="container-validation"><a class="header" href="#container-validation">Container validation</a></h2>
-<p>Container validation checks the packaged binary and container networking while still using a known local BOBS server.</p>
+<p>Container validation checks the packaged binary, container networking, and whether the runtime permits the default Linux <code>io_uring</code> backend.</p>
+<p>The default backend requires Linux 5.11+ because it submits <code>io_uring</code> operations against raw file descriptors, and it requires access to the <code>io_uring_setup</code> syscall. If the policy blocks <code>io_uring_setup</code>, use an io_uring-capable seccomp/sysctl policy or a <code>tokio-fileio-fallback</code> build. On this development host, validation showed:</p>
+<pre><code class="language-text">host io_uring_setup: allowed
+docker default seccomp: io_uring_setup returned ENOSYS
+docker --security-opt seccomp=unconfined: allowed
+</code></pre>
+<p>So the default Docker seccomp profile blocked <code>io_uring_setup</code> here, even though the host kernel supported it. The Dockerfile was not changed because this is a runtime security policy, not an image-layer setting.</p>
+<p>If your default container policy blocks <code>io_uring_setup</code>, either run the default image with a seccomp profile that permits io_uring, or use a fallback build/image:</p>
+<pre><code class="language-bash"># Default backend with an unconfined seccomp policy for local validation.
+docker run --rm --security-opt seccomp=unconfined bobs:bench bobs --help
+
+# Fallback backend build outside the default Dockerfile path.
+cargo build --release --bins --features tokio-fileio-fallback
+</code></pre>
 <p>On Linux, use host networking to reach the local server:</p>
 <pre><code class="language-bash">docker run --rm --network host bobs:bench bobs-benchmark \
   --base-url http://127.0.0.1:3000 \
@@ -390,6 +413,7 @@ YAML
 <p>If host networking is unavailable, publish or otherwise route the BOBS server and replace <code>127.0.0.1</code> with an address reachable from the benchmark container.</p>
 <h2 id="kubernetespod-validation"><a class="header" href="#kubernetespod-validation">Kubernetes/pod validation</a></h2>
 <p>Run from inside the cluster after local and container validation pass. This measures in-cluster DNS, pod networking, and BOBS pod placement effects.</p>
+<p>For the default Linux image, ask the chart/platform team whether the cluster runtime seccomp profile and node sysctls permit <code>io_uring_setup</code>. In particular, check the effective seccomp profile and node settings such as <code>/proc/sys/kernel/io_uring_disabled</code>. If the profile is <code>RuntimeDefault</code> and blocks io_uring, use a chart override or pod security context that applies an io_uring-capable seccomp profile, or deploy a <code>tokio-fileio-fallback</code> image instead. No Kubernetes YAML setting can compensate for a node kernel older than Linux 5.11.</p>
 <h3 id="single-endpoint-mode"><a class="header" href="#single-endpoint-mode">Single endpoint mode</a></h3>
 <p>Use single endpoint mode when all benchmark objects should target one BOBS pod or a service with guaranteed routing affinity.</p>
 <pre><code class="language-bash">kubectl run bobs-benchmark \
@@ -419,7 +443,7 @@ YAML
   --read-body-chunk-bytes 1048576 \
   --start-delay-ms 2000
 </code></pre>
-<p>Avoid an aggregate multi-pod Kubernetes service for multi-BOBS benchmark runs unless the deployment guarantees that create, write, complete, and read for an object route to the same pod. Prefer per-pod services or pod DNS names with <code>--base-url-template</code>.</p>
+<p>Avoid an aggregate multi-pod Kubernetes service for multi-BOBS benchmark runs unless the deployment guarantees that create, write, complete, and read for an object route to the same pod. Prefer per-pod services or pod DNS names with <code>--base-url-template</code>. Within one BOBS instance, data and metadata <code>io_uring</code> work for the same key is routed to the same shard by stable key hashing; that does not replace the need for correct HTTP-level routing between pods.</p>
 <h2 id="output-and-summary-fields"><a class="header" href="#output-and-summary-fields">Output and summary fields</a></h2>
 <p>The benchmark writes grep-friendly event lines during the run and one final machine-readable line:</p>
 <pre><code class="language-text">SUMMARY:{...json...}
@@ -599,6 +623,11 @@ curl -L http://localhost:3000/read/YOUR_KEY -H "Range: bytes=1048576-"
 <p>Without a config file, BOBS runs with defaults:</p>
 <pre><code class="language-bash">./target/release/bobs
 </code></pre>
+<p>Backend selection is build-feature based, not a YAML option: Linux builds without extra features use the <code>io_uring</code> FileIO and sidecar metadata backend; builds with <code>--features tokio-fileio-fallback</code>, and non-Linux builds, use the Tokio/blocking fallback backend with the same on-disk <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code> plus <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code> layout. These backend settings do not change the HTTP API and do not require an on-disk migration.</p>
+<p>Default Linux builds use sharded <code>io_uring</code> rings. <code>io_uring_shards</code> is optional. If <code>io_uring_shards</code> is unset, BOBS resolves it to <code>max(1, num_cpus / 4)</code>. File operations are assigned to shards by stable object-key hashing, and each object’s data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.</p>
+<p>The default Linux backend requires Linux 5.11+ because BOBS submits operations against raw file descriptors, and it requires a container/runtime policy that permits <code>io_uring_setup</code>. If <code>io_uring_setup</code> is blocked, use a runtime seccomp/sysctl policy that permits it or build the fallback binary:</p>
+<pre><code class="language-bash">cargo build --release --bins --features tokio-fileio-fallback
+</code></pre>
 <h2 id="fields"><a class="header" href="#fields">Fields</a></h2>
 <div class="table-wrapper">
 <table>
@@ -618,6 +647,7 @@ curl -L http://localhost:3000/read/YOUR_KEY -H "Range: bytes=1048576-"
 <tr><td><code>unread_ttl_secs</code></td><td><code>3600</code></td><td>Deprecated compatibility field. Parsed but no longer drives cleanup.</td></tr>
 <tr><td><code>cleanup_sweep_interval_secs</code></td><td><code>30</code></td><td>How often the background cleanup task runs.</td></tr>
 <tr><td><code>long_poll_timeout_ms</code></td><td><code>25000</code></td><td>Maximum time in ms to wait for new data during a read before redirecting.</td></tr>
+<tr><td><code>io_uring_shards</code></td><td>unset</td><td>Linux default-backend ring-pool shard count. Leave unset to resolve to <code>max(1, num_cpus / 4)</code>. Keys are mapped to shards with stable hashing. Must be greater than <code>0</code> when set. Ignored by fallback builds.</td></tr>
 <tr><td><code>host_prefix</code></td><td><code>""</code></td><td>External download host prefix used when generating read URLs.</td></tr>
 <tr><td><code>domain</code></td><td><code>""</code></td><td>External download domain used when generating read URLs.</td></tr>
 <tr><td><code>route_name</code></td><td><code>""</code></td><td>External download route prefix, for example <code>download</code>.</td></tr>
@@ -637,6 +667,7 @@ reader_done_ttl_secs: 60      # deprecated compatibility field
 unread_ttl_secs: 3600         # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
+io_uring_shards: 4              # optional; omit to use max(1, num_cpus / 4) on Linux default backend
 host_prefix: polytope-example
 domain: example.com
 route_name: download
@@ -646,6 +677,17 @@ route_name: download
 max_cache_bytes: 4194304
 read_idle_ttl_secs: 600
 </code></pre>
+<h2 id="storage-backend-selection"><a class="header" href="#storage-backend-selection">Storage backend selection</a></h2>
+<p>There is no config-file field for the storage backend. The binary chooses its backend at compile time:</p>
+<pre><code class="language-bash"># Default Linux build: io_uring FileIO and io_uring sidecar commits.
+cargo build --release --bins
+
+# Portable/fallback build: Tokio blocking positional FileIO and sync sidecar commits.
+cargo build --release --bins --features tokio-fileio-fallback
+</code></pre>
+<p>Both builds use the same config defaults and the same on-disk layout. The fallback build is useful for non-Linux development, Linux kernels older than 5.11, or container/Kubernetes environments where seccomp or sysctl policy blocks <code>io_uring_setup</code>.</p>
+<p>Linux startup logs include <code>configured_shards</code>, <code>resolved_shards</code>, and <code>cpu_pinning_enabled</code>. <code>cpu_pinning_enabled</code> is currently <code>false</code> by default.</p>
+<p>Future optimizations not implemented in the current backend are <code>IORING_REGISTER_FILES</code>, <code>IORING_REGISTER_BUFFERS</code>, and <code>IORING_SETUP_ATTACH_WQ</code>.</p>
 <h2 id="page-size-tuning"><a class="header" href="#page-size-tuning">Page size tuning</a></h2>
 <p>The default <code>page_size</code> is intentionally kept at <code>4096</code>. It is a correctness-neutral default and should not be changed just because in-progress metadata commits have been removed from the write hot path.</p>
 <p>Larger pages such as <code>1048576</code> (1 MiB), <code>4194304</code> (4 MiB), and <code>16777216</code> (16 MiB) may improve write/read throughput by reducing per-page overhead, but they change streaming behaviour:</p>
@@ -658,62 +700,83 @@ read_idle_ttl_secs: 600
 <p>See the standalone benchmark guide for page-size comparison commands.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="key-behaviours"><a class="header" href="#key-behaviours">Key Behaviours</a></h1>
-<p>Understanding these internal behaviours is crucial for effectively using BOBS.</p>
+<p>Understanding these behaviours is crucial for effectively using BOBS.</p>
 <h3 id="1-page-based-streaming"><a class="header" href="#1-page-based-streaming">1. Page-based Streaming</a></h3>
-<p>Data is organized into fixed-size pages (configured via <code>page_size</code>, default <code>4096</code>). A successful <code>/write</code> has already accepted the bytes into <code>spool.dat</code> before it returns, including any trailing partial page. Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in <code>spool.dat</code> but are not visible to readers until more writes complete the page or the writer calls <code>/complete</code> to finalize the spool. This ensures readers always receive consistent, non-torn data.</p>
-<p>Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput now that writes no longer commit byte-derived metadata on the hot path, but they also delay reader visibility until that larger page is full. They also consume more of the global cache budget per cached page, so cache reach can fall unless <code>max_cache_bytes</code> is increased alongside <code>page_size</code>. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching entirely; if a full page is larger than the cache cap, that page simply bypasses the cache and reads fall back to disk. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.</p>
+<p>Data is organized into fixed-size pages, configured via <code>page_size</code> and defaulting to <code>4096</code>. A successful <code>/write</code> has already accepted the bytes into <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code> before it returns, including any trailing partial page.</p>
+<p>Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in <code>spool.dat</code> but are not visible to readers until more writes complete the page or the writer calls <code>/complete</code> to finalize the spool. This ensures readers always receive consistent, non-torn data.</p>
+<p>Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they also delay reader visibility until that larger page is full. They consume more of the global cache budget per cached page, so cache reach can fall unless <code>max_cache_bytes</code> is increased alongside <code>page_size</code>. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching entirely; if a full page is larger than the cache cap, that page simply bypasses the cache and reads fall back to disk. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.</p>
 <h3 id="2-long-poll-with-timeout"><a class="header" href="#2-long-poll-with-timeout">2. Long-poll with Timeout</a></h3>
-<p>When a reader requests data that hasn’t been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure (like Kubernetes Ingress or Load Balancers), BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>long_poll_timeout_ms</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
+<p>When a reader requests data that has not been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure, such as Kubernetes Ingress or load balancers, BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>long_poll_timeout_ms</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
 <h3 id="3-follow-mode"><a class="header" href="#3-follow-mode">3. Follow Mode</a></h3>
-<p>A read request without a <code>Range</code> header enters follow mode from byte <code>0</code> (or from byte <code>X</code> with <code>Range: bytes=X-</code>). The server keeps the stream open and pushes new pages as they become available until the spool is finalized.</p>
+<p>A read request without a <code>Range</code> header enters follow mode from byte <code>0</code>, or from byte <code>X</code> with <code>Range: bytes=X-</code>. The server keeps the stream open and pushes new pages as they become available until the spool is finalized.</p>
 <h3 id="4-write-locked-mode"><a class="header" href="#4-write-locked-mode">4. Write-locked Mode</a></h3>
 <p>A spool can be created with <code>write_locked: true</code>. In this state, any attempt to read results in a <code>423 Locked</code> error until the writer calls <code>/complete</code> or otherwise makes the spool readable. This is useful for preventing consumers from seeing any data until the payload is ready for consumption.</p>
-<p>The write-locked/readable state is lifecycle metadata and is committed to <code>redb</code> when it changes. If BOBS restarts while the spool is still <code>WriteLocked</code> or <code>Writing</code>, byte-derived metadata in <code>redb</code> may be stale; recovery must inspect <code>spool.dat</code> to determine the current length, page counts, final page size, and running checksum.</p>
+<p>The write-locked/readable state is lifecycle metadata and is committed to <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code> when it changes. If BOBS restarts while the spool is still <code>WriteLocked</code> or <code>Writing</code>, byte-derived metadata in the sidecar may be stale; recovery inspects <code>spool.dat</code> to determine the current length, page counts, final page size, and running checksum.</p>
 <h3 id="5-parallel-reads"><a class="header" href="#5-parallel-reads">5. Parallel Reads</a></h3>
 <p>BOBS supports a single consumer opening multiple concurrent connections for the same spool. Each connection can request independent byte ranges. Read activity is tracked when bytes are actually served, so slow clients keep their spool alive while making progress but stalled connections do not protect a spool forever.</p>
 <h3 id="6-crc-32c-integrity"><a class="header" href="#6-crc-32c-integrity">6. CRC-32C Integrity</a></h3>
-<p>BOBS calculates a running CRC-32C checksum using hardware-accelerated instructions (where available) as data is written. Once a spool is complete, every read response includes the <code>X-Checksum-CRC32C</code> header containing the Base64-encoded checksum of the entire object. This allows clients to verify data integrity, which is especially important when reassembling parallel range reads.</p>
+<p>BOBS calculates a running CRC-32C checksum using hardware-accelerated instructions, where available, as data is written. Once a spool is complete, every read response includes the <code>X-Checksum-CRC32C</code> header containing the Base64-encoded checksum of the entire object. This allows clients to verify data integrity, which is especially important when reassembling parallel range reads.</p>
 <h3 id="7-sequential-writes"><a class="header" href="#7-sequential-writes">7. Sequential Writes</a></h3>
 <p>Writes must be strictly sequential. The <code>offset</code> provided in the <code>/write</code> request must exactly match the total number of bytes currently stored in the spool. Random-access writes or overwrites are not supported.</p>
-<p>A successful <code>/write</code> means BOBS accepted the bytes into <code>spool.dat</code> through the kernel/file handle before returning. It does not mean the data has been forced to stable storage with <code>sync_data()</code>: the in-progress spool contract is designed for BOBS process restart, where <code>spool.dat</code> can be reread, not for a node or storage crash before completion. <code>/complete</code> remains the durability boundary and keeps <code>sync_data()</code> before marking the spool complete in <code>redb</code>.</p>
-<h3 id="8-recovery-and-cleanup"><a class="header" href="#8-recovery-and-cleanup">8. Recovery and Cleanup</a></h3>
-<p>On restart, <code>redb</code> determines which spools exist and their lifecycle state: created, readable/write-locked, complete, or deleting. For in-progress <code>Writing</code> and <code>WriteLocked</code> spools, <code>spool.dat</code> is authoritative for byte state. Any persisted <code>total_bytes_written</code>, <code>total_pages</code>, <code>final_page_size</code>, or <code>checksum_crc32c</code> for those states is advisory only and recovery recomputes it from the file.</p>
+<p>A successful <code>/write</code> means BOBS accepted the bytes into <code>spool.dat</code> through the kernel/file handle before returning. It does not mean the data has been forced to stable storage with <code>sync_data()</code>: the in-progress spool contract is designed for BOBS restart recovery from <code>spool.dat</code>, not for a node or storage crash before completion. <code>/complete</code> remains the durability boundary and syncs <code>spool.dat</code> data before committing final metadata to <code>meta.json</code>.</p>
+<h3 id="8-atomic-sidecar-metadata"><a class="header" href="#8-atomic-sidecar-metadata">8. Atomic Sidecar Metadata</a></h3>
+<p>Metadata is stored as <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code>. Each commit writes <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json.tmp</code>, syncs the temporary file’s data, atomically renames it over <code>meta.json</code>, and syncs the spool directory. Recovery ignores leftover temporary files and accepts only complete <code>meta.json</code> sidecars.</p>
+<p>This protocol keeps metadata off the write hot path while still making lifecycle transitions durable. It also suits shared filesystems because each key has its own directory and sidecar, with one writer per spool rather than one global metadata writer.</p>
+<h3 id="9-recovery-and-cleanup"><a class="header" href="#9-recovery-and-cleanup">9. Recovery and Cleanup</a></h3>
+<p>On restart, BOBS scans <code>&lt;data_dir&gt;</code> for key directories containing <code>meta.json</code>. For in-progress <code>Writing</code> and <code>WriteLocked</code> spools, <code>spool.dat</code> is authoritative for byte state. Any persisted <code>total_bytes_written</code>, <code>total_pages</code>, <code>final_page_size</code>, or <code>checksum_crc32c</code> for those states is advisory only and recovery recomputes it from the file.</p>
 <p>A background task periodically sweeps the spool manager and deletes spools based on three triggers:</p>
 <ul>
 <li><strong>Writer Inactivity</strong>: The producer stopped writing without completing the spool.</li>
 <li><strong>Read Idle TTL</strong>: The spool is readable but has not served bytes for <code>read_idle_ttl_secs</code>. For never-read spools, this timer starts when the spool becomes readable.</li>
 <li><strong>Full Read TTL</strong>: BOBS has served every byte of the object at least once, possibly across multiple range requests, and <code>full_read_complete_ttl_secs</code> has elapsed since the latest read activity.</li>
 </ul>
+<p>Cleanup TTL semantics are unchanged by sidecar metadata. Expired cleanup removes the key directory, including <code>spool.dat</code>, <code>meta.json</code>, and any interrupted <code>meta.json.tmp</code>.</p>
 <p>Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.</p>
-<h3 id="9-http2-support"><a class="header" href="#9-http2-support">9. HTTP/2 Support</a></h3>
+<h3 id="10-http2-support"><a class="header" href="#10-http2-support">10. HTTP/2 Support</a></h3>
 <p>The server supports both HTTP/1.1 and HTTP/2 (h2c cleartext). Using HTTP/2 is recommended for high-concurrency streaming to benefit from request multiplexing.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="architecture"><a class="header" href="#architecture">Architecture</a></h1>
-<p>BOBS is built on a high-performance, asynchronous foundation.</p>
+<p>BOBS is built around one directory per object key and an asynchronous filesystem backend.</p>
 <h3 id="internal-components"><a class="header" href="#internal-components">Internal Components</a></h3>
 <ul>
-<li><strong>Spool</strong>: The core entity representing a data stream. It contains metadata, a write buffer, and handles synchronization between the writer and readers.</li>
-<li><strong>FileIO</strong>: An abstraction for asynchronous disk I/O. The default high-performance implementation, <code>TokioFileIO</code>, is currently Unix-only: it stores an <code>Arc&lt;std::fs::File&gt;</code>, opens files through <code>std::fs::OpenOptions</code> on Tokio blocking tasks, and performs reads and writes with Unix positional file APIs (<code>FileExt::read_at</code> / <code>write_at</code>, <code>pread</code>/<code>pwrite</code> style) so concurrent operations do not share a file cursor. Writes loop until the owned <code>Bytes</code> buffer has been fully accepted, and <code>/complete</code> durability is preserved with <code>File::sync_data</code> on a blocking task. Non-Unix builds are compile-gated until an explicit positional backend is added for those platforms.</li>
-<li><strong>SpoolManager</strong>: A central registry (using <code>DashMap</code>) that tracks all active spools. It uses <code>redb</code> for lightweight persistence of lifecycle metadata, allowing the service to recover state after a BOBS process restart.</li>
-<li><strong>Page Cache</strong>: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it’s written. Entries are keyed by <code>(spool_key, page_idx)</code>, and <code>max_cache_bytes</code> is the total cache budget across all spools. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching; pages larger than the byte cap are valid but bypass the cache.</li>
+<li><strong>Spool</strong>: The core entity representing a data stream. A spool owns its byte file, lifecycle metadata, page visibility state, reader notifications, and cleanup timestamps.</li>
+<li><strong>On-disk layout</strong>: Each key is stored under <code>&lt;data_dir&gt;/&lt;key&gt;/</code>. Payload bytes live in <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code>; lifecycle and byte-derived metadata live in <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code>.</li>
+<li><strong>FileIO</strong>: An abstraction for asynchronous disk I/O. On Linux, the default backend uses a sharded <code>io_uring</code> ring pool. It requires a Linux 5.11+ kernel because BOBS submits operations against raw file descriptors, plus a runtime policy that permits <code>io_uring_setup</code>. Builds with the <code>tokio-fileio-fallback</code> Cargo feature, and non-Linux builds, use the Tokio/blocking positional-file backend instead.</li>
+<li><strong>Metadata store</strong>: Sidecar metadata is committed atomically by writing <code>meta.json.tmp</code>, syncing that temporary file’s data, atomically renaming it over <code>meta.json</code>, and syncing the spool directory. Startup recovery ignores leftover temporary files and reads only complete sidecars.</li>
+<li><strong>SpoolManager</strong>: A central registry, using <code>DashMap</code>, that tracks active spools and reconstructs them from sidecar files during startup.</li>
+<li><strong>Page Cache</strong>: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it is written. Entries are keyed by <code>(spool_key, page_idx)</code>, and <code>max_cache_bytes</code> is the total cache budget across all spools. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching; pages larger than the byte cap are valid but bypass the cache.</li>
 </ul>
+<h3 id="linux-io_uring-routing"><a class="header" href="#linux-io_uring-routing">Linux <code>io_uring</code> routing</a></h3>
+<p>Default Linux builds route file operations through a fixed-size pool of <code>io_uring</code> shards. <code>io_uring_shards</code> can set the shard count explicitly. If <code>io_uring_shards</code> is unset, BOBS resolves it to <code>max(1, num_cpus / 4)</code>. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust’s randomized <code>Hash</code> state, so the same object key maps to the same shard for a given shard count across restarts and builds.</p>
+<p>Data-file operations and metadata sidecar commits for the same object are routed by the same object key and therefore use the same shard. This keeps a key’s <code>spool.dat</code> work and its <code>meta.json</code> create/rename/fsync work on one ring while still allowing independent keys to spread across shards.</p>
+<p>CPU pinning is not enabled by default. If <code>io_uring_setup</code> is blocked, use a runtime seccomp/sysctl policy that permits it or build with <code>--features tokio-fileio-fallback</code>.</p>
+<p>This backend change does not alter the HTTP API or the on-disk <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code> plus <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code> layout, so it does not require an on-disk migration.</p>
+<p>Future Linux optimizations that are intentionally not implemented yet include <code>IORING_REGISTER_FILES</code>, <code>IORING_REGISTER_BUFFERS</code>, and <code>IORING_SETUP_ATTACH_WQ</code>.</p>
 <h3 id="data-flow"><a class="header" href="#data-flow">Data Flow</a></h3>
 <ol>
-<li><strong>Write</strong>: Data arrives via POST -&gt; accepted bytes are appended to <code>spool.dat</code> through the kernel/file handle before <code>/write</code> returns. In-memory state tracks page assembly, but it is not the source of truth for accepted bytes.</li>
-<li><strong>Page visibility</strong>: Once enough accepted bytes form a complete page, that page becomes reader-visible, is added to the page cache, and any parked reader requests are notified.</li>
+<li><strong>Create</strong>: BOBS creates <code>&lt;data_dir&gt;/&lt;key&gt;/</code>, opens <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code>, and commits an initial <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code> sidecar.</li>
+<li><strong>Write</strong>: Data arrives via POST. Accepted bytes are appended to <code>spool.dat</code> through the selected FileIO backend before <code>/write</code> returns. In-memory state tracks page assembly, but the data file is the source of truth for accepted bytes.</li>
+<li><strong>Page visibility</strong>: Once enough accepted bytes form a complete page, that page becomes reader-visible, is added to the global FIFO page cache, and any parked reader requests are notified.</li>
 <li><strong>Read</strong>: Reader requests a visible range -&gt; check page cache -&gt; if miss, read from <code>spool.dat</code> -&gt; stream bytes to the HTTP response. Trailing partial-page bytes may already be present in <code>spool.dat</code>, but they are not reader-visible until they become a complete page or <code>/complete</code> finalizes the spool.</li>
+<li><strong>Complete</strong>: <code>/complete</code> publishes any trailing partial page, syncs <code>spool.dat</code> data, then commits final completed metadata to <code>meta.json</code> with the sidecar atomic commit protocol.</li>
 <li><strong>Lifecycle</strong>: Spool moves from <code>Creating</code> -&gt; <code>Writing</code> (or <code>WriteLocked</code>) -&gt; <code>Complete</code> -&gt; <code>Deleting</code>.</li>
 </ol>
 <h3 id="persistence-contract"><a class="header" href="#persistence-contract">Persistence Contract</a></h3>
 <p>BOBS persists two things with different authority:</p>
 <ul>
-<li><code>redb</code> stores lifecycle metadata. Metadata is committed when a spool is created, completed, deleted, and when it transitions between write-locked and readable states.</li>
-<li><code>spool.dat</code> stores the bytes. For in-progress <code>Writing</code> and <code>WriteLocked</code> spools, <code>spool.dat</code> is the source of truth after a BOBS process restart.</li>
+<li><code>spool.dat</code> stores accepted bytes. For in-progress <code>Writing</code> and <code>WriteLocked</code> spools, it is authoritative after a BOBS restart.</li>
+<li><code>meta.json</code> stores lifecycle metadata and completed-object byte metadata. It is committed atomically at lifecycle boundaries such as create, write-lock/readable transitions, complete, and delete.</li>
 </ul>
-<p>Ordinary writes deliberately do not update a <code>redb</code> high-water mark, and completed pages do not commit per-page metadata. Adding a mandatory per-write or per-page checkpoint would put <code>redb</code> back on the write hot path, which this design avoids.</p>
-<p>While a spool is still <code>Writing</code> or <code>WriteLocked</code>, persisted byte-derived metadata such as <code>total_bytes_written</code>, <code>total_pages</code>, <code>final_page_size</code>, and <code>checksum_crc32c</code> is advisory and may be stale. Recovery must derive those values from <code>spool.dat</code> rather than trusting <code>redb</code>: the logical accepted length comes from the data file length, page counts and partial-page state are reconstructed from that length, and the running CRC is recomputed by scanning the file bytes.</p>
-<p>The durability invariant is recovery from a BOBS process restart, not survival of a node or storage crash before <code>/complete</code>. A successful <code>/write</code> therefore requires the bytes to have been accepted by the kernel/file handle before the handler returns, but it does not require <code>sync_data()</code>. <code>/complete</code> is the durability boundary for a finished object and must keep <code>sync_data()</code> before committing the completed lifecycle metadata.</p>
-<p>If startup recovery time later becomes an operational concern, BOBS may add optional coarse-grained checkpoints. Such checkpoints must be an optimization only: they may be written periodically or at lifecycle transitions, but never per write or per completed page, and recovery correctness must not depend on them being present or current.</p>
+<p>Ordinary writes deliberately do not update a durable high-water mark, and completed pages do not commit per-page metadata. Adding a mandatory per-write or per-page checkpoint would put metadata commits back on the write hot path, which this design avoids.</p>
+<p>While a spool is still <code>Writing</code> or <code>WriteLocked</code>, persisted byte-derived metadata such as <code>total_bytes_written</code>, <code>total_pages</code>, <code>final_page_size</code>, and <code>checksum_crc32c</code> is advisory and may be stale. Recovery derives those values from <code>spool.dat</code>: the logical accepted length comes from the data file length, page counts and partial-page state are reconstructed from that length, and the running CRC is recomputed by scanning the file bytes.</p>
+<p>The in-progress durability invariant is recovery from a BOBS restart, not survival of a node or storage crash before <code>/complete</code>. A successful <code>/write</code> therefore requires the bytes to have been accepted by the kernel/file handle before the handler returns, but it does not require <code>sync_data()</code>. <code>/complete</code> is the durability boundary for a finished object: BOBS syncs <code>spool.dat</code> data before committing final completed metadata.</p>
+<p>Completed metadata is durable through the sidecar protocol: write <code>meta.json.tmp</code>, sync it, rename it to <code>meta.json</code>, and sync the parent directory. Recovery treats <code>meta.json</code> as all-or-nothing and ignores any leftover <code>meta.json.tmp</code> from an interrupted commit.</p>
+<h3 id="recovery-and-shared-filesystems"><a class="header" href="#recovery-and-shared-filesystems">Recovery and Shared Filesystems</a></h3>
+<p>Startup recovery scans <code>&lt;data_dir&gt;</code> for key directories with <code>meta.json</code>. In-progress spools are rebuilt from <code>spool.dat</code>; completed spools validate that the data file still satisfies the committed logical length before serving.</p>
+<p>The layout is friendly to shared filesystems and multi-BOBS deployments because each object has its own directory and sidecar, and each spool has a single writer. Independent keys can be created, completed, recovered, and deleted without a global metadata database or cross-key write serialization. Correct routing is still required: create, write, complete, and read traffic for a key must reach a BOBS instance that can see the same <code>&lt;data_dir&gt;/&lt;key&gt;</code> files.</p>
+<p>Cleanup TTL behaviour is preserved with sidecar metadata. Writer inactivity, read-idle, and full-read-complete cleanup still remove both <code>spool.dat</code> and <code>meta.json</code> for expired keys; TTL timestamps are committed at lifecycle boundaries and reconstructed conservatively on recovery.</p>
+<h3 id="legacy-metadata-migration"><a class="header" href="#legacy-metadata-migration">Legacy Metadata Migration</a></h3>
+<p>Older BOBS builds stored lifecycle metadata in a native redb database. Current BOBS uses sidecar <code>meta.json</code> files. Legacy native redb state is handled as an export/import migration path into sidecars rather than as the live metadata backend.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="write-routing"><a class="header" href="#write-routing">Write Routing</a></h1>
 <p>BOBS supports horizontal scaling of writes across a StatefulSet. Each pod owns the spools it created, and clients are directed to the owning pod for all body-path operations via the <code>write_url</code> returned at create time.</p>

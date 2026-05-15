@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::io::FileIO;
 use crate::manager::SpoolManager;
+use crate::metadata::MetadataStore;
 use crate::spool::SpoolState;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -21,7 +22,11 @@ use tokio::time::{self, Duration};
 ///
 /// Note: `reader_count` is NOT used as an absolute guard. Stalled connections that serve
 /// no bytes will expire via the idle TTL like any other unserved spool.
-pub async fn run_cleanup_loop<F: FileIO>(manager: Arc<SpoolManager<F>>, config: Arc<Config>) {
+pub async fn run_cleanup_loop<F, M>(manager: Arc<SpoolManager<F, M>>, config: Arc<Config>)
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     let mut interval = time::interval(Duration::from_secs(config.cleanup_sweep_interval_secs));
 
     loop {
@@ -82,10 +87,14 @@ pub async fn run_cleanup_loop<F: FileIO>(manager: Arc<SpoolManager<F>>, config: 
     }
 }
 
-pub fn start_cleanup_task<F: FileIO>(
-    manager: Arc<SpoolManager<F>>,
+pub fn start_cleanup_task<F, M>(
+    manager: Arc<SpoolManager<F, M>>,
     config: Arc<Config>,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     tokio::spawn(run_cleanup_loop(manager, config))
 }
 
@@ -100,7 +109,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::io::TokioFileIO;
-    use crate::manager::SPOOL_TABLE;
+    use crate::metadata::MetadataStore;
     use crate::spool::SpoolMetadata;
     use tempfile::tempdir;
 
@@ -118,6 +127,7 @@ mod tests {
             unread_ttl_secs: 1,
             cleanup_sweep_interval_secs: 1,
             long_poll_timeout_ms: 25000,
+            io_uring_shards: None,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
@@ -126,7 +136,7 @@ mod tests {
 
     async fn test_manager() -> Arc<SpoolManager<TokioFileIO>> {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         Arc::new(
             SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
@@ -134,34 +144,23 @@ mod tests {
         )
     }
 
-    fn rewrite_persisted_metadata<F: FileIO>(
+    async fn rewrite_persisted_metadata<F: FileIO>(
         manager: &SpoolManager<F>,
         key: &str,
         mutate: impl FnOnce(&mut SpoolMetadata),
     ) {
-        let read_txn = manager.db.begin_read().expect("begin read");
-        let table = read_txn.open_table(SPOOL_TABLE).expect("open table");
-        let raw = table
-            .get(key)
+        let mut meta = manager
+            .metadata_store
+            .read(key)
+            .await
             .expect("read metadata")
-            .expect("metadata exists")
-            .value()
-            .to_vec();
-        drop(table);
-        drop(read_txn);
-
-        let mut meta: SpoolMetadata = serde_json::from_slice(&raw).expect("deserialize metadata");
+            .expect("metadata exists");
         mutate(&mut meta);
-        let payload = serde_json::to_vec(&meta).expect("serialize metadata");
-
-        let write_txn = manager.db.begin_write().expect("begin write");
-        {
-            let mut table = write_txn.open_table(SPOOL_TABLE).expect("open table");
-            table
-                .insert(key, payload.as_slice())
-                .expect("rewrite metadata");
-        }
-        write_txn.commit().expect("commit metadata rewrite");
+        manager
+            .metadata_store
+            .write(&meta)
+            .await
+            .expect("rewrite metadata");
     }
 
     // -----------------------------------------------------------------------
@@ -203,12 +202,12 @@ mod tests {
     /// Recovery must seed in-progress spools with a fresh in-memory last_write_at.
     /// Persisted metadata is only final lifecycle state; its write timestamp may be
     /// stale, so cleanup must not delete a recovered writer on the first sweep solely
-    /// because the redb timestamp is old.
+    /// because the sidecar timestamp is old.
     #[tokio::test]
     async fn test_recovered_in_progress_stale_last_write_survives_first_cleanup() {
         tokio::time::pause();
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let config = test_config();
         let key = uuid::Uuid::new_v4().to_string();
@@ -229,7 +228,8 @@ mod tests {
             rewrite_persisted_metadata(&manager, &key, |meta| {
                 meta.state = SpoolState::Writing;
                 meta.last_write_at = 0;
-            });
+            })
+            .await;
         }
 
         let manager = Arc::new(
@@ -262,7 +262,7 @@ mod tests {
     async fn test_post_recovery_write_refreshes_last_write_anchor() {
         tokio::time::pause();
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
+        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let config = test_config();
         let key = uuid::Uuid::new_v4().to_string();
@@ -279,7 +279,7 @@ mod tests {
                 .write(0, bytes::Bytes::copy_from_slice(&[0xBB; 4096]))
                 .await
                 .expect("write page");
-            rewrite_persisted_metadata(&manager, &key, |meta| meta.last_write_at = 0);
+            rewrite_persisted_metadata(&manager, &key, |meta| meta.last_write_at = 0).await;
         }
 
         let manager = Arc::new(

@@ -6,7 +6,11 @@ use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::spool::{Spool, SpoolState};
 
-impl<F: FileIO> Spool<F> {
+impl<F, M> Spool<F, M>
+where
+    F: FileIO,
+    M: crate::metadata::MetadataStore + Clone + Send + Sync + 'static,
+{
     pub fn acquire_reader(&self) {
         self.reader_count.fetch_add(1, Ordering::SeqCst);
     }
@@ -88,6 +92,7 @@ mod tests {
 
     use super::*;
     use crate::io::{FileIO, TokioFileIO};
+    use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
     use crate::spool::SpoolMetadata;
 
     async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
@@ -99,18 +104,12 @@ mod tests {
         page_size: usize,
         cache_bytes: usize,
     ) -> Spool<TokioFileIO> {
-        let path = dir.join("spool.dat");
-        let db_path = dir.join("test.redb");
-        let db = Arc::new(redb::Database::create(&db_path).expect("create test db"));
-        {
-            let write_txn = db.begin_write().expect("begin write");
-            {
-                let _ = write_txn
-                    .open_table(crate::manager::SPOOL_TABLE)
-                    .expect("open table");
-            }
-            write_txn.commit().expect("commit");
-        }
+        let spool_dir = dir.join("test-key");
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .expect("create spool dir");
+        let path = spool_dir.join("spool.dat");
+        let metadata_store = SyncSidecarMetadataStore::new(dir);
         let handle = TokioFileIO::create(&path)
             .await
             .expect("failed to create spool file");
@@ -131,6 +130,11 @@ mod tests {
             data_path: path,
         };
 
+        metadata_store
+            .write(&meta)
+            .await
+            .expect("insert initial metadata");
+
         Spool::new(
             meta,
             handle,
@@ -138,7 +142,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
                 cache_bytes,
             ))),
-            db,
+            metadata_store,
         )
         .await
     }

@@ -10,16 +10,22 @@ The `bobs-benchmark` binary drives complete BOBS object lifecycles directly over
 
 Use it to validate BOBS itself before adding Polytope, ingress, or other clients to the path. Start local, then repeat the same workload from a container or Kubernetes pod.
 
-Persistence expectations for this benchmark match the BOBS contract: before `/complete`, recovery is required across a BOBS process restart, not across a node or storage crash. During `Writing` or `WriteLocked`, `spool.dat` is the source of truth and persisted `redb` byte metadata is advisory; `/write` must append accepted bytes to `spool.dat` through the kernel/file handle before returning, but does not force them to stable storage with `sync_data()`. Full pages become reader-visible as they are completed; trailing partial-page bytes may already be in `spool.dat` but remain invisible until more writes complete the page or `/complete` finalizes the spool. `/complete` is the durability boundary and keeps `sync_data()` before committing completion metadata.
+Persistence expectations for this benchmark match the BOBS contract: each object is stored as `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json`. Before `/complete`, recovery is required across a BOBS restart by reconstructing in-progress byte state from `spool.dat`, not across a node or storage crash. `/write` must append accepted bytes to `spool.dat` through the kernel/file handle before returning, but does not force them to stable storage with `sync_data()`. Full pages become reader-visible as they are completed; trailing partial-page bytes may already be in `spool.dat` but remain invisible until more writes complete the page or `/complete` finalizes the spool. `/complete` is the durability boundary: BOBS syncs `spool.dat` data before committing final metadata to `meta.json` with the sidecar atomic commit protocol.
 
 > Plain HTTP only: this first benchmark implementation accepts `http://` BOBS endpoints. `https://` support requires an approved dependency or feature change.
 
 ## Build
 
-Local binary:
+Default Linux `io_uring` binary. This build uses sharded rings:
 
 ```bash
 cargo build --release --bin bobs --bin bobs-benchmark
+```
+
+Fallback binary, for non-Linux development, Linux kernels older than 5.11, or runtimes that block `io_uring_setup` entirely:
+
+```bash
+cargo build --release --bin bobs --bin bobs-benchmark --features tokio-fileio-fallback
 ```
 
 Container image, after the image has been built with the benchmark binary included:
@@ -29,11 +35,13 @@ docker build --target release -t bobs:bench .
 docker run --rm bobs:bench bobs-benchmark --help
 ```
 
+The Dockerfile builds the default Linux backend. Build a fallback image by passing the fallback feature in a dedicated build stage or by building the binaries outside Docker with `--features tokio-fileio-fallback` and packaging those artifacts.
+
 ## Local-first validation
 
 Run a local BOBS server first. This keeps network and Kubernetes scheduling effects out of the initial measurement.
 
-Create a temporary config:
+Create a temporary config. The Linux `io_uring_shards` field is omitted here so BOBS resolves it to `max(1, num_cpus / 4)`. CPU pinning is not enabled by default.
 
 ```bash
 cat >/tmp/bobs-bench.yaml <<'YAML'
@@ -48,13 +56,22 @@ domain: 127.0.0.1:3000
 YAML
 ```
 
-Start BOBS in one terminal:
+Start BOBS in one terminal with the default Linux `io_uring` backend:
 
 ```bash
 rm -rf /tmp/bobs-bench-data
 HOSTNAME=bobs-0 \
 BOBS_INTERNAL_BASE_URL_TEMPLATE=http://127.0.0.1:3000/api/v1 \
 cargo run --release --bin bobs -- /tmp/bobs-bench.yaml
+```
+
+Or start the fallback backend:
+
+```bash
+rm -rf /tmp/bobs-bench-data
+HOSTNAME=bobs-0 \
+BOBS_INTERNAL_BASE_URL_TEMPLATE=http://127.0.0.1:3000/api/v1 \
+cargo run --release --bin bobs --features tokio-fileio-fallback -- /tmp/bobs-bench.yaml
 ```
 
 Run the benchmark in another terminal:
@@ -171,7 +188,27 @@ For each config, start BOBS with that file and run the same benchmark command, c
 
 ## Container validation
 
-Container validation checks the packaged binary and container networking while still using a known local BOBS server.
+Container validation checks the packaged binary, container networking, and whether the runtime permits the default Linux `io_uring` backend.
+
+The default backend requires Linux 5.11+ because it submits `io_uring` operations against raw file descriptors, and it requires access to the `io_uring_setup` syscall. If the policy blocks `io_uring_setup`, use an io_uring-capable seccomp/sysctl policy or a `tokio-fileio-fallback` build. On this development host, validation showed:
+
+```text
+host io_uring_setup: allowed
+docker default seccomp: io_uring_setup returned ENOSYS
+docker --security-opt seccomp=unconfined: allowed
+```
+
+So the default Docker seccomp profile blocked `io_uring_setup` here, even though the host kernel supported it. The Dockerfile was not changed because this is a runtime security policy, not an image-layer setting.
+
+If your default container policy blocks `io_uring_setup`, either run the default image with a seccomp profile that permits io_uring, or use a fallback build/image:
+
+```bash
+# Default backend with an unconfined seccomp policy for local validation.
+docker run --rm --security-opt seccomp=unconfined bobs:bench bobs --help
+
+# Fallback backend build outside the default Dockerfile path.
+cargo build --release --bins --features tokio-fileio-fallback
+```
 
 On Linux, use host networking to reach the local server:
 
@@ -190,6 +227,8 @@ If host networking is unavailable, publish or otherwise route the BOBS server an
 ## Kubernetes/pod validation
 
 Run from inside the cluster after local and container validation pass. This measures in-cluster DNS, pod networking, and BOBS pod placement effects.
+
+For the default Linux image, ask the chart/platform team whether the cluster runtime seccomp profile and node sysctls permit `io_uring_setup`. In particular, check the effective seccomp profile and node settings such as `/proc/sys/kernel/io_uring_disabled`. If the profile is `RuntimeDefault` and blocks io_uring, use a chart override or pod security context that applies an io_uring-capable seccomp profile, or deploy a `tokio-fileio-fallback` image instead. No Kubernetes YAML setting can compensate for a node kernel older than Linux 5.11.
 
 ### Single endpoint mode
 
@@ -228,7 +267,7 @@ kubectl run bobs-benchmark \
   --start-delay-ms 2000
 ```
 
-Avoid an aggregate multi-pod Kubernetes service for multi-BOBS benchmark runs unless the deployment guarantees that create, write, complete, and read for an object route to the same pod. Prefer per-pod services or pod DNS names with `--base-url-template`.
+Avoid an aggregate multi-pod Kubernetes service for multi-BOBS benchmark runs unless the deployment guarantees that create, write, complete, and read for an object route to the same pod. Prefer per-pod services or pod DNS names with `--base-url-template`. Within one BOBS instance, data and metadata `io_uring` work for the same key is routed to the same shard by stable key hashing; that does not replace the need for correct HTTP-level routing between pods.
 
 ## Output and summary fields
 

@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::error::BobsError;
 use crate::io::FileIO;
 use crate::manager::SpoolManager;
+use crate::metadata::MetadataStore;
 use async_stream::stream;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -24,23 +25,27 @@ enum ReadRequestRange {
     },
 }
 
-pub struct AppState<F: FileIO> {
-    pub manager: Arc<SpoolManager<F>>,
+pub struct AppState<F: FileIO, M: MetadataStore> {
+    pub manager: Arc<SpoolManager<F, M>>,
     pub config: Arc<Config>,
     pub hostname: String,
     pub ordinal: String,
     pub internal_base_url: String,
 }
 
-pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
+pub fn router<F, M>() -> Router<Arc<AppState<F, M>>>
+where
+    F: FileIO + 'static,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     Router::new()
-        .route("/api/v1/health", get(health::<F>))
-        .route("/api/v1/status", get(status).head(status_head))
-        .route("/api/v1/create", put(create_spool::<F>))
-        .route("/api/v1/write/{key}/{offset}", post(write_spool::<F>))
-        .route("/api/v1/complete/{key}", post(complete_spool::<F>))
-        .route("/api/v1/read/{key}", get(read_spool::<F>))
-        .route("/api/v1/delete/{key}", delete(delete_spool::<F>))
+        .route("/api/v1/health", get(health::<F, M>))
+        .route("/api/v1/status", get(status::<F, M>).head(status_head))
+        .route("/api/v1/create", put(create_spool::<F, M>))
+        .route("/api/v1/write/{key}/{offset}", post(write_spool::<F, M>))
+        .route("/api/v1/complete/{key}", post(complete_spool::<F, M>))
+        .route("/api/v1/read/{key}", get(read_spool::<F, M>))
+        .route("/api/v1/delete/{key}", delete(delete_spool::<F, M>))
 }
 
 #[derive(Debug, Serialize)]
@@ -49,14 +54,18 @@ struct StatusResponse {
     hostname: String,
 }
 
-async fn health<F: FileIO>(State(state): State<Arc<AppState<F>>>) -> impl IntoResponse {
+async fn health<F: FileIO, M: MetadataStore>(
+    State(state): State<Arc<AppState<F, M>>>,
+) -> impl IntoResponse {
     Json(StatusResponse {
         status: "ok",
         hostname: state.hostname.clone(),
     })
 }
 
-async fn status<F: FileIO>(State(state): State<Arc<AppState<F>>>) -> impl IntoResponse {
+async fn status<F: FileIO, M: MetadataStore>(
+    State(state): State<Arc<AppState<F, M>>>,
+) -> impl IntoResponse {
     Json(StatusResponse {
         status: "ok",
         hostname: state.hostname.clone(),
@@ -87,10 +96,14 @@ struct CreateResponse {
     write_url: String,
 }
 
-async fn create_spool<F: FileIO>(
-    State(state): State<Arc<AppState<F>>>,
+async fn create_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     body: Bytes,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     let req = if body.is_empty() {
         CreateRequest::default()
     } else {
@@ -131,11 +144,15 @@ async fn create_spool<F: FileIO>(
         .into_response())
 }
 
-async fn write_spool<F: FileIO>(
-    State(state): State<Arc<AppState<F>>>,
+async fn write_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     Path((key, offset)): Path<(String, u64)>,
     mut body: Body,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     tracing::info!(key = %key, offset = offset, "write spool request");
     let spool = state
         .manager
@@ -185,11 +202,15 @@ async fn write_spool<F: FileIO>(
     Ok(StatusCode::OK.into_response())
 }
 
-async fn complete_spool<F: FileIO>(
-    State(state): State<Arc<AppState<F>>>,
+async fn complete_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     Path(key): Path<String>,
     body: Bytes,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     let req = if body.is_empty() {
         CompleteRequest::default()
     } else {
@@ -208,25 +229,37 @@ async fn complete_spool<F: FileIO>(
 
 /// RAII guard that decrements the spool's reader count on drop, ensuring cleanup
 /// sees the correct active reader count even if the stream is cancelled mid-flight.
-struct ReaderLease<F: FileIO> {
-    spool: Arc<crate::spool::Spool<F>>,
+struct ReaderLease<F, M>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
+    spool: Arc<crate::spool::Spool<F, M>>,
 }
 
 fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
     page.slice(slice_start..slice_end)
 }
 
-impl<F: FileIO> Drop for ReaderLease<F> {
+impl<F, M> Drop for ReaderLease<F, M>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     fn drop(&mut self) {
         self.spool.release_reader();
     }
 }
 
-async fn read_spool<F: FileIO + 'static>(
-    State(state): State<Arc<AppState<F>>>,
+async fn read_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     Path(key): Path<String>,
     headers: axum::http::HeaderMap,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO + 'static,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     let request_range = parse_range(headers.get(axum::http::header::RANGE)).map_err(ApiError)?;
 
     let spool = state
@@ -562,10 +595,14 @@ fn parse_range(header: Option<&HeaderValue>) -> crate::error::Result<ReadRequest
     })
 }
 
-async fn delete_spool<F: FileIO>(
-    State(state): State<Arc<AppState<F>>>,
+async fn delete_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     Path(key): Path<String>,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     tracing::info!(key = %key, "delete spool request");
     state.manager.delete_spool(&key).await.map_err(ApiError)?;
     Ok(StatusCode::OK.into_response())
@@ -613,7 +650,8 @@ mod tests {
     use super::*;
     use crate::cleanup::start_cleanup_task;
     use crate::error::BobsError;
-    use crate::io::TokioFileIO;
+    use crate::io::DefaultFileIO;
+    use crate::metadata::DefaultMetadataStore;
     use axum::http::Request;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
@@ -634,6 +672,7 @@ mod tests {
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 30,
             long_poll_timeout_ms: 25000,
+            io_uring_shards: None,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
@@ -657,6 +696,7 @@ mod tests {
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 1,
             long_poll_timeout_ms: 25000,
+            io_uring_shards: None,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
@@ -665,14 +705,18 @@ mod tests {
 
     /// Returns both the `Router` and the shared `AppState` so tests can inspect
     /// spool fields (e.g. `full_object_read_at`) after HTTP round-trips.
-    async fn app_with_state() -> (Router, Arc<AppState<TokioFileIO>>) {
+    async fn app_with_state() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
-        let db_path = root.join("spools.redb");
         let data_dir = root.join("data");
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
-                .expect("manager init"),
+            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+                DefaultMetadataStore::new(&data_dir),
+                &data_dir,
+                4096,
+                65536,
+            )
+            .expect("manager init"),
         );
         let state = Arc::new(AppState {
             manager,
@@ -681,19 +725,23 @@ mod tests {
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
         });
-        let app = router::<TokioFileIO>().with_state(Arc::clone(&state));
+        let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
     }
 
     /// Like `app_with_state` but uses `test_config_ttl` (short sweep + TTL values).
-    async fn app_with_ttl_config() -> (Router, Arc<AppState<TokioFileIO>>) {
+    async fn app_with_ttl_config() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
-        let db_path = root.join("spools.redb");
         let data_dir = root.join("data");
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
-                .expect("manager init"),
+            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+                DefaultMetadataStore::new(&data_dir),
+                &data_dir,
+                4096,
+                65536,
+            )
+            .expect("manager init"),
         );
         let state = Arc::new(AppState {
             manager,
@@ -702,7 +750,7 @@ mod tests {
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
         });
-        let app = router::<TokioFileIO>().with_state(Arc::clone(&state));
+        let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
     }
 

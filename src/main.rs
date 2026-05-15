@@ -1,8 +1,9 @@
 use bobs::cleanup;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
-use bobs::io::TokioFileIO;
+use bobs::io::DefaultFileIO;
 use bobs::manager::SpoolManager;
+use bobs::metadata::{legacy_redb, DefaultMetadataStore};
 use bobs::shutdown;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -70,15 +71,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "BOBS starting",
     );
 
-    let manager = Arc::new(SpoolManager::<TokioFileIO>::new(
-        config.data_dir.join("spools.redb"),
-        &config.data_dir,
-        config.page_size,
-        config.max_cache_bytes,
-    )?);
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    {
+        let ring_pool = bobs::io::initialize_production_ring_pool(config.io_uring_shards)?;
+        tracing::info!(
+            configured_shards = ?ring_pool.configured_shards,
+            resolved_shards = ring_pool.resolved_shards,
+            cpu_pinning_enabled = ring_pool.cpu_pinning_enabled,
+            "io_uring production ring pool initialized",
+        );
+    }
+
+    legacy_redb::migrate_from_redb(config.data_dir.join("spools.redb"), &config.data_dir)?;
+    let manager = Arc::new(
+        SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+            DefaultMetadataStore::new(&config.data_dir),
+            &config.data_dir,
+            config.page_size,
+            config.max_cache_bytes,
+        )?,
+    );
 
     manager.recover().await?;
-    let _cleanup = cleanup::start_cleanup_task(manager.clone(), config.clone());
+    let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
     let state = Arc::new(AppState {
         manager,
@@ -87,7 +102,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ordinal: ordinal.clone(),
         internal_base_url,
     });
-    let app = router::<TokioFileIO>().with_state(state);
+    let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("listening on {}", addr);
@@ -130,6 +145,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Drain in-flight connections before exiting.
     while tasks.join_next().await.is_some() {}
+
+    // Drop HTTP entrypoints and background manager users before tearing down
+    // the global io_uring pool; otherwise lingering Arc<SpoolManager> handles
+    // can keep pool clones alive and prevent driver shutdown from joining.
+    drop(listener);
+    drop(app);
+    cleanup_task.abort();
+    match cleanup_task.await {
+        Ok(()) => tracing::info!("cleanup task exited before shutdown"),
+        Err(err) if err.is_cancelled() => tracing::info!("cleanup task aborted for shutdown"),
+        Err(err) => tracing::warn!(error = %err, "cleanup task failed during shutdown"),
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    {
+        match bobs::io::uring_fs::shutdown_global_ring_pool_for_exit()? {
+            Some(shutdown) => tracing::info!(
+                joined_driver_handles = shutdown.joined_driver_handles,
+                in_flight_operations_remaining = shutdown.in_flight_operations_remaining,
+                driver_threads_all_stopped = shutdown.driver_threads_all_stopped,
+                "io_uring production ring pool shut down"
+            ),
+            None => tracing::warn!(
+                "io_uring production ring pool was still shared during shutdown; dropping global reference"
+            ),
+        }
+    }
 
     Ok(())
 }

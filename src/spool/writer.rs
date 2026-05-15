@@ -4,7 +4,11 @@ use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::spool::{Spool, SpoolState};
 
-impl<F: FileIO> Spool<F> {
+impl<F, M> Spool<F, M>
+where
+    F: FileIO,
+    M: crate::metadata::MetadataStore + Clone + Send + Sync + 'static,
+{
     /// Append data at the given offset. Writes are strictly sequential — the offset
     /// must match total_bytes_written exactly. Every accepted non-empty body is
     /// appended to spool.dat before any in-memory state advances. Full pages are
@@ -129,23 +133,18 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::io::{FileIO, TokioFileIO};
+    use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
     use crate::spool::SpoolMetadata;
     use std::sync::Arc;
     use tempfile::tempdir;
 
     async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
-        let path = dir.join("spool.dat");
-        let db_path = dir.join("test.redb");
-        let db = Arc::new(redb::Database::create(&db_path).expect("create test db"));
-        {
-            let write_txn = db.begin_write().expect("begin write");
-            {
-                let _ = write_txn
-                    .open_table(crate::manager::SPOOL_TABLE)
-                    .expect("open table");
-            }
-            write_txn.commit().expect("commit");
-        }
+        let spool_dir = dir.join("test-key");
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .expect("create spool dir");
+        let path = spool_dir.join("spool.dat");
+        let metadata_store = SyncSidecarMetadataStore::new(dir);
         let handle = TokioFileIO::create(&path)
             .await
             .expect("failed to create spool file");
@@ -165,19 +164,10 @@ mod tests {
             final_page_size: None,
             data_path: path,
         };
-        let payload = serde_json::to_vec(&meta).expect("serialize initial metadata");
-        {
-            let write_txn = db.begin_write().expect("begin write");
-            {
-                let mut table = write_txn
-                    .open_table(crate::manager::SPOOL_TABLE)
-                    .expect("open table");
-                table
-                    .insert(meta.key.as_str(), payload.as_slice())
-                    .expect("insert initial metadata");
-            }
-            write_txn.commit().expect("commit");
-        }
+        metadata_store
+            .write(&meta)
+            .await
+            .expect("insert initial metadata");
 
         Spool::new(
             meta,
@@ -186,23 +176,18 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
                 page_size * 256,
             ))),
-            db,
+            metadata_store,
         )
         .await
     }
 
-    fn persisted_metadata(spool: &Spool<TokioFileIO>) -> SpoolMetadata {
-        let read_txn = spool.db.begin_read().expect("begin read");
-        let table = read_txn
-            .open_table(crate::manager::SPOOL_TABLE)
-            .expect("open table");
-        let raw = table
-            .get("test-key")
+    async fn persisted_metadata(spool: &Spool<TokioFileIO>) -> SpoolMetadata {
+        spool
+            .metadata_store
+            .read("test-key")
+            .await
             .expect("read metadata")
             .expect("metadata exists")
-            .value()
-            .to_vec();
-        serde_json::from_slice(&raw).expect("deserialize metadata")
     }
 
     #[tokio::test]
@@ -275,7 +260,7 @@ mod tests {
             .len();
         assert_eq!(file_len, first.len() as u64);
 
-        let persisted = persisted_metadata(&spool);
+        let persisted = persisted_metadata(&spool).await;
         assert_eq!(persisted.total_bytes_written, 0);
         assert_eq!(persisted.total_pages, 0);
         assert_eq!(persisted.last_write_at, 0);
