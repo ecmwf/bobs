@@ -24,6 +24,7 @@ pub struct Config {
     pub unread_ttl_secs: u64,
     pub cleanup_sweep_interval_secs: u64,
     pub long_poll_timeout_ms: u64,
+    pub io_uring_shards: Option<usize>,
     pub host_prefix: String,
     pub domain: String,
     pub route_name: String,
@@ -44,6 +45,7 @@ impl Default for Config {
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 30,
             long_poll_timeout_ms: 25000,
+            io_uring_shards: None,
             host_prefix: String::new(),
             domain: String::new(),
             route_name: String::new(),
@@ -66,13 +68,6 @@ impl Config {
             ));
         }
 
-        if self.max_cache_bytes < self.page_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "max_cache_bytes must be at least page_size",
-            ));
-        }
-
         if self.cleanup_sweep_interval_secs == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -84,6 +79,13 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "long_poll_timeout_ms must be greater than 0",
+            ));
+        }
+
+        if self.io_uring_shards == Some(0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "io_uring_shards must be greater than 0 when set",
             ));
         }
 
@@ -147,6 +149,7 @@ mod tests {
         assert_eq!(config.unread_ttl_secs, 3600);
         assert_eq!(config.cleanup_sweep_interval_secs, 30);
         assert_eq!(config.long_poll_timeout_ms, 25000);
+        assert_eq!(config.io_uring_shards, None);
     }
 
     #[test]
@@ -167,8 +170,10 @@ reader_done_ttl_secs: 22
 unread_ttl_secs: 33
 cleanup_sweep_interval_secs: 44
 long_poll_timeout_ms: 555
+io_uring_shards: 7
 host_prefix: test-prefix
 domain: test.example.com
+route_name: test-route
 "#,
         )
         .expect("write yaml");
@@ -186,8 +191,10 @@ domain: test.example.com
         assert_eq!(cfg.unread_ttl_secs, 33);
         assert_eq!(cfg.cleanup_sweep_interval_secs, 44);
         assert_eq!(cfg.long_poll_timeout_ms, 555);
+        assert_eq!(cfg.io_uring_shards, Some(7));
         assert_eq!(cfg.host_prefix, "test-prefix");
         assert_eq!(cfg.domain, "test.example.com");
+        assert_eq!(cfg.route_name, "test-route");
     }
 
     #[test]
@@ -225,7 +232,7 @@ domain: test.example.com
     }
 
     #[test]
-    fn test_validate_rejects_small_cache() {
+    fn test_validate_accepts_cache_smaller_than_page_size() {
         let config = Config {
             max_cache_bytes: 1024,
             page_size: 4096,
@@ -235,8 +242,21 @@ domain: test.example.com
             ..Config::default()
         };
 
-        let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        config.validate().expect("validation should succeed");
+    }
+
+    #[test]
+    fn test_validate_accepts_zero_cache_bytes() {
+        let config = Config {
+            max_cache_bytes: 0,
+            page_size: 4096,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        config.validate().expect("validation should succeed");
     }
 
     #[test]
@@ -287,6 +307,65 @@ domain: test.example.com
     }
 
     #[test]
+    fn config_io_uring_defaults_keep_auto_shards() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.io_uring_shards, None);
+    }
+
+    #[test]
+    fn config_io_uring_from_file_yaml_parses_explicit_knobs() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("io-uring.yaml");
+        std::fs::write(
+            &path,
+            r#"io_uring_shards: 3
+host_prefix: x
+domain: y
+route_name: z
+"#,
+        )
+        .expect("write yaml");
+
+        let cfg = Config::from_file(&path).expect("parse yaml");
+        assert_eq!(cfg.io_uring_shards, Some(3));
+        assert_eq!(cfg.host_prefix, "x");
+        assert_eq!(cfg.domain, "y");
+        assert_eq!(cfg.route_name, "z");
+    }
+
+    #[test]
+    fn config_io_uring_from_file_yaml_defaults_to_auto_shards_when_omitted() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("io-uring-defaults.yaml");
+        std::fs::write(
+            &path,
+            r#"host_prefix: x
+domain: y
+route_name: z
+"#,
+        )
+        .expect("write yaml");
+
+        let cfg = Config::from_file(&path).expect("parse yaml");
+        assert_eq!(cfg.io_uring_shards, None);
+    }
+
+    #[test]
+    fn config_io_uring_validate_rejects_zero_shards() {
+        let config = Config {
+            io_uring_shards: Some(0),
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn test_from_file_yaml_old_keys_parse_without_new_keys() {
         // Old YAML without the new keys should parse successfully, using defaults.
         let tmp = tempdir().expect("tempdir");
@@ -303,9 +382,10 @@ route_name: z
         .expect("write yaml");
 
         let cfg = Config::from_file(&path).expect("parse yaml");
-        // New fields get defaults.
+        // Current fields get defaults.
         assert_eq!(cfg.read_idle_ttl_secs, 600);
         assert_eq!(cfg.full_read_complete_ttl_secs, 30);
+        assert_eq!(cfg.io_uring_shards, None);
         // Old fields still parsed.
         assert_eq!(cfg.reader_done_ttl_secs, 99);
         assert_eq!(cfg.unread_ttl_secs, 888);
@@ -322,5 +402,6 @@ route_name: z
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.max_cache_bytes, 1048576);
+        assert_eq!(cfg.io_uring_shards, None);
     }
 }

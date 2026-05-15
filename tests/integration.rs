@@ -3,9 +3,16 @@ use base64::Engine;
 use bobs::cleanup::start_cleanup_task;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
-use bobs::io::TokioFileIO;
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+use bobs::io::UringFileIO;
+use bobs::io::{DefaultFileIO, TokioFileIO};
 use bobs::manager::SpoolManager;
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+use bobs::metadata::UringSidecarMetadataStore;
+use bobs::metadata::{DefaultMetadataStore, SyncSidecarMetadataStore};
 use serde_json::{json, Value};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -14,10 +21,51 @@ use tokio::task::JoinHandle;
 
 struct TestServer {
     base_url: String,
+    manager: Arc<SpoolManager<DefaultFileIO, DefaultMetadataStore>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
     cleanup_handle: Option<JoinHandle<()>>,
-    _tmp: TempDir,
+    _tmp: Option<TempDir>,
+}
+
+impl TestServer {
+    async fn stop(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let mut handle = handle;
+            tokio::select! {
+                join_result = &mut handle => {
+                    let _ = join_result;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    // Graceful shutdown can wait for idle keep-alive clients;
+                    // aborting still simulates a process stop for restart tests.
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
+        }
+        if let Some(handle) = self.cleanup_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+#[test]
+fn test_helpers_can_name_explicit_backend_managers() {
+    fn accepts_manager<F, M>()
+    where
+        F: bobs::io::FileIO,
+        M: bobs::metadata::MetadataStore + Clone + Send + Sync + 'static,
+    {
+    }
+
+    accepts_manager::<TokioFileIO, SyncSidecarMetadataStore>();
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    accepts_manager::<UringFileIO, UringSidecarMetadataStore>();
 }
 
 impl Drop for TestServer {
@@ -25,7 +73,9 @@ impl Drop for TestServer {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        self.handle.abort();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
         if let Some(h) = self.cleanup_handle.take() {
             h.abort();
         }
@@ -46,6 +96,7 @@ async fn start_server() -> TestServer {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -61,8 +112,18 @@ async fn start_server() -> TestServer {
 /// expected TTL duration.
 async fn start_server_with_config(config: Arc<Config>) -> TestServer {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let db_path = tmp.path().join("spools.redb");
-    let data_dir = tmp.path().join("data");
+    let mut server = start_server_with_storage_root(Arc::clone(&config), tmp.path()).await;
+    server._tmp = Some(tmp);
+    server
+}
+
+/// Start a real TCP HTTP server using caller-owned storage.
+///
+/// This helper is used by restart tests: the caller owns `storage_root`, so the
+/// first server can be stopped and a second server can recover from the same
+/// sidecar metadata and data directory.
+async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path) -> TestServer {
+    let data_dir = storage_root.join("data");
 
     let config = Arc::new(Config {
         data_dir: data_dir.clone(),
@@ -70,8 +131,8 @@ async fn start_server_with_config(config: Arc<Config>) -> TestServer {
     });
 
     let manager = Arc::new(
-        SpoolManager::<TokioFileIO>::new(
-            &db_path,
+        SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+            DefaultMetadataStore::new(&data_dir),
             &data_dir,
             config.page_size,
             config.max_cache_bytes,
@@ -87,7 +148,8 @@ async fn start_server_with_config(config: Arc<Config>) -> TestServer {
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
     });
-    let app: Router = router::<TokioFileIO>().with_state(Arc::clone(&state));
+    let app: Router =
+        router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -109,10 +171,11 @@ async fn start_server_with_config(config: Arc<Config>) -> TestServer {
 
     TestServer {
         base_url: format!("http://{}", addr),
+        manager,
         shutdown_tx: Some(tx),
-        handle,
+        handle: Some(handle),
         cleanup_handle,
-        _tmp: tmp,
+        _tmp: None,
     }
 }
 
@@ -126,6 +189,236 @@ async fn create_key(client: &reqwest::Client, base_url: &str, body: Option<Value
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let v: Value = resp.json().await.expect("create json");
     v["key"].as_str().expect("key str").to_string()
+}
+
+async fn assert_http_restart_continues_from_acknowledged_offset(
+    first_write: Vec<u8>,
+    second_write: Vec<u8>,
+) {
+    let storage_root = tempfile::tempdir().expect("create caller-owned storage root");
+    let config = Arc::new(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        data_dir: std::path::PathBuf::from("./data"),
+        page_size: 4096,
+        max_cache_bytes: 262144,
+        writer_inactivity_timeout_secs: 300,
+        read_idle_ttl_secs: 600,
+        full_read_complete_ttl_secs: 30,
+        reader_done_ttl_secs: 60,
+        unread_ttl_secs: 3600,
+        cleanup_sweep_interval_secs: 30,
+        long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
+        host_prefix: "test".into(),
+        domain: "example.com".into(),
+        route_name: "bobs".into(),
+    });
+
+    let client = reqwest::Client::new();
+    let first_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let key = create_key(&client, &first_server.base_url, None).await;
+
+    let write_resp = client
+        .post(format!("{}/api/v1/write/{}/0", first_server.base_url, key))
+        .body(first_write.clone())
+        .send()
+        .await
+        .expect("first write send");
+    assert_eq!(write_resp.status(), reqwest::StatusCode::OK);
+    drop(write_resp);
+
+    // Stop without calling /complete. A 200 OK from /write is the producer's
+    // acknowledgement; after restart it must be safe to continue at that offset.
+    first_server.stop().await;
+
+    let second_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let acknowledged_offset = first_write.len() as u64;
+    let continue_resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/write/{}/{}",
+            second_server.base_url, key, acknowledged_offset
+        ))
+        .body(second_write.clone())
+        .send()
+        .await
+        .expect("continued write send");
+    assert_eq!(continue_resp.status(), reqwest::StatusCode::OK);
+
+    let expected_len = first_write.len() + second_write.len();
+    let complete_resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/complete/{}",
+            second_server.base_url, key
+        ))
+        .json(&json!({ "expected_size": expected_len }))
+        .send()
+        .await
+        .expect("complete send");
+    assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
+
+    let read_resp = reqwest::Client::new()
+        .get(format!("{}/api/v1/read/{}", second_server.base_url, key))
+        .header("Range", format!("bytes=0-{}", expected_len - 1))
+        .send()
+        .await
+        .expect("read send");
+    assert_eq!(read_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+
+    let mut expected = first_write;
+    expected.extend_from_slice(&second_write);
+    let actual = read_resp.bytes().await.expect("read bytes");
+    assert_eq!(actual.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn test_http_restart_after_acknowledged_full_pages_write_allows_continue() {
+    let first_write: Vec<u8> = (0..(4096 * 2)).map(|i| (i % 251) as u8).collect();
+    let second_write: Vec<u8> = (0..4096).map(|i| (255 - (i % 251)) as u8).collect();
+
+    assert_http_restart_continues_from_acknowledged_offset(first_write, second_write).await;
+}
+
+#[tokio::test]
+async fn test_http_restart_after_acknowledged_trailing_partial_page_write_allows_continue() {
+    let first_write: Vec<u8> = (0..(4096 + 123)).map(|i| (i % 251) as u8).collect();
+    let second_write: Vec<u8> = (0..5000).map(|i| (255 - (i % 251)) as u8).collect();
+
+    assert_http_restart_continues_from_acknowledged_offset(first_write, second_write).await;
+}
+
+#[tokio::test]
+async fn test_http_restart_persists_write_locked_and_readable_metadata_sidecar() {
+    let storage_root = tempfile::tempdir().expect("create caller-owned storage root");
+    let config = Arc::new(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        data_dir: std::path::PathBuf::from("./data"),
+        page_size: 4096,
+        max_cache_bytes: 262144,
+        writer_inactivity_timeout_secs: 300,
+        read_idle_ttl_secs: 600,
+        full_read_complete_ttl_secs: 30,
+        reader_done_ttl_secs: 60,
+        unread_ttl_secs: 3600,
+        cleanup_sweep_interval_secs: 30,
+        long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
+        host_prefix: "test".into(),
+        domain: "example.com".into(),
+        route_name: "bobs".into(),
+    });
+    let client = reqwest::Client::new();
+
+    let first_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let key = create_key(
+        &client,
+        &first_server.base_url,
+        Some(json!({
+            "write_locked": true,
+            "content_type": "application/x-bobs-test",
+            "content_encoding": "gzip"
+        })),
+    )
+    .await;
+    let meta_path = storage_root
+        .path()
+        .join("data")
+        .join(&key)
+        .join("meta.json");
+    assert!(meta_path.exists(), "create must persist sidecar metadata");
+
+    let locked_read = client
+        .get(format!("{}/api/v1/read/{}", first_server.base_url, key))
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .expect("locked read send");
+    assert_eq!(locked_read.status(), reqwest::StatusCode::LOCKED);
+    first_server.stop().await;
+
+    let second_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let locked_read_after_restart = client
+        .get(format!("{}/api/v1/read/{}", second_server.base_url, key))
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .expect("locked read after restart send");
+    assert_eq!(
+        locked_read_after_restart.status(),
+        reqwest::StatusCode::LOCKED
+    );
+
+    let data = vec![0x5Au8; 5000];
+    let write_resp = client
+        .post(format!("{}/api/v1/write/{}/0", second_server.base_url, key))
+        .body(data.clone())
+        .send()
+        .await
+        .expect("write send");
+    assert_eq!(write_resp.status(), reqwest::StatusCode::OK);
+    let complete_resp = client
+        .post(format!(
+            "{}/api/v1/complete/{}",
+            second_server.base_url, key
+        ))
+        .json(&json!({ "expected_size": data.len() }))
+        .send()
+        .await
+        .expect("complete send");
+    assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
+    second_server.stop().await;
+
+    let third_server =
+        start_server_with_storage_root(Arc::clone(&config), storage_root.path()).await;
+    let read_resp = client
+        .get(format!("{}/api/v1/read/{}", third_server.base_url, key))
+        .header("Range", format!("bytes=0-{}", data.len() - 1))
+        .send()
+        .await
+        .expect("read after complete restart send");
+    assert_eq!(read_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        read_resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok()),
+        Some("application/x-bobs-test")
+    );
+    assert_eq!(
+        read_resp
+            .headers()
+            .get("content-encoding")
+            .and_then(|h| h.to_str().ok()),
+        Some("gzip")
+    );
+    assert_eq!(
+        read_resp.bytes().await.expect("read bytes").as_ref(),
+        data.as_slice()
+    );
+}
+
+#[tokio::test]
+async fn test_http_delete_removes_sidecar_metadata_file() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let key = create_key(&client, &server.base_url, None).await;
+    let spool_dir = server.manager.data_dir.join(&key);
+    let meta_path = spool_dir.join("meta.json");
+    assert!(meta_path.exists(), "create should write sidecar metadata");
+
+    let resp = client
+        .delete(format!("{}/api/v1/delete/{}", server.base_url, key))
+        .send()
+        .await
+        .expect("delete send");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(!meta_path.exists(), "delete should remove sidecar metadata");
+    assert!(!spool_dir.exists(), "delete should remove spool directory");
 }
 
 #[tokio::test]
@@ -535,6 +828,213 @@ async fn test_open_ended_range_reads_current_eof_without_following() {
     assert_eq!(body.as_ref(), &data[4096..]);
 }
 
+#[tokio::test]
+async fn test_in_flight_writer_completes_while_parallel_readers_follow_and_read_ranges() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let key = create_key(&client, &server.base_url, None).await;
+
+    let page_size = 4096usize;
+    let total_pages = 8usize;
+    let all_data: Vec<u8> = (0..(page_size * total_pages))
+        .map(|i| (i % 251) as u8)
+        .collect();
+
+    let mut follow_tasks = Vec::new();
+    for _ in 0..3 {
+        let read_client = client.clone();
+        let read_url = format!("{}/api/v1/read/{}", server.base_url, key);
+        let expected = all_data.clone();
+        follow_tasks.push(tokio::spawn(async move {
+            let resp = read_client
+                .get(read_url)
+                .send()
+                .await
+                .expect("follow read send");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            let body = resp.bytes().await.expect("follow read bytes");
+            assert_eq!(body.as_ref(), expected.as_slice());
+        }));
+    }
+
+    // Let follow readers enter read_page(0) before the writer starts publishing.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    for page_idx in 0..2usize {
+        let offset = page_idx * page_size;
+        let resp = client
+            .post(format!(
+                "{}/api/v1/write/{}/{}",
+                server.base_url, key, offset
+            ))
+            .body(all_data[offset..offset + page_size].to_vec())
+            .send()
+            .await
+            .expect("initial write send");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    let mut range_tasks = Vec::new();
+    for reader_idx in 0..6usize {
+        let read_client = client.clone();
+        let read_url = format!("{}/api/v1/read/{}", server.base_url, key);
+        let range_start = (reader_idx % 2) * page_size;
+        let range_end = range_start + page_size - 1;
+        let expected = all_data[range_start..=range_end].to_vec();
+        range_tasks.push(tokio::spawn(async move {
+            let resp = read_client
+                .get(read_url)
+                .header("Range", format!("bytes={range_start}-{range_end}"))
+                .send()
+                .await
+                .expect("range read send");
+            assert_eq!(resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+            let body = resp.bytes().await.expect("range read bytes");
+            assert_eq!(body.as_ref(), expected.as_slice());
+        }));
+    }
+
+    let write_client = client.clone();
+    let write_base_url = server.base_url.clone();
+    let write_key = key.clone();
+    let write_data = all_data.clone();
+    let writer_task = tokio::spawn(async move {
+        for page_idx in 2..total_pages {
+            let offset = page_idx * page_size;
+            let resp = write_client
+                .post(format!(
+                    "{write_base_url}/api/v1/write/{write_key}/{offset}"
+                ))
+                .body(write_data[offset..offset + page_size].to_vec())
+                .send()
+                .await
+                .expect("continued write send");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+
+        let complete_resp = write_client
+            .post(format!("{write_base_url}/api/v1/complete/{write_key}"))
+            .json(&json!({ "expected_size": write_data.len() }))
+            .send()
+            .await
+            .expect("complete send");
+        assert_eq!(complete_resp.status(), reqwest::StatusCode::OK);
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), writer_task)
+        .await
+        .expect("writer and complete should not wait behind active readers")
+        .expect("writer task join");
+
+    for task in range_tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("range reader timeout")
+            .expect("range reader join");
+    }
+    for task in follow_tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("follow reader timeout")
+            .expect("follow reader join");
+    }
+}
+
+#[tokio::test]
+async fn test_many_active_spools_share_global_cache_cap() {
+    let page_size = 1024usize;
+    let max_cache_bytes = page_size * 3;
+    let config = Arc::new(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        data_dir: std::path::PathBuf::from("./data"),
+        page_size,
+        max_cache_bytes,
+        writer_inactivity_timeout_secs: 300,
+        read_idle_ttl_secs: 600,
+        full_read_complete_ttl_secs: 30,
+        reader_done_ttl_secs: 60,
+        unread_ttl_secs: 3600,
+        cleanup_sweep_interval_secs: 30,
+        long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
+        host_prefix: "test".into(),
+        domain: "example.com".into(),
+        route_name: "bobs".into(),
+    });
+    let server = start_server_with_config(config).await;
+    let client = reqwest::Client::new();
+
+    let spool_count = 12usize;
+    let pages_per_spool = 6usize;
+    let mut keys = Vec::new();
+    for _ in 0..spool_count {
+        keys.push(create_key(&client, &server.base_url, None).await);
+    }
+
+    let stop_monitor = Arc::new(AtomicBool::new(false));
+    let monitor_done = Arc::clone(&stop_monitor);
+    let monitor_manager = Arc::clone(&server.manager);
+    let monitor = tokio::spawn(async move {
+        while !monitor_done.load(Ordering::Relaxed) {
+            let cache = monitor_manager.page_cache.lock().await;
+            assert!(
+                cache.current_bytes() <= cache.max_bytes(),
+                "cache exceeded global cap while writes were active: {} > {}",
+                cache.current_bytes(),
+                cache.max_bytes()
+            );
+            drop(cache);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    });
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(spool_count));
+    let mut write_tasks = Vec::new();
+    for (spool_idx, key) in keys.into_iter().enumerate() {
+        let write_client = client.clone();
+        let write_base_url = server.base_url.clone();
+        let write_barrier = Arc::clone(&barrier);
+        write_tasks.push(tokio::spawn(async move {
+            let data: Vec<u8> = (0..(page_size * pages_per_spool))
+                .map(|i| ((spool_idx + i) % 251) as u8)
+                .collect();
+            write_barrier.wait().await;
+            let resp = write_client
+                .post(format!("{write_base_url}/api/v1/write/{key}/0"))
+                .body(data)
+                .send()
+                .await
+                .expect("many-spool write send");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        }));
+    }
+
+    for task in write_tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("many-spool write timeout")
+            .expect("many-spool write join");
+    }
+
+    stop_monitor.store(true, Ordering::Relaxed);
+    monitor.await.expect("cache monitor join");
+
+    let cache = server.manager.page_cache.lock().await;
+    assert_eq!(cache.max_bytes(), max_cache_bytes);
+    assert!(
+        spool_count * pages_per_spool * page_size > max_cache_bytes,
+        "test must write more full pages than the cache cap"
+    );
+    assert!(
+        cache.current_bytes() <= max_cache_bytes,
+        "shared page cache must remain within global cap after many active spool writes: {} > {}",
+        cache.current_bytes(),
+        max_cache_bytes
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Range-coverage cleanup integration tests
 //
@@ -619,6 +1119,7 @@ fn config_short_full_read_ttl() -> Arc<Config> {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -640,6 +1141,7 @@ fn config_short_idle_ttl() -> Arc<Config> {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -775,6 +1277,7 @@ async fn test_idle_ttl_not_anchored_on_created_at() {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -854,6 +1357,7 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
+        io_uring_shards: None,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -897,8 +1401,19 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
     );
 
     // --- No more reads: idle TTL will now fire ---
-    // Wait > read_idle_ttl_secs (2 s) + several cleanup sweeps (interval = 1 s).
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    // Cleanup sweeps are scheduled independently from the test, so poll until
+    // the spool is gone instead of assuming a fixed sleep aligns with a sweep.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        if server.manager.get_spool(&key).is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "spool must be deleted once reads stop for > read_idle_ttl_secs"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 
     let after = reqwest::Client::new()
         .get(format!("{}/api/v1/read/{}", server.base_url, key))
@@ -906,9 +1421,5 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
         .send()
         .await
         .expect("post-idle read");
-    assert_eq!(
-        after.status(),
-        reqwest::StatusCode::NOT_FOUND,
-        "spool must be deleted once reads stop for > read_idle_ttl_secs"
-    );
+    assert_eq!(after.status(), reqwest::StatusCode::NOT_FOUND);
 }

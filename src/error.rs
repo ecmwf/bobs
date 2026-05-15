@@ -27,7 +27,7 @@ pub enum BobsError {
     IoError(#[from] std::io::Error),
 
     #[error("storage error: {0}")]
-    StorageError(#[source] Box<redb::Error>),
+    StorageError(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("serialization error: {0}")]
     SerializationError(String),
@@ -37,12 +37,6 @@ pub enum BobsError {
         current: String,
         attempted_action: String,
     },
-}
-
-impl From<redb::Error> for BobsError {
-    fn from(error: redb::Error) -> Self {
-        Self::StorageError(Box::new(error))
-    }
 }
 
 pub type Result<T> = std::result::Result<T, BobsError>;

@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Key Behaviours - BOBS Documentation</title>
+        <title>Standalone Benchmark - BOBS Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -174,51 +174,275 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="key-behaviours"><a class="header" href="#key-behaviours">Key Behaviours</a></h1>
-<p>Understanding these behaviours is crucial for effectively using BOBS.</p>
-<h3 id="1-page-based-streaming"><a class="header" href="#1-page-based-streaming">1. Page-based Streaming</a></h3>
-<p>Data is organized into fixed-size pages, configured via <code>page_size</code> and defaulting to <code>4096</code>. A successful <code>/write</code> has already accepted the bytes into <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code> before it returns, including any trailing partial page.</p>
-<p>Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in <code>spool.dat</code> but are not visible to readers until more writes complete the page or the writer calls <code>/complete</code> to finalize the spool. This ensures readers always receive consistent, non-torn data.</p>
-<p>Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they also delay reader visibility until that larger page is full. They consume more of the global cache budget per cached page, so cache reach can fall unless <code>max_cache_bytes</code> is increased alongside <code>page_size</code>. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching entirely; if a full page is larger than the cache cap, that page simply bypasses the cache and reads fall back to disk. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.</p>
-<h3 id="2-long-poll-with-timeout"><a class="header" href="#2-long-poll-with-timeout">2. Long-poll with Timeout</a></h3>
-<p>When a reader requests data that has not been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure, such as Kubernetes Ingress or load balancers, BOBS returns a <code>307 Temporary Redirect</code> if no data arrives within <code>long_poll_timeout_ms</code>. Clients like <code>curl -L</code> will automatically follow the redirect and resume the poll.</p>
-<h3 id="3-follow-mode"><a class="header" href="#3-follow-mode">3. Follow Mode</a></h3>
-<p>A read request without a <code>Range</code> header enters follow mode from byte <code>0</code>, or from byte <code>X</code> with <code>Range: bytes=X-</code>. The server keeps the stream open and pushes new pages as they become available until the spool is finalized.</p>
-<h3 id="4-write-locked-mode"><a class="header" href="#4-write-locked-mode">4. Write-locked Mode</a></h3>
-<p>A spool can be created with <code>write_locked: true</code>. In this state, any attempt to read results in a <code>423 Locked</code> error until the writer calls <code>/complete</code> or otherwise makes the spool readable. This is useful for preventing consumers from seeing any data until the payload is ready for consumption.</p>
-<p>The write-locked/readable state is lifecycle metadata and is committed to <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code> when it changes. If BOBS restarts while the spool is still <code>WriteLocked</code> or <code>Writing</code>, byte-derived metadata in the sidecar may be stale; recovery inspects <code>spool.dat</code> to determine the current length, page counts, final page size, and running checksum.</p>
-<h3 id="5-parallel-reads"><a class="header" href="#5-parallel-reads">5. Parallel Reads</a></h3>
-<p>BOBS supports a single consumer opening multiple concurrent connections for the same spool. Each connection can request independent byte ranges. Read activity is tracked when bytes are actually served, so slow clients keep their spool alive while making progress but stalled connections do not protect a spool forever.</p>
-<h3 id="6-crc-32c-integrity"><a class="header" href="#6-crc-32c-integrity">6. CRC-32C Integrity</a></h3>
-<p>BOBS calculates a running CRC-32C checksum using hardware-accelerated instructions, where available, as data is written. Once a spool is complete, every read response includes the <code>X-Checksum-CRC32C</code> header containing the Base64-encoded checksum of the entire object. This allows clients to verify data integrity, which is especially important when reassembling parallel range reads.</p>
-<h3 id="7-sequential-writes"><a class="header" href="#7-sequential-writes">7. Sequential Writes</a></h3>
-<p>Writes must be strictly sequential. The <code>offset</code> provided in the <code>/write</code> request must exactly match the total number of bytes currently stored in the spool. Random-access writes or overwrites are not supported.</p>
-<p>A successful <code>/write</code> means BOBS accepted the bytes into <code>spool.dat</code> through the kernel/file handle before returning. It does not mean the data has been forced to stable storage with <code>sync_data()</code>: the in-progress spool contract is designed for BOBS restart recovery from <code>spool.dat</code>, not for a node or storage crash before completion. <code>/complete</code> remains the durability boundary and syncs <code>spool.dat</code> data before committing final metadata to <code>meta.json</code>.</p>
-<h3 id="8-atomic-sidecar-metadata"><a class="header" href="#8-atomic-sidecar-metadata">8. Atomic Sidecar Metadata</a></h3>
-<p>Metadata is stored as <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code>. Each commit writes <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json.tmp</code>, syncs the temporary file’s data, atomically renames it over <code>meta.json</code>, and syncs the spool directory. Recovery ignores leftover temporary files and accepts only complete <code>meta.json</code> sidecars.</p>
-<p>This protocol keeps metadata off the write hot path while still making lifecycle transitions durable. It also suits shared filesystems because each key has its own directory and sidecar, with one writer per spool rather than one global metadata writer.</p>
-<h3 id="9-recovery-and-cleanup"><a class="header" href="#9-recovery-and-cleanup">9. Recovery and Cleanup</a></h3>
-<p>On restart, BOBS scans <code>&lt;data_dir&gt;</code> for key directories containing <code>meta.json</code>. For in-progress <code>Writing</code> and <code>WriteLocked</code> spools, <code>spool.dat</code> is authoritative for byte state. Any persisted <code>total_bytes_written</code>, <code>total_pages</code>, <code>final_page_size</code>, or <code>checksum_crc32c</code> for those states is advisory only and recovery recomputes it from the file.</p>
-<p>A background task periodically sweeps the spool manager and deletes spools based on three triggers:</p>
+                        <h1 id="standalone-bobs-benchmark"><a class="header" href="#standalone-bobs-benchmark">Standalone BOBS benchmark</a></h1>
+<p>The <code>bobs-benchmark</code> binary drives complete BOBS object lifecycles directly over the BOBS HTTP API:</p>
+<ol>
+<li>create an object;</li>
+<li>write deterministic bytes;</li>
+<li>complete the object;</li>
+<li>read the complete object once;</li>
+<li>optionally delete it.</li>
+</ol>
+<p>Use it to validate BOBS itself before adding Polytope, ingress, or other clients to the path. Start local, then repeat the same workload from a container or Kubernetes pod.</p>
+<p>Persistence expectations for this benchmark match the BOBS contract: each object is stored as <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code> plus <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code>. Before <code>/complete</code>, recovery is required across a BOBS restart by reconstructing in-progress byte state from <code>spool.dat</code>, not across a node or storage crash. <code>/write</code> must append accepted bytes to <code>spool.dat</code> through the kernel/file handle before returning, but does not force them to stable storage with <code>sync_data()</code>. Full pages become reader-visible as they are completed; trailing partial-page bytes may already be in <code>spool.dat</code> but remain invisible until more writes complete the page or <code>/complete</code> finalizes the spool. <code>/complete</code> is the durability boundary: BOBS syncs <code>spool.dat</code> data before committing final metadata to <code>meta.json</code> with the sidecar atomic commit protocol.</p>
+<blockquote>
+<p>Plain HTTP only: this first benchmark implementation accepts <code>http://</code> BOBS endpoints. <code>https://</code> support requires an approved dependency or feature change.</p>
+</blockquote>
+<h2 id="build"><a class="header" href="#build">Build</a></h2>
+<p>Default Linux <code>io_uring</code> binary. This build uses sharded rings:</p>
+<pre><code class="language-bash">cargo build --release --bin bobs --bin bobs-benchmark
+</code></pre>
+<p>Fallback binary, for non-Linux development, Linux kernels older than 5.11, or runtimes that block <code>io_uring_setup</code> entirely:</p>
+<pre><code class="language-bash">cargo build --release --bin bobs --bin bobs-benchmark --features tokio-fileio-fallback
+</code></pre>
+<p>Container image, after the image has been built with the benchmark binary included:</p>
+<pre><code class="language-bash">docker build --target release -t bobs:bench .
+docker run --rm bobs:bench bobs-benchmark --help
+</code></pre>
+<p>The Dockerfile builds the default Linux backend. Build a fallback image by passing the fallback feature in a dedicated build stage or by building the binaries outside Docker with <code>--features tokio-fileio-fallback</code> and packaging those artifacts.</p>
+<h2 id="local-first-validation"><a class="header" href="#local-first-validation">Local-first validation</a></h2>
+<p>Run a local BOBS server first. This keeps network and Kubernetes scheduling effects out of the initial measurement.</p>
+<p>Create a temporary config. The Linux <code>io_uring_shards</code> field is omitted here so BOBS resolves it to <code>max(1, num_cpus / 4)</code>. CPU pinning is not enabled by default.</p>
+<pre><code class="language-bash">cat &gt;/tmp/bobs-bench.yaml &lt;&lt;'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data
+page_size: 4096
+max_cache_bytes: 1048576
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+</code></pre>
+<p>Start BOBS in one terminal with the default Linux <code>io_uring</code> backend:</p>
+<pre><code class="language-bash">rm -rf /tmp/bobs-bench-data
+HOSTNAME=bobs-0 \
+BOBS_INTERNAL_BASE_URL_TEMPLATE=http://127.0.0.1:3000/api/v1 \
+cargo run --release --bin bobs -- /tmp/bobs-bench.yaml
+</code></pre>
+<p>Or start the fallback backend:</p>
+<pre><code class="language-bash">rm -rf /tmp/bobs-bench-data
+HOSTNAME=bobs-0 \
+BOBS_INTERNAL_BASE_URL_TEMPLATE=http://127.0.0.1:3000/api/v1 \
+cargo run --release --bin bobs --features tokio-fileio-fallback -- /tmp/bobs-bench.yaml
+</code></pre>
+<p>Run the benchmark in another terminal:</p>
+<pre><code class="language-bash">cargo run --release --bin bobs-benchmark -- \
+  --base-url http://127.0.0.1:3000 \
+  --objects 32 \
+  --object-bytes 16777216 \
+  --write-body-chunk-bytes 1048576 \
+  --read-body-chunk-bytes 1048576 \
+  --start-delay-ms 2000
+</code></pre>
+<p>Useful local variations:</p>
+<pre><code class="language-bash"># Split each object into multiple write requests.
+cargo run --release --bin bobs-benchmark -- \
+  --base-url http://127.0.0.1:3000 \
+  --objects 32 \
+  --object-bytes 16777216 \
+  --write-request-bytes 1048576 \
+  --write-body-chunk-bytes 1048576 \
+  --read-body-chunk-bytes 1048576
+
+# Delete benchmark objects after successful reads.
+cargo run --release --bin bobs-benchmark -- \
+  --base-url http://127.0.0.1:3000 \
+  --objects 8 \
+  --object-bytes 1048576 \
+  --delete-after-read
+</code></pre>
+<h2 id="page-size-comparison"><a class="header" href="#page-size-comparison">Page size comparison</a></h2>
+<p>Keep the runtime default at <code>4096</code> unless benchmark evidence says otherwise. Wider pages can reduce per-page overhead and may improve throughput, especially after removal of write-hot-path metadata commits. They also delay reader visibility until a full page is available and consume more of the global cache budget per cached page, so cache reach may fall unless <code>max_cache_bytes</code> is increased. <code>page_size</code> may be larger than <code>max_cache_bytes</code>; oversized pages simply bypass the cache.</p>
+<p>Compare at least the default, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The example below uses a global cache budget sized to hold roughly 256 pages for each run, if the workload and eviction order allow.</p>
+<p>Start one BOBS server per page size, run the matching benchmark, then stop the server before moving to the next size:</p>
+<pre><code class="language-bash"># 4 KiB default-page run
+cat &gt;/tmp/bobs-bench-4096.yaml &lt;&lt;'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data-4096
+page_size: 4096
+max_cache_bytes: 1048576
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+rm -rf /tmp/bobs-bench-data-4096
+HOSTNAME=bobs-0 BOBS_INTERNAL_BASE_URL_TEMPLATE=http://127.0.0.1:3000/api/v1 \
+  cargo run --release --bin bobs -- /tmp/bobs-bench-4096.yaml
+</code></pre>
+<p>In another terminal:</p>
+<pre><code class="language-bash">cargo run --release --bin bobs-benchmark -- \
+  --base-url http://127.0.0.1:3000 \
+  --objects 32 \
+  --object-bytes 67108864 \
+  --write-body-chunk-bytes 1048576 \
+  --read-body-chunk-bytes 1048576 \
+  --start-delay-ms 2000 \
+  --summary-json /tmp/bobs-summary-page-4096.json
+</code></pre>
+<p>Repeat with wider page configs and matching labels:</p>
+<pre><code class="language-bash"># 1 MiB pages
+cat &gt;/tmp/bobs-bench-1m.yaml &lt;&lt;'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data-1m
+page_size: 1048576
+max_cache_bytes: 268435456
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+
+# 4 MiB pages
+cat &gt;/tmp/bobs-bench-4m.yaml &lt;&lt;'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data-4m
+page_size: 4194304
+max_cache_bytes: 1073741824
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+
+# 16 MiB pages
+cat &gt;/tmp/bobs-bench-16m.yaml &lt;&lt;'YAML'
+host: 127.0.0.1
+port: 3000
+data_dir: /tmp/bobs-bench-data-16m
+page_size: 16777216
+max_cache_bytes: 4294967296
+host_prefix: bobs
+route_name: download
+domain: 127.0.0.1:3000
+YAML
+</code></pre>
+<p>For each config, start BOBS with that file and run the same benchmark command, changing only the summary path, for example <code>/tmp/bobs-summary-page-1m.json</code>, <code>/tmp/bobs-summary-page-4m.json</code>, or <code>/tmp/bobs-summary-page-16m.json</code>. Compare <code>write_active_mib_s</code>, <code>read_active_mib_s</code>, <code>wall_mib_s</code>, and <code>wait-to-read</code>/read timing percentiles from the <code>SUMMARY</code> output. If reader-latency percentiles regress, a throughput improvement may not be worth the wider page.</p>
+<h2 id="container-validation"><a class="header" href="#container-validation">Container validation</a></h2>
+<p>Container validation checks the packaged binary, container networking, and whether the runtime permits the default Linux <code>io_uring</code> backend.</p>
+<p>The default backend requires Linux 5.11+ because it submits <code>io_uring</code> operations against raw file descriptors, and it requires access to the <code>io_uring_setup</code> syscall. If the policy blocks <code>io_uring_setup</code>, use an io_uring-capable seccomp/sysctl policy or a <code>tokio-fileio-fallback</code> build. On this development host, validation showed:</p>
+<pre><code class="language-text">host io_uring_setup: allowed
+docker default seccomp: io_uring_setup returned ENOSYS
+docker --security-opt seccomp=unconfined: allowed
+</code></pre>
+<p>So the default Docker seccomp profile blocked <code>io_uring_setup</code> here, even though the host kernel supported it. The Dockerfile was not changed because this is a runtime security policy, not an image-layer setting.</p>
+<p>If your default container policy blocks <code>io_uring_setup</code>, either run the default image with a seccomp profile that permits io_uring, or use a fallback build/image:</p>
+<pre><code class="language-bash"># Default backend with an unconfined seccomp policy for local validation.
+docker run --rm --security-opt seccomp=unconfined bobs:bench bobs --help
+
+# Fallback backend build outside the default Dockerfile path.
+cargo build --release --bins --features tokio-fileio-fallback
+</code></pre>
+<p>On Linux, use host networking to reach the local server:</p>
+<pre><code class="language-bash">docker run --rm --network host bobs:bench bobs-benchmark \
+  --base-url http://127.0.0.1:3000 \
+  --objects 32 \
+  --object-bytes 16777216 \
+  --write-body-chunk-bytes 1048576 \
+  --read-body-chunk-bytes 1048576 \
+  --start-delay-ms 2000
+</code></pre>
+<p>If host networking is unavailable, publish or otherwise route the BOBS server and replace <code>127.0.0.1</code> with an address reachable from the benchmark container.</p>
+<h2 id="kubernetespod-validation"><a class="header" href="#kubernetespod-validation">Kubernetes/pod validation</a></h2>
+<p>Run from inside the cluster after local and container validation pass. This measures in-cluster DNS, pod networking, and BOBS pod placement effects.</p>
+<p>For the default Linux image, ask the chart/platform team whether the cluster runtime seccomp profile and node sysctls permit <code>io_uring_setup</code>. In particular, check the effective seccomp profile and node settings such as <code>/proc/sys/kernel/io_uring_disabled</code>. If the profile is <code>RuntimeDefault</code> and blocks io_uring, use a chart override or pod security context that applies an io_uring-capable seccomp profile, or deploy a <code>tokio-fileio-fallback</code> image instead. No Kubernetes YAML setting can compensate for a node kernel older than Linux 5.11.</p>
+<h3 id="single-endpoint-mode"><a class="header" href="#single-endpoint-mode">Single endpoint mode</a></h3>
+<p>Use single endpoint mode when all benchmark objects should target one BOBS pod or a service with guaranteed routing affinity.</p>
+<pre><code class="language-bash">kubectl run bobs-benchmark \
+  --rm -i \
+  --restart=Never \
+  --image=&lt;image&gt; \
+  -- bobs-benchmark \
+  --base-url http://&lt;release&gt;-bobs-0:3000 \
+  --objects 32 \
+  --object-bytes 16777216 \
+  --write-body-chunk-bytes 1048576 \
+  --read-body-chunk-bytes 1048576 \
+  --start-delay-ms 2000
+</code></pre>
+<h3 id="endpoint-template-mode"><a class="header" href="#endpoint-template-mode">Endpoint-template mode</a></h3>
+<p>Use template mode for multi-BOBS deployments where each ordinal has a stable, directly addressable endpoint. Objects are assigned deterministically across the configured ordinals.</p>
+<pre><code class="language-bash">kubectl run bobs-benchmark \
+  --rm -i \
+  --restart=Never \
+  --image=&lt;image&gt; \
+  -- bobs-benchmark \
+  --base-url-template http://&lt;release&gt;-bobs-{ordinal}:3000 \
+  --ordinals 0,1,2,3 \
+  --objects 64 \
+  --object-bytes 16777216 \
+  --write-body-chunk-bytes 1048576 \
+  --read-body-chunk-bytes 1048576 \
+  --start-delay-ms 2000
+</code></pre>
+<p>Avoid an aggregate multi-pod Kubernetes service for multi-BOBS benchmark runs unless the deployment guarantees that create, write, complete, and read for an object route to the same pod. Prefer per-pod services or pod DNS names with <code>--base-url-template</code>. Within one BOBS instance, data and metadata <code>io_uring</code> work for the same key is routed to the same shard by stable key hashing; that does not replace the need for correct HTTP-level routing between pods.</p>
+<h2 id="output-and-summary-fields"><a class="header" href="#output-and-summary-fields">Output and summary fields</a></h2>
+<p>The benchmark writes grep-friendly event lines during the run and one final machine-readable line:</p>
+<pre><code class="language-text">SUMMARY:{...json...}
+</code></pre>
+<p>Important summary fields:</p>
 <ul>
-<li><strong>Writer Inactivity</strong>: The producer stopped writing without completing the spool.</li>
-<li><strong>Read Idle TTL</strong>: The spool is readable but has not served bytes for <code>read_idle_ttl_secs</code>. For never-read spools, this timer starts when the spool becomes readable.</li>
-<li><strong>Full Read TTL</strong>: BOBS has served every byte of the object at least once, possibly across multiple range requests, and <code>full_read_complete_ttl_secs</code> has elapsed since the latest read activity.</li>
+<li><code>total_objects</code>, <code>successes</code>, <code>failures</code>: workload size and final outcome counts.</li>
+<li><code>total_bytes_written</code>, <code>total_bytes_read</code>: successful object bytes only; failed objects are excluded from throughput byte totals.</li>
+<li><code>wall_ms</code>, <code>wall_mib_s</code>: whole benchmark wall-clock duration and read throughput over that full window.</li>
+<li><code>write_active_ms</code>, <code>write_active_mib_s</code>: aggregate write throughput over the active write window, from earliest write start to latest write end.</li>
+<li><code>read_active_ms</code>, <code>read_active_mib_s</code>: aggregate read throughput over the active read window.</li>
+<li><code>read_mib_per_reader_second</code>: sum of successful read bytes divided by summed per-object read time.</li>
+<li><code>timings</code>: p50, p95, and max timings for create, write, complete, wait-to-read, read, and lifecycle phases.</li>
+<li><code>per_ordinal</code>: object counts, bytes, active windows, and throughput grouped by response ordinal when available, otherwise configured ordinal, otherwise <code>unknown</code>.</li>
+<li><code>results</code>: per-object records including <code>object_index</code>, <code>object_label</code>, endpoint URL, ordinals, key, outcome, error, timings, and bytes.</li>
 </ul>
-<p>Cleanup TTL semantics are unchanged by sidecar metadata. Expired cleanup removes the key directory, including <code>spool.dat</code>, <code>meta.json</code>, and any interrupted <code>meta.json.tmp</code>.</p>
-<p>Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.</p>
-<h3 id="10-http2-support"><a class="header" href="#10-http2-support">10. HTTP/2 Support</a></h3>
-<p>The server supports both HTTP/1.1 and HTTP/2 (h2c cleartext). Using HTTP/2 is recommended for high-concurrency streaming to benefit from request multiplexing.</p>
+<p>To extract the summary from logs:</p>
+<pre><code class="language-bash">grep '^SUMMARY:' benchmark.log | tail -n1 | sed 's/^SUMMARY://'
+</code></pre>
+<p>Optional file outputs, if supported by the binary version you are running:</p>
+<pre><code class="language-bash">bobs-benchmark \
+  --base-url http://127.0.0.1:3000 \
+  --objects 8 \
+  --object-bytes 1048576 \
+  --summary-json /tmp/bobs-summary.json \
+  --results-jsonl /tmp/bobs-results.jsonl
+</code></pre>
+<h2 id="grep-and-correlation-guidance"><a class="header" href="#grep-and-correlation-guidance">Grep and correlation guidance</a></h2>
+<p>Benchmark event lines include stable fields such as:</p>
+<pre><code class="language-text">object=000007 key=&lt;bobs-key&gt; ordinal=0 event=write_end unix_ms=&lt;ms&gt; status=200 duration_ms=&lt;ms&gt; bytes=&lt;n&gt;
+</code></pre>
+<p>Useful searches:</p>
+<pre><code class="language-bash"># Follow one benchmark object through create/write/complete/read.
+grep 'object=000007 ' benchmark.log
+
+# After create has emitted the BOBS key, correlate benchmark lines by key.
+grep 'key=&lt;bobs-key&gt;' benchmark.log
+
+# Search BOBS pod logs for the same key.
+kubectl logs &lt;bobs-pod&gt; | grep '&lt;bobs-key&gt;'
+
+# In template mode, compare configured/response ordinal grouping.
+grep 'ordinal=2 ' benchmark.log
+</code></pre>
+<p>If <code>configured_ordinal</code> and <code>response_ordinal</code> disagree, the benchmark emits an <code>object_error</code> event with <code>error=ordinal_mismatch</code>. Treat that as a routing or read URL generation issue before comparing throughput numbers.</p>
+<h2 id="cleanup-notes"><a class="header" href="#cleanup-notes">Cleanup notes</a></h2>
+<p>Local cleanup:</p>
+<pre><code class="language-bash"># Stop the local BOBS process, then remove benchmark data.
+rm -rf /tmp/bobs-bench-data /tmp/bobs-bench.yaml
+</code></pre>
+<p>Kubernetes cleanup:</p>
+<pre><code class="language-bash"># kubectl run --rm removes the benchmark pod after completion.
+# If a failed run leaves a pod behind:
+kubectl delete pod bobs-benchmark --ignore-not-found
+</code></pre>
+<p>Use <code>--delete-after-read</code> when you want the benchmark to delete objects immediately after successful reads. Without it, BOBS cleanup is governed by the server TTL settings in the BOBS config.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="configuration.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="getting-started.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="architecture.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="api-reference.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -228,11 +452,11 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="configuration.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="getting-started.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="architecture.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="api-reference.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

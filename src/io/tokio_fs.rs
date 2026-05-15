@@ -1,31 +1,40 @@
+#[cfg(not(unix))]
+compile_error!(
+    "TokioFileIO requires Unix positional file APIs; add an explicit non-Unix backend before building on this platform"
+);
+
 use super::FileIO;
+use bytes::Bytes;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::task;
 
-/// TokioFileIO: FileIO implementation using tokio::fs::File.
-/// Uses Arc<Mutex<File>> to allow shared access with seek operations.
+/// TokioFileIO: FileIO implementation backed by standard file handles and
+/// Tokio blocking tasks for positional file operations. Reads and writes do not
+/// rely on or mutate a shared file cursor.
 #[derive(Clone)]
 pub struct TokioFileIO;
 
 impl FileIO for TokioFileIO {
-    type Handle = Arc<Mutex<File>>;
+    type Handle = Arc<std::fs::File>;
 
     fn create(
         path: &Path,
     ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
         let path = path.to_path_buf();
         async move {
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .read(true)
-                .open(path)
-                .await?;
-            Ok(Arc::new(Mutex::new(file)))
+            let file = task::spawn_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .read(true)
+                    .open(path)
+            })
+            .await
+            .map_err(join_error_to_io)??;
+            Ok(Arc::new(file))
         }
     }
 
@@ -34,50 +43,70 @@ impl FileIO for TokioFileIO {
     ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
         let path = path.to_path_buf();
         async move {
-            let file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .read(true)
-                .open(path)
-                .await?;
-            Ok(Arc::new(Mutex::new(file)))
+            let file = task::spawn_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .open(path)
+            })
+            .await
+            .map_err(join_error_to_io)??;
+            Ok(Arc::new(file))
         }
     }
 
     fn write_at(
         handle: &Self::Handle,
         offset: u64,
-        data: &[u8],
+        data: Bytes,
     ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
-        let handle = Arc::clone(handle);
-        let data = data.to_vec();
+        let file = Arc::clone(handle);
         async move {
-            let mut file = handle.lock().await;
-            file.seek(std::io::SeekFrom::Start(offset)).await?;
-            file.write_all(&data).await?;
-            Ok(data.len())
+            task::spawn_blocking(move || {
+                let mut written = 0usize;
+                while written < data.len() {
+                    let n = file.write_at(&data[written..], offset + written as u64)?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            format!("short write: wrote {written} of {} bytes", data.len()),
+                        ));
+                    }
+                    written += n;
+                }
+                Ok(written)
+            })
+            .await
+            .map_err(join_error_to_io)?
         }
     }
 
     fn read_at(
         handle: &Self::Handle,
         offset: u64,
-        buf: &mut [u8],
-    ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
-        let handle = Arc::clone(handle);
+        len: usize,
+    ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+        let file = Arc::clone(handle);
         async move {
-            let mut file = handle.lock().await;
-            file.seek(std::io::SeekFrom::Start(offset)).await?;
-            file.read(buf).await
+            task::spawn_blocking(move || {
+                let mut buf = vec![0u8; len];
+                let n = file.read_at(&mut buf, offset)?;
+                buf.truncate(n);
+                Ok(Bytes::from(buf))
+            })
+            .await
+            .map_err(join_error_to_io)?
         }
     }
 
     fn sync_data(
         handle: &Self::Handle,
     ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-        let handle = Arc::clone(handle);
+        let file = Arc::clone(handle);
         async move {
-            let file = handle.lock().await;
-            file.sync_data().await
+            task::spawn_blocking(move || file.sync_data())
+                .await
+                .map_err(join_error_to_io)?
         }
     }
 
@@ -92,121 +121,49 @@ impl FileIO for TokioFileIO {
     }
 }
 
+fn join_error_to_io(error: task::JoinError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::io::fileio_test_cases::FileIOTestSuite;
+
+    type Suite = FileIOTestSuite<TokioFileIO>;
 
     #[tokio::test]
-    async fn test_write_read_at_offset() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("test.bin");
+    async fn tokio_fileio_write_read_at_offset() {
+        Suite::write_read_at_offset().await;
+    }
 
-        // Create file and write data at offset 0
-        let handle = TokioFileIO::create(&file_path)
-            .await
-            .expect("failed to create file");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tokio_fileio_parallel_disjoint_writes() {
+        Suite::parallel_disjoint_writes().await;
+    }
 
-        let data = b"hello world";
-        let written = TokioFileIO::write_at(&handle, 0, data)
-            .await
-            .expect("failed to write");
-        assert_eq!(written, data.len());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tokio_fileio_parallel_reads_from_same_file_return_owned_bytes() {
+        Suite::parallel_reads_from_same_file_return_owned_bytes().await;
+    }
 
-        // Sync to ensure data is written
-        TokioFileIO::sync_data(&handle)
-            .await
-            .expect("failed to sync");
-
-        // Read back the data
-        let mut buf = vec![0u8; data.len()];
-        let read = TokioFileIO::read_at(&handle, 0, &mut buf)
-            .await
-            .expect("failed to read");
-        assert_eq!(read, data.len());
-        assert_eq!(&buf, data);
-
-        // Write at offset 5
-        let offset_data = b"WORLD";
-        let written = TokioFileIO::write_at(&handle, 5, offset_data)
-            .await
-            .expect("failed to write at offset");
-        assert_eq!(written, offset_data.len());
-
-        TokioFileIO::sync_data(&handle)
-            .await
-            .expect("failed to sync");
-
-        // Read back and verify offset write
-        let mut buf = vec![0u8; 10];
-        let read = TokioFileIO::read_at(&handle, 0, &mut buf)
-            .await
-            .expect("failed to read");
-        assert_eq!(read, 10);
-        assert_eq!(&buf, b"helloWORLD");
-
-        TokioFileIO::close(handle).await.expect("failed to close");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tokio_fileio_parallel_reads_while_writes_append_later_offsets() {
+        Suite::parallel_reads_while_writes_append_later_offsets().await;
     }
 
     #[tokio::test]
-    async fn test_read_beyond_eof() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("test_eof.bin");
-
-        let handle = TokioFileIO::create(&file_path)
-            .await
-            .expect("failed to create file");
-
-        let data = b"short";
-        TokioFileIO::write_at(&handle, 0, data)
-            .await
-            .expect("failed to write");
-
-        TokioFileIO::sync_data(&handle)
-            .await
-            .expect("failed to sync");
-
-        // Try to read beyond EOF
-        let mut buf = vec![0u8; 100];
-        let read = TokioFileIO::read_at(&handle, 0, &mut buf)
-            .await
-            .expect("failed to read");
-        assert_eq!(read, data.len(), "should read only available data");
-
-        // Read at offset beyond EOF
-        let mut buf = vec![0u8; 10];
-        let read = TokioFileIO::read_at(&handle, 100, &mut buf)
-            .await
-            .expect("failed to read beyond eof");
-        assert_eq!(read, 0, "reading beyond EOF should return 0");
-
-        TokioFileIO::close(handle).await.expect("failed to close");
+    async fn tokio_fileio_read_beyond_eof_returns_available_then_empty_bytes() {
+        Suite::read_beyond_eof_returns_available_then_empty_bytes().await;
     }
 
     #[tokio::test]
-    async fn test_remove() {
-        let dir = tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("test_remove.bin");
+    async fn tokio_fileio_remove_unlinks_file() {
+        Suite::remove_unlinks_file().await;
+    }
 
-        let handle = TokioFileIO::create(&file_path)
-            .await
-            .expect("failed to create file");
-
-        TokioFileIO::write_at(&handle, 0, b"data")
-            .await
-            .expect("failed to write");
-
-        TokioFileIO::close(handle).await.expect("failed to close");
-
-        // File should exist
-        assert!(file_path.exists(), "file should exist after creation");
-
-        // Remove the file
-        TokioFileIO::remove(&file_path)
-            .await
-            .expect("failed to remove file");
-
-        // File should not exist
-        assert!(!file_path.exists(), "file should not exist after removal");
+    #[tokio::test]
+    async fn tokio_fileio_close_and_drop_are_safe() {
+        Suite::close_and_drop_are_safe().await;
     }
 }

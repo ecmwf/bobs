@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1c6f0b4e.js";
+            window.path_to_searchindex_js = "searchindex-22639d04.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-fd9758cf.js"></script>
+        <script src="toc-953381c0.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,6 +181,11 @@
 <p>Without a config file, BOBS runs with defaults:</p>
 <pre><code class="language-bash">./target/release/bobs
 </code></pre>
+<p>Backend selection is build-feature based, not a YAML option: Linux builds without extra features use the <code>io_uring</code> FileIO and sidecar metadata backend; builds with <code>--features tokio-fileio-fallback</code>, and non-Linux builds, use the Tokio/blocking fallback backend with the same on-disk <code>&lt;data_dir&gt;/&lt;key&gt;/spool.dat</code> plus <code>&lt;data_dir&gt;/&lt;key&gt;/meta.json</code> layout. These backend settings do not change the HTTP API and do not require an on-disk migration.</p>
+<p>Default Linux builds use sharded <code>io_uring</code> rings. <code>io_uring_shards</code> is optional. If <code>io_uring_shards</code> is unset, BOBS resolves it to <code>max(1, num_cpus / 4)</code>. File operations are assigned to shards by stable object-key hashing, and each object’s data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.</p>
+<p>The default Linux backend requires Linux 5.11+ because BOBS submits operations against raw file descriptors, and it requires a container/runtime policy that permits <code>io_uring_setup</code>. If <code>io_uring_setup</code> is blocked, use a runtime seccomp/sysctl policy that permits it or build the fallback binary:</p>
+<pre><code class="language-bash">cargo build --release --bins --features tokio-fileio-fallback
+</code></pre>
 <h2 id="fields"><a class="header" href="#fields">Fields</a></h2>
 <div class="table-wrapper">
 <table>
@@ -191,8 +196,8 @@
 <tr><td><code>host</code></td><td><code>0.0.0.0</code></td><td>Address for the HTTP server to bind to.</td></tr>
 <tr><td><code>port</code></td><td><code>3000</code></td><td>Port for the HTTP server to listen on.</td></tr>
 <tr><td><code>data_dir</code></td><td><code>./data</code></td><td>File system path for storing spool files.</td></tr>
-<tr><td><code>page_size</code></td><td><code>4096</code></td><td>Size of internal data pages in bytes. Writes are buffered until a page is full.</td></tr>
-<tr><td><code>max_cache_bytes</code></td><td><code>1048576</code></td><td>Max bytes to keep in the per-spool memory cache. Effective page count is <code>max_cache_bytes / page_size</code>.</td></tr>
+<tr><td><code>page_size</code></td><td><code>4096</code></td><td>Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when <code>/complete</code> finalizes a trailing partial page.</td></tr>
+<tr><td><code>max_cache_bytes</code></td><td><code>1048576</code></td><td>Global byte budget for the in-memory page cache across all spools. Set to <code>0</code> to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk.</td></tr>
 <tr><td><code>writer_inactivity_timeout_secs</code></td><td><code>300</code></td><td>Cleanup spool if the writer doesn’t send data for this long.</td></tr>
 <tr><td><code>read_idle_ttl_secs</code></td><td><code>600</code></td><td>TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served.</td></tr>
 <tr><td><code>full_read_complete_ttl_secs</code></td><td><code>30</code></td><td>Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served.</td></tr>
@@ -200,6 +205,7 @@
 <tr><td><code>unread_ttl_secs</code></td><td><code>3600</code></td><td>Deprecated compatibility field. Parsed but no longer drives cleanup.</td></tr>
 <tr><td><code>cleanup_sweep_interval_secs</code></td><td><code>30</code></td><td>How often the background cleanup task runs.</td></tr>
 <tr><td><code>long_poll_timeout_ms</code></td><td><code>25000</code></td><td>Maximum time in ms to wait for new data during a read before redirecting.</td></tr>
+<tr><td><code>io_uring_shards</code></td><td>unset</td><td>Linux default-backend ring-pool shard count. Leave unset to resolve to <code>max(1, num_cpus / 4)</code>. Keys are mapped to shards with stable hashing. Must be greater than <code>0</code> when set. Ignored by fallback builds.</td></tr>
 <tr><td><code>host_prefix</code></td><td><code>""</code></td><td>External download host prefix used when generating read URLs.</td></tr>
 <tr><td><code>domain</code></td><td><code>""</code></td><td>External download domain used when generating read URLs.</td></tr>
 <tr><td><code>route_name</code></td><td><code>""</code></td><td>External download route prefix, for example <code>download</code>.</td></tr>
@@ -211,7 +217,7 @@
 port: 3000
 data_dir: /data/bobs
 page_size: 4096
-max_cache_bytes: 1048576
+max_cache_bytes: 1048576          # global page-cache byte budget; set to 0 to disable caching
 writer_inactivity_timeout_secs: 300
 read_idle_ttl_secs: 600
 full_read_complete_ttl_secs: 30
@@ -219,6 +225,7 @@ reader_done_ttl_secs: 60      # deprecated compatibility field
 unread_ttl_secs: 3600         # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
+io_uring_shards: 4              # optional; omit to use max(1, num_cpus / 4) on Linux default backend
 host_prefix: polytope-example
 domain: example.com
 route_name: download
@@ -228,6 +235,27 @@ route_name: download
 max_cache_bytes: 4194304
 read_idle_ttl_secs: 600
 </code></pre>
+<h2 id="storage-backend-selection"><a class="header" href="#storage-backend-selection">Storage backend selection</a></h2>
+<p>There is no config-file field for the storage backend. The binary chooses its backend at compile time:</p>
+<pre><code class="language-bash"># Default Linux build: io_uring FileIO and io_uring sidecar commits.
+cargo build --release --bins
+
+# Portable/fallback build: Tokio blocking positional FileIO and sync sidecar commits.
+cargo build --release --bins --features tokio-fileio-fallback
+</code></pre>
+<p>Both builds use the same config defaults and the same on-disk layout. The fallback build is useful for non-Linux development, Linux kernels older than 5.11, or container/Kubernetes environments where seccomp or sysctl policy blocks <code>io_uring_setup</code>.</p>
+<p>Linux startup logs include <code>configured_shards</code>, <code>resolved_shards</code>, and <code>cpu_pinning_enabled</code>. <code>cpu_pinning_enabled</code> is currently <code>false</code> by default.</p>
+<p>Future optimizations not implemented in the current backend are <code>IORING_REGISTER_FILES</code>, <code>IORING_REGISTER_BUFFERS</code>, and <code>IORING_SETUP_ATTACH_WQ</code>.</p>
+<h2 id="page-size-tuning"><a class="header" href="#page-size-tuning">Page size tuning</a></h2>
+<p>The default <code>page_size</code> is intentionally kept at <code>4096</code>. It is a correctness-neutral default and should not be changed just because in-progress metadata commits have been removed from the write hot path.</p>
+<p>Larger pages such as <code>1048576</code> (1 MiB), <code>4194304</code> (4 MiB), and <code>16777216</code> (16 MiB) may improve write/read throughput by reducing per-page overhead, but they change streaming behaviour:</p>
+<ul>
+<li>readers do not see in-progress bytes until a full page is available, so wider pages can increase reader-visible latency;</li>
+<li>larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless <code>max_cache_bytes</code> is increased;</li>
+<li>benchmark representative object sizes and write chunk sizes before changing production defaults.</li>
+</ul>
+<p><code>page_size</code> does not need to be less than or equal to <code>max_cache_bytes</code>. Setting <code>max_cache_bytes</code> to <code>0</code> disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work.</p>
+<p>See the standalone benchmark guide for page-size comparison commands.</p>
 
                     </main>
 

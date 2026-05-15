@@ -1,8 +1,10 @@
+pub mod benchmark;
 pub mod cleanup;
 pub mod config;
 pub mod error;
 pub mod http;
 pub mod io;
 pub mod manager;
+pub mod metadata;
 pub mod shutdown;
 pub mod spool;

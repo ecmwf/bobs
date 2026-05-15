@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::error::BobsError;
 use crate::io::FileIO;
 use crate::manager::SpoolManager;
+use crate::metadata::MetadataStore;
 use async_stream::stream;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -24,23 +25,27 @@ enum ReadRequestRange {
     },
 }
 
-pub struct AppState<F: FileIO> {
-    pub manager: Arc<SpoolManager<F>>,
+pub struct AppState<F: FileIO, M: MetadataStore> {
+    pub manager: Arc<SpoolManager<F, M>>,
     pub config: Arc<Config>,
     pub hostname: String,
     pub ordinal: String,
     pub internal_base_url: String,
 }
 
-pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
+pub fn router<F, M>() -> Router<Arc<AppState<F, M>>>
+where
+    F: FileIO + 'static,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     Router::new()
-        .route("/api/v1/health", get(health::<F>))
-        .route("/api/v1/status", get(status).head(status_head))
-        .route("/api/v1/create", put(create_spool::<F>))
-        .route("/api/v1/write/{key}/{offset}", post(write_spool::<F>))
-        .route("/api/v1/complete/{key}", post(complete_spool::<F>))
-        .route("/api/v1/read/{key}", get(read_spool::<F>))
-        .route("/api/v1/delete/{key}", delete(delete_spool::<F>))
+        .route("/api/v1/health", get(health::<F, M>))
+        .route("/api/v1/status", get(status::<F, M>).head(status_head))
+        .route("/api/v1/create", put(create_spool::<F, M>))
+        .route("/api/v1/write/{key}/{offset}", post(write_spool::<F, M>))
+        .route("/api/v1/complete/{key}", post(complete_spool::<F, M>))
+        .route("/api/v1/read/{key}", get(read_spool::<F, M>))
+        .route("/api/v1/delete/{key}", delete(delete_spool::<F, M>))
 }
 
 #[derive(Debug, Serialize)]
@@ -49,14 +54,18 @@ struct StatusResponse {
     hostname: String,
 }
 
-async fn health<F: FileIO>(State(state): State<Arc<AppState<F>>>) -> impl IntoResponse {
+async fn health<F: FileIO, M: MetadataStore>(
+    State(state): State<Arc<AppState<F, M>>>,
+) -> impl IntoResponse {
     Json(StatusResponse {
         status: "ok",
         hostname: state.hostname.clone(),
     })
 }
 
-async fn status<F: FileIO>(State(state): State<Arc<AppState<F>>>) -> impl IntoResponse {
+async fn status<F: FileIO, M: MetadataStore>(
+    State(state): State<Arc<AppState<F, M>>>,
+) -> impl IntoResponse {
     Json(StatusResponse {
         status: "ok",
         hostname: state.hostname.clone(),
@@ -87,10 +96,14 @@ struct CreateResponse {
     write_url: String,
 }
 
-async fn create_spool<F: FileIO>(
-    State(state): State<Arc<AppState<F>>>,
+async fn create_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     body: Bytes,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     let req = if body.is_empty() {
         CreateRequest::default()
     } else {
@@ -131,22 +144,26 @@ async fn create_spool<F: FileIO>(
         .into_response())
 }
 
-async fn write_spool<F: FileIO>(
-    State(state): State<Arc<AppState<F>>>,
+async fn write_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     Path((key, offset)): Path<(String, u64)>,
     mut body: Body,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     tracing::info!(key = %key, offset = offset, "write spool request");
     let spool = state
         .manager
         .get_spool(&key)
         .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
 
-    // Batch incoming body frames into page-sized writes. `spool.write` does a
-    // redb metadata commit per call, so writing each HTTP/2 DATA frame directly
-    // would be expensive; buffering the whole request body would make memory
-    // scale with the client chunk size. Page-sized batches keep the write path
-    // bounded while preserving BOBS's page-at-a-time persistence model.
+    // Batch incoming body frames into page-sized writes. Each `spool.write`
+    // appends accepted bytes to spool.dat before acknowledging them; batching
+    // avoids excessive small writes without buffering the whole request body.
+    // Page-sized batches keep the write path bounded while preserving BOBS's
+    // page-at-a-time reader notification model.
     let write_batch_size = state.config.page_size;
     let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
     let mut write_offset = offset;
@@ -162,12 +179,14 @@ async fn write_spool<F: FileIO>(
                 cursor += take;
 
                 if pending.len() == write_batch_size {
-                    spool
-                        .write(write_offset, &pending)
-                        .await
-                        .map_err(ApiError)?;
-                    write_offset += pending.len() as u64;
-                    pending.clear();
+                    let batch = std::mem::replace(
+                        &mut pending,
+                        bytes::BytesMut::with_capacity(write_batch_size),
+                    )
+                    .freeze();
+                    let batch_len = batch.len();
+                    spool.write(write_offset, batch).await.map_err(ApiError)?;
+                    write_offset += batch_len as u64;
                 }
             }
         }
@@ -175,7 +194,7 @@ async fn write_spool<F: FileIO>(
 
     if !pending.is_empty() {
         spool
-            .write(write_offset, &pending)
+            .write(write_offset, pending.freeze())
             .await
             .map_err(ApiError)?;
     }
@@ -183,11 +202,15 @@ async fn write_spool<F: FileIO>(
     Ok(StatusCode::OK.into_response())
 }
 
-async fn complete_spool<F: FileIO>(
-    State(state): State<Arc<AppState<F>>>,
+async fn complete_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     Path(key): Path<String>,
     body: Bytes,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     let req = if body.is_empty() {
         CompleteRequest::default()
     } else {
@@ -206,21 +229,37 @@ async fn complete_spool<F: FileIO>(
 
 /// RAII guard that decrements the spool's reader count on drop, ensuring cleanup
 /// sees the correct active reader count even if the stream is cancelled mid-flight.
-struct ReaderLease<F: FileIO> {
-    spool: Arc<crate::spool::Spool<F>>,
+struct ReaderLease<F, M>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
+    spool: Arc<crate::spool::Spool<F, M>>,
 }
 
-impl<F: FileIO> Drop for ReaderLease<F> {
+fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
+    page.slice(slice_start..slice_end)
+}
+
+impl<F, M> Drop for ReaderLease<F, M>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     fn drop(&mut self) {
         self.spool.release_reader();
     }
 }
 
-async fn read_spool<F: FileIO + 'static>(
-    State(state): State<Arc<AppState<F>>>,
+async fn read_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     Path(key): Path<String>,
     headers: axum::http::HeaderMap,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO + 'static,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     let request_range = parse_range(headers.get(axum::http::header::RANGE)).map_err(ApiError)?;
 
     let spool = state
@@ -238,15 +277,28 @@ async fn read_spool<F: FileIO + 'static>(
     };
     let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
     let page_size = spool.page_size as u64;
-    let (content_type, content_encoding, checksum_crc32c, complete_size, total_bytes_written) = {
+    let (
+        content_type,
+        content_encoding,
+        checksum_crc32c,
+        complete_size,
+        total_bytes_written,
+        servable_bytes,
+    ) = {
         let meta = spool.metadata.lock().await;
-        let complete_size = if matches!(
+        let is_complete = matches!(
             meta.state,
             crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting
-        ) {
+        );
+        let complete_size = if is_complete {
             Some(meta.total_bytes_written)
         } else {
             None
+        };
+        let servable_bytes = if is_complete {
+            meta.total_bytes_written
+        } else {
+            meta.total_pages * page_size
         };
         (
             meta.content_type.clone(),
@@ -254,6 +306,7 @@ async fn read_spool<F: FileIO + 'static>(
             meta.checksum_crc32c,
             complete_size,
             meta.total_bytes_written,
+            servable_bytes,
         )
     };
     let (start, end, follow) = match request_range {
@@ -265,12 +318,18 @@ async fn read_spool<F: FileIO + 'static>(
             start,
             end_inclusive,
         } => {
-            let end = match end_inclusive {
-                Some(end_inclusive) => Some(end_inclusive.checked_add(1).ok_or_else(|| {
+            let requested_end = match end_inclusive {
+                Some(end_inclusive) => end_inclusive.checked_add(1).ok_or_else(|| {
                     ApiError(BobsError::InvalidRange("range end overflow".into()))
-                })?),
-                None => Some(total_bytes_written),
+                })?,
+                None => total_bytes_written,
             };
+            // Bounded range responses must only advertise bytes that this
+            // response can actually serve. For in-progress spools, recovered or
+            // freshly written trailing partial bytes contribute to offset
+            // validation (`total_bytes_written`) but are not servable until the
+            // page is completed or the spool is completed.
+            let end = Some(requested_end.min(servable_bytes));
             (start, end, false)
         }
     };
@@ -284,9 +343,9 @@ async fn read_spool<F: FileIO + 'static>(
         }
     }
 
-    if !follow && start >= total_bytes_written {
+    if !follow && start >= servable_bytes {
         return Err(ApiError(BobsError::InvalidRange(
-            "range start exceeds available bytes".into(),
+            "range start exceeds servable bytes".into(),
         )));
     }
 
@@ -358,7 +417,7 @@ async fn read_spool<F: FileIO + 'static>(
             let slice_end = ((logical_end - page_start) as usize).min(page.len());
 
             if slice_start < slice_end {
-                let chunk = Bytes::copy_from_slice(&page[slice_start..slice_end]);
+                let chunk = read_page_chunk(&page, slice_start, slice_end);
                 let chunk_start = offset;
                 offset += chunk.len() as u64;
                 let chunk_end = offset;
@@ -536,10 +595,14 @@ fn parse_range(header: Option<&HeaderValue>) -> crate::error::Result<ReadRequest
     })
 }
 
-async fn delete_spool<F: FileIO>(
-    State(state): State<Arc<AppState<F>>>,
+async fn delete_spool<F, M>(
+    State(state): State<Arc<AppState<F, M>>>,
     Path(key): Path<String>,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Response, ApiError>
+where
+    F: FileIO,
+    M: MetadataStore + Clone + Send + Sync + 'static,
+{
     tracing::info!(key = %key, "delete spool request");
     state.manager.delete_spool(&key).await.map_err(ApiError)?;
     Ok(StatusCode::OK.into_response())
@@ -587,7 +650,8 @@ mod tests {
     use super::*;
     use crate::cleanup::start_cleanup_task;
     use crate::error::BobsError;
-    use crate::io::TokioFileIO;
+    use crate::io::DefaultFileIO;
+    use crate::metadata::DefaultMetadataStore;
     use axum::http::Request;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
@@ -608,6 +672,7 @@ mod tests {
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 30,
             long_poll_timeout_ms: 25000,
+            io_uring_shards: None,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
@@ -631,6 +696,7 @@ mod tests {
             unread_ttl_secs: 3600,
             cleanup_sweep_interval_secs: 1,
             long_poll_timeout_ms: 25000,
+            io_uring_shards: None,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
@@ -639,14 +705,18 @@ mod tests {
 
     /// Returns both the `Router` and the shared `AppState` so tests can inspect
     /// spool fields (e.g. `full_object_read_at`) after HTTP round-trips.
-    async fn app_with_state() -> (Router, Arc<AppState<TokioFileIO>>) {
+    async fn app_with_state() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
-        let db_path = root.join("spools.redb");
         let data_dir = root.join("data");
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
-                .expect("manager init"),
+            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+                DefaultMetadataStore::new(&data_dir),
+                &data_dir,
+                4096,
+                65536,
+            )
+            .expect("manager init"),
         );
         let state = Arc::new(AppState {
             manager,
@@ -655,19 +725,23 @@ mod tests {
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
         });
-        let app = router::<TokioFileIO>().with_state(Arc::clone(&state));
+        let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
     }
 
     /// Like `app_with_state` but uses `test_config_ttl` (short sweep + TTL values).
-    async fn app_with_ttl_config() -> (Router, Arc<AppState<TokioFileIO>>) {
+    async fn app_with_ttl_config() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
-        let db_path = root.join("spools.redb");
         let data_dir = root.join("data");
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
-                .expect("manager init"),
+            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+                DefaultMetadataStore::new(&data_dir),
+                &data_dir,
+                4096,
+                65536,
+            )
+            .expect("manager init"),
         );
         let state = Arc::new(AppState {
             manager,
@@ -676,7 +750,7 @@ mod tests {
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
         });
-        let app = router::<TokioFileIO>().with_state(Arc::clone(&state));
+        let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
     }
 
@@ -687,6 +761,135 @@ mod tests {
     // -----------------------------------------------------------------------
     // Shared test helpers
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_page_chunk_uses_zero_copy_slice() {
+        let page = Bytes::from((0u8..64).collect::<Vec<_>>());
+        let slice_start = 7;
+        let slice_end = 23;
+
+        let chunk = read_page_chunk(&page, slice_start, slice_end);
+
+        assert_eq!(&chunk[..], &page[slice_start..slice_end]);
+        assert_eq!(
+            chunk.as_ptr(),
+            unsafe { page.as_ptr().add(slice_start) },
+            "chunk should point into the cached page allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_spool_range_yields_zero_copy_cached_page_slice() {
+        let (app, state) = app_with_state().await;
+        let data = (0..4096).map(|v| (v % 251) as u8).collect::<Vec<_>>();
+        let key = write_and_complete(&app, data).await;
+        let spool = state.manager.get_spool(&key).expect("spool must exist");
+        let page = spool
+            .read_page(0)
+            .await
+            .expect("page read should succeed")
+            .expect("page should exist");
+        let slice_start = 7usize;
+        let slice_end = 23usize;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", format!("bytes={}-{}", slice_start, slice_end - 1))
+            .body(Body::empty())
+            .expect("build range read request");
+        let resp = app.clone().oneshot(req).await.expect("range read oneshot");
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+
+        let mut body = resp.into_body();
+        let frame = body
+            .frame()
+            .await
+            .expect("body should yield a frame")
+            .expect("frame should be ok");
+        let chunk = frame.into_data().expect("frame should contain data");
+
+        assert_eq!(&chunk[..], &page[slice_start..slice_end]);
+        assert_eq!(
+            chunk.as_ptr(),
+            unsafe { page.as_ptr().add(slice_start) },
+            "yielded chunk should point into the cached page allocation"
+        );
+        assert!(body.frame().await.is_none(), "range should yield one chunk");
+    }
+
+    #[tokio::test]
+    async fn read_range_hides_trailing_partial_until_complete_then_serves_it() {
+        let app = app().await;
+        let key = create_key(&app).await;
+        let data = vec![0xA5u8; 777];
+
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(data.clone()))
+            .expect("build write request");
+        let write_resp = app.clone().oneshot(write_req).await.expect("write oneshot");
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let hidden_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=0-776")
+            .body(Body::empty())
+            .expect("build pre-complete read request");
+        let hidden_resp = app
+            .clone()
+            .oneshot(hidden_req)
+            .await
+            .expect("pre-complete read oneshot");
+        assert_eq!(
+            hidden_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "bounded reads must not expose a trailing partial page before /complete"
+        );
+
+        let complete_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("build complete request");
+        let complete_resp = app
+            .clone()
+            .oneshot(complete_req)
+            .await
+            .expect("complete oneshot");
+        assert_eq!(complete_resp.status(), StatusCode::OK);
+
+        let visible_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=0-776")
+            .body(Body::empty())
+            .expect("build post-complete read request");
+        let visible_resp = app
+            .clone()
+            .oneshot(visible_req)
+            .await
+            .expect("post-complete read oneshot");
+        assert_eq!(visible_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            visible_resp
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .expect("content-length")
+                .to_str()
+                .expect("content-length string"),
+            data.len().to_string()
+        );
+        let body = visible_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        assert_eq!(&body[..], data.as_slice());
+    }
 
     /// Write `data` at offset 0 and mark the spool complete. Returns the key.
     async fn write_and_complete(app: &Router, data: Vec<u8>) -> String {
@@ -1055,6 +1258,74 @@ mod tests {
                 .and_then(|h| h.to_str().ok()),
             Some("bytes 4096-8191/*")
         );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_range_does_not_advertise_unservable_trailing_partial() {
+        let app = app().await;
+        let key = create_key(&app).await;
+        let data = vec![9u8; 5000];
+
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(data))
+            .expect("request build");
+        let write_resp = app.clone().oneshot(write_req).await.expect("oneshot");
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let read_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=0-4999")
+            .body(Body::empty())
+            .expect("request build");
+        let read_resp = app.clone().oneshot(read_req).await.expect("oneshot");
+        assert_eq!(read_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            read_resp
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|h| h.to_str().ok()),
+            Some("4096")
+        );
+        assert_eq!(
+            read_resp
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .and_then(|h| h.to_str().ok()),
+            Some("bytes 0-4095/*")
+        );
+        let body = read_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("drain response body")
+            .to_bytes();
+        assert_eq!(body.len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn test_bounded_range_rejects_only_unservable_trailing_partial() {
+        let app = app().await;
+        let key = create_key(&app).await;
+
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(vec![7u8; 1000]))
+            .expect("request build");
+        let write_resp = app.clone().oneshot(write_req).await.expect("oneshot");
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let read_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("Range", "bytes=0-999")
+            .body(Body::empty())
+            .expect("request build");
+        let read_resp = app.oneshot(read_req).await.expect("oneshot");
+        assert_eq!(read_resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
