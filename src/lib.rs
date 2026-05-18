@@ -6,5 +6,6 @@ pub mod http;
 pub mod io;
 pub mod manager;
 pub mod metadata;
+pub mod observability;
 pub mod shutdown;
 pub mod spool;

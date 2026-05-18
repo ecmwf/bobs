@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::io::FileIO;
-use crate::manager::SpoolManager;
+use crate::manager::{DeleteReason, SpoolManager};
 use crate::metadata::MetadataStore;
 use crate::spool::SpoolState;
 use std::sync::atomic::Ordering;
@@ -31,10 +31,20 @@ where
 
     loop {
         interval.tick().await;
+        let started = std::time::Instant::now();
         let now = now_secs();
         let mut to_delete = Vec::new();
+        let keys = manager.spool_keys();
+        let mut inspected = 0_u64;
+        tracing::debug!(
+            "event.name" = "bobs.cleanup.run.started",
+            spool_count = keys.len() as u64,
+            outcome = "success",
+            "cleanup run started"
+        );
 
-        for key in manager.spool_keys() {
+        for key in keys {
+            inspected += 1;
             let Some(spool) = manager.get_spool(&key) else {
                 continue;
             };
@@ -79,11 +89,33 @@ where
             }
         }
 
+        let mut deleted = 0_u64;
+        let mut failed_delete = 0_u64;
         for key in to_delete {
-            if let Err(err) = manager.delete_spool(&key).await {
-                tracing::debug!(%key, error = %err, "cleanup delete failed");
+            match manager
+                .delete_spool_with_reason(&key, DeleteReason::Ttl, None)
+                .await
+            {
+                Ok(()) => deleted += 1,
+                Err(err) => {
+                    failed_delete += 1;
+                    tracing::debug!(%key, error = %err, "cleanup delete failed");
+                }
             }
         }
+        tracing::info!(
+            "event.name" = "bobs.cleanup.run.completed",
+            inspected = inspected,
+            deleted = deleted,
+            failed_delete = failed_delete,
+            duration_ms = started.elapsed().as_millis() as u64,
+            outcome = if failed_delete == 0 {
+                "success"
+            } else {
+                "error"
+            },
+            "cleanup run completed"
+        );
     }
 }
 

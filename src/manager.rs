@@ -7,8 +7,27 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteReason {
+    Explicit,
+    Ttl,
+    Orphan,
+    Corrupt,
+}
+
+impl DeleteReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Ttl => "ttl",
+            Self::Orphan => "orphan",
+            Self::Corrupt => "corrupt",
+        }
+    }
+}
 
 pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub spools: DashMap<String, Arc<Spool<F, M>>>,
@@ -133,6 +152,37 @@ where
     }
 
     pub async fn delete_spool(&self, key: &str) -> Result<()> {
+        self.delete_spool_with_reason(key, DeleteReason::Explicit, None)
+            .await
+    }
+
+    pub async fn delete_spool_with_reason(
+        &self,
+        key: &str,
+        reason: DeleteReason,
+        job_id: Option<&str>,
+    ) -> Result<()> {
+        let result = self.delete_spool_inner(key).await;
+        match &result {
+            Ok(()) => {
+                if let Some(job_id) = job_id {
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "job.id" = %job_id, reason = reason.as_str(), outcome = "success", "spool deleted");
+                } else {
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "success", "spool deleted");
+                }
+            }
+            Err(error) => {
+                if let Some(job_id) = job_id {
+                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "job.id" = %job_id, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
+                } else {
+                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
+                }
+            }
+        }
+        result
+    }
+
+    async fn delete_spool_inner(&self, key: &str) -> Result<()> {
         let spool = self
             .spools
             .get(key)
@@ -156,24 +206,18 @@ where
 
         let spool_dir = self.data_dir.join(key);
         match tokio::fs::remove_dir_all(&spool_dir).await {
-            Ok(()) => {
-                tracing::info!(key = %key, "spool deleted");
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!(key = %key, "spool deleted (data already gone)");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(key = %key, error = %e, "failed to remove spool directory");
-                Err(BobsError::IoError(e))
-            }
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(BobsError::IoError(e)),
         }
     }
 
     pub async fn recover(&self) -> Result<()> {
+        let started = Instant::now();
         let mut recovered: Vec<(String, SpoolMetadata)> = Vec::new();
         let mut stale_keys: Vec<String> = Vec::new();
+        let mut corrupt_deleted = 0_u64;
+        let mut orphan_deleted = 0_u64;
 
         for meta in self.metadata_store.list()? {
             match meta {
@@ -188,12 +232,6 @@ where
         let recovered_keys: HashSet<String> =
             recovered.iter().map(|(key, _)| key.clone()).collect();
 
-        tracing::info!(
-            total = recovered.len(),
-            stale = stale_keys.len(),
-            "recovery: scanning spools"
-        );
-
         for (key, mut meta) in recovered {
             if !meta.data_path.exists() {
                 tracing::warn!(key = %key, "recovery: data file missing, discarding");
@@ -203,14 +241,14 @@ where
 
             match meta.state {
                 SpoolState::Creating => {
-                    tracing::info!(key = %key, "recovery: removing incomplete spool (Creating)");
+                    tracing::debug!(key = %key, "recovery removing incomplete spool (Creating)");
                     stale_keys.push(key.clone());
                     let spool_dir = self.data_dir.join(&key);
                     let _ = tokio::fs::remove_dir_all(&spool_dir).await;
                     continue;
                 }
                 SpoolState::Deleting => {
-                    tracing::info!(key = %key, "recovery: removing incomplete spool (Deleting)");
+                    tracing::debug!(key = %key, "recovery removing incomplete spool (Deleting)");
                     stale_keys.push(key.clone());
                     let spool_dir = self.data_dir.join(&key);
                     let _ = tokio::fs::remove_dir_all(&spool_dir).await;
@@ -349,12 +387,6 @@ where
             self.spools.insert(key, spool);
         }
 
-        tracing::info!(
-            recovered = self.spools.len(),
-            stale = stale_keys.len(),
-            "recovery: spools loaded"
-        );
-
         stale_keys.sort();
         stale_keys.dedup();
 
@@ -362,7 +394,10 @@ where
             self.metadata_store.delete(key).await?;
             let spool_dir = self.data_dir.join(key);
             match tokio::fs::remove_dir_all(&spool_dir).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    corrupt_deleted += 1;
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(BobsError::IoError(error)),
             }
@@ -390,10 +425,23 @@ where
                 && !stale_key_set.contains(&name)
             {
                 tracing::warn!(orphan = %name, "removing orphan spool directory");
-                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+                if tokio::fs::remove_dir_all(entry.path()).await.is_ok() {
+                    orphan_deleted += 1;
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
+                }
             }
         }
 
+        tracing::info!(
+            "event.name" = "bobs.recovery.completed",
+            recovered = self.spools.len(),
+            stale = stale_keys.len(),
+            orphan_deleted = orphan_deleted,
+            corrupt_deleted = corrupt_deleted,
+            duration_ms = started.elapsed().as_millis() as u64,
+            outcome = "success",
+            "recovery completed"
+        );
         Ok(())
     }
 

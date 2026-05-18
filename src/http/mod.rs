@@ -6,7 +6,7 @@ use crate::metadata::MetadataStore;
 use async_stream::stream;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -15,7 +15,50 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 use uuid::Uuid;
+
+const JOB_ID_HEADER: &str = "X-Polytope-Job-Id";
+
+fn extract_job_id(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(JOB_ID_HEADER)?.to_str().ok()?;
+    if value.len() > 64 || value.len() != 26 {
+        return None;
+    }
+    if value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z')) {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+fn request_span(
+    job_id: Option<&str>,
+    key: Option<&str>,
+    offset: Option<u64>,
+    range: Option<&str>,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        "bobs.request",
+        "job.id" = tracing::field::Empty,
+        "bobs.spool.key" = tracing::field::Empty,
+        offset = tracing::field::Empty,
+        range = tracing::field::Empty,
+    );
+    if let Some(job_id) = job_id {
+        span.record("job.id", job_id);
+    }
+    if let Some(key) = key {
+        span.record("bobs.spool.key", key);
+    }
+    if let Some(offset) = offset {
+        span.record("offset", offset);
+    }
+    if let Some(range) = range {
+        span.record("range", range);
+    }
+    span
+}
 
 enum ReadRequestRange {
     Follow,
@@ -98,133 +141,140 @@ struct CreateResponse {
 
 async fn create_spool<F, M>(
     State(state): State<Arc<AppState<F, M>>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Response, ApiError>
 where
     F: FileIO,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
-    let req = if body.is_empty() {
-        CreateRequest::default()
-    } else {
-        serde_json::from_slice::<CreateRequest>(&body)
-            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
-    };
-    tracing::info!(
-        content_type = ?req.content_type,
-        content_encoding = ?req.content_encoding,
-        write_locked = req.write_locked,
-        "create spool request"
-    );
-    let key = Uuid::new_v4().to_string();
-    state
-        .manager
-        .create_spool(
-            key.clone(),
-            req.content_type,
-            req.content_encoding,
-            req.write_locked,
+    let job_id = extract_job_id(&headers);
+    let span = request_span(job_id.as_deref(), None, None, None);
+    async move {
+        let req = if body.is_empty() {
+            CreateRequest::default()
+        } else {
+            serde_json::from_slice::<CreateRequest>(&body)
+                .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
+        };
+        let key = Uuid::new_v4().to_string();
+        state
+            .manager
+            .create_spool(
+                key.clone(),
+                req.content_type.clone(),
+                req.content_encoding.clone(),
+                req.write_locked,
+            )
+            .await
+            .map_err(ApiError)?;
+        tracing::Span::current().record("bobs.spool.key", key.as_str());
+        if let Some(job_id) = &job_id {
+            tracing::info!("event.name" = "bobs.spool.created", "job.id" = %job_id, "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
+        } else {
+            tracing::info!("event.name" = "bobs.spool.created", "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
+        }
+        let read_url = format!(
+            "https://{}.{}/{}-{}/{}",
+            state.config.host_prefix, state.config.domain, state.config.route_name, state.ordinal, key
+        );
+        let write_url = state.internal_base_url.clone();
+        Ok((
+            StatusCode::CREATED,
+            Json(CreateResponse {
+                key,
+                read_url,
+                write_url,
+            }),
         )
-        .await
-        .map_err(ApiError)?;
-    tracing::info!(key = %key, "spool created");
-    let read_url = format!(
-        "https://{}.{}/{}-{}/{}",
-        state.config.host_prefix, state.config.domain, state.config.route_name, state.ordinal, key
-    );
-    let write_url = state.internal_base_url.clone();
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateResponse {
-            key,
-            read_url,
-            write_url,
-        }),
-    )
-        .into_response())
+            .into_response())
+    }.instrument(span).await
 }
 
 async fn write_spool<F, M>(
     State(state): State<Arc<AppState<F, M>>>,
     Path((key, offset)): Path<(String, u64)>,
+    headers: HeaderMap,
     mut body: Body,
 ) -> std::result::Result<Response, ApiError>
 where
     F: FileIO,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
-    tracing::info!(key = %key, offset = offset, "write spool request");
-    let spool = state
-        .manager
-        .get_spool(&key)
-        .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
-
-    // Batch incoming body frames into page-sized writes. Each `spool.write`
-    // appends accepted bytes to spool.dat before acknowledging them; batching
-    // avoids excessive small writes without buffering the whole request body.
-    // Page-sized batches keep the write path bounded while preserving BOBS's
-    // page-at-a-time reader notification model.
-    let write_batch_size = state.config.page_size;
-    let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
-    let mut write_offset = offset;
-
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
-        if let Ok(data) = frame.into_data() {
-            let mut cursor = 0;
-            while cursor < data.len() {
-                let remaining_batch_space = write_batch_size - pending.len();
-                let take = remaining_batch_space.min(data.len() - cursor);
-                pending.extend_from_slice(&data[cursor..cursor + take]);
-                cursor += take;
-
-                if pending.len() == write_batch_size {
-                    let batch = std::mem::replace(
-                        &mut pending,
-                        bytes::BytesMut::with_capacity(write_batch_size),
-                    )
-                    .freeze();
-                    let batch_len = batch.len();
-                    spool.write(write_offset, batch).await.map_err(ApiError)?;
-                    write_offset += batch_len as u64;
+    let job_id = extract_job_id(&headers);
+    let span = request_span(job_id.as_deref(), Some(&key), Some(offset), None);
+    async move {
+        let spool = state
+            .manager
+            .get_spool(&key)
+            .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
+        let write_batch_size = state.config.page_size;
+        let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
+        let mut write_offset = offset;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
+            if let Ok(data) = frame.into_data() {
+                let mut cursor = 0;
+                while cursor < data.len() {
+                    let remaining_batch_space = write_batch_size - pending.len();
+                    let take = remaining_batch_space.min(data.len() - cursor);
+                    pending.extend_from_slice(&data[cursor..cursor + take]);
+                    cursor += take;
+                    if pending.len() == write_batch_size {
+                        let batch = std::mem::replace(&mut pending, bytes::BytesMut::with_capacity(write_batch_size)).freeze();
+                        let batch_len = batch.len();
+                        spool.write(write_offset, batch).await.map_err(ApiError)?;
+                        write_offset += batch_len as u64;
+                    }
                 }
             }
         }
-    }
-
-    if !pending.is_empty() {
-        spool
-            .write(write_offset, pending.freeze())
-            .await
-            .map_err(ApiError)?;
-    }
-
-    Ok(StatusCode::OK.into_response())
+        if !pending.is_empty() {
+            let batch_len = pending.len();
+            spool.write(write_offset, pending.freeze()).await.map_err(ApiError)?;
+            write_offset += batch_len as u64;
+        }
+        if let Some(job_id) = &job_id {
+            tracing::debug!("event.name" = "bobs.spool.write.completed", "job.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = write_offset.saturating_sub(offset), outcome = "success", "spool write completed");
+        } else {
+            tracing::debug!("event.name" = "bobs.spool.write.completed", "bobs.spool.key" = %key, offset = offset, bytes = write_offset.saturating_sub(offset), outcome = "success", "spool write completed");
+        }
+        Ok(StatusCode::OK.into_response())
+    }.instrument(span).await
 }
 
 async fn complete_spool<F, M>(
     State(state): State<Arc<AppState<F, M>>>,
     Path(key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Response, ApiError>
 where
     F: FileIO,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
-    let req = if body.is_empty() {
-        CompleteRequest::default()
-    } else {
-        serde_json::from_slice::<CompleteRequest>(&body)
-            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
-    };
-
-    let spool = state
-        .manager
-        .get_spool(&key)
-        .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
-    spool.complete(req.expected_size).await.map_err(ApiError)?;
-    tracing::info!(key = %key, expected_size = ?req.expected_size, "spool completed");
-    Ok(StatusCode::OK.into_response())
+    let job_id = extract_job_id(&headers);
+    let span = request_span(job_id.as_deref(), Some(&key), None, None);
+    async move {
+        let req = if body.is_empty() {
+            CompleteRequest::default()
+        } else {
+            serde_json::from_slice::<CompleteRequest>(&body)
+                .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
+        };
+        let spool = state
+            .manager
+            .get_spool(&key)
+            .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
+        spool.complete(req.expected_size).await.map_err(ApiError)?;
+        let meta = spool.metadata.lock().await;
+        if let Some(job_id) = &job_id {
+            tracing::info!("event.name" = "bobs.spool.completed", "job.id" = %job_id, "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, checksum = ?meta.checksum_crc32c, outcome = "success", "spool completed");
+        } else {
+            tracing::info!("event.name" = "bobs.spool.completed", "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, checksum = ?meta.checksum_crc32c, outcome = "success", "spool completed");
+        }
+        Ok(StatusCode::OK.into_response())
+    }.instrument(span).await
 }
 
 /// RAII guard that decrements the spool's reader count on drop, ensuring cleanup
@@ -260,6 +310,12 @@ where
     F: FileIO + 'static,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
+    let job_id = extract_job_id(&headers);
+    let raw_range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("follow")
+        .to_string();
     let request_range = parse_range(headers.get(axum::http::header::RANGE)).map_err(ApiError)?;
 
     let spool = state
@@ -333,7 +389,11 @@ where
             (start, end, false)
         }
     };
-    tracing::info!(key = %key, start = start, end = ?end, follow = follow, "read spool request");
+    if let Some(job_id) = &job_id {
+        tracing::info!("event.name" = "bobs.spool.read.started", "job.id" = %job_id, "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "success", "spool read started");
+    } else {
+        tracing::info!("event.name" = "bobs.spool.read.started", "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "success", "spool read started");
+    }
 
     if let Some(end) = end {
         if start > end {
@@ -353,19 +413,29 @@ where
     // If the timeout fires before any data arrives, return a 307 redirect
     // so standard clients (curl -L, browsers) retry automatically.
     let first_page_idx = start / page_size;
-    let first_page =
-        match tokio::time::timeout(long_poll_timeout, spool.read_page(first_page_idx)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(ApiError(e)),
-            Err(_) => {
-                // Lease drops here, releasing the reader.
-                return Ok(long_poll_redirect(&key));
+    let first_page = match tokio::time::timeout(long_poll_timeout, spool.read_page(first_page_idx))
+        .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(ApiError(e)),
+        Err(_) => {
+            if let Some(job_id) = &job_id {
+                tracing::warn!("event.name" = "bobs.spool.read.timeout", "job.id" = %job_id, "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "error", "spool read timed out");
+            } else {
+                tracing::warn!("event.name" = "bobs.spool.read.timeout", "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "error", "spool read timed out");
             }
-        };
+            return Ok(long_poll_redirect(&key));
+        }
+    };
 
+    let stream_job_id = job_id.clone();
+    let stream_key = key.clone();
+    let stream_range = raw_range.clone();
     let stream = stream! {
         let _lease = lease;
         let mut offset = start;
+        let mut bytes_served = 0_u64;
+        let mut outcome = "success";
         let mut prefetched = first_page;
 
         loop {
@@ -392,6 +462,7 @@ where
                 ).await {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
+                        outcome = "error";
                         yield Err::<Bytes, BobsError>(e);
                         break;
                     }
@@ -401,6 +472,7 @@ where
                 match spool.read_page(page_idx).await {
                     Ok(v) => v,
                     Err(e) => {
+                        outcome = "error";
                         yield Err::<Bytes, BobsError>(e);
                         break;
                     }
@@ -419,7 +491,9 @@ where
             if slice_start < slice_end {
                 let chunk = read_page_chunk(&page, slice_start, slice_end);
                 let chunk_start = offset;
-                offset += chunk.len() as u64;
+                let chunk_len = chunk.len() as u64;
+                offset += chunk_len;
+                bytes_served += chunk_len;
                 let chunk_end = offset;
 
                 // 1. Refresh activity timestamp (atomic, lock-free).
@@ -465,6 +539,11 @@ where
             } else {
                 break;
             }
+        }
+        if let Some(job_id) = &stream_job_id {
+            tracing::info!("event.name" = "bobs.spool.read.completed", "job.id" = %job_id, "bobs.spool.key" = %stream_key, range = %stream_range, bytes = bytes_served, outcome = outcome, "spool read completed");
+        } else {
+            tracing::info!("event.name" = "bobs.spool.read.completed", "bobs.spool.key" = %stream_key, range = %stream_range, bytes = bytes_served, outcome = outcome, "spool read completed");
         }
     };
 
@@ -598,14 +677,28 @@ fn parse_range(header: Option<&HeaderValue>) -> crate::error::Result<ReadRequest
 async fn delete_spool<F, M>(
     State(state): State<Arc<AppState<F, M>>>,
     Path(key): Path<String>,
+    headers: HeaderMap,
 ) -> std::result::Result<Response, ApiError>
 where
     F: FileIO,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
-    tracing::info!(key = %key, "delete spool request");
-    state.manager.delete_spool(&key).await.map_err(ApiError)?;
-    Ok(StatusCode::OK.into_response())
+    let job_id = extract_job_id(&headers);
+    let span = request_span(job_id.as_deref(), Some(&key), None, None);
+    async move {
+        state
+            .manager
+            .delete_spool_with_reason(
+                &key,
+                crate::manager::DeleteReason::Explicit,
+                job_id.as_deref(),
+            )
+            .await
+            .map_err(ApiError)?;
+        Ok(StatusCode::OK.into_response())
+    }
+    .instrument(span)
+    .await
 }
 
 #[derive(Debug, Serialize)]
