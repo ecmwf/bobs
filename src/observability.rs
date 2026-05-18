@@ -275,7 +275,10 @@ fn debug_to_value(formatted: &str) -> Value {
     if trimmed == "None" {
         return Value::Null;
     }
-    if let Some(inner) = trimmed.strip_prefix("Some(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = trimmed
+        .strip_prefix("Some(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         return debug_to_value(inner);
     }
     if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
@@ -554,7 +557,7 @@ mod tests {
 #[cfg(test)]
 mod debug_to_value_tests {
     use super::debug_to_value;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     #[test]
     fn none_becomes_null() {
@@ -563,7 +566,10 @@ mod debug_to_value_tests {
 
     #[test]
     fn some_string_unwraps() {
-        assert_eq!(debug_to_value("Some(\"application/json\")"), json!("application/json"));
+        assert_eq!(
+            debug_to_value("Some(\"application/json\")"),
+            json!("application/json")
+        );
     }
 
     #[test]
