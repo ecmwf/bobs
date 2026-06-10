@@ -434,9 +434,11 @@ mod tests {
     use crate::benchmark::config::{normalize_endpoint, EndpointSpec};
     #[test]
     fn schedule_has_shared_barrier_model() {
-        let mut c = BenchmarkConfig::default();
-        c.objects = 3;
-        c.endpoint = EndpointSpec::Single(normalize_endpoint("http://localhost:3000").unwrap());
+        let c = BenchmarkConfig {
+            objects: 3,
+            endpoint: EndpointSpec::Single(normalize_endpoint("http://localhost:3000").unwrap()),
+            ..Default::default()
+        };
         let s = build_schedule(&c).unwrap();
         assert_eq!(s.plans.len(), 3);
         assert_eq!(s.plans[0].object_bytes, c.object_bytes);

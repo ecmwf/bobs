@@ -122,7 +122,7 @@ impl FileIO for TokioFileIO {
 }
 
 fn join_error_to_io(error: task::JoinError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, error)
+    std::io::Error::other(error)
 }
 
 #[cfg(test)]

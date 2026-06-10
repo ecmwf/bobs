@@ -74,18 +74,22 @@ mod tests {
     use crate::benchmark::config::{BenchmarkConfig, EndpointSpec};
     #[test]
     fn one_plan_per_object() {
-        let mut c = BenchmarkConfig::default();
-        c.objects = 4;
-        c.endpoint = EndpointSpec::Single(normalize_endpoint("http://localhost:3000").unwrap());
+        let c = BenchmarkConfig {
+            objects: 4,
+            endpoint: EndpointSpec::Single(normalize_endpoint("http://localhost:3000").unwrap()),
+            ..Default::default()
+        };
         assert_eq!(build_schedule(&c).unwrap().plans.len(), 4);
     }
     #[test]
     fn deterministic_endpoint_assignment() {
-        let mut c = BenchmarkConfig::default();
-        c.objects = 5;
-        c.endpoint = EndpointSpec::Template {
-            template: "http://bobs-{ordinal}:3000".into(),
-            ordinals: vec![0, 1],
+        let c = BenchmarkConfig {
+            objects: 5,
+            endpoint: EndpointSpec::Template {
+                template: "http://bobs-{ordinal}:3000".into(),
+                ordinals: vec![0, 1],
+            },
+            ..Default::default()
         };
         let s = build_schedule(&c).unwrap();
         assert_eq!(

@@ -11,7 +11,7 @@ async fn main() {
             print!("{text}");
             std::process::exit(0);
         }
-        Ok(ParseOutcome::Run(cfg)) => cfg,
+        Ok(ParseOutcome::Run(cfg)) => *cfg,
         Err(e) => {
             eprintln!("error: {e}\n\n{}", bobs::benchmark::config::usage());
             std::process::exit(2);
