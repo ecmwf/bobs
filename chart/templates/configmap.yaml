@@ -21,6 +21,10 @@ data:
     unread_ttl_secs: {{ .Values.config.unread_ttl_secs }}
     cleanup_sweep_interval_secs: {{ .Values.config.cleanup_sweep_interval_secs }}
     long_poll_timeout_ms: {{ .Values.config.long_poll_timeout_ms }}
+    {{ if ne .Values.config.io_uring_shards nil }}
+    io_uring_shards: {{ .Values.config.io_uring_shards }}
+    {{ end }}
+    io_uring_queue_capacity: {{ .Values.config.io_uring_queue_capacity }}
     host_prefix: {{ required "bobs.config.host_prefix must be set" .Values.config.host_prefix | quote }}
     domain: {{ required "bobs.config.domain must be set" .Values.config.domain | quote }}
     route_name: {{ required "bobs.config.route_name must be set" .Values.config.route_name | quote }}
