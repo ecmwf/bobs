@@ -12,6 +12,20 @@ metadata:
   annotations:
     nginx.org/mergeable-ingress-type: minion
     nginx.org/location-snippets: |
+      # Preserve the external route prefix for BOBS long-poll redirects. In-cluster
+      # callers can also set X-Forwarded-Prefix directly; the app validates it as
+      # a short relative path prefix before using it in Location.
+      set $bobs_forwarded_prefix "";
+      if ($uri ~ ^(/{{ $routeName }}-\d+)(?:/|$)) {
+        set $bobs_forwarded_prefix $1;
+      }
+      proxy_set_header X-Forwarded-Prefix $bobs_forwarded_prefix;
+      # Defining proxy_set_header in a location overrides inherited headers in
+      # nginx, so keep the standard forwarded headers explicit here.
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
       rewrite ^/{{ $routeName }}-\d+/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
       rewrite ^/{{ $routeName }}-\d+/api/v1/read/([^/]+)$ /api/v1/read/$1 break;
       rewrite ^/{{ $routeName }}-\d+/api/v1/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
