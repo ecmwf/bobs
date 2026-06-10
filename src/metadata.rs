@@ -60,7 +60,7 @@ impl SyncSidecarMetadataStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
-            sync_directory: sync_directory,
+            sync_directory,
         }
     }
 
@@ -72,12 +72,7 @@ impl SyncSidecarMetadataStore {
     fn with_directory_sync_error(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
-            sync_directory: |_| {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "injected directory fsync failure",
-                ))
-            },
+            sync_directory: |_| Err(io::Error::other("injected directory fsync failure")),
         }
     }
 

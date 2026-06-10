@@ -37,7 +37,7 @@ pub struct Endpoint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseOutcome {
-    Run(BenchmarkConfig),
+    Run(Box<BenchmarkConfig>),
     Help(String),
 }
 
@@ -135,7 +135,7 @@ impl BenchmarkConfig {
             }
         };
         cfg.validate()?;
-        Ok(ParseOutcome::Run(cfg))
+        Ok(ParseOutcome::Run(Box::new(cfg)))
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -201,14 +201,10 @@ pub fn normalize_endpoint(input: &str) -> Result<Endpoint, String> {
     }
     let (host, port, host_header) = parse_authority(authority)?;
     let clean_path = path.trim_end_matches('/');
-    let prefix = if clean_path.is_empty() {
-        ""
-    } else if clean_path == "/api/v1" {
-        ""
-    } else {
+    if !clean_path.is_empty() && clean_path != "/api/v1" {
         return Err("endpoint URL path must be empty or /api/v1".into());
-    };
-    let root_url = format!("http://{host_header}{prefix}");
+    }
+    let root_url = format!("http://{host_header}");
     rest = "";
     let _ = rest;
     Ok(Endpoint {
