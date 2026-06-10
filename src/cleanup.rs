@@ -3,6 +3,7 @@ use crate::io::FileIO;
 use crate::manager::{DeleteReason, SpoolManager};
 use crate::metadata::MetadataStore;
 use crate::spool::SpoolState;
+use crate::time::now_secs;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -130,13 +131,6 @@ where
     tokio::spawn(run_cleanup_loop(manager, config))
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +154,7 @@ mod tests {
             cleanup_sweep_interval_secs: 1,
             long_poll_timeout_ms: 25000,
             io_uring_shards: None,
+            io_uring_queue_capacity: 1024,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),

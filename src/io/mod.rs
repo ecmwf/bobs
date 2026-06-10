@@ -16,8 +16,9 @@ pub type DefaultFileIO = UringFileIO;
 #[cfg(any(not(target_os = "linux"), feature = "tokio-fileio-fallback"))]
 pub type DefaultFileIO = TokioFileIO;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::future::Future;
+use std::io;
 use std::path::Path;
 
 /// FileIO trait for async positional file operations.
@@ -27,6 +28,30 @@ use std::path::Path;
 /// `write_at`; concurrent operations on the same handle must behave as
 /// independent positional I/O. Implementations must be Send + Sync + Clone for
 /// use in concurrent contexts.
+pub async fn read_exact_at<F: FileIO>(
+    handle: &F::Handle,
+    offset: u64,
+    len: usize,
+    context: &str,
+) -> io::Result<Bytes> {
+    let mut out = BytesMut::with_capacity(len);
+
+    while out.len() < len {
+        let read_offset = offset + out.len() as u64;
+        let remaining = len - out.len();
+        let buf = F::read_at(handle, read_offset, remaining).await?;
+        if buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("expected {len} bytes while {context}, got {}", out.len()),
+            ));
+        }
+        out.extend_from_slice(&buf);
+    }
+
+    Ok(out.freeze())
+}
+
 pub trait FileIO: Send + Sync + Clone + 'static {
     /// Associated type for file handles. Must be Send + Sync.
     type Handle: Send + Sync + 'static;
