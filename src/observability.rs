@@ -84,9 +84,9 @@ where
         let body = visitor
             .fields
             .remove("message")
-            .and_then(|v| match v {
-                Value::String(s) => Some(redact_text(&s)),
-                other => Some(redact_text(&other.to_string())),
+            .map(|v| match v {
+                Value::String(s) => redact_text(&s),
+                other => redact_text(&other.to_string()),
             })
             .unwrap_or_default();
 
