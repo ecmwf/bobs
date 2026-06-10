@@ -11,7 +11,34 @@ service:
   type: ClusterIP
   port: 3000
 
-resources: {}
+resources:
+  requests:
+    memory: 16Gi
+    cpu: "4"
+  limits:
+    memory: 16Gi
+    cpu: "8"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  # seccompProfile is intentionally unset by default. Kubernetes RuntimeDefault
+  # profiles have historically blocked io_uring_setup/io_uring_enter/
+  # io_uring_register, which would break BOBS' default Linux I/O backend.
+  # Operators may set a validated profile explicitly, for example:
+  # seccompProfile:
+  #   type: RuntimeDefault
+
+internalBaseUrlTemplate: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ .Values.headlessService.name }}:{{ .Values.service.port }}/api/v1'
 
 config:
   host: "0.0.0.0"
@@ -26,6 +53,8 @@ config:
   unread_ttl_secs: 3600
   cleanup_sweep_interval_secs: 30
   long_poll_timeout_ms: 25000
+  io_uring_shards: null
+  io_uring_queue_capacity: 1024
   host_prefix: ""
   domain: ""
   route_name: "download"
