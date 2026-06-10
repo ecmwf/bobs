@@ -52,14 +52,16 @@ impl AsRawFd for UringFileHandle {
 
 pub fn initialize_production_ring_pool(
     configured_shards: Option<usize>,
+    queue_capacity: usize,
 ) -> Result<ring_pool::RingPoolStartup> {
-    ring_pool::initialize_production_ring_pool(configured_shards)
+    ring_pool::initialize_production_ring_pool(configured_shards, queue_capacity)
 }
 
 pub fn init_global_ring_pool(
     configured_shards: Option<usize>,
+    queue_capacity: usize,
 ) -> Result<ring_pool::RingPoolStartup> {
-    ring_pool::init_global_ring_pool(configured_shards)
+    ring_pool::init_global_ring_pool(configured_shards, queue_capacity)
 }
 
 #[allow(dead_code)]
@@ -99,7 +101,8 @@ impl FileIO for UringFileIO {
                 data,
                 tx,
             },
-        )?;
+        )
+        .await?;
         recv_result(rx).await
     }
 
@@ -120,7 +123,8 @@ impl FileIO for UringFileIO {
                 len,
                 tx,
             },
-        )?;
+        )
+        .await?;
         recv_result(rx).await
     }
 
@@ -139,7 +143,8 @@ impl FileIO for UringFileIO {
                 fd: Arc::clone(&handle.fd),
                 tx,
             },
-        )?;
+        )
+        .await?;
         recv_result(rx).await
     }
 
@@ -162,7 +167,8 @@ impl FileIO for UringFileIO {
             ring_index,
         );
         let (tx, rx) = oneshot::channel();
-        pool.submit_to_ring(ring_index, ring_pool::Request::Remove { path, tx })?;
+        pool.submit_to_ring(ring_index, ring_pool::Request::Remove { path, tx })
+            .await?;
         recv_result(rx).await
     }
 }
@@ -210,7 +216,8 @@ async fn submit_open(path: &Path, flags: i32, mode: u32) -> Result<UringFileHand
             mode,
             tx,
         },
-    )?;
+    )
+    .await?;
     let fd = recv_result(rx).await?;
     Ok(UringFileHandle::new(fd, pool, ring_index, routed_key))
 }
@@ -258,6 +265,7 @@ mod tests {
     fn explicit_test_options(shard_count: usize) -> RingPoolOptions {
         RingPoolOptions {
             shard_count,
+            queue_capacity: 1024,
             driver_name_prefix: "bobs-uring-routing-test".to_owned(),
         }
     }
@@ -472,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn io_uring_fileio_propagates_fsync_completion_errors() {
-        let error = Error::new(ErrorKind::Other, "injected fsync failure");
+        let error = Error::other("injected fsync failure");
         let mut fake = FakeSubmitter::fsync_error(error);
         let observed = fake.next_fsync().expect_err("fake fsync should fail");
         assert_eq!(observed.kind(), ErrorKind::Other);

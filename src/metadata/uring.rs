@@ -583,6 +583,7 @@ mod tests {
         let pool = Arc::new(
             RingPool::new_for_test(RingPoolOptions {
                 shard_count: 4,
+                queue_capacity: 1024,
                 driver_name_prefix: "bobs-metadata-routing-test".to_owned(),
             })
             .expect("metadata routing test ring pool should start"),

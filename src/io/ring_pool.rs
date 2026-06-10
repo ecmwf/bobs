@@ -72,6 +72,7 @@ pub(crate) enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingPoolOptions {
     pub shard_count: usize,
+    pub queue_capacity: usize,
     pub driver_name_prefix: String,
 }
 
@@ -147,7 +148,7 @@ pub struct RingShard {
     #[allow(dead_code)]
     index: usize,
     driver_name: String,
-    sender: Option<mpsc::UnboundedSender<Request>>,
+    sender: Option<mpsc::Sender<Request>>,
     driver: Option<JoinHandle<()>>,
     counters: RingShardCounters,
 }
@@ -187,9 +188,10 @@ pub struct RingPoolShutdown {
 }
 
 impl RingPoolOptions {
-    pub fn production(configured_shards: Option<usize>) -> Result<Self> {
+    pub fn production(configured_shards: Option<usize>, queue_capacity: usize) -> Result<Self> {
         Ok(Self {
             shard_count: resolve_shard_count(configured_shards)?,
+            queue_capacity,
             driver_name_prefix: "bobs-io-uring-shard".to_owned(),
         })
     }
@@ -197,7 +199,7 @@ impl RingPoolOptions {
 
 impl RingPool {
     pub fn new(configured_shards: Option<usize>) -> Result<Self> {
-        Self::from_options(RingPoolOptions::production(configured_shards)?)
+        Self::from_options(RingPoolOptions::production(configured_shards, 1024)?)
     }
 
     #[cfg(test)]
@@ -210,6 +212,12 @@ impl RingPool {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "ring pool shard_count must be greater than 0",
+            ));
+        }
+        if options.queue_capacity == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "ring pool queue_capacity must be greater than 0",
             ));
         }
 
@@ -233,6 +241,7 @@ impl RingPool {
             shards.push(start_shard(
                 index,
                 &options.driver_name_prefix,
+                options.queue_capacity,
                 ring,
                 submission_instrumentation.clone(),
             )?);
@@ -302,7 +311,8 @@ impl RingPool {
                 payload,
                 tx,
             },
-        )?;
+        )
+        .await?;
         rx.await.map_err(|_| {
             Error::new(
                 ErrorKind::BrokenPipe,
@@ -311,7 +321,7 @@ impl RingPool {
         })?
     }
 
-    pub(crate) fn submit_to_ring(&self, ring_index: usize, request: Request) -> Result<()> {
+    pub(crate) async fn submit_to_ring(&self, ring_index: usize, request: Request) -> Result<()> {
         let shard = self.shards.get(ring_index).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -331,6 +341,7 @@ impl RingPool {
                 )
             })?
             .send(request)
+            .await
             .map_err(|_| {
                 Error::new(
                     ErrorKind::BrokenPipe,
@@ -439,10 +450,11 @@ impl Drop for RingPool {
 fn start_shard(
     index: usize,
     prefix: &str,
+    queue_capacity: usize,
     ring: IoUring,
     submission_instrumentation: RingPoolSubmissionInstrumentation,
 ) -> Result<RingShard> {
-    let (sender, receiver) = mpsc::unbounded_channel();
+    let (sender, receiver) = mpsc::channel(queue_capacity);
     let driver_name = format!("{prefix}-{index}");
     let counters = RingShardCounters::default();
     let driver_stopped = Arc::clone(&counters.driver_stopped);
@@ -474,7 +486,7 @@ fn run_driver(
     shard_index: usize,
     driver_name: String,
     ring: IoUring,
-    receiver: mpsc::UnboundedReceiver<Request>,
+    receiver: mpsc::Receiver<Request>,
     in_flight_operations: Arc<AtomicUsize>,
     driver_stopped: Arc<AtomicBool>,
     submission_instrumentation: RingPoolSubmissionInstrumentation,
@@ -543,7 +555,7 @@ struct RingDriver {
     #[allow(dead_code)]
     driver_name: String,
     ring: IoUring,
-    rx: mpsc::UnboundedReceiver<Request>,
+    rx: mpsc::Receiver<Request>,
     in_flight: HashMap<u64, InFlight>,
     pending: VecDeque<Request>,
     next_id: u64,
@@ -557,7 +569,7 @@ impl RingDriver {
         shard_index: usize,
         driver_name: String,
         ring: IoUring,
-        rx: mpsc::UnboundedReceiver<Request>,
+        rx: mpsc::Receiver<Request>,
         in_flight_operations: Arc<AtomicUsize>,
         submission_instrumentation: RingPoolSubmissionInstrumentation,
     ) -> Self {
@@ -1230,14 +1242,18 @@ pub fn resolve_shard_count(configured_shards: Option<usize>) -> Result<usize> {
 /// Initialize the production ring-pool settings for the Linux default backend.
 pub fn initialize_production_ring_pool(
     configured_shards: Option<usize>,
+    queue_capacity: usize,
 ) -> Result<RingPoolStartup> {
-    init_global_ring_pool(configured_shards)
+    init_global_ring_pool(configured_shards, queue_capacity)
 }
 
 /// Install the production global ring pool, or validate that an existing one
 /// was initialized with the same production configuration.
-pub fn init_global_ring_pool(configured_shards: Option<usize>) -> Result<RingPoolStartup> {
-    let requested_options = RingPoolOptions::production(configured_shards)?;
+pub fn init_global_ring_pool(
+    configured_shards: Option<usize>,
+    queue_capacity: usize,
+) -> Result<RingPoolStartup> {
+    let requested_options = RingPoolOptions::production(configured_shards, queue_capacity)?;
     let slot = global_ring_pool_slot();
     let mut guard = slot.lock().expect("global ring-pool slot poisoned");
 
@@ -1293,16 +1309,18 @@ pub(crate) fn global_or_default_ring_pool() -> Result<Arc<RingPool>> {
             return Ok(pool);
         }
 
-        return TEST_DEFAULT_RING_POOL.with(|default_pool| {
+        TEST_DEFAULT_RING_POOL.with(|default_pool| {
             let mut default_pool = default_pool.borrow_mut();
             if let Some(pool) = default_pool.as_ref() {
                 return Ok(Arc::clone(pool));
             }
 
-            let pool = Arc::new(RingPool::from_options(RingPoolOptions::production(None)?)?);
+            let pool = Arc::new(RingPool::from_options(RingPoolOptions::production(
+                None, 1024,
+            )?)?);
             *default_pool = Some(Arc::clone(&pool));
             Ok(pool)
-        });
+        })
     }
 
     #[cfg(not(test))]
@@ -1313,7 +1331,9 @@ pub(crate) fn global_or_default_ring_pool() -> Result<Arc<RingPool>> {
             return Ok(Arc::clone(pool));
         }
 
-        let pool = Arc::new(RingPool::from_options(RingPoolOptions::production(None)?)?);
+        let pool = Arc::new(RingPool::from_options(RingPoolOptions::production(
+            None, 1024,
+        )?)?);
         *guard = Some(Arc::clone(&pool));
         Ok(pool)
     }
@@ -1348,13 +1368,13 @@ fn shutdown_owned_pool_when_unshared(pool: Arc<RingPool>) -> Result<Option<RingP
                 }
             }
         }
-        return match Arc::try_unwrap(pool) {
+        match Arc::try_unwrap(pool) {
             Ok(pool) => pool.shutdown().map(Some),
             Err(pool) => {
                 drop(pool);
                 Ok(None)
             }
-        };
+        }
     }
 
     #[cfg(not(test))]
@@ -1421,6 +1441,8 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::{timeout, Duration};
 
     const PROBE_ENV: &str = "BOBS_RING_POOL_HASH_PROBE";
     const PROBE_PREFIX: &str = "BOBS_RING_POOL_HASH_PROBE_RESULT";
@@ -1614,6 +1636,7 @@ mod tests {
     fn explicit_test_options(shard_count: usize) -> RingPoolOptions {
         RingPoolOptions {
             shard_count,
+            queue_capacity: 1024,
             driver_name_prefix: "bobs-uring-test".to_owned(),
         }
     }
@@ -1630,14 +1653,14 @@ mod tests {
             .expect("ring-pool global test lock poisoned");
         let _ = shutdown_global_ring_pool_for_exit();
 
-        let startup =
-            init_global_ring_pool(Some(2)).expect("production global ring pool should initialize");
+        let startup = init_global_ring_pool(Some(2), 1024)
+            .expect("production global ring pool should initialize");
         assert_eq!(startup.configured_shards, Some(2));
         assert_eq!(startup.resolved_shards, 2);
         let first = global_ring_pool().expect("initialized global ring pool should be available");
         assert_eq!(first.shard_count(), 2);
 
-        let matching = init_global_ring_pool(Some(2))
+        let matching = init_global_ring_pool(Some(2), 1024)
             .expect("matching global ring-pool initialization should be idempotent");
         let second = global_ring_pool().expect("global ring pool should remain available");
         assert_eq!(matching, startup);
@@ -1646,7 +1669,7 @@ mod tests {
             "idempotent initialization must keep the installed pool"
         );
 
-        let conflict = init_global_ring_pool(Some(3))
+        let conflict = init_global_ring_pool(Some(3), 1024)
             .expect_err("conflicting global ring-pool initialization should be rejected");
         assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
         assert!(
@@ -1699,7 +1722,7 @@ mod tests {
             "dropping the scoped override must remove the direct pool without leaking a global"
         );
 
-        let _startup = init_global_ring_pool(Some(2))
+        let _startup = init_global_ring_pool(Some(2), 1024)
             .expect("production global ring pool should initialize after override drops");
         let production_pool = global_ring_pool().expect("production global should be available");
         assert_eq!(production_pool.shard_count(), 2);
@@ -1744,6 +1767,17 @@ mod tests {
     }
 
     #[test]
+    fn ring_pool_rejects_zero_queue_capacity() {
+        let err = RingPool::new_for_test(RingPoolOptions {
+            shard_count: 1,
+            queue_capacity: 0,
+            driver_name_prefix: "bobs-uring-test".to_owned(),
+        })
+        .expect_err("zero queue capacity should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn ring_pool_driver_shutdown() {
         let pool = RingPool::new_for_test(explicit_test_options(4))
             .expect("explicit RingPool instance should start");
@@ -1764,6 +1798,47 @@ mod tests {
             "shutdown must leave no in-flight operations"
         );
         assert!(shutdown.driver_threads_all_stopped);
+    }
+
+    #[tokio::test]
+    async fn ring_pool_bounded_submission_queue_waits_for_capacity() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(temp_dir.path().join("bounded-queue.dat"))
+            .expect("bounded queue test file should open");
+        let fd = Arc::new(OwnedFd::from(file));
+        let (tx, mut rx) = mpsc::channel::<Request>(1);
+
+        let (first_tx, _first_rx) = oneshot::channel();
+        tx.send(Request::SyncData {
+            fd: Arc::clone(&fd),
+            tx: first_tx,
+        })
+        .await
+        .expect("first send should fill the bounded queue");
+
+        let (second_tx, _second_rx) = oneshot::channel();
+        let second_send = tx.send(Request::SyncData {
+            fd: Arc::clone(&fd),
+            tx: second_tx,
+        });
+        tokio::pin!(second_send);
+        timeout(Duration::from_millis(25), &mut second_send)
+            .await
+            .expect_err("second send should wait while capacity is exhausted");
+
+        let (drained, _rx) = tokio::task::spawn_blocking(move || (rx.blocking_recv(), rx))
+            .await
+            .expect("blocking recv task should not panic");
+        assert!(matches!(drained, Some(Request::SyncData { .. })));
+        timeout(Duration::from_secs(1), second_send)
+            .await
+            .expect("second send should complete after capacity is drained")
+            .expect("receiver should remain open");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1790,7 +1865,7 @@ mod tests {
             let fd = Arc::clone(&fd);
             handles.push(tokio::spawn(async move {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                pool.submit_to_ring(0, Request::SyncData { fd, tx })?;
+                pool.submit_to_ring(0, Request::SyncData { fd, tx }).await?;
                 rx.await.map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::BrokenPipe,
