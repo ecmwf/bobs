@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 
 use crate::error::{BobsError, Result};
-use crate::io::FileIO;
+use crate::io::{read_exact_at, FileIO};
 use crate::spool::{Spool, SpoolState};
 
 impl<F, M> Spool<F, M>
@@ -52,9 +52,14 @@ where
                         return Err(BobsError::WriterInactive);
                     };
 
-                    let disk_buf = F::read_at(handle, file_offset, page_len)
-                        .await
-                        .map_err(BobsError::IoError)?;
+                    let disk_buf = read_exact_at::<F>(
+                        handle,
+                        file_offset,
+                        page_len,
+                        "reading spool page from disk",
+                    )
+                    .await
+                    .map_err(BobsError::IoError)?;
                     return Ok(Some(disk_buf));
                 }
             }
@@ -76,7 +81,7 @@ where
                     continue;
                 }
                 _ = self.cancel.cancelled() => {
-                    return Err(BobsError::SpoolNotFound { key: self.data_path.to_string_lossy().to_string() });
+                    return Err(BobsError::SpoolNotFound { key: self.key.clone() });
                 }
             }
         }
@@ -85,6 +90,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use bytes::Bytes;
@@ -94,6 +100,94 @@ mod tests {
     use crate::io::{FileIO, TokioFileIO};
     use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
     use crate::spool::SpoolMetadata;
+
+    #[derive(Clone)]
+    struct ShortReadFileIO;
+
+    struct ShortReadHandle {
+        data: Bytes,
+        max_chunk: usize,
+    }
+
+    impl FileIO for ShortReadFileIO {
+        type Handle = ShortReadHandle;
+
+        async fn create(_path: &Path) -> std::io::Result<Self::Handle> {
+            unreachable!("short-read tests construct handles directly")
+        }
+
+        async fn open(_path: &Path) -> std::io::Result<Self::Handle> {
+            unreachable!("short-read tests construct handles directly")
+        }
+
+        async fn write_at(
+            _handle: &Self::Handle,
+            _offset: u64,
+            _data: Bytes,
+        ) -> std::io::Result<usize> {
+            unreachable!("short-read tests do not write through mock FileIO")
+        }
+
+        async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> std::io::Result<Bytes> {
+            let start = offset as usize;
+            if start >= handle.data.len() {
+                return Ok(Bytes::new());
+            }
+            let end = handle.data.len().min(start + len.min(handle.max_chunk));
+            Ok(handle.data.slice(start..end))
+        }
+
+        async fn sync_data(_handle: &Self::Handle) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn close(_handle: Self::Handle) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn remove(_path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn make_short_read_spool(
+        dir: &std::path::Path,
+        data: Bytes,
+        max_chunk: usize,
+        page_size: usize,
+    ) -> Spool<ShortReadFileIO> {
+        let spool_dir = dir.join("short-read-key");
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .expect("create spool dir");
+        let path = spool_dir.join("spool.dat");
+        let metadata_store = SyncSidecarMetadataStore::new(dir);
+        let meta = SpoolMetadata {
+            key: "short-read-key".to_string(),
+            content_type: None,
+            content_encoding: None,
+            state: SpoolState::Writing,
+            write_locked: false,
+            created_at: 0,
+            last_write_at: 0,
+            last_read_at: None,
+            readable_at: None,
+            total_bytes_written: page_size as u64,
+            checksum_crc32c: None,
+            total_pages: 1,
+            final_page_size: None,
+            data_path: path,
+        };
+
+        Spool::new(
+            meta,
+            ShortReadHandle { data, max_chunk },
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(0))),
+            metadata_store,
+        )
+        .await
+    }
 
     async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
         make_spool_with_cache_bytes(dir, page_size, page_size * 256).await
@@ -228,6 +322,36 @@ mod tests {
 
         let got = spool.read_page(0).await.expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(data)));
+    }
+
+    #[tokio::test]
+    async fn test_read_disk_page_loops_over_short_reads_until_full_page() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let page_size = 4096;
+        let data = Bytes::from((0..page_size).map(|n| (n % 251) as u8).collect::<Vec<_>>());
+        let spool = make_short_read_spool(dir.path(), data.clone(), 997, page_size).await;
+
+        let got = spool.read_page(0).await.expect("read should succeed");
+        assert_eq!(got, Some(data));
+    }
+
+    #[tokio::test]
+    async fn test_read_disk_page_returns_unexpected_eof_for_short_logical_page() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let page_size = 4096;
+        let spool = make_short_read_spool(
+            dir.path(),
+            Bytes::from(vec![0x11u8; page_size - 17]),
+            512,
+            page_size,
+        )
+        .await;
+
+        let err = spool.read_page(0).await.expect_err("read should fail");
+        let BobsError::IoError(err) = err else {
+            panic!("expected IoError, got {err:?}");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
@@ -369,8 +493,12 @@ mod tests {
             .expect("reader task timed out")
             .expect("join should succeed");
 
-        assert!(result.is_err());
-        assert!(matches!(result, Err(BobsError::SpoolNotFound { .. })));
+        let Err(BobsError::SpoolNotFound { key }) = result else {
+            panic!("expected SpoolNotFound, got {result:?}");
+        };
+        assert_eq!(key, spool.key);
+        assert!(!key.contains("spool.dat"));
+        assert!(!key.contains(dir.path().to_string_lossy().as_ref()));
     }
 
     #[tokio::test]

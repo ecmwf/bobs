@@ -1,13 +1,14 @@
 use crate::error::{BobsError, Result};
-use crate::io::FileIO;
+use crate::io::{read_exact_at, FileIO};
 use crate::metadata::{legacy_redb, MetadataStore, SyncSidecarMetadataStore};
 use crate::spool::{PageCache, Spool, SpoolMetadata, SpoolState};
+use crate::time::now_secs;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -412,23 +413,41 @@ where
             if name == "spools.redb" {
                 continue;
             }
-            if !entry
-                .file_type()
-                .await
-                .map_err(BobsError::IoError)?
-                .is_dir()
+            let file_type = entry.file_type().await.map_err(BobsError::IoError)?;
+            if file_type.is_symlink() {
+                tracing::warn!(orphan = %name, "recovery: skipping symlink during orphan sweep");
+                continue;
+            }
+            if !file_type.is_dir() {
+                tracing::warn!(orphan = %name, "recovery: skipping non-directory entry during orphan sweep");
+                continue;
+            }
+            if uuid::Uuid::parse_str(&name).is_err() {
+                tracing::warn!(orphan = %name, "recovery: skipping non-UUID directory during orphan sweep");
+                continue;
+            }
+            if recovered_keys.contains(&name)
+                || self.spools.contains_key(&name)
+                || stale_key_set.contains(&name)
             {
                 continue;
             }
-            if !recovered_keys.contains(&name)
-                && !self.spools.contains_key(&name)
-                && !stale_key_set.contains(&name)
-            {
-                tracing::warn!(orphan = %name, "removing orphan spool directory");
-                if tokio::fs::remove_dir_all(entry.path()).await.is_ok() {
-                    orphan_deleted += 1;
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
-                }
+
+            let entry_path = entry.path();
+            // UUID-named empty directories are preserved: they may be unrelated
+            // operator data, or a future spool shape, and are not safe orphans
+            // unless they contain a known spool marker.
+            let shaped_like_spool =
+                entry_path.join("spool.dat").exists() || entry_path.join("meta.json").exists();
+            if !shaped_like_spool {
+                tracing::warn!(orphan = %name, "recovery: skipping UUID directory without spool markers during orphan sweep");
+                continue;
+            }
+
+            tracing::warn!(orphan = %name, "removing orphan spool directory");
+            if tokio::fs::remove_dir_all(entry_path).await.is_ok() {
+                orphan_deleted += 1;
+                tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
             }
         }
 
@@ -496,15 +515,9 @@ async fn crc32c_for_logical_size<F: FileIO>(handle: &F::Handle, logical_size: u6
 
     while remaining > 0 {
         let want = remaining.min(CHUNK_LEN) as usize;
-        let buf = F::read_at(handle, offset, want)
+        let buf = read_exact_at::<F>(handle, offset, want, "reconstructing CRC")
             .await
             .map_err(BobsError::IoError)?;
-        if buf.is_empty() {
-            return Err(BobsError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("expected {logical_size} bytes while reconstructing CRC, got {offset}"),
-            )));
-        }
         crc = crc32c::crc32c_append(crc, &buf);
         offset += buf.len() as u64;
         remaining -= buf.len() as u64;
@@ -524,30 +537,12 @@ async fn read_exact_logical_range<F: FileIO>(
         return Err(BobsError::WriterInactive);
     };
 
-    while out.len() < len {
-        let buf = F::read_at(handle, offset + out.len() as u64, len - out.len())
-            .await
-            .map_err(BobsError::IoError)?;
-        if buf.is_empty() {
-            return Err(BobsError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "expected {len} bytes while loading trailing partial page, got {}",
-                    out.len()
-                ),
-            )));
-        }
-        out.extend_from_slice(&buf);
-    }
+    let buf = read_exact_at::<F>(handle, offset, len, "loading trailing partial page")
+        .await
+        .map_err(BobsError::IoError)?;
+    out.extend_from_slice(&buf);
 
     Ok(out)
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]
@@ -579,7 +574,7 @@ mod tests {
         } else {
             logical_size.div_ceil(page_size)
         };
-        let final_page_size = if total_pages == 0 || logical_size % page_size == 0 {
+        let final_page_size = if total_pages == 0 || logical_size.is_multiple_of(page_size) {
             None
         } else {
             Some(logical_size % page_size)
@@ -1342,13 +1337,21 @@ mod tests {
             b"",
         )
         .await;
-        let orphan_dir = data_dir.join("orphan-no-sidecar");
+        let orphan_key = uuid::Uuid::new_v4().to_string();
+        let orphan_dir = data_dir.join(&orphan_key);
         tokio::fs::create_dir_all(&orphan_dir)
             .await
-            .expect("create orphan dir");
+            .expect("create UUID orphan dir");
         tokio::fs::write(orphan_dir.join("spool.dat"), b"orphan")
             .await
             .expect("write orphan data");
+        let non_uuid_orphan_dir = data_dir.join("orphan-no-sidecar");
+        tokio::fs::create_dir_all(&non_uuid_orphan_dir)
+            .await
+            .expect("create non-UUID orphan dir");
+        tokio::fs::write(non_uuid_orphan_dir.join("spool.dat"), b"not a spool key")
+            .await
+            .expect("write non-UUID orphan data");
 
         let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
             .expect("manager2 init");
@@ -1357,7 +1360,69 @@ mod tests {
         assert!(!data_dir.join(creating).exists());
         assert!(!data_dir.join(deleting).exists());
         assert!(!orphan_dir.exists());
+        assert!(
+            non_uuid_orphan_dir.exists(),
+            "non-UUID orphan directories must be preserved"
+        );
         assert!(manager2.spool_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_orphan_sweep_preserves_uuid_empty_and_uuid_symlink_dirs() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("legacy-metadata.db");
+        let data_dir = dir.path().join("data");
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .expect("create data dir");
+
+        let empty_uuid_key = uuid::Uuid::new_v4().to_string();
+        let empty_uuid_dir = data_dir.join(&empty_uuid_key);
+        tokio::fs::create_dir_all(&empty_uuid_dir)
+            .await
+            .expect("create empty UUID dir");
+
+        #[cfg(unix)]
+        let (symlink_path, target_dir) = {
+            let symlink_key = uuid::Uuid::new_v4().to_string();
+            let target_dir = dir.path().join("outside-target");
+            tokio::fs::create_dir_all(&target_dir)
+                .await
+                .expect("create symlink target");
+            tokio::fs::write(target_dir.join("spool.dat"), b"outside")
+                .await
+                .expect("write target marker");
+            let symlink_path = data_dir.join(&symlink_key);
+            std::os::unix::fs::symlink(&target_dir, &symlink_path).expect("create UUID symlink");
+            (Some(symlink_path), Some(target_dir))
+        };
+        #[cfg(not(unix))]
+        let (symlink_path, target_dir): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+            .expect("manager init");
+        manager.recover().await.expect("recover succeeds");
+
+        assert!(
+            empty_uuid_dir.exists(),
+            "UUID-named empty directories must be preserved"
+        );
+        if let Some(symlink_path) = symlink_path {
+            assert!(
+                tokio::fs::symlink_metadata(&symlink_path)
+                    .await
+                    .expect("symlink metadata")
+                    .file_type()
+                    .is_symlink(),
+                "UUID symlink must be preserved"
+            );
+        }
+        if let Some(target_dir) = target_dir {
+            assert!(
+                target_dir.join("spool.dat").exists(),
+                "orphan sweep must not traverse a skipped symlink target"
+            );
+        }
     }
 
     #[tokio::test]
