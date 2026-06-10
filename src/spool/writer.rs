@@ -3,6 +3,7 @@ use bytes::Bytes;
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::spool::{Spool, SpoolState};
+use crate::time::now_secs;
 
 impl<F, M> Spool<F, M>
 where
@@ -120,13 +121,6 @@ where
 
         self.notify.notify_waiters();
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]
