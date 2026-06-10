@@ -23,6 +23,9 @@ pub enum BobsError {
     #[error("invalid range header: {0}")]
     InvalidRange(String),
 
+    #[error("range not satisfiable: {reason}")]
+    RangeNotSatisfiable { total: Option<u64>, reason: String },
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
