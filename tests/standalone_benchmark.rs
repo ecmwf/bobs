@@ -88,6 +88,7 @@ where
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "download".into(),
@@ -172,14 +173,15 @@ fn benchmark_config_for(
     object_bytes: u64,
     chunk_bytes: usize,
 ) -> BenchmarkConfig {
-    let mut cfg = BenchmarkConfig::default();
-    cfg.endpoint = EndpointSpec::Single(normalize_endpoint(base_url).unwrap());
-    cfg.objects = objects;
-    cfg.object_bytes = object_bytes;
-    cfg.write_body_chunk_bytes = chunk_bytes;
-    cfg.read_body_chunk_bytes = chunk_bytes;
-    cfg.start_delay = Duration::from_millis(10);
-    cfg
+    BenchmarkConfig {
+        endpoint: EndpointSpec::Single(normalize_endpoint(base_url).unwrap()),
+        objects,
+        object_bytes,
+        write_body_chunk_bytes: chunk_bytes,
+        read_body_chunk_bytes: chunk_bytes,
+        start_delay: Duration::from_millis(10),
+        ..Default::default()
+    }
 }
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]

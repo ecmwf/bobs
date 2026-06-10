@@ -29,9 +29,9 @@ dashmap = "6"
 async-stream = "0.3"
 crc32c = "0.6"
 base64 = "0.22"
-serde_yml = "0.0.12"
 num_cpus = "1"
 siphasher = "1"
+serde_norway = "0.9.42"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Low-level Linux interface chosen over tokio-uring and compio to avoid a

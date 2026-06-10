@@ -25,6 +25,7 @@ pub struct Config {
     pub cleanup_sweep_interval_secs: u64,
     pub long_poll_timeout_ms: u64,
     pub io_uring_shards: Option<usize>,
+    pub io_uring_queue_capacity: usize,
     pub host_prefix: String,
     pub domain: String,
     pub route_name: String,
@@ -46,6 +47,7 @@ impl Default for Config {
             cleanup_sweep_interval_secs: 30,
             long_poll_timeout_ms: 25000,
             io_uring_shards: None,
+            io_uring_queue_capacity: 1024,
             host_prefix: String::new(),
             domain: String::new(),
             route_name: String::new(),
@@ -56,7 +58,7 @@ impl Default for Config {
 impl Config {
     pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        serde_yml::from_str(&contents)
+        serde_norway::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
@@ -86,6 +88,13 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "io_uring_shards must be greater than 0 when set",
+            ));
+        }
+
+        if self.io_uring_queue_capacity == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "io_uring_queue_capacity must be greater than 0",
             ));
         }
 
@@ -150,6 +159,7 @@ mod tests {
         assert_eq!(config.cleanup_sweep_interval_secs, 30);
         assert_eq!(config.long_poll_timeout_ms, 25000);
         assert_eq!(config.io_uring_shards, None);
+        assert_eq!(config.io_uring_queue_capacity, 1024);
     }
 
     #[test]
@@ -171,6 +181,7 @@ unread_ttl_secs: 33
 cleanup_sweep_interval_secs: 44
 long_poll_timeout_ms: 555
 io_uring_shards: 7
+io_uring_queue_capacity: 2048
 host_prefix: test-prefix
 domain: test.example.com
 route_name: test-route
@@ -192,6 +203,7 @@ route_name: test-route
         assert_eq!(cfg.cleanup_sweep_interval_secs, 44);
         assert_eq!(cfg.long_poll_timeout_ms, 555);
         assert_eq!(cfg.io_uring_shards, Some(7));
+        assert_eq!(cfg.io_uring_queue_capacity, 2048);
         assert_eq!(cfg.host_prefix, "test-prefix");
         assert_eq!(cfg.domain, "test.example.com");
         assert_eq!(cfg.route_name, "test-route");
@@ -307,10 +319,11 @@ route_name: test-route
     }
 
     #[test]
-    fn config_io_uring_defaults_keep_auto_shards() {
+    fn config_io_uring_defaults_keep_auto_shards_and_bounded_queue_capacity() {
         let cfg = Config::default();
 
         assert_eq!(cfg.io_uring_shards, None);
+        assert_eq!(cfg.io_uring_queue_capacity, 1024);
     }
 
     #[test]
@@ -320,6 +333,7 @@ route_name: test-route
         std::fs::write(
             &path,
             r#"io_uring_shards: 3
+io_uring_queue_capacity: 8
 host_prefix: x
 domain: y
 route_name: z
@@ -329,6 +343,7 @@ route_name: z
 
         let cfg = Config::from_file(&path).expect("parse yaml");
         assert_eq!(cfg.io_uring_shards, Some(3));
+        assert_eq!(cfg.io_uring_queue_capacity, 8);
         assert_eq!(cfg.host_prefix, "x");
         assert_eq!(cfg.domain, "y");
         assert_eq!(cfg.route_name, "z");
@@ -349,12 +364,27 @@ route_name: z
 
         let cfg = Config::from_file(&path).expect("parse yaml");
         assert_eq!(cfg.io_uring_shards, None);
+        assert_eq!(cfg.io_uring_queue_capacity, 1024);
     }
 
     #[test]
     fn config_io_uring_validate_rejects_zero_shards() {
         let config = Config {
             io_uring_shards: Some(0),
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn config_io_uring_validate_rejects_zero_queue_capacity() {
+        let config = Config {
+            io_uring_queue_capacity: 0,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
@@ -386,6 +416,7 @@ route_name: z
         assert_eq!(cfg.read_idle_ttl_secs, 600);
         assert_eq!(cfg.full_read_complete_ttl_secs, 30);
         assert_eq!(cfg.io_uring_shards, None);
+        assert_eq!(cfg.io_uring_queue_capacity, 1024);
         // Old fields still parsed.
         assert_eq!(cfg.reader_done_ttl_secs, 99);
         assert_eq!(cfg.unread_ttl_secs, 888);
@@ -403,5 +434,6 @@ route_name: z
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.max_cache_bytes, 1048576);
         assert_eq!(cfg.io_uring_shards, None);
+        assert_eq!(cfg.io_uring_queue_capacity, 1024);
     }
 }

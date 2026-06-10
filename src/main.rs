@@ -13,17 +13,21 @@ use tokio::task::JoinSet;
 use tower::ServiceExt;
 
 fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
-    hostname
-        .rsplit('-')
-        .next()
-        .filter(|segment| !segment.is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "HOSTNAME must contain '-' (e.g. bobs-0)",
-            )
-        })
+    let (_, ordinal) = hostname.rsplit_once('-').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOSTNAME must end with a numeric StatefulSet ordinal (e.g. bobs-0)",
+        )
+    })?;
+
+    if ordinal.is_empty() || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOSTNAME must end with a numeric StatefulSet ordinal (e.g. bobs-0)",
+        ));
+    }
+
+    Ok(ordinal.to_string())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -83,11 +87,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     {
-        let ring_pool = bobs::io::initialize_production_ring_pool(config.io_uring_shards)?;
+        let ring_pool = bobs::io::initialize_production_ring_pool(
+            config.io_uring_shards,
+            config.io_uring_queue_capacity,
+        )?;
         tracing::debug!(
             configured_shards = ?ring_pool.configured_shards,
             resolved_shards = ring_pool.resolved_shards,
             cpu_pinning_enabled = ring_pool.cpu_pinning_enabled,
+            queue_capacity = config.io_uring_queue_capacity,
             "io_uring production ring pool initialized",
         );
     }
@@ -197,5 +205,24 @@ async fn main() {
     if let Err(error) = run().await {
         tracing::error!(error = %error, "BOBS failed to start");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ordinal_accepts_numeric_final_segment() {
+        assert_eq!(parse_ordinal("bobs-0").expect("ordinal"), "0");
+        assert_eq!(parse_ordinal("release-bobs-12").expect("ordinal"), "12");
+    }
+
+    #[test]
+    fn parse_ordinal_rejects_malformed_hostnames() {
+        for hostname in ["bobs", "bobs-", "bobs-a", "bobs-١"] {
+            let error = parse_ordinal(hostname).expect_err("hostname should be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 }
