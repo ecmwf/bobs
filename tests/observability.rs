@@ -47,6 +47,7 @@ fn test_config(dir: &std::path::Path) -> Arc<Config> {
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
