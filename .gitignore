@@ -5,3 +5,4 @@
 skaffold.env
 .weave/
 /docs/book
+profiles/
