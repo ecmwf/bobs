@@ -32,6 +32,7 @@ base64 = "0.22"
 num_cpus = "1"
 siphasher = "1"
 serde_norway = "0.9.42"
+pprof = { version = "0.14", features = ["flamegraph"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Low-level Linux interface chosen over tokio-uring and compio to avoid a
@@ -43,3 +44,8 @@ io-uring = "0.7"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tempfile = "3"
 tower = "0.5"
+
+# Keep symbol/line info in release so the in-process CPU profiler
+# (/debug/pprof/profile) produces a readable flamegraph.
+[profile.release]
+debug = 1
