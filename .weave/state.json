@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "1528bce7-b9f2-4d70-a01e-b057723df090",
+  "description": "Fix BOBS Review Findings",
+  "phase": "done",
+  "plan_file": ".weave/plans/fix-bobs-review-findings.md",
+  "branch": "fix-bobs-review-findings",
+  "concurrency": 3,
+  "started_at": 1781081351806,
+  "completed_at": 1781083544658,
+  "start_sha": "9192ff477b2576cfd6358f0ff3a32da2471dd595",
+  "session_ids": [],
+  "profile": "gpt"
+}
