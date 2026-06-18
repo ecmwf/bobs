@@ -238,7 +238,7 @@ async fn read_spool<F: FileIO + 'static>(
     };
     let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
     let page_size = spool.page_size as u64;
-    let (content_type, content_encoding, checksum_crc32c, complete_size, total_bytes_written) = {
+    let (content_type, content_encoding, complete_size, total_bytes_written) = {
         let meta = spool.metadata.lock().await;
         let complete_size = if matches!(
             meta.state,
@@ -251,7 +251,6 @@ async fn read_spool<F: FileIO + 'static>(
         (
             meta.content_type.clone(),
             meta.content_encoding.clone(),
-            meta.checksum_crc32c,
             complete_size,
             meta.total_bytes_written,
         )
@@ -431,15 +430,6 @@ async fn read_spool<F: FileIO + 'static>(
         response
             .headers_mut()
             .insert(axum::http::header::CONTENT_ENCODING, encoding_header);
-    }
-    if let Some(crc) = checksum_crc32c {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
-        let checksum_header = HeaderValue::from_str(&encoded)
-            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
-        response
-            .headers_mut()
-            .insert("X-Checksum-CRC32C", checksum_header);
     }
     // Content-Length must be the number of bytes *this response will deliver*,
     // not the total object size. Bounded Range reads know the exact byte count.

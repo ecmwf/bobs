@@ -21,8 +21,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 dashmap = "6"
 async-stream = "0.3"
-crc32c = "0.6"
-base64 = "0.22"
 serde_yml = "0.0.12"
 
 [dev-dependencies]

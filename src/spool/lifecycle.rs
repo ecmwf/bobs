@@ -74,8 +74,6 @@ impl<F: FileIO> Spool<F> {
             }
         }
 
-        let crc32c = *self.running_crc32c.lock().await;
-
         {
             let mut meta = self.metadata.lock().await;
             if let Some(expected) = expected_size {
@@ -86,7 +84,6 @@ impl<F: FileIO> Spool<F> {
                     });
                 }
             }
-            meta.checksum_crc32c = Some(crc32c);
             meta.state = SpoolState::Complete;
             meta.readable_at.get_or_insert_with(now_secs);
         }
@@ -185,7 +182,6 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,

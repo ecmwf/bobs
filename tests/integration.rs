@@ -1,5 +1,4 @@
 use axum::Router;
-use base64::Engine;
 use bobs::cleanup::start_cleanup_task;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
@@ -345,13 +344,12 @@ async fn test_error_cases() {
 }
 
 #[tokio::test]
-async fn test_checksum_verification() {
+async fn test_checksum_header_is_not_emitted() {
     let server = start_server().await;
     let client = reqwest::Client::new();
     let key = create_key(&client, &server.base_url, None).await;
 
     let data = vec![0x42u8; 8192];
-    let expected_crc = crc32c::crc32c(&data);
 
     client
         .post(format!("{}/api/v1/write/{}/0", server.base_url, key))
@@ -373,20 +371,7 @@ async fn test_checksum_verification() {
         .await
         .expect("read send");
     assert_eq!(read_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-
-    let checksum_header = read_resp
-        .headers()
-        .get("X-Checksum-CRC32C")
-        .expect("checksum header should be present")
-        .to_str()
-        .expect("valid header string")
-        .to_string();
-
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&checksum_header)
-        .expect("valid base64");
-    let actual_crc = u32::from_be_bytes(decoded.try_into().expect("4 bytes"));
-    assert_eq!(actual_crc, expected_crc);
+    assert!(read_resp.headers().get("X-Checksum-CRC32C").is_none());
 }
 
 #[tokio::test]

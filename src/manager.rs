@@ -95,7 +95,6 @@ impl<F: FileIO> SpoolManager<F> {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path,
@@ -290,7 +289,6 @@ impl<F: FileIO> SpoolManager<F> {
                 } else {
                     None
                 };
-                meta.checksum_crc32c = None;
                 metadata_corrected = true;
             }
 
@@ -307,54 +305,6 @@ impl<F: FileIO> SpoolManager<F> {
                 write_txn.commit().map_err(storage)?;
             }
 
-            let crc = if meta.state == SpoolState::Complete {
-                if let Some(checksum) = meta.checksum_crc32c {
-                    checksum
-                } else {
-                    let mut crc: u32 = 0;
-                    if meta.total_pages > 0 {
-                        for page_idx in 0..meta.total_pages {
-                            let offset = page_idx * self.page_size as u64;
-                            let read_size = if page_idx == meta.total_pages - 1 {
-                                meta.final_page_size
-                                    .map(|size| size as usize)
-                                    .unwrap_or(self.page_size)
-                            } else {
-                                self.page_size
-                            };
-                            let mut buf = vec![0u8; read_size];
-                            let n = F::read_at(&handle, offset, &mut buf)
-                                .await
-                                .map_err(BobsError::IoError)?;
-                            buf.truncate(n);
-                            crc = crc32c::crc32c_append(crc, &buf);
-                        }
-                    }
-                    crc
-                }
-            } else {
-                let mut crc: u32 = 0;
-                if meta.total_pages > 0 {
-                    for page_idx in 0..meta.total_pages {
-                        let offset = page_idx * self.page_size as u64;
-                        let read_size = if page_idx == meta.total_pages - 1 {
-                            meta.final_page_size
-                                .map(|size| size as usize)
-                                .unwrap_or(self.page_size)
-                        } else {
-                            self.page_size
-                        };
-                        let mut buf = vec![0u8; read_size];
-                        let n = F::read_at(&handle, offset, &mut buf)
-                            .await
-                            .map_err(BobsError::IoError)?;
-                        buf.truncate(n);
-                        crc = crc32c::crc32c_append(crc, &buf);
-                    }
-                }
-                crc
-            };
-
             // Capture fields needed for post-init before meta is moved.
             let meta_state_for_init = meta.state.clone();
             let meta_total_bytes_for_init = meta.total_bytes_written;
@@ -369,7 +319,6 @@ impl<F: FileIO> SpoolManager<F> {
                 )
                 .await,
             );
-            *spool.running_crc32c.lock().await = crc;
 
             // Seed last_read_activity_at so recovered spools get a full
             // read_idle_ttl_secs grace period before cleanup can fire.
@@ -697,7 +646,6 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path,

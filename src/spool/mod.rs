@@ -28,7 +28,6 @@ pub struct Spool<F: FileIO> {
     pub write_buffer: Arc<Mutex<BytesMut>>,
     pub file_handle: Arc<Mutex<Option<F::Handle>>>,
     pub db: Arc<Database>,
-    pub running_crc32c: Arc<Mutex<u32>>,
     /// Writer notifies after each completed page; readers long-poll on this.
     pub notify: Arc<Notify>,
     /// Fired on spool deletion to unblock any waiting readers.
@@ -64,7 +63,6 @@ impl<F: FileIO> Spool<F> {
             write_buffer: Arc::new(Mutex::new(BytesMut::new())),
             file_handle: Arc::new(Mutex::new(Some(file_handle))),
             db,
-            running_crc32c: Arc::new(Mutex::new(0)),
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
             page_size,

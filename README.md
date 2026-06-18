@@ -90,17 +90,7 @@ curl http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=0-52428
 curl http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=524288-1048575"
 ```
 
-### 6. Verify checksum
-Every read response includes an S3-compatible CRC-32C checksum in the `X-Checksum-CRC32C` header.
-
-```bash
-curl -I http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=0-1048575"
-# ...
-# X-Checksum-CRC32C: aB3dE==
-# ...
-```
-
-### 7. Delete the spool
+### 6. Delete the spool
 Manually remove a spool when finished.
 
 ```bash

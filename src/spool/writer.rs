@@ -36,11 +36,6 @@ impl<F: FileIO> Spool<F> {
             return Ok(());
         }
 
-        {
-            let mut crc = self.running_crc32c.lock().await;
-            *crc = crc32c::crc32c_append(*crc, data);
-        }
-
         buf.extend_from_slice(data);
 
         // Flush complete pages: write to disk, cache, and notify readers.
@@ -132,7 +127,6 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,
