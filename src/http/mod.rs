@@ -4,7 +4,7 @@ use crate::io::FileIO;
 use crate::manager::SpoolManager;
 use async_stream::stream;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -32,6 +32,41 @@ pub struct AppState<F: FileIO> {
     pub internal_base_url: String,
 }
 
+#[derive(Deserialize)]
+struct PprofParams {
+    seconds: Option<u64>,
+}
+
+/// On-demand CPU sampling profiler. `GET /debug/pprof/profile?seconds=N` runs an
+/// in-process pprof CPU profile for N seconds (default 30) and returns a
+/// flamegraph SVG. Used to find BOBS's per-pod CPU hot path under load.
+async fn pprof_profile(Query(params): Query<PprofParams>) -> Response {
+    let seconds = params.seconds.unwrap_or(30).clamp(1, 120);
+    let guard = match pprof::ProfilerGuardBuilder::default()
+        .frequency(199)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+    {
+        Ok(g) => g,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("profiler init: {e}"))
+                .into_response();
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    let report = match guard.report().build() {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("report: {e}")).into_response();
+        }
+    };
+    let mut svg = Vec::new();
+    if let Err(e) = report.flamegraph(&mut svg) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("flamegraph: {e}")).into_response();
+    }
+    ([(axum::http::header::CONTENT_TYPE, "image/svg+xml")], svg).into_response()
+}
+
 pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
     Router::new()
         .route("/api/v1/health", get(health::<F>))
@@ -41,6 +76,7 @@ pub fn router<F: FileIO + 'static>() -> Router<Arc<AppState<F>>> {
         .route("/api/v1/complete/{key}", post(complete_spool::<F>))
         .route("/api/v1/read/{key}", get(read_spool::<F>))
         .route("/api/v1/delete/{key}", delete(delete_spool::<F>))
+        .route("/debug/pprof/profile", get(pprof_profile))
 }
 
 #[derive(Debug, Serialize)]
