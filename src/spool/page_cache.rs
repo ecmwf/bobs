@@ -43,6 +43,14 @@ impl PageCache {
         self.entries.iter().any(|(idx, _)| *idx == page_idx)
     }
 
+    /// Drop all cached pages, releasing their memory. Used once a spool has been
+    /// fully read: the cache only serves the first read of freshly-written,
+    /// not-yet-served data, so after full coverage it is pure overhead.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.entries.shrink_to_fit();
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -90,6 +98,21 @@ mod tests {
         assert!(cache.get(8).is_some());
         assert!(cache.get(9).is_some());
         assert!(cache.get(0).is_none());
+    }
+
+    #[test]
+    fn test_clear_releases_all_pages() {
+        let mut cache = PageCache::new(4);
+        cache.insert(0, Bytes::from_static(b"page0"));
+        cache.insert(1, Bytes::from_static(b"page1"));
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert!(cache.get(0).is_none());
+        // Cache remains usable after clear.
+        cache.insert(2, Bytes::from_static(b"page2"));
+        assert_eq!(cache.get(2), Some(Bytes::from_static(b"page2")));
     }
 
     #[test]

@@ -97,14 +97,19 @@ impl<F: FileIO> Spool<F> {
 
         // Initialize coverage tracking and detect immediate full-coverage
         // (zero-byte objects or objects whose bytes were all served pre-complete).
-        {
+        let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.initialize(total_size);
-            if mr.is_complete() {
-                self.full_object_read_at
+            mr.is_complete()
+                && self
+                    .full_object_read_at
                     .compare_exchange(0, now_secs(), Ordering::SeqCst, Ordering::SeqCst)
-                    .ok();
-            }
+                    .is_ok()
+        };
+        // If every byte was already served before completion (or this is a
+        // zero-byte object), the page cache is redundant — free it now.
+        if became_fully_read {
+            self.page_cache.lock().await.clear();
         }
 
         self.notify.notify_waiters();
