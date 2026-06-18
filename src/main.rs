@@ -127,6 +127,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 16 MiB h2 windows — one body fits in a single window with no flow-control pauses.
     const H2_WINDOW: u32 = 16 * 1024 * 1024;
+    // Largest HTTP/2 frame we let peers send us (spec ceiling 2^24-1). The default is
+    // 16 KiB, which shreds a 16 MiB write body into ~1024 DATA frames; at the ceiling a
+    // 16 MiB body is ~1-2 frames. After CRC removal the per-frame h2 codec/flow-control
+    // work was ~37% of BOBS CPU on the worker->BOBS write path — this collapses it.
+    const H2_MAX_FRAME: u32 = 16 * 1024 * 1024 - 1;
 
     let mut shutdown = std::pin::pin!(shutdown::shutdown_signal());
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -142,7 +147,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     builder
                         .http2()
                         .initial_stream_window_size(H2_WINDOW)
-                        .initial_connection_window_size(H2_WINDOW);
+                        .initial_connection_window_size(H2_WINDOW)
+                        .max_frame_size(H2_MAX_FRAME);
                     let svc = hyper::service::service_fn(move |req| {
                         let app = app.clone();
                         async move { app.oneshot(req).await }
