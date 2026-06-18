@@ -395,15 +395,22 @@ async fn read_spool<F: FileIO + 'static>(
 
                 yield Ok::<Bytes, BobsError>(chunk);
             } else if follow {
-                // Page exists but has no data at our offset yet. Check if the
-                // writer is done; if so, we've consumed everything. Otherwise
-                // loop back and long-poll for more data.
-                let done = {
+                // Page exists but has no data at our offset yet. If the writer is
+                // done, no further data will ever arrive, so stop -- never
+                // busy-spin on a completed spool. (Previously this required
+                // offset >= total_bytes_written; a short/truncated page left
+                // offset stuck below total and turned the `continue` into an
+                // unbounded CPU spin. Breaking on writer-done makes that
+                // impossible: by here we have served all available data.)
+                // Otherwise loop back and long-poll for more data.
+                let writer_done = {
                     let meta = spool.metadata.lock().await;
-                    matches!(meta.state, crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting)
-                        && offset >= meta.total_bytes_written
+                    matches!(
+                        meta.state,
+                        crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting
+                    )
                 };
-                if done {
+                if writer_done {
                     break;
                 }
                 continue;

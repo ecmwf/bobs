@@ -67,7 +67,20 @@ impl FileIO for TokioFileIO {
         async move {
             let mut file = handle.lock().await;
             file.seek(std::io::SeekFrom::Start(offset)).await?;
-            file.read(buf).await
+            // Fill the whole buffer. A single read() may return fewer bytes than
+            // requested for large buffers (e.g. a 16 MiB page), which previously
+            // produced truncated pages and an unbounded reader spin for large
+            // multi-page objects. Loop until the buffer is full or EOF (the final
+            // partial page legitimately stops short).
+            let mut total = 0;
+            while total < buf.len() {
+                let n = file.read(&mut buf[total..]).await?;
+                if n == 0 {
+                    break; // EOF
+                }
+                total += n;
+            }
+            Ok(total)
         }
     }
 
@@ -179,6 +192,36 @@ mod tests {
             .await
             .expect("failed to read beyond eof");
         assert_eq!(read, 0, "reading beyond EOF should return 0");
+
+        TokioFileIO::close(handle).await.expect("failed to close");
+    }
+
+    #[tokio::test]
+    async fn test_read_at_fills_large_buffer() {
+        // Regression: a single read() may return fewer bytes than requested for
+        // a large buffer, which truncated pages and spun the HTTP reader for
+        // large objects. read_at must loop to fill the whole buffer.
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("test_large.bin");
+        let handle = TokioFileIO::create(&file_path)
+            .await
+            .expect("failed to create file");
+
+        let size = 8 * 1024 * 1024; // 8 MiB
+        let data = vec![0x5Au8; size];
+        TokioFileIO::write_at(&handle, 0, &data)
+            .await
+            .expect("failed to write");
+        TokioFileIO::sync_data(&handle)
+            .await
+            .expect("failed to sync");
+
+        let mut buf = vec![0u8; size];
+        let read = TokioFileIO::read_at(&handle, 0, &mut buf)
+            .await
+            .expect("failed to read");
+        assert_eq!(read, size, "read_at must fill the entire buffer, not short-read");
+        assert_eq!(buf, data);
 
         TokioFileIO::close(handle).await.expect("failed to close");
     }

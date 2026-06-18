@@ -116,7 +116,7 @@ mod tests {
             data_path: path,
         };
 
-        Spool::new(meta, handle, page_size, 256, db).await
+        Spool::new(meta, handle, page_size, 256, db, None).await
     }
 
     #[tokio::test]
@@ -163,6 +163,46 @@ mod tests {
 
         let got = spool.read_page(0).await.expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(data)));
+    }
+
+    #[tokio::test]
+    async fn test_read_disk_page_large_full_length() {
+        // Regression: a multi-MiB page evicted to disk must read back at full
+        // page_size. A short read truncates the page, so the HTTP reader can
+        // never advance past it and spins (large-object download hang).
+        let dir = tempdir().expect("failed to create tempdir");
+        let page_size = 4 * 1024 * 1024; // 4 MiB
+        let spool = make_spool(dir.path(), page_size).await;
+
+        let data = vec![0x7Au8; page_size];
+        {
+            let handle_guard = spool.file_handle.lock().await;
+            let handle = handle_guard
+                .as_ref()
+                .expect("file handle should be active for disk read test");
+            TokioFileIO::write_at(handle, 0, &data)
+                .await
+                .expect("failed to write test data to disk");
+            TokioFileIO::sync_data(handle)
+                .await
+                .expect("failed to sync test data");
+        }
+        {
+            let mut meta = spool.metadata.lock().await;
+            meta.total_pages = 1;
+        }
+
+        let got = spool
+            .read_page(0)
+            .await
+            .expect("read should succeed")
+            .expect("page should be present");
+        assert_eq!(
+            got.len(),
+            page_size,
+            "disk page must read back at full length, not short-read"
+        );
+        assert_eq!(got, Bytes::from(data));
     }
 
     #[tokio::test]
