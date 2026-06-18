@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 
 pub const SPOOL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("spools");
 
@@ -21,6 +22,11 @@ pub struct SpoolManager<F: FileIO> {
     pub data_dir: PathBuf,
     pub page_size: usize,
     pub page_cache_capacity: usize,
+    /// Admission gate: bounds the number of spools concurrently holding an
+    /// in-memory page cache. `create_spool` awaits a permit, so writers block
+    /// (backpressure) when the limit is reached rather than growing memory
+    /// without bound.
+    pub admission: Arc<Semaphore>,
 }
 
 impl<F: FileIO> SpoolManager<F> {
@@ -29,6 +35,7 @@ impl<F: FileIO> SpoolManager<F> {
         data_dir: impl AsRef<Path>,
         page_size: usize,
         max_cache_bytes: usize,
+        max_live_spools: usize,
     ) -> Result<Self> {
         if page_size == 0 {
             return Err(BobsError::IoError(std::io::Error::new(
@@ -40,6 +47,12 @@ impl<F: FileIO> SpoolManager<F> {
             return Err(BobsError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "max_cache_bytes must be at least page_size",
+            )));
+        }
+        if max_live_spools == 0 {
+            return Err(BobsError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_live_spools must be greater than 0",
             )));
         }
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
@@ -60,6 +73,7 @@ impl<F: FileIO> SpoolManager<F> {
             data_dir: data_dir.as_ref().to_path_buf(),
             page_size,
             page_cache_capacity,
+            admission: Arc::new(Semaphore::new(max_live_spools)),
         })
     }
 
@@ -70,6 +84,15 @@ impl<F: FileIO> SpoolManager<F> {
         content_encoding: Option<String>,
         write_locked: bool,
     ) -> Result<()> {
+        // Admission backpressure: block until a slot frees rather than letting
+        // in-memory spools (and their page caches) grow without bound. The
+        // permit is moved into the Spool and released when the object is fully
+        // read or the spool is deleted.
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| BobsError::IoError(std::io::Error::other("admission semaphore closed")))?;
+
         let spool_dir = self.data_dir.join(&key);
         let data_path = spool_dir.join("spool.dat");
 
@@ -121,6 +144,7 @@ impl<F: FileIO> SpoolManager<F> {
                 self.page_size,
                 self.page_cache_capacity,
                 Arc::clone(&self.db),
+                Some(permit),
             )
             .await,
         );
@@ -309,6 +333,9 @@ impl<F: FileIO> SpoolManager<F> {
             let meta_state_for_init = meta.state.clone();
             let meta_total_bytes_for_init = meta.total_bytes_written;
 
+            // Recovered spools occupy memory too; take a permit if available.
+            // Over-limit recoveries (rare) load without one and drain via TTL.
+            let permit = Arc::clone(&self.admission).try_acquire_owned().ok();
             let spool = Arc::new(
                 Spool::new(
                     meta,
@@ -316,6 +343,7 @@ impl<F: FileIO> SpoolManager<F> {
                     self.page_size,
                     self.page_cache_capacity,
                     Arc::clone(&self.db),
+                    permit,
                 )
                 .await,
             );
@@ -407,7 +435,7 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -433,7 +461,7 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -450,12 +478,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admission_blocks_at_capacity_and_releases_on_delete() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        // Admission limit of 1: only one live spool permitted at a time.
+        let manager = Arc::new(
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 1)
+                .expect("manager init"),
+        );
+
+        manager
+            .create_spool("a".into(), None, None, false)
+            .await
+            .expect("first create succeeds");
+
+        // Second create must block while at capacity.
+        let m2 = Arc::clone(&manager);
+        let mut create2 =
+            tokio::spawn(async move { m2.create_spool("b".into(), None, None, false).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !create2.is_finished(),
+            "second create must block while admission is at capacity"
+        );
+
+        // Freeing a slot (delete) must unblock the waiting create.
+        manager.delete_spool("a").await.expect("delete first");
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut create2)
+            .await
+            .expect("second create should unblock once a slot frees")
+            .expect("join")
+            .expect("second create succeeds");
+        assert!(manager.get_spool("b").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_release_admission_frees_a_slot_before_delete() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("spools.redb");
+        let data_dir = dir.path().join("data");
+        let manager = Arc::new(
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 1)
+                .expect("manager init"),
+        );
+
+        manager
+            .create_spool("a".into(), None, None, false)
+            .await
+            .expect("first create succeeds");
+        // Simulate the full-read transition releasing the permit while the spool
+        // remains live (cache freed, slot returned).
+        manager.get_spool("a").unwrap().release_admission();
+
+        // A second create now proceeds without blocking even though "a" is alive.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.create_spool("b".into(), None, None, false),
+        )
+        .await
+        .expect("create must not block after admission released")
+        .expect("second create succeeds");
+        assert!(manager.get_spool("a").is_some(), "a remains live");
+        assert!(manager.get_spool("b").is_some());
+    }
+
+    #[tokio::test]
     async fn test_delete_nonexistent_key() {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let result = manager.delete_spool("nonexistent-key").await;
@@ -473,8 +567,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager1 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager1 init");
+            let manager1 =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager1 init");
 
             let key = uuid::Uuid::new_v4().to_string();
             manager1
@@ -484,7 +579,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
 
         manager2.recover().await.expect("recover should succeed");
@@ -500,7 +595,7 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -532,8 +627,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
 
             let key = uuid::Uuid::new_v4().to_string();
             manager
@@ -575,7 +671,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -593,8 +689,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
 
             let key = uuid::Uuid::new_v4().to_string();
             manager
@@ -611,7 +708,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -626,7 +723,7 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let key = "fake-creating-key".to_string();
@@ -684,8 +781,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
                 .create_spool(key.clone(), None, None, true) // WriteLocked
@@ -694,7 +792,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover should succeed");
 
@@ -716,8 +814,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
                 .create_spool(key.clone(), None, None, false)
@@ -732,7 +831,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover should succeed");
 
@@ -762,8 +861,9 @@ mod tests {
 
         // Step 1: create and complete a spool normally (sets readable_at).
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
                 .create_spool(key.clone(), None, None, false)
@@ -806,7 +906,7 @@ mod tests {
         }
 
         // Step 3: recover and verify readable_at is backfilled.
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover should succeed");
 
@@ -841,8 +941,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
 
             let key = uuid::Uuid::new_v4().to_string();
             manager
@@ -885,7 +986,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 

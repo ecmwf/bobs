@@ -38,6 +38,7 @@ async fn start_server() -> TestServer {
         data_dir: std::path::PathBuf::from("./data"), // overridden
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         read_idle_ttl_secs: 600,
         full_read_complete_ttl_secs: 30,
@@ -74,6 +75,7 @@ async fn start_server_with_config(config: Arc<Config>) -> TestServer {
             &data_dir,
             config.page_size,
             config.max_cache_bytes,
+            config.max_live_spools,
         )
         .expect("init manager"),
     );
@@ -597,6 +599,7 @@ fn config_short_full_read_ttl() -> Arc<Config> {
         data_dir: std::path::PathBuf::from("./data"), // overridden by start_server_with_config
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         full_read_complete_ttl_secs: 1,
         read_idle_ttl_secs: 60,
@@ -618,6 +621,7 @@ fn config_short_idle_ttl() -> Arc<Config> {
         data_dir: std::path::PathBuf::from("./data"),
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         full_read_complete_ttl_secs: 60,
         read_idle_ttl_secs: 1,
@@ -753,6 +757,7 @@ async fn test_idle_ttl_not_anchored_on_created_at() {
         data_dir: std::path::PathBuf::from("./data"),
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         full_read_complete_ttl_secs: 60,
         read_idle_ttl_secs: 2,
@@ -828,6 +833,7 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
         data_dir: std::path::PathBuf::from("./data"),
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         // Long full-read TTL so it does not fire before we finish simulating
         // the slow reader.

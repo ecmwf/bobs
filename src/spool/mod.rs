@@ -44,6 +44,11 @@ pub struct Spool<F: FileIO> {
     pub last_read_activity_at: Arc<AtomicU64>,
     /// Unix secs when full-object coverage was first detected. 0 = not yet.
     pub full_object_read_at: Arc<AtomicU64>,
+    /// Admission permit held for the memory-expensive window (created until
+    /// fully read). Released by `release_admission` at the full-read transition,
+    /// or on drop if the spool is deleted before being read. `None` for spools
+    /// recovered over the admission limit at startup.
+    admission_permit: std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
     pub(crate) _phantom: PhantomData<F>,
 }
 
@@ -54,6 +59,7 @@ impl<F: FileIO> Spool<F> {
         page_size: usize,
         cache_capacity: usize,
         db: Arc<Database>,
+        admission_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Self {
         let data_path = metadata.data_path.clone();
 
@@ -71,7 +77,17 @@ impl<F: FileIO> Spool<F> {
             missing_ranges: Arc::new(Mutex::new(MissingRanges::new(1024))),
             last_read_activity_at: Arc::new(AtomicU64::new(0)),
             full_object_read_at: Arc::new(AtomicU64::new(0)),
+            admission_permit: std::sync::Mutex::new(admission_permit),
             _phantom: PhantomData,
+        }
+    }
+
+    /// Release the admission permit, if still held. Called once the object is
+    /// fully read (its page cache is freed), so the admission slot is returned
+    /// for the memory it no longer occupies rather than waiting for deletion.
+    pub fn release_admission(&self) {
+        if let Ok(mut guard) = self.admission_permit.lock() {
+            guard.take();
         }
     }
 

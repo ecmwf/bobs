@@ -384,6 +384,7 @@ async fn read_spool<F: FileIO + 'static>(
                 // it now. Done outside the missing_ranges lock to avoid nesting.
                 if became_fully_read {
                     spool.page_cache.lock().await.clear();
+                    spool.release_admission();
                 }
 
                 // 3. Keep legacy last_read_at for observability (not used in new cleanup).
@@ -595,6 +596,7 @@ mod tests {
             data_dir: dir.to_path_buf(),
             page_size: 4096,
             max_cache_bytes: 65536,
+            max_live_spools: 256,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 600,
             full_read_complete_ttl_secs: 30,
@@ -618,6 +620,7 @@ mod tests {
             data_dir: std::path::PathBuf::from("./data"),
             page_size: 4096,
             max_cache_bytes: 65536,
+            max_live_spools: 256,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 2,
             full_read_complete_ttl_secs: 2,
@@ -639,7 +642,7 @@ mod tests {
         let db_path = root.join("spools.redb");
         let data_dir = root.join("data");
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536, 256)
                 .expect("manager init"),
         );
         let state = Arc::new(AppState {
@@ -660,7 +663,7 @@ mod tests {
         let db_path = root.join("spools.redb");
         let data_dir = root.join("data");
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536, 256)
                 .expect("manager init"),
         );
         let state = Arc::new(AppState {

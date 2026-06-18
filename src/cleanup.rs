@@ -109,6 +109,7 @@ mod tests {
             data_dir: std::path::PathBuf::from("./data"),
             page_size: 4096,
             max_cache_bytes: 65536,
+            max_live_spools: 256,
             writer_inactivity_timeout_secs: 1,
             read_idle_ttl_secs: 1,
             full_read_complete_ttl_secs: 1,
@@ -127,7 +128,7 @@ mod tests {
         let db_path = dir.path().join("spools.redb");
         let data_dir = dir.path().join("data");
         Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536, 256)
                 .expect("manager init"),
         )
     }

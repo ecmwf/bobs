@@ -110,6 +110,7 @@ impl<F: FileIO> Spool<F> {
         // zero-byte object), the page cache is redundant — free it now.
         if became_fully_read {
             self.page_cache.lock().await.clear();
+            self.release_admission();
         }
 
         self.notify.notify_waiters();
@@ -192,7 +193,7 @@ mod tests {
             data_path: path,
         };
 
-        Spool::new(meta, handle, page_size, 256, db).await
+        Spool::new(meta, handle, page_size, 256, db, None).await
     }
 
     #[tokio::test]

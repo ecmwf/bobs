@@ -9,6 +9,11 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub page_size: usize,
     pub max_cache_bytes: usize,
+    /// Admission limit: maximum number of spools that may concurrently hold an
+    /// in-memory page cache (i.e. created but not yet fully read). `create`
+    /// blocks until a slot frees, applying backpressure to writers instead of
+    /// growing memory without bound. Default: 4096.
+    pub max_live_spools: usize,
     pub writer_inactivity_timeout_secs: u64,
     /// Idle TTL (seconds) anchored on the time the spool became readable,
     /// refreshed whenever bytes are actually served. Default: 600.
@@ -37,6 +42,7 @@ impl Default for Config {
             data_dir: PathBuf::from("./data"),
             page_size: 4096,
             max_cache_bytes: 1048576,
+            max_live_spools: 4096,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 600,
             full_read_complete_ttl_secs: 30,
@@ -70,6 +76,13 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "max_cache_bytes must be at least page_size",
+            ));
+        }
+
+        if self.max_live_spools == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_live_spools must be greater than 0",
             ));
         }
 
