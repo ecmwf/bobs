@@ -1,5 +1,6 @@
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
+use crate::metrics;
 use crate::spool::types::SpoolState;
 use bytes::BytesMut;
 use std::sync::atomic::Ordering;
@@ -12,6 +13,15 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn state_label(state: &SpoolState) -> &'static str {
+    match state {
+        SpoolState::Writing | SpoolState::Creating => metrics::state::WRITING,
+        SpoolState::WriteLocked => metrics::state::WRITE_LOCKED,
+        SpoolState::Complete | SpoolState::Deleting => metrics::state::COMPLETE,
+        SpoolState::Readable => metrics::state::READABLE,
+    }
 }
 
 impl<F, M> Spool<F, M>
@@ -80,8 +90,13 @@ where
                 }
             }
             meta.checksum_crc32c = Some(crc32c);
+            let old_state = meta.state.clone();
             meta.state = SpoolState::Complete;
             meta.readable_at.get_or_insert_with(now_secs);
+            self.metrics.record_state_transition(
+                Some(state_label(&old_state)),
+                crate::metrics::state::COMPLETE,
+            );
         }
 
         let (meta, total_size) = {
@@ -117,9 +132,17 @@ where
             meta.write_locked = locked;
             if locked && meta.state == SpoolState::Writing {
                 meta.state = SpoolState::WriteLocked;
+                self.metrics.record_state_transition(
+                    Some(crate::metrics::state::WRITING),
+                    crate::metrics::state::WRITE_LOCKED,
+                );
             } else if !locked && meta.state == SpoolState::WriteLocked {
                 meta.state = SpoolState::Readable;
                 meta.readable_at.get_or_insert_with(now_secs);
+                self.metrics.record_state_transition(
+                    Some(crate::metrics::state::WRITE_LOCKED),
+                    crate::metrics::state::READABLE,
+                );
             }
 
             if meta.state != old_state || meta.write_locked != old_locked {

@@ -356,6 +356,17 @@ impl BobsMetrics {
         }
     }
 
+    /// Decrement the active spool gauge when a spool is removed (deleted).
+    #[allow(unused_variables)]
+    pub fn record_spool_removed(&self, old_state: &str) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            inner
+                .spools_active
+                .add(-1, &[KeyValue::new("state", old_state.to_string())]);
+        }
+    }
+
     pub fn record_cache_hit(&self) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {

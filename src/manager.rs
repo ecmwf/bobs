@@ -148,6 +148,14 @@ where
         );
         self.spools.insert(key.clone(), spool);
 
+        // Record initial state for the active spool gauge.
+        let initial_state = if write_locked {
+            crate::metrics::state::WRITE_LOCKED
+        } else {
+            crate::metrics::state::WRITING
+        };
+        self.metrics.record_state_transition(None, initial_state);
+
         Ok(())
     }
 
@@ -202,10 +210,20 @@ where
                 key: key.to_string(),
             })?;
 
-        {
+        let old_state = {
             let mut meta = spool.metadata.lock().await;
+            let old = meta.state.clone();
             meta.state = SpoolState::Deleting;
-        }
+            old
+        };
+        // Decrement the active spool gauge — spool is being removed.
+        let old_label = match &old_state {
+            SpoolState::Writing | SpoolState::Creating => crate::metrics::state::WRITING,
+            SpoolState::WriteLocked => crate::metrics::state::WRITE_LOCKED,
+            SpoolState::Complete | SpoolState::Deleting => crate::metrics::state::COMPLETE,
+            SpoolState::Readable => crate::metrics::state::READABLE,
+        };
+        self.metrics.record_spool_removed(old_label);
         spool.cancel.cancel();
 
         self.spools.remove(key);
