@@ -30,6 +30,7 @@ where
             {
                 let cache = self.page_cache.lock().await;
                 if let Some(page) = cache.get(&self.key, page_idx) {
+                    self.metrics.record_cache_hit();
                     return Ok(Some(page));
                 }
             }
@@ -55,6 +56,7 @@ where
                     let disk_buf = F::read_at(handle, file_offset, page_len)
                         .await
                         .map_err(BobsError::IoError)?;
+                    self.metrics.record_cache_miss();
                     return Ok(Some(disk_buf));
                 }
             }
@@ -145,6 +147,7 @@ mod tests {
                 cache_bytes,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false, vec![], 128)),
         )
         .await
     }

@@ -179,6 +179,7 @@ mod tests {
                 page_size * 256,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false, vec![], 128)),
         )
         .await
     }

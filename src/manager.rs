@@ -1,6 +1,7 @@
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::metadata::{legacy_redb, MetadataStore, SyncSidecarMetadataStore};
+use crate::metrics::BobsMetrics;
 use crate::spool::{PageCache, Spool, SpoolMetadata, SpoolState};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,7 @@ pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> 
     pub page_size: usize,
     pub max_cache_bytes: usize,
     pub page_cache: Arc<Mutex<PageCache>>,
+    pub metrics: Arc<BobsMetrics>,
 }
 
 impl<F: FileIO> SpoolManager<F, SyncSidecarMetadataStore> {
@@ -82,7 +84,13 @@ where
             page_size,
             max_cache_bytes,
             page_cache,
+            metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
         })
+    }
+
+    /// Set the metrics handle (replaces the default no-op).
+    pub fn set_metrics(&mut self, metrics: Arc<BobsMetrics>) {
+        self.metrics = metrics;
     }
 
     pub async fn create_spool(
@@ -134,6 +142,7 @@ where
                 self.page_size,
                 Arc::clone(&self.page_cache),
                 self.metadata_store.clone(),
+                Arc::clone(&self.metrics),
             )
             .await,
         );
@@ -353,6 +362,7 @@ where
                     self.page_size,
                     Arc::clone(&self.page_cache),
                     self.metadata_store.clone(),
+                    Arc::clone(&self.metrics),
                 )
                 .await,
             );

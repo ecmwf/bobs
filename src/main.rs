@@ -13,6 +13,9 @@ use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tower::ServiceExt;
 
+#[cfg(feature = "telemetry")]
+use bobs::metrics::init_meter_provider;
+
 fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
     hostname
         .rsplit('-')
@@ -94,23 +97,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     legacy_redb::migrate_from_redb(config.data_dir.join("spools.redb"), &config.data_dir)?;
-    let manager = Arc::new(
-        SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-            DefaultMetadataStore::new(&config.data_dir),
-            &config.data_dir,
-            config.page_size,
-            config.max_cache_bytes,
-        )?,
-    );
 
-    manager.recover().await?;
-    let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
+    #[cfg(feature = "telemetry")]
+    let _meter_provider = if config.metrics.enabled {
+        let provider = init_meter_provider(&config.metrics, &hostname);
+        if provider.is_some() {
+            tracing::info!("event.name" = "startup.metrics.enabled", outcome = "success", endpoint = ?config.metrics.otlp_endpoint, "OTLP metrics exporter enabled");
+        }
+        provider
+    } else {
+        None
+    };
 
     let metrics = Arc::new(BobsMetrics::new(
         config.metrics.enabled,
         config.metrics.allowed_labels.clone(),
         config.metrics.max_label_value_length,
     ));
+
+    let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+        DefaultMetadataStore::new(&config.data_dir),
+        &config.data_dir,
+        config.page_size,
+        config.max_cache_bytes,
+    )?;
+    manager.set_metrics(Arc::clone(&metrics));
+    let manager = Arc::new(manager);
+
+    manager.recover().await?;
+    let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
     let state = Arc::new(AppState {
         manager,
@@ -188,6 +203,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             None => tracing::warn!(
                 "io_uring production ring pool was still shared during shutdown; dropping global reference"
             ),
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    if let Some(provider) = _meter_provider {
+        if let Err(e) = provider.shutdown() {
+            tracing::warn!(error = %e, "failed to shut down meter provider");
         }
     }
 

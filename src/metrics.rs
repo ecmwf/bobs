@@ -11,6 +11,64 @@ use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
 #[cfg(feature = "telemetry")]
 use opentelemetry::KeyValue;
 
+#[cfg(feature = "telemetry")]
+use crate::config::MetricsConfig;
+
+/// Initialize the OpenTelemetry `SdkMeterProvider` with an OTLP HTTP exporter.
+///
+/// Returns `Some(provider)` if the endpoint is configured, `None` otherwise.
+/// The caller must hold the returned provider and call `shutdown()` on exit.
+#[cfg(feature = "telemetry")]
+pub fn init_meter_provider(
+    config: &MetricsConfig,
+    hostname: &str,
+) -> Option<opentelemetry_sdk::metrics::SdkMeterProvider> {
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::Resource;
+
+    let endpoint = config.otlp_endpoint.as_deref()?;
+    let metrics_endpoint = if endpoint.ends_with("/v1/metrics") {
+        endpoint.to_owned()
+    } else {
+        format!("{}/v1/metrics", endpoint.trim_end_matches('/'))
+    };
+
+    let environment = std::env::var("POLYTOPE_ENV").unwrap_or_else(|_| "unknown".to_string());
+
+    let resource = Resource::builder()
+        .with_attributes([
+            KeyValue::new("service.name", "bobs"),
+            KeyValue::new("service.instance.id", hostname.to_owned()),
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            KeyValue::new("deployment.environment", environment),
+            KeyValue::new(
+                "k8s.pod.name",
+                std::env::var("K8S_POD_NAME").unwrap_or_default(),
+            ),
+        ])
+        .build();
+
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_endpoint(&metrics_endpoint)
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "failed to build OTLP metric exporter");
+            std::process::exit(1);
+        });
+
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build();
+
+    opentelemetry::global::set_meter_provider(provider.clone());
+    Some(provider)
+}
+
 /// Deletion reason label values.
 pub mod reason {
     pub const CLIENT: &str = "client";

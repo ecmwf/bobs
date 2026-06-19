@@ -1,5 +1,6 @@
 use crate::io::FileIO;
 use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
+use crate::metrics::BobsMetrics;
 use bytes::BytesMut;
 use std::marker::PhantomData;
 use std::path::PathBuf;
@@ -46,6 +47,8 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub last_read_activity_at: Arc<AtomicU64>,
     /// Unix secs when full-object coverage was first detected. 0 = not yet.
     pub full_object_read_at: Arc<AtomicU64>,
+    /// Metrics handle for cache hit/miss recording.
+    pub metrics: Arc<BobsMetrics>,
     pub(crate) _phantom: PhantomData<F>,
 }
 
@@ -60,6 +63,7 @@ where
         page_size: usize,
         page_cache: Arc<Mutex<PageCache>>,
         metadata_store: M,
+        metrics: Arc<BobsMetrics>,
     ) -> Self {
         let data_path = metadata.data_path.clone();
         let key = metadata.key.clone();
@@ -80,6 +84,7 @@ where
             missing_ranges: Arc::new(Mutex::new(MissingRanges::new(1024))),
             last_read_activity_at: Arc::new(AtomicU64::new(0)),
             full_object_read_at: Arc::new(AtomicU64::new(0)),
+            metrics,
             _phantom: PhantomData,
         }
     }

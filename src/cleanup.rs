@@ -85,18 +85,34 @@ where
             };
 
             if writer_inactive || full_read_expired || idle_expired {
-                to_delete.push(key);
+                let reason = if writer_inactive {
+                    crate::metrics::reason::WRITER_TIMEOUT
+                } else if full_read_expired {
+                    crate::metrics::reason::FULL_READ_TTL
+                } else {
+                    crate::metrics::reason::IDLE_TTL
+                };
+                to_delete.push((key, reason));
             }
         }
 
         let mut deleted = 0_u64;
         let mut failed_delete = 0_u64;
-        for key in to_delete {
+        for (key, reason) in to_delete {
+            // Capture labels before deletion removes the spool.
+            let labels = if let Some(spool) = manager.get_spool(&key) {
+                spool.metadata.lock().await.labels.clone()
+            } else {
+                std::collections::HashMap::new()
+            };
             match manager
                 .delete_spool_with_reason(&key, DeleteReason::Ttl, None)
                 .await
             {
-                Ok(()) => deleted += 1,
+                Ok(()) => {
+                    deleted += 1;
+                    manager.metrics.record_spool_deleted(&labels, reason);
+                }
                 Err(err) => {
                     failed_delete += 1;
                     tracing::debug!(%key, error = %err, "cleanup delete failed");
