@@ -85,6 +85,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use bytes::Bytes;
@@ -128,6 +129,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
 
         metadata_store

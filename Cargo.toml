@@ -7,6 +7,8 @@ edition = "2021"
 default = []
 # Opt in to the existing Tokio/blocking filesystem path for baseline benchmarking.
 tokio-fileio-fallback = []
+# OpenTelemetry metrics export via OTLP.
+telemetry = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "http2"] }
@@ -32,6 +34,9 @@ base64 = "0.22"
 serde_yml = "0.0.12"
 num_cpus = "1"
 siphasher = "1"
+opentelemetry = { version = "0.30", optional = true }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.30", features = ["http-proto", "reqwest-client"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Low-level Linux interface chosen over tokio-uring and compio to avoid a

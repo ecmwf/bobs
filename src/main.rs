@@ -4,6 +4,7 @@ use bobs::http::{router, AppState};
 use bobs::io::DefaultFileIO;
 use bobs::manager::SpoolManager;
 use bobs::metadata::{legacy_redb, DefaultMetadataStore};
+use bobs::metrics::BobsMetrics;
 use bobs::shutdown;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -105,12 +106,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     manager.recover().await?;
     let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
+    let metrics = Arc::new(BobsMetrics::new(
+        config.metrics.enabled,
+        config.metrics.allowed_labels.clone(),
+        config.metrics.max_label_value_length,
+    ));
+
     let state = Arc::new(AppState {
         manager,
         config: config.clone(),
         hostname: hostname.clone(),
         ordinal: ordinal.clone(),
         internal_base_url,
+        metrics,
     });
     let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(state);
     let addr = format!("{}:{}", config.host, config.port);

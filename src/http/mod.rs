@@ -3,6 +3,7 @@ use crate::error::BobsError;
 use crate::io::FileIO;
 use crate::manager::SpoolManager;
 use crate::metadata::MetadataStore;
+use crate::metrics::BobsMetrics;
 use async_stream::stream;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -12,6 +13,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +76,7 @@ pub struct AppState<F: FileIO, M: MetadataStore> {
     pub hostname: String,
     pub ordinal: String,
     pub internal_base_url: String,
+    pub metrics: Arc<BobsMetrics>,
 }
 
 pub fn router<F, M>() -> Router<Arc<AppState<F, M>>>
@@ -125,6 +128,9 @@ struct CreateRequest {
     content_encoding: Option<String>,
     #[serde(default)]
     write_locked: bool,
+    /// Caller-provided labels propagated to metrics as OTel attributes.
+    #[serde(default)]
+    labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -157,6 +163,7 @@ where
             serde_json::from_slice::<CreateRequest>(&body)
                 .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
         };
+        let labels = state.config.filter_labels(&req.labels);
         let key = Uuid::new_v4().to_string();
         state
             .manager
@@ -165,9 +172,11 @@ where
                 req.content_type.clone(),
                 req.content_encoding.clone(),
                 req.write_locked,
+                labels.clone(),
             )
             .await
             .map_err(ApiError)?;
+        state.metrics.record_spool_created(&labels);
         tracing::Span::current().record("bobs.spool.key", key.as_str());
         if let Some(job_id) = &job_id {
             tracing::info!("event.name" = "bobs.spool.created", "job.id" = %job_id, "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
@@ -208,6 +217,8 @@ where
             .manager
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
+        let labels = spool.metadata.lock().await.labels.clone();
+        let write_start = std::time::Instant::now();
         let write_batch_size = state.config.page_size;
         let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
         let mut write_offset = offset;
@@ -234,6 +245,9 @@ where
             spool.write(write_offset, pending.freeze()).await.map_err(ApiError)?;
             write_offset += batch_len as u64;
         }
+        let total_written = write_offset.saturating_sub(offset);
+        state.metrics.record_write_bytes(&labels, total_written);
+        state.metrics.record_write_duration(&labels, write_start.elapsed().as_secs_f64());
         if let Some(job_id) = &job_id {
             tracing::debug!("event.name" = "bobs.spool.write.completed", "job.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = write_offset.saturating_sub(offset), outcome = "success", "spool write completed");
         } else {
@@ -268,6 +282,7 @@ where
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
         spool.complete(req.expected_size).await.map_err(ApiError)?;
         let meta = spool.metadata.lock().await;
+        state.metrics.record_spool_completed(&meta.labels);
         if let Some(job_id) = &job_id {
             tracing::info!("event.name" = "bobs.spool.completed", "job.id" = %job_id, "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, checksum = ?meta.checksum_crc32c, outcome = "success", "spool completed");
         } else {
@@ -327,6 +342,15 @@ where
         return Err(ApiError(BobsError::SpoolLocked));
     }
     spool.acquire_reader();
+
+    let read_labels = spool.metadata.lock().await.labels.clone();
+    let read_mode = if matches!(request_range, ReadRequestRange::Follow) {
+        crate::metrics::mode::FOLLOW
+    } else {
+        crate::metrics::mode::RANGE
+    };
+    state.metrics.record_reader_acquired(&read_labels);
+    let read_start = std::time::Instant::now();
 
     let lease = ReaderLease {
         spool: Arc::clone(&spool),
@@ -431,6 +455,9 @@ where
     let stream_job_id = job_id.clone();
     let stream_key = key.clone();
     let stream_range = raw_range.clone();
+    let stream_metrics = Arc::clone(&state.metrics);
+    let stream_labels = read_labels.clone();
+    let stream_mode = read_mode;
     let stream = stream! {
         let _lease = lease;
         let mut offset = start;
@@ -545,6 +572,9 @@ where
         } else {
             tracing::info!("event.name" = "bobs.spool.read.completed", "bobs.spool.key" = %stream_key, range = %stream_range, bytes = bytes_served, outcome = outcome, "spool read completed");
         }
+        stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
+        stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
+        stream_metrics.record_reader_released(&stream_labels);
     };
 
     let mut response = Body::from_stream(stream).into_response();
@@ -686,6 +716,20 @@ where
     let job_id = extract_job_id(&headers);
     let span = request_span(job_id.as_deref(), Some(&key), None, None);
     async move {
+        // Capture labels before deletion removes the spool from memory.
+        let delete_labels = state
+            .manager
+            .get_spool(&key)
+            .map(|s| {
+                // We can't async-lock inside a sync map ref, so clone the Arc.
+                s
+            });
+        let labels = if let Some(spool) = &delete_labels {
+            spool.metadata.lock().await.labels.clone()
+        } else {
+            std::collections::HashMap::new()
+        };
+        drop(delete_labels);
         state
             .manager
             .delete_spool_with_reason(
@@ -695,6 +739,7 @@ where
             )
             .await
             .map_err(ApiError)?;
+        state.metrics.record_spool_deleted(&labels, crate::metrics::reason::CLIENT);
         Ok(StatusCode::OK.into_response())
     }
     .instrument(span)
@@ -742,6 +787,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::cleanup::start_cleanup_task;
+    use crate::config::MetricsConfig;
     use crate::error::BobsError;
     use crate::io::DefaultFileIO;
     use crate::metadata::DefaultMetadataStore;
@@ -769,6 +815,7 @@ mod tests {
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
+            metrics: MetricsConfig::default(),
         })
     }
 
@@ -793,6 +840,7 @@ mod tests {
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
+            metrics: MetricsConfig::default(),
         })
     }
 
@@ -817,6 +865,7 @@ mod tests {
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
+            metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
@@ -842,6 +891,7 @@ mod tests {
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
+            metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)

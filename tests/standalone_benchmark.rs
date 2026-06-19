@@ -4,6 +4,7 @@ use bobs::benchmark::run::run_benchmark;
 use bobs::cleanup::start_cleanup_task;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
+use bobs::metrics::BobsMetrics;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use bobs::io::UringFileIO;
 use bobs::io::{DefaultFileIO, TokioFileIO};
@@ -91,6 +92,7 @@ where
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "download".into(),
+        ..Config::default()
     });
     let manager = Arc::new(
         SpoolManager::<F, M>::with_metadata_store(
@@ -108,6 +110,7 @@ where
         hostname: "bobs-0".into(),
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
+        metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
     });
     let app: Router = router::<F, M>().with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

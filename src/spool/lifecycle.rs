@@ -162,6 +162,7 @@ mod tests {
     use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
     use crate::spool::types::SpoolMetadata;
     use bytes::Bytes;
+    use std::collections::HashMap;
     use std::fs::{self, File};
     use std::future::Future;
     use std::io::{self, Write};
@@ -502,6 +503,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -561,6 +563,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -604,6 +607,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -659,6 +663,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -869,6 +874,7 @@ mod tests {
                 total_pages: 0,
                 final_page_size: None,
                 data_path: path,
+                labels: HashMap::new(),
             };
             metadata_store
                 .write(&meta)
@@ -973,7 +979,7 @@ mod tests {
                 SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
                     .expect("manager init");
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");

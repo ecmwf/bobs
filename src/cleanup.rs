@@ -143,6 +143,7 @@ mod tests {
     use crate::io::TokioFileIO;
     use crate::metadata::MetadataStore;
     use crate::spool::SpoolMetadata;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     fn test_config() -> Arc<Config> {
@@ -163,6 +164,7 @@ mod tests {
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
+            ..Config::default()
         })
     }
 
@@ -209,7 +211,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -248,7 +250,7 @@ mod tests {
             let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
                 .expect("manager init");
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
@@ -303,7 +305,7 @@ mod tests {
             let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
                 .expect("manager init");
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
@@ -360,7 +362,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -396,7 +398,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -432,7 +434,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -470,7 +472,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -505,7 +507,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -540,7 +542,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -591,7 +593,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -632,7 +634,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -663,7 +665,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -697,7 +699,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");

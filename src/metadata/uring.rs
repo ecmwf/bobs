@@ -418,6 +418,7 @@ impl MetadataCommitSubmitter for FakeLinkedSubmitter {
 mod tests {
     use super::*;
     use crate::spool::SpoolState;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     const LINKED_CHAIN_TEST_SHARDS: usize = 4;
@@ -442,6 +443,7 @@ mod tests {
             total_pages: generation,
             final_page_size: if generation == 0 { None } else { Some(4096) },
             data_path: PathBuf::from(format!("/tmp/sidecar-test-key.{generation}.data")),
+            labels: HashMap::new(),
         }
     }
 

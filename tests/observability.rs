@@ -5,6 +5,7 @@ use bobs::http::{router, AppState};
 use bobs::io::DefaultFileIO;
 use bobs::manager::SpoolManager;
 use bobs::metadata::DefaultMetadataStore;
+use bobs::metrics::BobsMetrics;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -50,6 +51,7 @@ fn test_config(dir: &std::path::Path) -> Arc<Config> {
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     })
 }
 
@@ -71,6 +73,7 @@ async fn app() -> axum::Router {
         hostname: "bobs-0".into(),
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
+        metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
     });
     router::<DefaultFileIO, DefaultMetadataStore>().with_state(state)
 }
