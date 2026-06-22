@@ -736,21 +736,11 @@ where
                 let now = now_secs();
                 spool.last_read_activity_at.store(now, Ordering::Relaxed);
 
-                // 2. Record coverage and detect full-read completion.
-                // Both locks are uncontested in the common single-reader case;
-                // can be batched in a future optimisation if profiling shows contention.
-                {
-                    let mut mr = spool.missing_ranges.lock().await;
-                    mr.mark_served(chunk_start, chunk_end);
-                    if mr.is_complete()
-                        && spool.full_object_read_at.load(Ordering::Relaxed) == 0
-                    {
-                        spool
-                            .full_object_read_at
-                            .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
-                            .ok();
-                    }
-                }
+                // 2. Record coverage and run the full-read transition when this
+                // chunk completes first coverage of the whole object.
+                spool
+                    .mark_served_and_maybe_fully_read(chunk_start, chunk_end, now)
+                    .await;
 
                 // 3. Keep legacy last_read_at for observability (not used in new cleanup).
                 {
@@ -2046,6 +2036,11 @@ mod tests {
             spool.full_object_read_at.load(Ordering::Relaxed) > 0,
             "full-range read must set full_object_read_at"
         );
+        let cache = spool.page_cache.lock().await;
+        assert!(
+            !cache.contains(&key, 0) && !cache.contains(&key, 1),
+            "full-read transition must free this spool's page cache entries"
+        );
     }
 
     /// A partial Range request leaves bytes un-served; `full_object_read_at`
@@ -2063,6 +2058,11 @@ mod tests {
             spool.full_object_read_at.load(Ordering::Relaxed),
             0,
             "partial range must not set full_object_read_at"
+        );
+        let cache = spool.page_cache.lock().await;
+        assert!(
+            cache.contains(&key, 0) || cache.contains(&key, 1),
+            "partial reads must not free this spool's page cache entries"
         );
     }
 

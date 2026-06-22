@@ -90,19 +90,47 @@ where
 
         // Initialize coverage tracking and detect immediate full-coverage
         // (zero-byte objects or objects whose bytes were all served pre-complete).
-        {
+        let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.initialize(total_size);
-            if mr.is_complete() {
-                self.full_object_read_at
+            mr.is_complete()
+                && self
+                    .full_object_read_at
                     .compare_exchange(0, now_secs(), Ordering::SeqCst, Ordering::SeqCst)
-                    .ok();
-            }
+                    .is_ok()
+        };
+        if became_fully_read {
+            self.on_fully_read().await;
         }
 
         self.notify.notify_waiters();
 
         Ok(())
+    }
+
+    /// Record that a byte range has been served and run the first full-read
+    /// transition exactly once when coverage reaches the complete object.
+    pub async fn mark_served_and_maybe_fully_read(&self, start: u64, end: u64, now: u64) {
+        let became_fully_read = {
+            let mut mr = self.missing_ranges.lock().await;
+            mr.mark_served(start, end);
+            mr.is_complete()
+                && self.full_object_read_at.load(Ordering::Relaxed) == 0
+                && self
+                    .full_object_read_at
+                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+        };
+
+        if became_fully_read {
+            self.on_fully_read().await;
+        }
+    }
+
+    /// First full-read transition hook. At this point every byte has been served
+    /// at least once, so the first-read page cache for this spool is redundant.
+    pub async fn on_fully_read(&self) {
+        self.page_cache.lock().await.free_spool(&self.key);
     }
 
     pub async fn set_write_locked(&self, locked: bool) -> Result<()> {
