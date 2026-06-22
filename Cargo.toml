@@ -27,8 +27,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 dashmap = "6"
 async-stream = "0.3"
-crc32c = "0.6"
-base64 = "0.22"
 num_cpus = "1"
 siphasher = "1"
 serde_norway = "0.9.42"

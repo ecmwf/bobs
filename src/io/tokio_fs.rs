@@ -189,7 +189,9 @@ mod tests {
         let handle = TokioFileIO::create(&path).await.unwrap();
         let size = 8 * 1024 * 1024;
         let data = Bytes::from((0..size).map(|i| i as u8).collect::<Vec<u8>>());
-        let written = TokioFileIO::write_at(&handle, 0, data.clone()).await.unwrap();
+        let written = TokioFileIO::write_at(&handle, 0, data.clone())
+            .await
+            .unwrap();
         assert_eq!(written, size);
         TokioFileIO::sync_data(&handle).await.unwrap();
         let read = TokioFileIO::read_at(&handle, 0, size).await.unwrap();

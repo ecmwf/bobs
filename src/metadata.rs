@@ -377,7 +377,6 @@ mod tests {
             last_read_at: None,
             readable_at: Some(30 + generation),
             total_bytes_written: generation * 4096,
-            checksum_crc32c: Some(generation as u32),
             total_pages: generation,
             final_page_size: if generation == 0 { None } else { Some(4096) },
             data_path: PathBuf::from(format!("/tmp/sidecar-test-key.{generation}.data")),

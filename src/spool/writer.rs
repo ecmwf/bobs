@@ -60,11 +60,6 @@ where
             }
         }
 
-        {
-            let mut crc = self.running_crc32c.lock().await;
-            *crc = crc32c::crc32c_append(*crc, &data);
-        }
-
         let mut cursor = 0;
 
         // If a previous call left a partial page, copy only enough incoming bytes
@@ -153,7 +148,6 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,

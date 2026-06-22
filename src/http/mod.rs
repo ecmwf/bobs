@@ -400,7 +400,7 @@ where
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
         spool.complete(req.expected_size).await.map_err(ApiError)?;
         let meta = spool.metadata.lock().await;
-        tracing::info!("event.name" = "bobs.spool.completed", "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, checksum = ?meta.checksum_crc32c, outcome = "success", "spool completed");
+        tracing::info!("event.name" = "bobs.spool.completed", "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
         Ok(StatusCode::OK.into_response())
     }.instrument(span).await
 }
@@ -422,7 +422,6 @@ fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes 
 struct ReadMetadata {
     content_type: Option<String>,
     content_encoding: Option<String>,
-    checksum_crc32c: Option<u32>,
     complete_size: Option<u64>,
     total_bytes_written: u64,
     servable_bytes: u64,
@@ -537,16 +536,6 @@ fn apply_read_response_headers(
             .insert(axum::http::header::CONTENT_ENCODING, encoding_header);
     }
 
-    if let Some(crc) = metadata.checksum_crc32c {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
-        let checksum_header = HeaderValue::from_str(&encoded)
-            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
-        response
-            .headers_mut()
-            .insert("X-Checksum-CRC32C", checksum_header);
-    }
-
     // Content-Length must be the number of bytes *this response will deliver*,
     // not the total object size. Bounded Range reads know the exact byte count.
     // No-Range reads know it too once the spool is complete; in-progress follow
@@ -649,7 +638,6 @@ where
             ReadMetadata {
                 content_type: meta.content_type.clone(),
                 content_encoding: meta.content_encoding.clone(),
-                checksum_crc32c: meta.checksum_crc32c,
                 complete_size,
                 total_bytes_written: meta.total_bytes_written,
                 servable_bytes,
