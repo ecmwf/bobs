@@ -103,7 +103,6 @@ For follow mode, the connection remains open and BOBS streams pages as they are 
 - `Content-Range: bytes X-Y/*` for bounded reads (or `bytes X-Y/TOTAL` once complete).
 - `Content-Type`: As defined during creation.
 - `Content-Encoding`: As defined during creation (if provided).
-- `X-Checksum-CRC32C`: Base64-encoded CRC-32C of the **full object**. Only available after completion.
 - `X-Accel-Buffering`: `no` (disables proxy buffering).
 
 Examples:

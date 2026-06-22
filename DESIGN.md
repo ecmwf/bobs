@@ -38,11 +38,11 @@ Each spool is stored in its own directory:
   meta.json
 ```
 
-`spool.dat` contains accepted payload bytes. `meta.json` is a sidecar metadata file containing lifecycle state, content metadata, timestamps, byte counts, page counts, final partial-page size, checksum, and the data path.
+`spool.dat` contains accepted payload bytes. `meta.json` is a sidecar metadata file containing lifecycle state, content metadata, timestamps, byte counts, page counts, final partial-page size, and the data path.
 
 Sidecar metadata commits are atomic at the file level: BOBS writes `meta.json.tmp`, syncs that file, renames it over `meta.json`, and syncs the spool directory. Recovery ignores leftover temporary metadata files.
 
-Ordinary `/write` calls do not persist a metadata high-water mark. For in-progress spools, `spool.dat` is authoritative after a BOBS process restart; recovery recomputes length, page state, and CRC from the data file.
+Ordinary `/write` calls do not persist a metadata high-water mark. For in-progress spools, `spool.dat` is authoritative after a BOBS process restart; recovery recomputes length and page state from the data file.
 
 ## File I/O
 
@@ -75,7 +75,7 @@ A request without `Range`, or with `Range: bytes=X-`, enters follow mode. If the
 
 When the long-poll timeout fires, BOBS returns `307 Temporary Redirect` to a read URL for the same key. If a trusted ingress supplies a valid `X-Forwarded-Prefix`, the redirect preserves that external prefix; otherwise it falls back to `/api/v1/read/{key}`. The redirect is temporary and includes `Cache-Control: no-store` because the location can depend on request headers.
 
-Completed reads include the full-object CRC-32C checksum header when available. Range reads update aggregate read-coverage tracking so cleanup can detect when the whole object has been served, even across multiple range requests.
+Range reads update aggregate read-coverage tracking so cleanup can detect when the whole object has been served, even across multiple range requests.
 
 ## Write-locked spools
 

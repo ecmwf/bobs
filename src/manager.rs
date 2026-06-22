@@ -118,7 +118,6 @@ where
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path,
@@ -292,7 +291,6 @@ where
                 if meta.total_bytes_written != progress.total_bytes_written
                     || meta.total_pages != progress.total_pages
                     || meta.final_page_size.is_some()
-                    || meta.checksum_crc32c.is_some()
                 {
                     tracing::warn!(
                         key = %key,
@@ -304,7 +302,6 @@ where
                     meta.total_bytes_written = progress.total_bytes_written;
                     meta.total_pages = progress.total_pages;
                     meta.final_page_size = None;
-                    meta.checksum_crc32c = None;
                 }
             } else {
                 let expected_full_pages_bytes = match meta.final_page_size {
@@ -331,16 +328,6 @@ where
                 self.metadata_store.write(&meta).await?;
             }
 
-            let crc = if matches!(meta.state, SpoolState::Complete | SpoolState::Readable) {
-                if let Some(checksum) = meta.checksum_crc32c {
-                    checksum
-                } else {
-                    crc32c_for_logical_size::<F>(&handle, meta.total_bytes_written).await?
-                }
-            } else {
-                crc32c_for_logical_size::<F>(&handle, file_size).await?
-            };
-
             // Capture fields needed for post-init before meta is moved.
             let meta_state_for_init = meta.state.clone();
             let meta_total_bytes_for_init = meta.total_bytes_written;
@@ -355,7 +342,6 @@ where
                 )
                 .await,
             );
-            *spool.running_crc32c.lock().await = crc;
 
             if trailing_partial_len > 0 {
                 let partial = read_exact_logical_range::<F>(
@@ -507,25 +493,6 @@ fn in_progress_progress_from_file(file_size: u64, page_size: usize) -> InProgres
     }
 }
 
-async fn crc32c_for_logical_size<F: FileIO>(handle: &F::Handle, logical_size: u64) -> Result<u32> {
-    let mut crc = 0u32;
-    let mut offset = 0u64;
-    let mut remaining = logical_size;
-    const CHUNK_LEN: u64 = 64 * 1024;
-
-    while remaining > 0 {
-        let want = remaining.min(CHUNK_LEN) as usize;
-        let buf = read_exact_at::<F>(handle, offset, want, "reconstructing CRC")
-            .await
-            .map_err(BobsError::IoError)?;
-        crc = crc32c::crc32c_append(crc, &buf);
-        offset += buf.len() as u64;
-        remaining -= buf.len() as u64;
-    }
-
-    Ok(crc)
-}
-
 async fn read_exact_logical_range<F: FileIO>(
     file_handle: &Arc<tokio::sync::Mutex<Option<F::Handle>>>,
     offset: u64,
@@ -590,7 +557,6 @@ mod tests {
             last_read_at: None,
             readable_at: Some(13),
             total_bytes_written: logical_size,
-            checksum_crc32c: None,
             total_pages,
             final_page_size,
             data_path: data_dir.join(key).join("spool.dat"),
@@ -599,7 +565,7 @@ mod tests {
 
     async fn write_sidecar_fixture(
         manager: &SpoolManager<TokioFileIO>,
-        mut metadata: SpoolMetadata,
+        metadata: SpoolMetadata,
         data: &[u8],
     ) {
         let spool_dir = manager.data_dir.join(&metadata.key);
@@ -609,9 +575,6 @@ mod tests {
         tokio::fs::write(&metadata.data_path, data)
             .await
             .expect("write spool data");
-        if matches!(metadata.state, SpoolState::Complete | SpoolState::Readable) {
-            metadata.checksum_crc32c = Some(crc32c::crc32c(data));
-        }
         manager
             .metadata_store
             .write(&metadata)
@@ -631,7 +594,6 @@ mod tests {
             last_read_at: Some(250 + generation),
             readable_at: Some(300 + generation),
             total_bytes_written: generation * 8192,
-            checksum_crc32c: Some((0xabc0 + generation) as u32),
             total_pages: generation,
             final_page_size: Some(4096),
             data_path: data_dir.join(key).join("spool.dat"),
@@ -973,13 +935,11 @@ mod tests {
         let in_memory = spool.metadata.lock().await.clone();
         assert_eq!(in_memory.total_bytes_written, data.len() as u64);
         assert_eq!(in_memory.total_pages, 2);
-        assert_eq!(in_memory.checksum_crc32c, None);
 
         let persisted = persisted_metadata(&manager, &key).await;
         assert_eq!(persisted.total_bytes_written, 0);
         assert_eq!(persisted.total_pages, 0);
         assert_eq!(persisted.final_page_size, None);
-        assert_eq!(persisted.checksum_crc32c, None);
         assert_eq!(persisted.state, SpoolState::Writing);
 
         spool.complete(None).await.expect("complete succeeds");
@@ -988,7 +948,6 @@ mod tests {
         assert_eq!(persisted.total_bytes_written, data.len() as u64);
         assert_eq!(persisted.total_pages, 3);
         assert_eq!(persisted.final_page_size, Some(123));
-        assert_eq!(persisted.checksum_crc32c, Some(crc32c::crc32c(&data)));
         assert_eq!(persisted.state, SpoolState::Complete);
     }
 
@@ -1031,7 +990,6 @@ mod tests {
         assert_eq!(meta.total_bytes_written, data.len() as u64);
         assert_eq!(meta.total_pages, 2);
         assert_eq!(meta.final_page_size, None);
-        assert_eq!(meta.checksum_crc32c, None);
 
         let trailing = spool.write_buffer.lock().await.clone();
         assert_eq!(trailing.as_ref(), &data[page_size * 2..]);
@@ -1058,54 +1016,6 @@ mod tests {
         assert_eq!(persisted.total_bytes_written, 0);
         assert_eq!(persisted.total_pages, 0);
         assert_eq!(persisted.final_page_size, None);
-        assert_eq!(persisted.checksum_crc32c, None);
-    }
-
-    #[tokio::test]
-    async fn test_crc_equivalence_across_restart_and_append() {
-        let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("legacy-metadata.db");
-        let data_dir = dir.path().join("data");
-        let page_size = 4096usize;
-        let first = vec![0x10u8; page_size + 321];
-        let second = vec![0x20u8; page_size + 17];
-        let mut all = first.clone();
-        all.extend_from_slice(&second);
-
-        let (key, crc_before_restart) = {
-            let manager =
-                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
-                    .expect("manager init");
-            let key = uuid::Uuid::new_v4().to_string();
-            manager
-                .create_spool(key.clone(), None, None, false)
-                .await
-                .expect("create spool");
-            let spool = manager.get_spool(&key).expect("spool exists");
-            spool
-                .write(0, bytes::Bytes::copy_from_slice(&first))
-                .await
-                .expect("write succeeds");
-            let crc = *spool.running_crc32c.lock().await;
-            assert_eq!(crc, crc32c::crc32c(&first));
-            (key, crc)
-        };
-
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
-            .expect("manager2 init");
-        manager2.recover().await.expect("recover succeeds");
-        let spool = manager2.get_spool(&key).expect("recovered spool exists");
-        assert_eq!(*spool.running_crc32c.lock().await, crc_before_restart);
-
-        spool
-            .write(first.len() as u64, bytes::Bytes::copy_from_slice(&second))
-            .await
-            .expect("append after restart succeeds");
-        assert_eq!(*spool.running_crc32c.lock().await, crc32c::crc32c(&all));
-
-        spool.complete(None).await.expect("complete succeeds");
-        let persisted = persisted_metadata(&manager2, &key).await;
-        assert_eq!(persisted.checksum_crc32c, Some(crc32c::crc32c(&all)));
     }
 
     #[tokio::test]
@@ -1140,7 +1050,6 @@ mod tests {
             assert_eq!(persisted.total_bytes_written, data.len() as u64);
             assert_eq!(persisted.total_pages, 3);
             assert_eq!(persisted.final_page_size, Some(19));
-            assert_eq!(persisted.checksum_crc32c, Some(crc32c::crc32c(&data)));
             key
         };
 
@@ -1154,7 +1063,6 @@ mod tests {
         assert_eq!(meta.total_bytes_written, data.len() as u64);
         assert_eq!(meta.total_pages, 3);
         assert_eq!(meta.final_page_size, Some(19));
-        assert_eq!(meta.checksum_crc32c, Some(crc32c::crc32c(&data)));
 
         assert_eq!(
             spool.read_page(0).await.expect("page 0").unwrap().as_ref(),
