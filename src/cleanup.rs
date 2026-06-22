@@ -132,6 +132,12 @@ where
             },
             "cleanup run completed"
         );
+
+        // Measure disk usage after cleanup. This is intentionally coarse
+        // (once per sweep interval) to avoid expensive stat syscalls.
+        if let Ok(usage) = measure_disk_usage(&config.data_dir).await {
+            manager.metrics.record_disk_usage(usage);
+        }
     }
 }
 
@@ -144,6 +150,24 @@ where
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
     tokio::spawn(run_cleanup_loop(manager, config))
+}
+
+/// Walk the data directory and sum file sizes to estimate disk usage.
+async fn measure_disk_usage(data_dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut read_dir = tokio::fs::read_dir(data_dir).await?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
+        if path.is_dir() {
+            let mut sub_dir = tokio::fs::read_dir(&path).await?;
+            while let Some(sub_entry) = sub_dir.next_entry().await? {
+                if let Ok(meta) = sub_entry.metadata().await {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    Ok(total)
 }
 
 fn now_secs() -> u64 {

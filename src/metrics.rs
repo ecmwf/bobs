@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 #[cfg(feature = "telemetry")]
-use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 #[cfg(feature = "telemetry")]
 use opentelemetry::KeyValue;
 
@@ -138,6 +138,7 @@ struct InnerMetrics {
 
     // System-level
     spools_active: UpDownCounter<i64>,
+    disk_usage: Gauge<u64>,
     cache_hits: Counter<u64>,
     cache_misses: Counter<u64>,
 }
@@ -212,6 +213,11 @@ impl BobsMetrics {
             spools_active: meter
                 .i64_up_down_counter("bobs.spools.active")
                 .with_description("Currently active spools by state")
+                .build(),
+            disk_usage: meter
+                .u64_gauge("bobs.disk.usage.bytes")
+                .with_description("Disk usage of the spool data directory")
+                .with_unit("By")
                 .build(),
             cache_hits: meter
                 .u64_counter("bobs.pages.cache.hits.total")
@@ -378,6 +384,15 @@ impl BobsMetrics {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
             inner.cache_misses.add(1, &[]);
+        }
+    }
+
+    /// Record current disk usage in bytes (called once per cleanup sweep).
+    #[allow(unused_variables)]
+    pub fn record_disk_usage(&self, bytes: u64) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            inner.disk_usage.record(bytes, &[]);
         }
     }
 }
