@@ -36,7 +36,7 @@ num_cpus = "1"
 siphasher = "1"
 opentelemetry = { version = "0.30", optional = true }
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.30", features = ["http-proto", "reqwest-client"], optional = true }
+opentelemetry-otlp = { version = "0.30", features = ["http-proto", "reqwest-blocking-client"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Low-level Linux interface chosen over tokio-uring and compio to avoid a
