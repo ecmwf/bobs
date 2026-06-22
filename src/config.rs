@@ -40,8 +40,13 @@ impl Default for Config {
             host: "0.0.0.0".to_string(),
             port: 3000,
             data_dir: PathBuf::from("./data"),
-            page_size: 4096,
-            max_cache_bytes: 1048576,
+            // 16 MiB pages. BOBS fsyncs a metadata commit once per page on
+            // write, so a small page (the old 4 KiB) capped writes at ~1.2 MB/s
+            // (one fsync per 4 KiB to the PVC). 16 MiB amortises the fsync over
+            // 4096x more data. Keep the cache comfortably above one page:
+            // 256 MiB holds 16 default-size pages.
+            page_size: 16 * 1024 * 1024,
+            max_cache_bytes: 256 * 1024 * 1024,
             max_live_spools: 4096,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 600,
@@ -160,8 +165,8 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3000);
         assert_eq!(config.data_dir, PathBuf::from("./data"));
-        assert_eq!(config.page_size, 4096);
-        assert_eq!(config.max_cache_bytes, 1048576);
+        assert_eq!(config.page_size, 16 * 1024 * 1024);
+        assert_eq!(config.max_cache_bytes, 256 * 1024 * 1024);
         assert_eq!(config.max_live_spools, 4096);
         assert_eq!(config.writer_inactivity_timeout_secs, 300);
         assert_eq!(config.read_idle_ttl_secs, 600);
@@ -461,7 +466,7 @@ route_name: z
         assert_eq!(cfg.page_size, 8192);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 3000);
-        assert_eq!(cfg.max_cache_bytes, 1048576);
+        assert_eq!(cfg.max_cache_bytes, 256 * 1024 * 1024);
         assert_eq!(cfg.max_live_spools, 4096);
         assert_eq!(cfg.io_uring_shards, None);
         assert_eq!(cfg.io_uring_queue_capacity, 1024);
