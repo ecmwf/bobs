@@ -68,7 +68,10 @@ impl PageCache {
             .cloned()
     }
 
-    pub fn remove_spool(&mut self, spool_key: &str) {
+    /// Drop all pages for one spool while preserving other spools' cached pages.
+    /// Used when the spool's object has been fully read and its first-read cache
+    /// is no longer useful.
+    pub fn free_spool(&mut self, spool_key: &str) {
         let mut removed_bytes = 0usize;
         self.entries.retain(|key, data| {
             if key.spool_key == spool_key {
@@ -81,6 +84,10 @@ impl PageCache {
         self.current_bytes = self.current_bytes.saturating_sub(removed_bytes);
         self.eviction_order
             .retain(|key| key.spool_key.as_str() != spool_key);
+    }
+
+    pub fn remove_spool(&mut self, spool_key: &str) {
+        self.free_spool(spool_key);
     }
 
     pub fn current_bytes(&self) -> usize {
@@ -273,13 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_spool_drops_only_that_spool_and_preserves_accounting() {
+    fn test_free_spool_drops_only_that_spool_and_preserves_accounting() {
         let mut cache = PageCache::new(100);
         insert_and_assert_bound(&mut cache, "a", 0, Bytes::from_static(b"aaaa"));
         insert_and_assert_bound(&mut cache, "b", 0, Bytes::from_static(b"bbbb"));
         insert_and_assert_bound(&mut cache, "a", 1, Bytes::from_static(b"cccc"));
 
-        cache.remove_spool("a");
+        cache.free_spool("a");
 
         assert_eq!(cache.current_bytes(), 4);
         assert!(!cache.contains("a", 0));

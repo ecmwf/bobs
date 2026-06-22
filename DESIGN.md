@@ -63,7 +63,7 @@ Write path:
 3. Full pages become reader-visible.
 4. Visible pages are inserted into a global FIFO page cache and waiting readers are notified.
 
-The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Setting `max_cache_bytes` to `0` disables caching. Pages larger than the cap bypass the cache.
+The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Setting `max_cache_bytes` to `0` disables caching. Pages larger than the cap bypass the cache. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 
 A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/complete` publishes it as the final page.
 
