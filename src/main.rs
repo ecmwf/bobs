@@ -79,6 +79,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_dir = %config.data_dir.display(),
         page_size = config.page_size,
         max_cache_bytes = config.max_cache_bytes,
+        max_live_spools = config.max_live_spools,
         route_name = %config.route_name,
         public_base = %format!("https://{}.{}/{}-{}/api/v1", config.host_prefix, config.domain, config.route_name, ordinal),
         internal_base_url = %internal_base_url,
@@ -107,6 +108,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &config.data_dir,
             config.page_size,
             config.max_cache_bytes,
+            config.max_live_spools,
         )?,
     );
 

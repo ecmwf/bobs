@@ -131,6 +131,7 @@ where
     /// at least once, so the first-read page cache for this spool is redundant.
     pub async fn on_fully_read(&self) {
         self.page_cache.lock().await.free_spool(&self.key);
+        self.release_admission();
     }
 
     pub async fn set_write_locked(&self, locked: bool) -> Result<()> {
@@ -1075,9 +1076,14 @@ mod tests {
         let data = vec![0x5Au8; page_size + 904];
 
         {
-            let manager =
-                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
-                    .expect("manager init");
+            let manager = SpoolManager::<TokioFileIO>::new(
+                &db_path,
+                &data_dir,
+                page_size,
+                16 * page_size,
+                256,
+            )
+            .expect("manager init");
             manager
                 .create_spool(key.clone(), None, None, false)
                 .await
@@ -1094,7 +1100,7 @@ mod tests {
         }
 
         let manager2 =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size, 256)
                 .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
         let spool = manager2.get_spool(&key).expect("recovered spool exists");

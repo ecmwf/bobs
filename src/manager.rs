@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteReason {
@@ -37,6 +37,8 @@ pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> 
     pub page_size: usize,
     pub max_cache_bytes: usize,
     pub page_cache: Arc<Mutex<PageCache>>,
+    /// Bounds spools concurrently holding first-read cache memory.
+    pub admission: Arc<Semaphore>,
 }
 
 impl<F: FileIO> SpoolManager<F, SyncSidecarMetadataStore> {
@@ -45,6 +47,7 @@ impl<F: FileIO> SpoolManager<F, SyncSidecarMetadataStore> {
         data_dir: impl AsRef<Path>,
         page_size: usize,
         max_cache_bytes: usize,
+        max_live_spools: usize,
     ) -> Result<Self> {
         legacy_redb::migrate_from_redb(db_path, data_dir.as_ref())?;
         Self::with_metadata_store(
@@ -52,6 +55,7 @@ impl<F: FileIO> SpoolManager<F, SyncSidecarMetadataStore> {
             data_dir,
             page_size,
             max_cache_bytes,
+            max_live_spools,
         )
     }
 }
@@ -66,11 +70,18 @@ where
         data_dir: impl AsRef<Path>,
         page_size: usize,
         max_cache_bytes: usize,
+        max_live_spools: usize,
     ) -> Result<Self> {
         if page_size == 0 {
             return Err(BobsError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "page_size must be greater than 0",
+            )));
+        }
+        if max_live_spools == 0 {
+            return Err(BobsError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_live_spools must be greater than 0",
             )));
         }
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
@@ -83,6 +94,7 @@ where
             page_size,
             max_cache_bytes,
             page_cache,
+            admission: Arc::new(Semaphore::new(max_live_spools)),
         })
     }
 
@@ -93,6 +105,11 @@ where
         content_encoding: Option<String>,
         write_locked: bool,
     ) -> Result<()> {
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| BobsError::IoError(std::io::Error::other("admission semaphore closed")))?;
+
         let spool_dir = self.data_dir.join(&key);
         let data_path = spool_dir.join("spool.dat");
 
@@ -126,12 +143,13 @@ where
         self.metadata_store.write(&metadata).await?;
 
         let spool = Arc::new(
-            Spool::new(
+            Spool::new_with_admission(
                 metadata,
                 handle,
                 self.page_size,
                 Arc::clone(&self.page_cache),
                 self.metadata_store.clone(),
+                Some(permit),
             )
             .await,
         );
@@ -198,6 +216,7 @@ where
         spool.cancel.cancel();
 
         self.spools.remove(key);
+        spool.release_admission();
         self.page_cache.lock().await.remove_spool(key);
 
         let deleting_meta = { spool.metadata.lock().await.clone() };
@@ -331,14 +350,16 @@ where
             // Capture fields needed for post-init before meta is moved.
             let meta_state_for_init = meta.state.clone();
             let meta_total_bytes_for_init = meta.total_bytes_written;
+            let permit = Arc::clone(&self.admission).try_acquire_owned().ok();
 
             let spool = Arc::new(
-                Spool::new(
+                Spool::new_with_admission(
                     meta,
                     handle,
                     self.page_size,
                     Arc::clone(&self.page_cache),
                     self.metadata_store.clone(),
+                    permit,
                 )
                 .await,
             );
@@ -518,6 +539,7 @@ mod tests {
     use crate::io::TokioFileIO;
     use crate::metadata::legacy_redb;
     use std::fs;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     async fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {
@@ -689,7 +711,7 @@ mod tests {
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 1024)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 1024, 256)
             .expect("manager init");
 
         assert_eq!(manager.page_size, 4096);
@@ -703,8 +725,8 @@ mod tests {
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
-        let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 0).expect("manager init");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 0, 256)
+            .expect("manager init");
 
         assert_eq!(manager.max_cache_bytes, 0);
         assert_eq!(manager.page_cache.lock().await.max_bytes(), 0);
@@ -715,7 +737,7 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 8192)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 8192, 256)
             .expect("manager init");
 
         manager
@@ -755,7 +777,7 @@ mod tests {
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let manager =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4, 8).expect("manager init");
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4, 8, 256).expect("manager init");
 
         manager
             .create_spool("a".to_string(), None, None, false)
@@ -812,9 +834,79 @@ mod tests {
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
-        let result = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 0, 1024);
+        let result = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 0, 1024, 256);
 
         assert!(matches!(result, Err(BobsError::IoError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_new_rejects_zero_max_live_spools() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("legacy-metadata.db");
+        let data_dir = dir.path().join("data");
+
+        let result = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 1024, 0);
+
+        assert!(matches!(result, Err(BobsError::IoError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_admission_blocks_at_capacity_and_releases_on_delete() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("legacy-metadata.db");
+        let data_dir = dir.path().join("data");
+        let manager = Arc::new(
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 1)
+                .expect("manager init"),
+        );
+
+        manager
+            .create_spool("a".into(), None, None, false)
+            .await
+            .expect("first create succeeds");
+
+        let manager2 = Arc::clone(&manager);
+        let mut create2 =
+            tokio::spawn(async move { manager2.create_spool("b".into(), None, None, false).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !create2.is_finished(),
+            "second create must block while admission is at capacity"
+        );
+
+        manager.delete_spool("a").await.expect("delete first");
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut create2)
+            .await
+            .expect("second create should unblock once a slot frees")
+            .expect("join")
+            .expect("second create succeeds");
+        assert!(manager.get_spool("b").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_full_read_transition_releases_admission_before_delete() {
+        let dir = tempdir().expect("create tempdir");
+        let db_path = dir.path().join("legacy-metadata.db");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 1)
+            .expect("manager init");
+
+        manager
+            .create_spool("a".into(), None, None, false)
+            .await
+            .expect("first create succeeds");
+        let spool = manager.get_spool("a").expect("spool a exists");
+        spool.on_fully_read().await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.create_spool("b".into(), None, None, false),
+        )
+        .await
+        .expect("create must not block after full-read transition releases admission")
+        .expect("second create succeeds");
+        assert!(manager.get_spool("a").is_some());
+        assert!(manager.get_spool("b").is_some());
     }
 
     #[tokio::test]
@@ -823,7 +915,7 @@ mod tests {
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -849,7 +941,7 @@ mod tests {
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -871,7 +963,7 @@ mod tests {
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let result = manager.delete_spool("nonexistent-key").await;
@@ -889,8 +981,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager1 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager1 init");
+            let manager1 =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager1 init");
 
             let key = uuid::Uuid::new_v4().to_string();
             manager1
@@ -900,7 +993,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
 
         manager2.recover().await.expect("recover should succeed");
@@ -916,7 +1009,7 @@ mod tests {
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -961,7 +1054,7 @@ mod tests {
 
         let key = {
             let manager =
-                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096, 256)
                     .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
@@ -980,8 +1073,9 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
-            .expect("manager2 init");
+        let manager2 =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096, 256)
+                .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
         let spool = manager2.get_spool(&key).expect("recovered spool exists");
@@ -1028,7 +1122,7 @@ mod tests {
 
         let key = {
             let manager =
-                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096, 256)
                     .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
@@ -1053,8 +1147,9 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096)
-            .expect("manager2 init");
+        let manager2 =
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * 4096, 256)
+                .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
         let spool = manager2.get_spool(&key).expect("recovered spool exists");
 
@@ -1086,8 +1181,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
 
             let key = uuid::Uuid::new_v4().to_string();
             manager
@@ -1104,7 +1200,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -1127,8 +1223,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
                 .create_spool(key.clone(), None, None, true) // WriteLocked
@@ -1137,7 +1234,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover should succeed");
 
@@ -1159,8 +1256,9 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let key = {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
-                .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
+                    .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
                 .create_spool(key.clone(), None, None, false)
@@ -1175,7 +1273,7 @@ mod tests {
             key
         };
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover should succeed");
 
@@ -1203,7 +1301,7 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
         let key = uuid::Uuid::new_v4().to_string();
         let data = vec![0x44; 4096];
@@ -1212,7 +1310,7 @@ mod tests {
         metadata.readable_at = None;
         write_sidecar_fixture(&manager, metadata, &data).await;
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -1229,7 +1327,7 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
         let creating = "creating-spool";
         let deleting = "deleting-spool";
@@ -1261,7 +1359,7 @@ mod tests {
             .await
             .expect("write non-UUID orphan data");
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -1307,7 +1405,7 @@ mod tests {
         #[cfg(not(unix))]
         let (symlink_path, target_dir): (Option<PathBuf>, Option<PathBuf>) = (None, None);
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
         manager.recover().await.expect("recover succeeds");
 
@@ -1338,7 +1436,7 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
         let key = uuid::Uuid::new_v4().to_string();
         write_sidecar_fixture(
@@ -1348,7 +1446,7 @@ mod tests {
         )
         .await;
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -1367,7 +1465,7 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
         let key = uuid::Uuid::new_v4().to_string();
         let metadata = sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, 4096);
@@ -1380,7 +1478,7 @@ mod tests {
             .await
             .expect("write sidecar");
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager2 = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -1405,7 +1503,7 @@ mod tests {
             .await
             .expect("write data");
 
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
         manager.recover().await.expect("recover succeeds");
 
@@ -1422,9 +1520,14 @@ mod tests {
         let data = vec![0x7Bu8; page_size * 2];
 
         let key = {
-            let manager =
-                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
-                    .expect("manager init");
+            let manager = SpoolManager::<TokioFileIO>::new(
+                &db_path,
+                &data_dir,
+                page_size,
+                16 * page_size,
+                256,
+            )
+            .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
                 .create_spool(key.clone(), None, None, false)
@@ -1440,7 +1543,7 @@ mod tests {
         };
 
         let manager2 =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
+            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size, 256)
                 .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
@@ -1461,7 +1564,7 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
-        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 8192)
+        let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 8192, 256)
             .expect("manager init");
 
         let key = uuid::Uuid::new_v4().to_string();

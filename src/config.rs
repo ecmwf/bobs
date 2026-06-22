@@ -9,6 +9,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub page_size: usize,
     pub max_cache_bytes: usize,
+    /// Maximum number of spools that may concurrently hold first-read cache memory.
+    /// Writers block on create until a slot frees.
+    pub max_live_spools: usize,
     pub writer_inactivity_timeout_secs: u64,
     /// Idle TTL (seconds) anchored on the time the spool became readable,
     /// refreshed whenever bytes are actually served. Default: 600.
@@ -39,6 +42,7 @@ impl Default for Config {
             data_dir: PathBuf::from("./data"),
             page_size: 4096,
             max_cache_bytes: 1048576,
+            max_live_spools: 4096,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 600,
             full_read_complete_ttl_secs: 30,
@@ -67,6 +71,13 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "page_size must be greater than 0",
+            ));
+        }
+
+        if self.max_live_spools == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_live_spools must be greater than 0",
             ));
         }
 
@@ -151,6 +162,7 @@ mod tests {
         assert_eq!(config.data_dir, PathBuf::from("./data"));
         assert_eq!(config.page_size, 4096);
         assert_eq!(config.max_cache_bytes, 1048576);
+        assert_eq!(config.max_live_spools, 4096);
         assert_eq!(config.writer_inactivity_timeout_secs, 300);
         assert_eq!(config.read_idle_ttl_secs, 600);
         assert_eq!(config.full_read_complete_ttl_secs, 30);
@@ -173,6 +185,7 @@ port: 9000
 data_dir: /tmp/yaml-data
 page_size: 8192
 max_cache_bytes: 131072
+max_live_spools: 123
 writer_inactivity_timeout_secs: 11
 read_idle_ttl_secs: 120
 full_read_complete_ttl_secs: 15
@@ -195,6 +208,7 @@ route_name: test-route
         assert_eq!(cfg.data_dir, PathBuf::from("/tmp/yaml-data"));
         assert_eq!(cfg.page_size, 8192);
         assert_eq!(cfg.max_cache_bytes, 131072);
+        assert_eq!(cfg.max_live_spools, 123);
         assert_eq!(cfg.writer_inactivity_timeout_secs, 11);
         assert_eq!(cfg.read_idle_ttl_secs, 120);
         assert_eq!(cfg.full_read_complete_ttl_secs, 15);
@@ -269,6 +283,20 @@ route_name: test-route
         };
 
         config.validate().expect("validation should succeed");
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_max_live_spools() {
+        let config = Config {
+            max_live_spools: 0,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -415,6 +443,7 @@ route_name: z
         // Current fields get defaults.
         assert_eq!(cfg.read_idle_ttl_secs, 600);
         assert_eq!(cfg.full_read_complete_ttl_secs, 30);
+        assert_eq!(cfg.max_live_spools, 4096);
         assert_eq!(cfg.io_uring_shards, None);
         assert_eq!(cfg.io_uring_queue_capacity, 1024);
         // Old fields still parsed.
@@ -433,6 +462,7 @@ route_name: z
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.max_cache_bytes, 1048576);
+        assert_eq!(cfg.max_live_spools, 4096);
         assert_eq!(cfg.io_uring_shards, None);
         assert_eq!(cfg.io_uring_queue_capacity, 1024);
     }
