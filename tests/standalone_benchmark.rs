@@ -80,6 +80,7 @@ where
         data_dir: data_dir.clone(),
         page_size,
         max_cache_bytes: page_size * 8,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         read_idle_ttl_secs: 600,
         full_read_complete_ttl_secs: 30,
@@ -99,6 +100,7 @@ where
             &data_dir,
             config.page_size,
             config.max_cache_bytes,
+            config.max_live_spools,
         )
         .expect("manager"),
     );

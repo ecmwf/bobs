@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
 pub mod coverage;
@@ -45,6 +45,9 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub last_read_activity_at: Arc<AtomicU64>,
     /// Unix secs when full-object coverage was first detected. 0 = not yet.
     pub full_object_read_at: Arc<AtomicU64>,
+    /// Admission permit held while this spool can retain first-read cache memory.
+    /// Released at the full-read transition, or on deletion/drop if that happens first.
+    admission_permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
     pub(crate) _phantom: PhantomData<F>,
 }
 
@@ -59,6 +62,25 @@ where
         page_size: usize,
         page_cache: Arc<Mutex<PageCache>>,
         metadata_store: M,
+    ) -> Self {
+        Self::new_with_admission(
+            metadata,
+            file_handle,
+            page_size,
+            page_cache,
+            metadata_store,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_with_admission(
+        metadata: SpoolMetadata,
+        file_handle: F::Handle,
+        page_size: usize,
+        page_cache: Arc<Mutex<PageCache>>,
+        metadata_store: M,
+        admission_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         let data_path = metadata.data_path.clone();
         let key = metadata.key.clone();
@@ -78,7 +100,14 @@ where
             missing_ranges: Arc::new(Mutex::new(MissingRanges::new(1024))),
             last_read_activity_at: Arc::new(AtomicU64::new(0)),
             full_object_read_at: Arc::new(AtomicU64::new(0)),
+            admission_permit: std::sync::Mutex::new(admission_permit),
             _phantom: PhantomData,
+        }
+    }
+
+    pub fn release_admission(&self) {
+        if let Ok(mut permit) = self.admission_permit.lock() {
+            permit.take();
         }
     }
 
