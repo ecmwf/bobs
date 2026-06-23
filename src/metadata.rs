@@ -9,9 +9,6 @@ use std::pin::Pin;
 const META_FILE: &str = "meta.json";
 const TMP_FILE: &str = "meta.json.tmp";
 
-#[path = "metadata/legacy_redb.rs"]
-pub mod legacy_redb;
-
 type BoxMetadataFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 /// Metadata persistence backend.
@@ -381,69 +378,6 @@ mod tests {
             final_page_size: if generation == 0 { None } else { Some(4096) },
             data_path: PathBuf::from(format!("/tmp/sidecar-test-key.{generation}.data")),
         }
-    }
-
-    fn legacy_metadata(key: &str, generation: u64, data_dir: &Path) -> SpoolMetadata {
-        let mut meta = metadata_with_generation(generation);
-        meta.key = key.to_string();
-        meta.data_path = data_dir.join(key).join("spool.dat");
-        meta
-    }
-
-    fn assert_sidecar_bytes_match_rows(data_dir: &Path, rows: &[legacy_redb::LegacyRedbRow]) {
-        for row in rows {
-            let meta_path = data_dir.join(&row.key).join(META_FILE);
-            let sidecar = fs::read(&meta_path).expect("read migrated meta.json");
-            assert_eq!(
-                sidecar, row.bytes,
-                "migrated sidecar bytes must exactly match legacy redb row for {}",
-                row.key
-            );
-
-            let recovered: SpoolMetadata =
-                serde_json::from_slice(&sidecar).expect("deserialize migrated sidecar");
-            let legacy: SpoolMetadata =
-                serde_json::from_slice(&row.bytes).expect("deserialize legacy row");
-            assert_metadata_eq(recovered, &legacy);
-        }
-    }
-
-    #[test]
-    fn migration_from_redb_preserves_legacy_row_bytes_and_metadata() {
-        let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
-        let data_dir = dir.path().join("data");
-        let metadata = vec![
-            legacy_metadata("spool-a", 1, &data_dir),
-            legacy_metadata("spool-b", 2, &data_dir),
-            legacy_metadata("spool-c", 3, &data_dir),
-        ];
-        let rows = legacy_redb::create_legacy_db(&db_path, &metadata).expect("create legacy db");
-
-        legacy_redb::migrate_from_redb(&db_path, &data_dir).expect("migrate legacy redb");
-
-        assert_sidecar_bytes_match_rows(&data_dir, &rows);
-        assert!(
-            !db_path.exists(),
-            "legacy redb must be removed after migration"
-        );
-    }
-
-    #[test]
-    fn migration_from_redb_is_noop_after_legacy_db_removed() {
-        let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("spools.redb");
-        let data_dir = dir.path().join("data");
-
-        let report = legacy_redb::migrate_from_redb(&db_path, &data_dir)
-            .expect("missing legacy db is a no-op");
-
-        assert_eq!(report.rows_seen, 0);
-        assert_eq!(report.sidecars_written, 0);
-        assert!(
-            !data_dir.exists(),
-            "no sidecars are created without a legacy db"
-        );
     }
 
     #[tokio::test]

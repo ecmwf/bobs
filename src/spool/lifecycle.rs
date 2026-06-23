@@ -1069,21 +1069,15 @@ mod tests {
     #[tokio::test]
     async fn test_complete_with_partial_page_survives_restart() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let page_size = 4096;
         let key = "partial-restart".to_string();
         let data = vec![0x5Au8; page_size + 904];
 
         {
-            let manager = SpoolManager::<TokioFileIO>::new(
-                &db_path,
-                &data_dir,
-                page_size,
-                16 * page_size,
-                256,
-            )
-            .expect("manager init");
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 16 * page_size, 256)
+                    .expect("manager init");
             manager
                 .create_spool(key.clone(), None, None, false)
                 .await
@@ -1099,9 +1093,8 @@ mod tests {
                 .expect("complete succeeds");
         }
 
-        let manager2 =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size, 256)
-                .expect("manager2 init");
+        let manager2 = SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 16 * page_size, 256)
+            .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
         let spool = manager2.get_spool(&key).expect("recovered spool exists");
 

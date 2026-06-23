@@ -3,7 +3,7 @@ use bobs::config::Config;
 use bobs::http::{router, AppState};
 use bobs::io::DefaultFileIO;
 use bobs::manager::SpoolManager;
-use bobs::metadata::{legacy_redb, DefaultMetadataStore};
+use bobs::metadata::DefaultMetadataStore;
 use bobs::shutdown;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -101,7 +101,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    legacy_redb::migrate_from_redb(config.data_dir.join("spools.redb"), &config.data_dir)?;
     let manager = Arc::new(
         SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
             DefaultMetadataStore::new(&config.data_dir),
