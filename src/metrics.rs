@@ -11,28 +11,26 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 #[cfg(feature = "telemetry")]
 use opentelemetry::KeyValue;
 
-#[cfg(feature = "telemetry")]
-use crate::config::MetricsConfig;
-
-/// Initialize the OpenTelemetry `SdkMeterProvider` with an OTLP HTTP exporter.
+/// Initialize the OpenTelemetry `SdkMeterProvider` with a Prometheus scrape exporter.
 ///
-/// Returns `Some(provider)` if the endpoint is configured, `None` otherwise.
-/// The caller must hold the returned provider and call `shutdown()` on exit.
+/// Returns `(provider, registry)`. The caller must hold the provider, pass the
+/// registry to `serve_metrics`, and call `provider.shutdown()` on exit.
 #[cfg(feature = "telemetry")]
 pub fn init_meter_provider(
-    config: &MetricsConfig,
     hostname: &str,
-) -> Option<opentelemetry_sdk::metrics::SdkMeterProvider> {
-    use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::metrics::SdkMeterProvider;
+) -> (
+    opentelemetry_sdk::metrics::SdkMeterProvider,
+    prometheus::Registry,
+) {
     use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
 
-    let endpoint = config.otlp_endpoint.as_deref()?;
-    let metrics_endpoint = if endpoint.ends_with("/v1/metrics") {
-        endpoint.to_owned()
-    } else {
-        format!("{}/v1/metrics", endpoint.trim_end_matches('/'))
-    };
+    let registry = prometheus::Registry::new();
+
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .build()
+        .expect("prometheus exporter should build");
 
     let environment = std::env::var("POLYTOPE_ENV").unwrap_or_else(|_| "unknown".to_string());
 
@@ -49,24 +47,50 @@ pub fn init_meter_provider(
         ])
         .build();
 
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_http()
-        .with_endpoint(&metrics_endpoint)
-        .build()
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "failed to build OTLP metric exporter");
-            std::process::exit(1);
-        });
-
-    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
-
     let provider = SdkMeterProvider::builder()
         .with_resource(resource)
-        .with_reader(reader)
+        .with_reader(exporter)
         .build();
 
     opentelemetry::global::set_meter_provider(provider.clone());
-    Some(provider)
+    (provider, registry)
+}
+
+/// Spawn a minimal HTTP server exposing `GET /metrics` for Prometheus scraping.
+#[cfg(feature = "telemetry")]
+pub async fn serve_metrics(registry: prometheus::Registry, port: u16) {
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use axum::{Router, routing::get};
+    use prometheus::Encoder;
+
+    async fn handler(State(reg): State<prometheus::Registry>) -> impl IntoResponse {
+        let encoder = prometheus::TextEncoder::new();
+        let families = reg.gather();
+        let mut buf = Vec::new();
+        encoder.encode(&families, &mut buf).unwrap();
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                encoder.format_type().to_owned(),
+            )],
+            buf,
+        )
+    }
+
+    let app = Router::new()
+        .route("/metrics", get(handler))
+        .with_state(registry);
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(port, error = %e, "failed to bind metrics endpoint");
+            std::process::exit(1);
+        });
+
+    tracing::info!(port, "prometheus /metrics endpoint listening");
+    let _ = axum::serve(listener, app).await;
 }
 
 /// Deletion reason label values.
@@ -248,7 +272,7 @@ impl BobsMetrics {
             .collect()
     }
 
-    // ─── Spool Lifecycle ─────────────────────────────────────────────
+    // --- Spool Lifecycle ---
 
     #[allow(unused_variables)]
     pub fn record_spool_created(&self, labels: &HashMap<String, String>) {
@@ -278,7 +302,7 @@ impl BobsMetrics {
         }
     }
 
-    // ─── Write Path ──────────────────────────────────────────────────
+    // --- Write Path ---
 
     #[allow(unused_variables)]
     pub fn record_write_bytes(&self, labels: &HashMap<String, String>, bytes: u64) {
@@ -298,7 +322,7 @@ impl BobsMetrics {
         }
     }
 
-    // ─── Read Path ───────────────────────────────────────────────────
+    // --- Read Path ---
 
     #[allow(unused_variables)]
     pub fn record_read_bytes(&self, labels: &HashMap<String, String>, mode: &str, bytes: u64) {
@@ -345,7 +369,7 @@ impl BobsMetrics {
         }
     }
 
-    // ─── System-Level ────────────────────────────────────────────────
+    // --- System-Level ---
 
     #[allow(unused_variables)]
     pub fn record_state_transition(&self, old_state: Option<&str>, new_state: &str) {
@@ -424,8 +448,6 @@ mod tests {
 
     #[test]
     fn allowed_labels_empty_passes_all() {
-        // With telemetry feature disabled, this is just a no-op test.
-        // With telemetry enabled, caller_attrs would filter.
         let metrics = BobsMetrics::new(false, vec![], 128);
         let labels: HashMap<String, String> = [
             ("collection".into(), "era5".into()),
@@ -434,7 +456,6 @@ mod tests {
         .into_iter()
         .collect();
 
-        // Should not panic regardless of labels content.
         metrics.record_spool_created(&labels);
     }
 

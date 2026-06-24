@@ -38,9 +38,8 @@ pub struct Config {
 pub struct MetricsConfig {
     /// Enable OpenTelemetry metrics export.
     pub enabled: bool,
-    /// OTLP HTTP endpoint (e.g. "http://otel-collector:4318").
-    /// Required when `enabled` is true.
-    pub otlp_endpoint: Option<String>,
+    /// Port for the Prometheus `/metrics` scrape endpoint.
+    pub port: u16,
     /// Only these label keys are propagated as metric attributes.
     /// If empty, ALL caller-provided labels are propagated.
     pub allowed_labels: Vec<String>,
@@ -52,7 +51,7 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         MetricsConfig {
             enabled: false,
-            otlp_endpoint: None,
+            port: 9090,
             allowed_labels: Vec::new(),
             max_label_value_length: 128,
         }
@@ -151,13 +150,6 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "route_name must be set in config",
-            ));
-        }
-
-        if self.metrics.enabled && self.metrics.otlp_endpoint.is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "metrics.otlp_endpoint must be set when metrics are enabled",
             ));
         }
 

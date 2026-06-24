@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use tower::ServiceExt;
 
 #[cfg(feature = "telemetry")]
-use bobs::metrics::init_meter_provider;
+use bobs::metrics::{init_meter_provider, serve_metrics};
 
 fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
     hostname
@@ -100,11 +100,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "telemetry")]
     let _meter_provider = if config.metrics.enabled {
-        let provider = init_meter_provider(&config.metrics, &hostname);
-        if provider.is_some() {
-            tracing::info!("event.name" = "startup.metrics.enabled", outcome = "success", endpoint = ?config.metrics.otlp_endpoint, "OTLP metrics exporter enabled");
-        }
-        provider
+        let (provider, registry) = init_meter_provider(&hostname);
+        let metrics_port = config.metrics.port;
+        tokio::spawn(serve_metrics(registry, metrics_port));
+        tracing::info!("event.name" = "startup.metrics.enabled", outcome = "success", port = metrics_port, "prometheus /metrics scrape endpoint enabled");
+        Some(provider)
     } else {
         None
     };
