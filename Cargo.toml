@@ -29,15 +29,14 @@ tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 dashmap = "6"
 async-stream = "0.3"
-crc32c = "0.6"
-base64 = "0.22"
-serde_yml = "0.0.12"
 num_cpus = "1"
 siphasher = "1"
 opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", features = ["metrics"], optional = true }
 opentelemetry-prometheus = { version = "0.32", optional = true }
 prometheus = { version = "0.14", optional = true, default-features = false }
+serde_norway = "0.9.42"
+pprof = { version = "0.14", features = ["flamegraph"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Low-level Linux interface chosen over tokio-uring and compio to avoid a
@@ -49,3 +48,8 @@ io-uring = "0.7"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tempfile = "3"
 tower = "0.5"
+
+# Keep symbol/line info in release so the in-process CPU profiler
+# (/debug/pprof/profile) produces a readable flamegraph.
+[profile.release]
+debug = 1

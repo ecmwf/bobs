@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
 pub mod coverage;
@@ -30,7 +30,6 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub write_buffer: Arc<Mutex<BytesMut>>,
     pub file_handle: Arc<Mutex<Option<F::Handle>>>,
     pub metadata_store: M,
-    pub running_crc32c: Arc<Mutex<u32>>,
     /// Writer notifies after each completed page; readers long-poll on this.
     pub notify: Arc<Notify>,
     /// Fired on spool deletion to unblock any waiting readers.
@@ -49,6 +48,9 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub full_object_read_at: Arc<AtomicU64>,
     /// Metrics handle for cache hit/miss recording.
     pub metrics: Arc<BobsMetrics>,
+    /// Admission permit held while this spool can retain first-read cache memory.
+    /// Released at the full-read transition, or on deletion/drop if that happens first.
+    admission_permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
     pub(crate) _phantom: PhantomData<F>,
 }
 
@@ -65,6 +67,27 @@ where
         metadata_store: M,
         metrics: Arc<BobsMetrics>,
     ) -> Self {
+        Self::new_with_admission(
+            metadata,
+            file_handle,
+            page_size,
+            page_cache,
+            metadata_store,
+            metrics,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_with_admission(
+        metadata: SpoolMetadata,
+        file_handle: F::Handle,
+        page_size: usize,
+        page_cache: Arc<Mutex<PageCache>>,
+        metadata_store: M,
+        metrics: Arc<BobsMetrics>,
+        admission_permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
         let data_path = metadata.data_path.clone();
         let key = metadata.key.clone();
 
@@ -75,7 +98,6 @@ where
             write_buffer: Arc::new(Mutex::new(BytesMut::new())),
             file_handle: Arc::new(Mutex::new(Some(file_handle))),
             metadata_store,
-            running_crc32c: Arc::new(Mutex::new(0)),
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
             page_size,
@@ -85,7 +107,14 @@ where
             last_read_activity_at: Arc::new(AtomicU64::new(0)),
             full_object_read_at: Arc::new(AtomicU64::new(0)),
             metrics,
+            admission_permit: std::sync::Mutex::new(admission_permit),
             _phantom: PhantomData,
+        }
+    }
+
+    pub fn release_admission(&self) {
+        if let Ok(mut permit) = self.admission_permit.lock() {
+            permit.take();
         }
     }
 

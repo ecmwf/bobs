@@ -3,7 +3,7 @@ use bobs::config::Config;
 use bobs::http::{router, AppState};
 use bobs::io::DefaultFileIO;
 use bobs::manager::SpoolManager;
-use bobs::metadata::{legacy_redb, DefaultMetadataStore};
+use bobs::metadata::DefaultMetadataStore;
 use bobs::metrics::BobsMetrics;
 use bobs::shutdown;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -17,17 +17,21 @@ use tower::ServiceExt;
 use bobs::metrics::{init_meter_provider, serve_metrics};
 
 fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
-    hostname
-        .rsplit('-')
-        .next()
-        .filter(|segment| !segment.is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "HOSTNAME must contain '-' (e.g. bobs-0)",
-            )
-        })
+    let (_, ordinal) = hostname.rsplit_once('-').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOSTNAME must end with a numeric StatefulSet ordinal (e.g. bobs-0)",
+        )
+    })?;
+
+    if ordinal.is_empty() || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOSTNAME must end with a numeric StatefulSet ordinal (e.g. bobs-0)",
+        ));
+    }
+
+    Ok(ordinal.to_string())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,6 +83,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_dir = %config.data_dir.display(),
         page_size = config.page_size,
         max_cache_bytes = config.max_cache_bytes,
+        max_live_spools = config.max_live_spools,
         route_name = %config.route_name,
         public_base = %format!("https://{}.{}/{}-{}/api/v1", config.host_prefix, config.domain, config.route_name, ordinal),
         internal_base_url = %internal_base_url,
@@ -87,16 +92,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     {
-        let ring_pool = bobs::io::initialize_production_ring_pool(config.io_uring_shards)?;
+        let ring_pool = bobs::io::initialize_production_ring_pool(
+            config.io_uring_shards,
+            config.io_uring_queue_capacity,
+        )?;
         tracing::debug!(
             configured_shards = ?ring_pool.configured_shards,
             resolved_shards = ring_pool.resolved_shards,
             cpu_pinning_enabled = ring_pool.cpu_pinning_enabled,
+            queue_capacity = config.io_uring_queue_capacity,
             "io_uring production ring pool initialized",
         );
     }
 
-    legacy_redb::migrate_from_redb(config.data_dir.join("spools.redb"), &config.data_dir)?;
 
     #[cfg(feature = "telemetry")]
     let _meter_provider = if config.metrics.enabled {
@@ -120,6 +128,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.data_dir,
         config.page_size,
         config.max_cache_bytes,
+        config.max_live_spools,
     )?;
     manager.set_metrics(Arc::clone(&metrics));
     let manager = Arc::new(manager);
@@ -142,6 +151,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 16 MiB h2 windows — one body fits in a single window with no flow-control pauses.
     const H2_WINDOW: u32 = 16 * 1024 * 1024;
+    // Largest HTTP/2 frame we let peers send us (spec ceiling 2^24-1). The default is
+    // 16 KiB, which shreds a 16 MiB write body into ~1024 DATA frames; at the ceiling a
+    // 16 MiB body is ~1-2 frames. After CRC removal the per-frame h2 codec/flow-control
+    // work was ~37% of BOBS CPU on the worker->BOBS write path — this collapses it.
+    const H2_MAX_FRAME: u32 = 16 * 1024 * 1024 - 1;
 
     let mut shutdown = std::pin::pin!(shutdown::shutdown_signal());
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -157,7 +171,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     builder
                         .http2()
                         .initial_stream_window_size(H2_WINDOW)
-                        .initial_connection_window_size(H2_WINDOW);
+                        .initial_connection_window_size(H2_WINDOW)
+                        .max_frame_size(H2_MAX_FRAME);
                     let svc = hyper::service::service_fn(move |req| {
                         let app = app.clone();
                         async move { app.oneshot(req).await }
@@ -227,5 +242,24 @@ async fn main() {
     if let Err(error) = run().await {
         tracing::error!(error = %error, "BOBS failed to start");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ordinal_accepts_numeric_final_segment() {
+        assert_eq!(parse_ordinal("bobs-0").expect("ordinal"), "0");
+        assert_eq!(parse_ordinal("release-bobs-12").expect("ordinal"), "12");
+    }
+
+    #[test]
+    fn parse_ordinal_rejects_malformed_hostnames() {
+        for hostname in ["bobs", "bobs-", "bobs-a", "bobs-١"] {
+            let error = parse_ordinal(hostname).expect_err("hostname should be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 }

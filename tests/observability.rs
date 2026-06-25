@@ -40,6 +40,7 @@ fn test_config(dir: &std::path::Path) -> Arc<Config> {
         data_dir: dir.to_path_buf(),
         page_size: 4096,
         max_cache_bytes: 65536,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         read_idle_ttl_secs: 600,
         full_read_complete_ttl_secs: 30,
@@ -48,6 +49,7 @@ fn test_config(dir: &std::path::Path) -> Arc<Config> {
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -64,6 +66,7 @@ async fn app() -> axum::Router {
             &data_dir,
             4096,
             65536,
+            256,
         )
         .expect("manager"),
     );

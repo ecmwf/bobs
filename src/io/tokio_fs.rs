@@ -90,8 +90,20 @@ impl FileIO for TokioFileIO {
         async move {
             task::spawn_blocking(move || {
                 let mut buf = vec![0u8; len];
-                let n = file.read_at(&mut buf, offset)?;
-                buf.truncate(n);
+                // A single pread may return fewer bytes than requested (a short
+                // read), which is more likely the larger the page. Loop to fill
+                // the whole buffer (mirroring write_at), stopping only at EOF, so
+                // callers never receive a truncated mid-file page -- a truncated
+                // page stalls the streaming follow-reader on large objects.
+                let mut total = 0usize;
+                while total < len {
+                    let n = file.read_at(&mut buf[total..], offset + total as u64)?;
+                    if n == 0 {
+                        break; // EOF
+                    }
+                    total += n;
+                }
+                buf.truncate(total);
                 Ok(Bytes::from(buf))
             })
             .await
@@ -122,7 +134,7 @@ impl FileIO for TokioFileIO {
 }
 
 fn join_error_to_io(error: task::JoinError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, error)
+    std::io::Error::other(error)
 }
 
 #[cfg(test)]
@@ -165,5 +177,29 @@ mod tests {
     #[tokio::test]
     async fn tokio_fileio_close_and_drop_are_safe() {
         Suite::close_and_drop_are_safe().await;
+    }
+
+    #[tokio::test]
+    async fn tokio_fileio_read_at_fills_large_buffer_not_short() {
+        // read_at must return the whole requested span (until EOF), never a
+        // truncated mid-file page -- the invariant that keeps the streaming
+        // follow-reader from spinning on large (e.g. 16 MiB page) objects.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        let handle = TokioFileIO::create(&path).await.unwrap();
+        let size = 8 * 1024 * 1024;
+        let data = Bytes::from((0..size).map(|i| i as u8).collect::<Vec<u8>>());
+        let written = TokioFileIO::write_at(&handle, 0, data.clone())
+            .await
+            .unwrap();
+        assert_eq!(written, size);
+        TokioFileIO::sync_data(&handle).await.unwrap();
+        let read = TokioFileIO::read_at(&handle, 0, size).await.unwrap();
+        assert_eq!(
+            read.len(),
+            size,
+            "read_at must fill the entire buffer, not short-read"
+        );
+        assert_eq!(&read[..], &data[..]);
     }
 }

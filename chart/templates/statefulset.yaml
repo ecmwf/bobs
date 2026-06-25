@@ -23,6 +23,8 @@ spec:
         app.kubernetes.io/instance: '{{ .Release.Name }}'
     spec:
       {{- include "bobs.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: bobs
           image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'
@@ -33,7 +35,25 @@ spec:
             - name: http
               containerPort: {{ .Values.config.port }}
               protocol: TCP
-          resources: {}
+          env:
+            - name: BOBS_INTERNAL_BASE_URL_TEMPLATE
+              value: {{ tpl .Values.internalBaseUrlTemplate . | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /etc/bobs

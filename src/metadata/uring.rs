@@ -439,7 +439,6 @@ mod tests {
             last_read_at: None,
             readable_at: Some(30 + generation),
             total_bytes_written: generation * 4096,
-            checksum_crc32c: Some(generation as u32),
             total_pages: generation,
             final_page_size: if generation == 0 { None } else { Some(4096) },
             data_path: PathBuf::from(format!("/tmp/sidecar-test-key.{generation}.data")),
@@ -585,6 +584,7 @@ mod tests {
         let pool = Arc::new(
             RingPool::new_for_test(RingPoolOptions {
                 shard_count: 4,
+                queue_capacity: 1024,
                 driver_name_prefix: "bobs-metadata-routing-test".to_owned(),
             })
             .expect("metadata routing test ring pool should start"),
@@ -614,7 +614,6 @@ mod tests {
             new.last_write_at = 22;
             new.readable_at = Some(32);
             new.total_bytes_written = 8192;
-            new.checksum_crc32c = Some(2);
             new.total_pages = 2;
             new.data_path = PathBuf::from(format!("/tmp/linked-chain-shard-{shard_index}.2.data"));
             let sync_store = crate::metadata::SyncSidecarMetadataStore::new(dir.path());

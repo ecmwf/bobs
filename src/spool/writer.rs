@@ -3,6 +3,7 @@ use bytes::Bytes;
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::spool::{Spool, SpoolState};
+use crate::time::now_secs;
 
 impl<F, M> Spool<F, M>
 where
@@ -57,11 +58,6 @@ where
                     format!("short write: wrote {written} of {} bytes", data.len()),
                 )));
             }
-        }
-
-        {
-            let mut crc = self.running_crc32c.lock().await;
-            *crc = crc32c::crc32c_append(*crc, &data);
         }
 
         let mut cursor = 0;
@@ -122,13 +118,6 @@ where
     }
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,7 +149,6 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,

@@ -41,7 +41,7 @@ BOBS persists two things with different authority:
 
 Ordinary writes deliberately do not update a durable high-water mark, and completed pages do not commit per-page metadata. Adding a mandatory per-write or per-page checkpoint would put metadata commits back on the write hot path, which this design avoids.
 
-While a spool is still `Writing` or `WriteLocked`, persisted byte-derived metadata such as `total_bytes_written`, `total_pages`, `final_page_size`, and `checksum_crc32c` is advisory and may be stale. Recovery derives those values from `spool.dat`: the logical accepted length comes from the data file length, page counts and partial-page state are reconstructed from that length, and the running CRC is recomputed by scanning the file bytes.
+While a spool is still `Writing` or `WriteLocked`, persisted byte-derived metadata such as `total_bytes_written`, `total_pages`, and `final_page_size` is advisory and may be stale. Recovery derives those values from `spool.dat`: the logical accepted length comes from the data file length, and page counts and partial-page state are reconstructed from that length.
 
 The in-progress durability invariant is recovery from a BOBS restart, not survival of a node or storage crash before `/complete`. A successful `/write` therefore requires the bytes to have been accepted by the kernel/file handle before the handler returns, but it does not require `sync_data()`. `/complete` is the durability boundary for a finished object: BOBS syncs `spool.dat` data before committing final completed metadata.
 

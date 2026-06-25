@@ -1,5 +1,4 @@
 use axum::Router;
-use base64::Engine;
 use bobs::cleanup::start_cleanup_task;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
@@ -90,6 +89,7 @@ async fn start_server() -> TestServer {
         data_dir: std::path::PathBuf::from("./data"), // overridden
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         read_idle_ttl_secs: 600,
         full_read_complete_ttl_secs: 30,
@@ -98,6 +98,7 @@ async fn start_server() -> TestServer {
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -138,6 +139,7 @@ async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path
             &data_dir,
             config.page_size,
             config.max_cache_bytes,
+            config.max_live_spools,
         )
         .expect("init manager"),
     );
@@ -205,6 +207,7 @@ async fn assert_http_restart_continues_from_acknowledged_offset(
         data_dir: std::path::PathBuf::from("./data"),
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         read_idle_ttl_secs: 600,
         full_read_complete_ttl_secs: 30,
@@ -213,6 +216,7 @@ async fn assert_http_restart_continues_from_acknowledged_offset(
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -302,6 +306,7 @@ async fn test_http_restart_persists_write_locked_and_readable_metadata_sidecar()
         data_dir: std::path::PathBuf::from("./data"),
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         read_idle_ttl_secs: 600,
         full_read_complete_ttl_secs: 30,
@@ -310,6 +315,7 @@ async fn test_http_restart_persists_write_locked_and_readable_metadata_sidecar()
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -643,51 +649,6 @@ async fn test_error_cases() {
 }
 
 #[tokio::test]
-async fn test_checksum_verification() {
-    let server = start_server().await;
-    let client = reqwest::Client::new();
-    let key = create_key(&client, &server.base_url, None).await;
-
-    let data = vec![0x42u8; 8192];
-    let expected_crc = crc32c::crc32c(&data);
-
-    client
-        .post(format!("{}/api/v1/write/{}/0", server.base_url, key))
-        .body(data.clone())
-        .send()
-        .await
-        .expect("write send");
-
-    client
-        .post(format!("{}/api/v1/complete/{}", server.base_url, key))
-        .send()
-        .await
-        .expect("complete send");
-
-    let read_resp = client
-        .get(format!("{}/api/v1/read/{}", server.base_url, key))
-        .header("Range", format!("bytes=0-{}", data.len() - 1))
-        .send()
-        .await
-        .expect("read send");
-    assert_eq!(read_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-
-    let checksum_header = read_resp
-        .headers()
-        .get("X-Checksum-CRC32C")
-        .expect("checksum header should be present")
-        .to_str()
-        .expect("valid header string")
-        .to_string();
-
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&checksum_header)
-        .expect("valid base64");
-    let actual_crc = u32::from_be_bytes(decoded.try_into().expect("4 bytes"));
-    assert_eq!(actual_crc, expected_crc);
-}
-
-#[tokio::test]
 async fn test_content_encoding_roundtrip() {
     let server = start_server().await;
     let client = reqwest::Client::new();
@@ -956,6 +917,7 @@ async fn test_many_active_spools_share_global_cache_cap() {
         data_dir: std::path::PathBuf::from("./data"),
         page_size,
         max_cache_bytes,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         read_idle_ttl_secs: 600,
         full_read_complete_ttl_secs: 30,
@@ -964,6 +926,7 @@ async fn test_many_active_spools_share_global_cache_cap() {
         cleanup_sweep_interval_secs: 30,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -1118,6 +1081,7 @@ fn config_short_full_read_ttl() -> Arc<Config> {
         data_dir: std::path::PathBuf::from("./data"), // overridden by start_server_with_config
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         full_read_complete_ttl_secs: 1,
         read_idle_ttl_secs: 60,
@@ -1126,6 +1090,7 @@ fn config_short_full_read_ttl() -> Arc<Config> {
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -1141,6 +1106,7 @@ fn config_short_idle_ttl() -> Arc<Config> {
         data_dir: std::path::PathBuf::from("./data"),
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         full_read_complete_ttl_secs: 60,
         read_idle_ttl_secs: 1,
@@ -1149,6 +1115,7 @@ fn config_short_idle_ttl() -> Arc<Config> {
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -1278,6 +1245,7 @@ async fn test_idle_ttl_not_anchored_on_created_at() {
         data_dir: std::path::PathBuf::from("./data"),
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         full_read_complete_ttl_secs: 60,
         read_idle_ttl_secs: 2,
@@ -1286,6 +1254,7 @@ async fn test_idle_ttl_not_anchored_on_created_at() {
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
@@ -1355,6 +1324,7 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
         data_dir: std::path::PathBuf::from("./data"),
         page_size: 4096,
         max_cache_bytes: 262144,
+        max_live_spools: 256,
         writer_inactivity_timeout_secs: 300,
         // Long full-read TTL so it does not fire before we finish simulating
         // the slow reader.
@@ -1367,6 +1337,7 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
         cleanup_sweep_interval_secs: 1,
         long_poll_timeout_ms: 25000,
         io_uring_shards: None,
+        io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),

@@ -3,6 +3,7 @@ use crate::io::FileIO;
 use crate::manager::{DeleteReason, SpoolManager};
 use crate::metadata::MetadataStore;
 use crate::spool::SpoolState;
+use crate::time::now_secs;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -170,12 +171,6 @@ async fn measure_disk_usage(data_dir: &std::path::Path) -> std::io::Result<u64> 
     Ok(total)
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 #[cfg(test)]
 mod tests {
@@ -193,6 +188,7 @@ mod tests {
             data_dir: std::path::PathBuf::from("./data"),
             page_size: 4096,
             max_cache_bytes: 65536,
+            max_live_spools: 256,
             writer_inactivity_timeout_secs: 1,
             read_idle_ttl_secs: 1,
             full_read_complete_ttl_secs: 1,
@@ -201,6 +197,7 @@ mod tests {
             cleanup_sweep_interval_secs: 1,
             long_poll_timeout_ms: 25000,
             io_uring_shards: None,
+            io_uring_queue_capacity: 1024,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
@@ -210,11 +207,9 @@ mod tests {
 
     async fn test_manager() -> Arc<SpoolManager<TokioFileIO>> {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
-                .expect("manager init"),
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 256).expect("manager init"),
         )
     }
 
@@ -281,13 +276,12 @@ mod tests {
     async fn test_recovered_in_progress_stale_last_write_survives_first_cleanup() {
         tokio::time::pause();
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let config = test_config();
         let key = uuid::Uuid::new_v4().to_string();
 
         {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+            let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 256)
                 .expect("manager init");
             manager
                 .create_spool(key.clone(), None, None, false, HashMap::new())
@@ -307,7 +301,7 @@ mod tests {
         }
 
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 256)
                 .expect("manager init after restart"),
         );
         manager.recover().await.expect("recover");
@@ -336,13 +330,12 @@ mod tests {
     async fn test_post_recovery_write_refreshes_last_write_anchor() {
         tokio::time::pause();
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let config = test_config();
         let key = uuid::Uuid::new_v4().to_string();
 
         {
-            let manager = SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+            let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 256)
                 .expect("manager init");
             manager
                 .create_spool(key.clone(), None, None, false, HashMap::new())
@@ -357,7 +350,7 @@ mod tests {
         }
 
         let manager = Arc::new(
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, 4096, 65536)
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 256)
                 .expect("manager init after restart"),
         );
         manager.recover().await.expect("recover");

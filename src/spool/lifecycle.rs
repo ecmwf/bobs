@@ -2,18 +2,10 @@ use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::metrics;
 use crate::spool::types::SpoolState;
-use bytes::BytesMut;
+use crate::time::now_secs;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::Spool;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 fn state_label(state: &SpoolState) -> &'static str {
     match state {
@@ -33,42 +25,58 @@ where
     /// disk, fsync, and transition to Complete. Notifies all waiting readers so
     /// they can see the final data and detect end-of-stream.
     pub async fn complete(&self, expected_size: Option<u64>) -> Result<()> {
-        {
+        let mut buf = self.write_buffer.lock().await;
+
+        let terminal_metadata = {
             let meta = self.metadata.lock().await;
             if matches!(meta.state, SpoolState::Complete | SpoolState::Deleting) {
-                return Ok(());
-            }
-        }
-
-        // Drain the write buffer — this is the final (possibly partial) page.
-        // Spool::write has already appended these bytes to spool.dat; completion
-        // only publishes page metadata/cache so readers can observe the partial
-        // final page. Do not rewrite the page here: the disk append is the source
-        // of persistence.
-        let partial_page = {
-            let mut buf = self.write_buffer.lock().await;
-            if buf.is_empty() {
-                None
+                Some(meta.clone())
             } else {
-                Some(std::mem::replace(&mut *buf, BytesMut::new()).freeze())
+                if let Some(expected) = expected_size {
+                    if meta.total_bytes_written != expected {
+                        return Err(BobsError::SizeMismatch {
+                            expected,
+                            actual: meta.total_bytes_written,
+                        });
+                    }
+                }
+                None
             }
         };
 
-        if let Some(page_data) = partial_page {
-            let partial_size = page_data.len() as u64;
-            let page_idx = {
-                let mut meta = self.metadata.lock().await;
-                let page_idx = meta.total_pages;
-                meta.total_pages += 1;
-                meta.final_page_size = Some(partial_size);
-                page_idx
-            };
-
-            {
-                let mut cache = self.page_cache.lock().await;
-                cache.insert(&self.key, page_idx, page_data);
+        if let Some(meta) = terminal_metadata {
+            let durable = self.metadata_store.read(&self.key).await?;
+            let durable_is_terminal = durable.as_ref().is_some_and(|metadata| {
+                matches!(metadata.state, SpoolState::Complete | SpoolState::Deleting)
+            });
+            if durable_is_terminal {
+                return Ok(());
             }
+            self.persist_metadata(&meta).await?;
+            return Ok(());
         }
+
+        // The write buffer is the final (possibly partial) page. Spool::write has
+        // already appended these bytes to spool.dat; completion only publishes
+        // page metadata/cache after the data file and sidecar metadata are durable.
+        let partial_page = (!buf.is_empty()).then(|| buf.clone().freeze());
+        let partial_page_idx = {
+            let meta = self.metadata.lock().await;
+            meta.total_pages
+        };
+
+        let (candidate, total_size) = {
+            let meta = self.metadata.lock().await;
+            let mut candidate = meta.clone();
+            if let Some(page_data) = partial_page.as_ref() {
+                candidate.total_pages += 1;
+                candidate.final_page_size = Some(page_data.len() as u64);
+            }
+            candidate.state = SpoolState::Complete;
+            candidate.readable_at.get_or_insert_with(now_secs);
+            let total_size = candidate.total_bytes_written;
+            (candidate, total_size)
+        };
 
         {
             let handle_guard = self.file_handle.lock().await;
@@ -77,50 +85,76 @@ where
             }
         }
 
-        let crc32c = *self.running_crc32c.lock().await;
+        self.persist_metadata(&candidate).await?;
+
+        if let Some(page_data) = partial_page {
+            buf.clear();
+            let mut cache = self.page_cache.lock().await;
+            cache.insert(&self.key, partial_page_idx, page_data);
+        }
 
         {
             let mut meta = self.metadata.lock().await;
             if let Some(expected) = expected_size {
-                if meta.total_bytes_written != expected {
+                if candidate.total_bytes_written != expected {
                     return Err(BobsError::SizeMismatch {
                         expected,
-                        actual: meta.total_bytes_written,
+                        actual: candidate.total_bytes_written,
                     });
                 }
             }
-            meta.checksum_crc32c = Some(crc32c);
             let old_state = meta.state.clone();
-            meta.state = SpoolState::Complete;
-            meta.readable_at.get_or_insert_with(now_secs);
+            *meta = candidate;
             self.metrics.record_state_transition(
                 Some(state_label(&old_state)),
                 crate::metrics::state::COMPLETE,
             );
         }
 
-        let (meta, total_size) = {
-            let m = self.metadata.lock().await.clone();
-            let sz = m.total_bytes_written;
-            (m, sz)
-        };
-        self.persist_metadata(&meta).await?;
-
         // Initialize coverage tracking and detect immediate full-coverage
         // (zero-byte objects or objects whose bytes were all served pre-complete).
-        {
+        let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.initialize(total_size);
-            if mr.is_complete() {
-                self.full_object_read_at
+            mr.is_complete()
+                && self
+                    .full_object_read_at
                     .compare_exchange(0, now_secs(), Ordering::SeqCst, Ordering::SeqCst)
-                    .ok();
-            }
+                    .is_ok()
+        };
+        if became_fully_read {
+            self.on_fully_read().await;
         }
 
         self.notify.notify_waiters();
 
         Ok(())
+    }
+
+    /// Record that a byte range has been served and run the first full-read
+    /// transition exactly once when coverage reaches the complete object.
+    pub async fn mark_served_and_maybe_fully_read(&self, start: u64, end: u64, now: u64) {
+        let became_fully_read = {
+            let mut mr = self.missing_ranges.lock().await;
+            mr.mark_served(start, end);
+            mr.is_complete()
+                && self.full_object_read_at.load(Ordering::Relaxed) == 0
+                && self
+                    .full_object_read_at
+                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+        };
+
+        if became_fully_read {
+            self.on_fully_read().await;
+        }
+    }
+
+    /// First full-read transition hook. At this point every byte has been served
+    /// at least once, so the first-read page cache for this spool is redundant.
+    pub async fn on_fully_read(&self) {
+        self.page_cache.lock().await.free_spool(&self.key);
+        self.release_admission();
     }
 
     pub async fn set_write_locked(&self, locked: bool) -> Result<()> {
@@ -191,7 +225,7 @@ mod tests {
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use tempfile::tempdir;
 
@@ -448,6 +482,54 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct FailFirstCompleteMetadataStore {
+        inner: SyncSidecarMetadataStore,
+        failed_once: Arc<AtomicBool>,
+    }
+
+    impl FailFirstCompleteMetadataStore {
+        fn new(data_dir: impl Into<PathBuf>) -> Self {
+            Self {
+                inner: SyncSidecarMetadataStore::new(data_dir),
+                failed_once: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl MetadataStore for FailFirstCompleteMetadataStore {
+        type WriteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+        type ReadFuture<'a> =
+            Pin<Box<dyn Future<Output = Result<Option<SpoolMetadata>>> + Send + 'a>>;
+        type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+        type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
+
+        fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
+            Box::pin(async move {
+                if metadata.state == SpoolState::Complete
+                    && !self.failed_once.swap(true, AtomicOrdering::SeqCst)
+                {
+                    return Err(storage_error(io::Error::other(
+                        "injected complete metadata write failure",
+                    )));
+                }
+                self.inner.write(metadata).await
+            })
+        }
+
+        fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
+            Box::pin(async move { self.inner.read(key).await })
+        }
+
+        fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
+            Box::pin(async move { self.inner.delete(key).await })
+        }
+
+        fn list(&self) -> Result<Self::ListIter> {
+            Ok(Vec::new().into_iter())
+        }
+    }
+
+    #[derive(Clone)]
     struct SyncFailingFileIO;
 
     impl FileIO for SyncFailingFileIO {
@@ -481,15 +563,8 @@ mod tests {
             TokioFileIO::read_at(handle, offset, len)
         }
 
-        fn sync_data(
-            _handle: &Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            async move {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "injected sync failure",
-                ))
-            }
+        async fn sync_data(_handle: &Self::Handle) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected sync failure"))
         }
 
         fn close(
@@ -522,7 +597,6 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,
@@ -583,7 +657,51 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
+            total_pages: 0,
+            final_page_size: None,
+            data_path: path,
+            labels: HashMap::new(),
+        };
+        metadata_store
+            .write(&meta)
+            .await
+            .expect("insert initial metadata");
+
+        Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false, vec![], 128)),
+        )
+        .await
+    }
+
+    async fn make_fail_first_metadata_spool(
+        dir: &std::path::Path,
+        page_size: usize,
+    ) -> Spool<TokioFileIO, FailFirstCompleteMetadataStore> {
+        let spool_dir = dir.join("test-key");
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .expect("create spool dir");
+        let path = spool_dir.join("spool.dat");
+        let metadata_store = FailFirstCompleteMetadataStore::new(dir);
+        let handle = TokioFileIO::create(&path).await.expect("create spool file");
+        let meta = SpoolMetadata {
+            key: "test-key".to_string(),
+            content_type: None,
+            content_encoding: None,
+            state: SpoolState::Writing,
+            write_locked: false,
+            created_at: 0,
+            last_write_at: 0,
+            last_read_at: None,
+            readable_at: None,
+            total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
             data_path: path,
@@ -628,7 +746,6 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,
@@ -656,6 +773,7 @@ mod tests {
     fn explicit_test_ring_pool_options(shard_count: usize) -> RingPoolOptions {
         RingPoolOptions {
             shard_count,
+            queue_capacity: 1024,
             driver_name_prefix: "bobs-complete-routing-test".to_owned(),
         }
     }
@@ -685,7 +803,6 @@ mod tests {
             last_read_at: None,
             readable_at: None,
             total_bytes_written: 0,
-            checksum_crc32c: None,
             total_pages: 0,
             final_page_size: None,
             data_path: path,
@@ -809,10 +926,6 @@ mod tests {
         assert_eq!(persisted.total_bytes_written, partial_data.len() as u64);
         assert_eq!(persisted.total_pages, 1);
         assert_eq!(persisted.final_page_size, Some(partial_data.len() as u64));
-        assert_eq!(
-            persisted.checksum_crc32c,
-            Some(crc32c::crc32c(&partial_data))
-        );
     }
 
     #[tokio::test]
@@ -897,7 +1010,6 @@ mod tests {
                 last_read_at: None,
                 readable_at: None,
                 total_bytes_written: 0,
-                checksum_crc32c: None,
                 total_pages: 0,
                 final_page_size: None,
                 data_path: path,
@@ -965,7 +1077,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_does_not_persist_final_metadata_if_sync_data_fails() {
+    async fn test_complete_does_not_publish_final_partial_page_if_sync_data_fails() {
         let dir = tempdir().expect("create tempdir");
         let spool = make_sync_failing_spool(dir.path(), 4096).await;
         let partial_data = vec![0xE6u8; 333];
@@ -978,25 +1090,29 @@ mod tests {
         let result = spool.complete(Some(partial_data.len() as u64)).await;
         assert!(matches!(result, Err(BobsError::IoError(_))));
 
-        let cached = {
+        {
             let cache = spool.page_cache.lock().await;
-            cache
-                .get(&spool.key, 0)
-                .expect("final partial page is published before sync")
-        };
-        assert_eq!(cached.as_ref(), partial_data.as_slice());
+            assert!(
+                cache.get(&spool.key, 0).is_none(),
+                "final partial page must not be published before sync succeeds"
+            );
+        }
+
+        let meta = spool.metadata.lock().await;
+        assert_eq!(meta.state, SpoolState::Writing);
+        assert_eq!(meta.total_pages, 0);
+        assert_eq!(meta.final_page_size, None);
+        drop(meta);
 
         let persisted = persisted_metadata(&spool).await;
         assert_eq!(persisted.state, SpoolState::Writing);
         assert_eq!(persisted.total_pages, 0);
         assert_eq!(persisted.final_page_size, None);
-        assert_eq!(persisted.checksum_crc32c, None);
     }
 
     #[tokio::test]
     async fn test_complete_with_partial_page_survives_restart() {
         let dir = tempdir().expect("create tempdir");
-        let db_path = dir.path().join("legacy-metadata.db");
         let data_dir = dir.path().join("data");
         let page_size = 4096;
         let key = "partial-restart".to_string();
@@ -1004,7 +1120,7 @@ mod tests {
 
         {
             let manager =
-                SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
+                SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 16 * page_size, 256)
                     .expect("manager init");
             manager
                 .create_spool(key.clone(), None, None, false, HashMap::new())
@@ -1021,9 +1137,8 @@ mod tests {
                 .expect("complete succeeds");
         }
 
-        let manager2 =
-            SpoolManager::<TokioFileIO>::new(&db_path, &data_dir, page_size, 16 * page_size)
-                .expect("manager2 init");
+        let manager2 = SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 16 * page_size, 256)
+            .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
         let spool = manager2.get_spool(&key).expect("recovered spool exists");
 
@@ -1032,7 +1147,6 @@ mod tests {
         assert_eq!(meta.total_bytes_written, data.len() as u64);
         assert_eq!(meta.total_pages, 2);
         assert_eq!(meta.final_page_size, Some(904));
-        assert_eq!(meta.checksum_crc32c, Some(crc32c::crc32c(&data)));
         drop(meta);
 
         let first = spool
@@ -1089,6 +1203,103 @@ mod tests {
             }
             other => panic!("expected SizeMismatch, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_complete_size_mismatch_preserves_partial_page_for_retry() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        let first = vec![0xBBu8; 2000];
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&first))
+            .await
+            .expect("first write succeeds");
+
+        let result = spool.complete(Some(400)).await;
+        assert!(matches!(
+            result,
+            Err(BobsError::SizeMismatch {
+                expected: 400,
+                actual: 2000
+            })
+        ));
+
+        {
+            let meta = spool.metadata.lock().await;
+            assert_eq!(meta.state, SpoolState::Writing);
+            assert_eq!(meta.total_pages, 0);
+            assert_eq!(meta.final_page_size, None);
+            assert_eq!(meta.total_bytes_written, first.len() as u64);
+        }
+        {
+            let buf = spool.write_buffer.lock().await;
+            assert_eq!(buf.as_ref(), first.as_slice());
+        }
+        {
+            let cache = spool.page_cache.lock().await;
+            assert!(cache.get(&spool.key, 0).is_none());
+        }
+
+        let second = vec![0xCCu8; 1234];
+        spool
+            .write(first.len() as u64, bytes::Bytes::copy_from_slice(&second))
+            .await
+            .expect("write after size mismatch succeeds");
+
+        let mut all = first;
+        all.extend_from_slice(&second);
+        spool
+            .complete(Some(all.len() as u64))
+            .await
+            .expect("complete with true size succeeds");
+
+        let got = spool
+            .read_page(0)
+            .await
+            .expect("read final partial page")
+            .expect("page present");
+        assert_eq!(got.as_ref(), all.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_complete_metadata_write_failure_does_not_publish_complete_until_retry() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_fail_first_metadata_spool(dir.path(), 4096).await;
+        let data = vec![0xADu8; 700];
+
+        spool
+            .write(0, bytes::Bytes::copy_from_slice(&data))
+            .await
+            .expect("write succeeds");
+
+        let result = spool.complete(Some(data.len() as u64)).await;
+        assert!(matches!(result, Err(BobsError::StorageError(_))));
+
+        {
+            let meta = spool.metadata.lock().await;
+            assert_eq!(meta.state, SpoolState::Writing);
+            assert_eq!(meta.total_pages, 0);
+            assert_eq!(meta.final_page_size, None);
+        }
+        {
+            let cache = spool.page_cache.lock().await;
+            assert!(cache.get(&spool.key, 0).is_none());
+        }
+        let persisted = persisted_metadata(&spool).await;
+        assert_eq!(persisted.state, SpoolState::Writing);
+        assert_eq!(persisted.total_pages, 0);
+        assert_eq!(persisted.final_page_size, None);
+
+        spool
+            .complete(Some(data.len() as u64))
+            .await
+            .expect("retry complete succeeds");
+
+        let persisted = persisted_metadata(&spool).await;
+        assert_eq!(persisted.state, SpoolState::Complete);
+        assert_eq!(persisted.total_pages, 1);
+        assert_eq!(persisted.final_page_size, Some(data.len() as u64));
     }
 
     #[tokio::test]
