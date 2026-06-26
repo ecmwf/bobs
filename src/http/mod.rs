@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -441,6 +441,11 @@ where
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
     spool: Arc<crate::spool::Spool<F, M>>,
+    metrics: Arc<BobsMetrics>,
+    labels: HashMap<String, String>,
+    mode: &'static str,
+    started_at: Instant,
+    duration_recorded: bool,
 }
 
 fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
@@ -610,6 +615,15 @@ where
 {
     fn drop(&mut self) {
         self.spool.release_reader();
+        self.metrics.record_reader_released(&self.labels);
+        if !self.duration_recorded {
+            self.metrics.record_read_duration(
+                &self.labels,
+                self.mode,
+                crate::metrics::outcome::SUCCESS,
+                self.started_at.elapsed().as_secs_f64(),
+            );
+        }
     }
 }
 
@@ -649,10 +663,15 @@ where
             crate::metrics::mode::RANGE
         };
         state.metrics.record_reader_acquired(&read_labels);
-        let read_start = std::time::Instant::now();
+        let read_start = Instant::now();
 
         let lease = ReaderLease {
             spool: Arc::clone(&spool),
+            metrics: Arc::clone(&state.metrics),
+            labels: read_labels.clone(),
+            mode: read_mode,
+            started_at: read_start,
+            duration_recorded: false,
         };
         let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
         let page_size = spool.page_size as u64;
@@ -708,7 +727,7 @@ where
     let stream_labels = read_labels.clone();
     let stream_mode = read_mode;
     let stream = stream! {
-        let _lease = lease;
+        let mut lease = lease;
         let mut offset = start;
         let mut bytes_served = 0_u64;
         let mut outcome = "success";
@@ -770,6 +789,7 @@ where
                 let chunk_len = chunk.len() as u64;
                 offset += chunk_len;
                 bytes_served += chunk_len;
+                stream_metrics.record_read_bytes(&stream_labels, stream_mode, chunk_len);
                 let chunk_end = offset;
 
                 // 1. Refresh activity timestamp (atomic, lock-free).
@@ -814,9 +834,8 @@ where
         );
         let _completion_span_guard = completion_span.enter();
         tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
-        stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
+        lease.duration_recorded = true;
         stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
-        stream_metrics.record_reader_released(&stream_labels);
     };
 
     let mut response = Body::from_stream(stream).into_response();
