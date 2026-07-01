@@ -12,6 +12,12 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+    {{- if .Values.config.metrics.enabled }}
+    - port: {{ .Values.config.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
   selector:
     app.kubernetes.io/name: '{{ include "bobs.name" . }}'
     app.kubernetes.io/instance: '{{ .Release.Name }}'
