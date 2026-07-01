@@ -22,8 +22,8 @@ pub fn init_meter_provider(
     opentelemetry_sdk::metrics::SdkMeterProvider,
     prometheus::Registry,
 ) {
-    use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::Resource;
 
     let registry = prometheus::Registry::new();
 
@@ -61,7 +61,7 @@ pub fn init_meter_provider(
 pub async fn serve_metrics(registry: prometheus::Registry, port: u16) {
     use axum::extract::State;
     use axum::response::IntoResponse;
-    use axum::{Router, routing::get};
+    use axum::{routing::get, Router};
     use prometheus::Encoder;
 
     async fn handler(State(reg): State<prometheus::Registry>) -> impl IntoResponse {
@@ -197,58 +197,85 @@ impl BobsMetrics {
 
     #[cfg(feature = "telemetry")]
     fn build_instruments(meter: &Meter) -> InnerMetrics {
+        // Naming rules (prevent double-suffixing by the OTel Prometheus exporter):
+        //   - Never include the unit word in the instrument name; the exporter
+        //     appends it from `.with_unit()` unconditionally.
+        //   - Never include "total" in a Counter name; the exporter appends
+        //     `_total` for every Counter.
+        //   - Prometheus output = underscored name + unit suffix + type suffix.
+        //     e.g. `bobs.write.duration` + unit "s" + Histogram
+        //          → bobs_write_duration_seconds_{bucket,sum,count}
+
+        // Bucket boundaries (seconds) for write and read duration histograms.
+        // Chosen to give useful percentile resolution across the observed range:
+        // fast cache-hit reads (~5 ms) through slow fsync-bound completes (~5 s).
+        let duration_boundaries = vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
+
         InnerMetrics {
+            // ── Spool lifecycle ───────────────────────────────────────────────
+            // Counter → exporter appends `_total`; do not include it in name.
             spools_created: meter
-                .u64_counter("bobs.spools.created.total")
+                .u64_counter("bobs.spools.created")
                 .with_description("Total spools created")
                 .build(),
             spools_completed: meter
-                .u64_counter("bobs.spools.completed.total")
+                .u64_counter("bobs.spools.completed")
                 .with_description("Total spools completed")
                 .build(),
             spools_deleted: meter
-                .u64_counter("bobs.spools.deleted.total")
+                .u64_counter("bobs.spools.deleted")
                 .with_description("Total spools deleted")
                 .build(),
+
+            // ── Write path ────────────────────────────────────────────────────
+            // Byte counter: keep "bytes" in the name, omit unit annotation so
+            // the exporter does not append a second `_bytes` suffix.
             write_bytes: meter
-                .u64_counter("bobs.write.bytes.total")
+                .u64_counter("bobs.write.bytes")
                 .with_description("Total bytes written to spools")
-                .with_unit("By")
                 .build(),
+            // Duration histogram: name has no unit word; exporter appends
+            // `_seconds` from `.with_unit("s")`.
             write_duration: meter
-                .f64_histogram("bobs.write.duration.seconds")
+                .f64_histogram("bobs.write.duration")
                 .with_description("Duration of write operations")
                 .with_unit("s")
+                .with_boundaries(duration_boundaries.clone())
                 .build(),
+
+            // ── Read path ─────────────────────────────────────────────────────
             read_bytes: meter
-                .u64_counter("bobs.read.bytes.total")
+                .u64_counter("bobs.read.bytes")
                 .with_description("Total bytes served from spools")
-                .with_unit("By")
                 .build(),
             read_duration: meter
-                .f64_histogram("bobs.read.duration.seconds")
+                .f64_histogram("bobs.read.duration")
                 .with_description("Duration of read operations")
                 .with_unit("s")
+                .with_boundaries(duration_boundaries)
                 .build(),
             read_active: meter
                 .i64_up_down_counter("bobs.read.active")
                 .with_description("Currently active readers")
                 .build(),
+
+            // ── System-level ──────────────────────────────────────────────────
             spools_active: meter
                 .i64_up_down_counter("bobs.spools.active")
                 .with_description("Currently active spools by state")
                 .build(),
+            // Gauge: same rule as byte counter — keep "bytes" in name, omit
+            // unit annotation.
             disk_usage: meter
                 .u64_gauge("bobs.disk.usage.bytes")
                 .with_description("Disk usage of the spool data directory")
-                .with_unit("By")
                 .build(),
             cache_hits: meter
-                .u64_counter("bobs.pages.cache.hits.total")
+                .u64_counter("bobs.pages.cache.hits")
                 .with_description("Page cache hits")
                 .build(),
             cache_misses: meter
-                .u64_counter("bobs.pages.cache.misses.total")
+                .u64_counter("bobs.pages.cache.misses")
                 .with_description("Page cache misses")
                 .build(),
         }
