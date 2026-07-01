@@ -171,7 +171,6 @@ async fn measure_disk_usage(data_dir: &std::path::Path) -> std::io::Result<u64> 
     Ok(total)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

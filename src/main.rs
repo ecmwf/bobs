@@ -105,13 +105,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-
     #[cfg(feature = "telemetry")]
     let _meter_provider = if config.metrics.enabled {
         let (provider, registry) = init_meter_provider(&hostname);
         let metrics_port = config.metrics.port;
         tokio::spawn(serve_metrics(registry, metrics_port));
-        tracing::info!("event.name" = "startup.metrics.enabled", outcome = "success", port = metrics_port, "prometheus /metrics scrape endpoint enabled");
+        tracing::info!(
+            "event.name" = "startup.metrics.enabled",
+            outcome = "success",
+            port = metrics_port,
+            "prometheus /metrics scrape endpoint enabled"
+        );
         Some(provider)
     } else {
         None

@@ -968,13 +968,10 @@ where
     let span = request_span(job_id.as_deref(), Some(&key), None, None);
     async move {
         // Capture labels before deletion removes the spool from memory.
-        let delete_labels = state
-            .manager
-            .get_spool(&key)
-            .map(|s| {
-                // We can't async-lock inside a sync map ref, so clone the Arc.
-                s
-            });
+        let delete_labels = state.manager.get_spool(&key).map(|s| {
+            // We can't async-lock inside a sync map ref, so clone the Arc.
+            s
+        });
         let labels = if let Some(spool) = &delete_labels {
             spool.metadata.lock().await.labels.clone()
         } else {
@@ -990,7 +987,9 @@ where
             )
             .await
             .map_err(ApiError)?;
-        state.metrics.record_spool_deleted(&labels, crate::metrics::reason::CLIENT);
+        state
+            .metrics
+            .record_spool_deleted(&labels, crate::metrics::reason::CLIENT);
         Ok(StatusCode::OK.into_response())
     }
     .instrument(span)

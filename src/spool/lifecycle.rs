@@ -1027,7 +1027,7 @@ mod tests {
                     4096 * 256,
                 ))),
                 metadata_store,
-            Arc::new(crate::metrics::BobsMetrics::new(false, vec![], 128)),
+                Arc::new(crate::metrics::BobsMetrics::new(false, vec![], 128)),
             )
             .await;
             routed_spool

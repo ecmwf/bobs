@@ -2,7 +2,6 @@ use axum::Router;
 use bobs::cleanup::start_cleanup_task;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
-use bobs::metrics::BobsMetrics;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use bobs::io::UringFileIO;
 use bobs::io::{DefaultFileIO, TokioFileIO};
@@ -10,6 +9,7 @@ use bobs::manager::SpoolManager;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use bobs::metadata::UringSidecarMetadataStore;
 use bobs::metadata::{DefaultMetadataStore, SyncSidecarMetadataStore};
+use bobs::metrics::BobsMetrics;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

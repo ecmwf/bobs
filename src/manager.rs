@@ -628,7 +628,6 @@ mod tests {
             .expect("write sidecar metadata");
     }
 
-
     #[tokio::test]
     async fn test_new_accepts_cache_smaller_than_page_size() {
         let dir = tempdir().expect("create tempdir");
@@ -781,8 +780,11 @@ mod tests {
             .expect("first create succeeds");
 
         let manager2 = Arc::clone(&manager);
-        let mut create2 =
-            tokio::spawn(async move { manager2.create_spool("b".into(), None, None, false, HashMap::new()).await });
+        let mut create2 = tokio::spawn(async move {
+            manager2
+                .create_spool("b".into(), None, None, false, HashMap::new())
+                .await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             !create2.is_finished(),
