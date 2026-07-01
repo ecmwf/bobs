@@ -151,6 +151,10 @@ struct InnerMetrics {
     spools_completed: Counter<u64>,
     spools_deleted: Counter<u64>,
 
+    // Spool operation durations
+    create_duration: Histogram<f64>,
+    complete_duration: Histogram<f64>,
+
     // Write path
     write_bytes: Counter<u64>,
     write_duration: Histogram<f64>,
@@ -225,6 +229,24 @@ impl BobsMetrics {
             spools_deleted: meter
                 .u64_counter("bobs.spools.deleted")
                 .with_description("Total spools deleted")
+                .build(),
+            create_duration: meter
+                .f64_histogram("bobs.create.duration")
+                .with_description("Duration of spool creation")
+                .with_unit("s")
+                .with_boundaries(vec![
+                    0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.0, 5.0,
+                ])
+                .build(),
+            complete_duration: meter
+                .f64_histogram("bobs.complete.duration")
+                .with_description(
+                    "Duration of spool completion (fdatasync + durable metadata commit)",
+                )
+                .with_unit("s")
+                .with_boundaries(vec![
+                    0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0,
+                ])
                 .build(),
 
             // ── Write path ────────────────────────────────────────────────────
@@ -341,11 +363,47 @@ impl BobsMetrics {
     }
 
     #[allow(unused_variables)]
-    pub fn record_write_duration(&self, labels: &HashMap<String, String>, seconds: f64) {
+    pub fn record_write_duration(
+        &self,
+        labels: &HashMap<String, String>,
+        outcome: &str,
+        seconds: f64,
+    ) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let attrs = self.caller_attrs(labels);
+            let mut attrs = self.caller_attrs(labels);
+            attrs.push(KeyValue::new("outcome", outcome.to_string()));
             inner.write_duration.record(seconds, &attrs);
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn record_create_duration(
+        &self,
+        labels: &HashMap<String, String>,
+        outcome: &str,
+        seconds: f64,
+    ) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            let mut attrs = self.caller_attrs(labels);
+            attrs.push(KeyValue::new("outcome", outcome.to_string()));
+            inner.create_duration.record(seconds, &attrs);
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn record_complete_duration(
+        &self,
+        labels: &HashMap<String, String>,
+        outcome: &str,
+        seconds: f64,
+    ) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            let mut attrs = self.caller_attrs(labels);
+            attrs.push(KeyValue::new("outcome", outcome.to_string()));
+            inner.complete_duration.record(seconds, &attrs);
         }
     }
 
@@ -462,7 +520,9 @@ mod tests {
         metrics.record_spool_completed(&labels);
         metrics.record_spool_deleted(&labels, reason::CLIENT);
         metrics.record_write_bytes(&labels, 4096);
-        metrics.record_write_duration(&labels, 1.5);
+        metrics.record_write_duration(&labels, outcome::SUCCESS, 1.5);
+        metrics.record_create_duration(&labels, outcome::SUCCESS, 0.05);
+        metrics.record_complete_duration(&labels, outcome::SUCCESS, 3.5);
         metrics.record_read_bytes(&labels, mode::FOLLOW, 8192);
         metrics.record_read_duration(&labels, mode::RANGE, outcome::SUCCESS, 0.5);
         metrics.record_reader_acquired(&labels);

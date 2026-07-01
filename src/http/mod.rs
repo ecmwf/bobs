@@ -306,7 +306,8 @@ where
         };
         let labels = state.config.filter_labels(&req.labels);
         let key = Uuid::new_v4().to_string();
-        state
+        let create_start = Instant::now();
+        let create_result = state
             .manager
             .create_spool(
                 key.clone(),
@@ -315,8 +316,13 @@ where
                 req.write_locked,
                 labels.clone(),
             )
-            .await
-            .map_err(ApiError)?;
+            .await;
+        state.metrics.record_create_duration(
+            &labels,
+            if create_result.is_ok() { crate::metrics::outcome::SUCCESS } else { crate::metrics::outcome::ERROR },
+            create_start.elapsed().as_secs_f64(),
+        );
+        create_result.map_err(ApiError)?;
         state.metrics.record_spool_created(&labels);
         tracing::Span::current().record("bobs.spool.key", key.as_str());
         if let Some(job_id) = &job_id {
@@ -359,40 +365,52 @@ where
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
         let labels = spool.metadata.lock().await.labels.clone();
-        let write_start = std::time::Instant::now();
+        let write_start = Instant::now();
         let write_batch_size = state.config.page_size;
         let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
         let mut write_offset = offset;
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
-            if let Ok(data) = frame.into_data() {
-                let mut cursor = 0;
-                while cursor < data.len() {
-                    let remaining_batch_space = write_batch_size - pending.len();
-                    let take = remaining_batch_space.min(data.len() - cursor);
-                    pending.extend_from_slice(&data[cursor..cursor + take]);
-                    cursor += take;
-                    if pending.len() == write_batch_size {
-                        let batch = std::mem::replace(&mut pending, bytes::BytesMut::with_capacity(write_batch_size)).freeze();
-                        let batch_len = batch.len();
-                        spool.write(write_offset, batch).await.map_err(ApiError)?;
-                        write_offset += batch_len as u64;
+        let write_result: std::result::Result<(), crate::error::BobsError> = async {
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
+                if let Ok(data) = frame.into_data() {
+                    let mut cursor = 0;
+                    while cursor < data.len() {
+                        let remaining_batch_space = write_batch_size - pending.len();
+                        let take = remaining_batch_space.min(data.len() - cursor);
+                        pending.extend_from_slice(&data[cursor..cursor + take]);
+                        cursor += take;
+                        if pending.len() == write_batch_size {
+                            let batch = std::mem::replace(&mut pending, bytes::BytesMut::with_capacity(write_batch_size)).freeze();
+                            let batch_len = batch.len();
+                            spool.write(write_offset, batch).await?;
+                            write_offset += batch_len as u64;
+                        }
                     }
                 }
             }
+            if !pending.is_empty() {
+                let batch_len = pending.len();
+                spool.write(write_offset, std::mem::take(&mut pending).freeze()).await?;
+                write_offset += batch_len as u64;
+            }
+            Ok(())
         }
-        if !pending.is_empty() {
-            let batch_len = pending.len();
-            spool.write(write_offset, pending.freeze()).await.map_err(ApiError)?;
-            write_offset += batch_len as u64;
-        }
+        .await;
+        let write_elapsed = write_start.elapsed().as_secs_f64();
         let total_written = write_offset.saturating_sub(offset);
-        state.metrics.record_write_bytes(&labels, total_written);
-        state.metrics.record_write_duration(&labels, write_start.elapsed().as_secs_f64());
+        if write_result.is_ok() {
+            state.metrics.record_write_bytes(&labels, total_written);
+        }
+        state.metrics.record_write_duration(
+            &labels,
+            if write_result.is_ok() { crate::metrics::outcome::SUCCESS } else { crate::metrics::outcome::ERROR },
+            write_elapsed,
+        );
+        write_result.map_err(ApiError)?;
         if let Some(job_id) = &job_id {
-            tracing::debug!("event.name" = "bobs.spool.write.completed", "job.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = write_offset.saturating_sub(offset), outcome = "success", "spool write completed");
+            tracing::debug!("event.name" = "bobs.spool.write.completed", "job.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
         } else {
-            tracing::debug!("event.name" = "bobs.spool.write.completed", "bobs.spool.key" = %key, offset = offset, bytes = write_offset.saturating_sub(offset), outcome = "success", "spool write completed");
+            tracing::debug!("event.name" = "bobs.spool.write.completed", "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
         }
         Ok(StatusCode::OK.into_response())
     }.instrument(span).await
@@ -421,9 +439,17 @@ where
             .manager
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
-        spool.complete(req.expected_size).await.map_err(ApiError)?;
+        let labels = spool.metadata.lock().await.labels.clone();
+        let complete_start = Instant::now();
+        let complete_result = spool.complete(req.expected_size).await;
+        state.metrics.record_complete_duration(
+            &labels,
+            if complete_result.is_ok() { crate::metrics::outcome::SUCCESS } else { crate::metrics::outcome::ERROR },
+            complete_start.elapsed().as_secs_f64(),
+        );
+        complete_result.map_err(ApiError)?;
+        state.metrics.record_spool_completed(&labels);
         let meta = spool.metadata.lock().await;
-        state.metrics.record_spool_completed(&meta.labels);
         if let Some(job_id) = &job_id {
             tracing::info!("event.name" = "bobs.spool.completed", "job.id" = %job_id, "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
         } else {
