@@ -66,7 +66,11 @@ spec:
                   key: {{ .Values.polytope.envConfigMapKey | default "POLYTOPE_ENV" | quote }}
               {{- end }}
             - name: BOBS_INTERNAL_BASE_URL_TEMPLATE
+              {{- if .Values.internalBaseUrlTemplate }}
+              value: {{ tpl .Values.internalBaseUrlTemplate . | quote }}
+              {{- else }}
               value: 'http://{{ include "bobs.fullname" . }}-{ordinal}:{{ .Values.service.port }}/api/v1'
+              {{- end }}
           command: ["bobs"]
           args: ["/etc/bobs/config.yaml"]
           ports:

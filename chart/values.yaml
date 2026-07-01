@@ -39,38 +39,44 @@ podAnnotations:
   opensearch.org/include: "true"
   opensearch.org/service.name: polytope
 
-# Pod-level securityContext. Left unset by default: the StatefulSet then applies
-# only `fsGroup: 10001` (matches the deployed/vendored chart). bobs/chart
-# historically shipped the fuller hardened context below; set it explicitly to
-# restore that behavior:
-# podSecurityContext:
-#   runAsNonRoot: true
-#   runAsUser: 10001
-#   runAsGroup: 10001
-#   fsGroup: 10001
+# Pod-level securityContext. Hardened by default: bobs runs non-root (image
+# USER 10001) and fsGroup makes mounted PVCs group-writable so the process can
+# write its spool data + sidecar metadata. Set to {} to fall back to fsGroup-only.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
 
-# Container-level securityContext. Empty by default (parity with the deployed
-# vendored chart, which omits it). bobs/chart historically shipped the hardened
-# context below; set it to restore that behavior:
-# containerSecurityContext:
-#   readOnlyRootFilesystem: true
-#   allowPrivilegeEscalation: false
-#   capabilities:
-#     drop:
-#       - ALL
-#   # seccompProfile is intentionally unset by default. Kubernetes RuntimeDefault
-#   # profiles have historically blocked io_uring_setup/io_uring_enter/
-#   # io_uring_register, which would break BOBS' default Linux I/O backend.
-#   # Operators may set a validated profile explicitly, for example:
-#   # seccompProfile:
-#   #   type: RuntimeDefault
-containerSecurityContext: {}
+# Container-level securityContext. Hardened by default. bobs writes only to its
+# data_dir PVC and reads its config read-only, so a read-only root filesystem is
+# safe (the historic bobs/chart shipped exactly this). Set to {} to disable.
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  # seccompProfile is intentionally unset by default. Kubernetes RuntimeDefault
+  # profiles have historically blocked io_uring_setup/io_uring_enter/
+  # io_uring_register, which would break BOBS' default Linux I/O backend.
+  # Operators may set a validated profile explicitly, for example:
+  # seccompProfile:
+  #   type: RuntimeDefault
 
 # HTTP health probes against /api/v1/health. Disabled by default (parity with
 # the deployed/vendored chart, which ships no probes). Set enabled: true to add
 # the readiness/liveness probes bobs/chart historically shipped.
 probes:
   enabled: false
+
+# Internal base URL template bobs uses to build per-ordinal pod URLs. Leave empty
+# to use the default derived from the release fullname and service port:
+#   http://<fullname>-{ordinal}:<service.port>/api/v1
+# Set to override (tpl-rendered; `{ordinal}` is substituted by bobs at runtime),
+# e.g. to route via the headless service:
+#   internalBaseUrlTemplate: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ .Values.headlessService.name }}:{{ .Values.service.port }}/api/v1'
+internalBaseUrlTemplate: ""
 
 polytope:
   # Standalone BOBS deployments can set env directly. Parent polytope-server
