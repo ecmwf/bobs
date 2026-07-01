@@ -109,7 +109,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _meter_provider = if config.metrics.enabled {
         let (provider, registry) = init_meter_provider(&hostname);
         let metrics_port = config.metrics.port;
-        tokio::spawn(serve_metrics(registry, metrics_port));
+        tokio::spawn(async move {
+            if let Err(e) = serve_metrics(registry, metrics_port).await {
+                tracing::error!(port = metrics_port, error = %e, "metrics server failed");
+            }
+        });
         tracing::info!(
             "event.name" = "startup.metrics.enabled",
             outcome = "success",

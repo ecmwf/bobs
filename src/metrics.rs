@@ -32,7 +32,11 @@ pub fn init_meter_provider(
         .build()
         .expect("prometheus exporter should build");
 
-    let environment = std::env::var("POLYTOPE_ENV").unwrap_or_else(|_| "unknown".to_string());
+    // Always emit deployment.environment (default "unknown") so Prometheus
+    // labels are consistent; observability.rs omits the field when unset.
+    let environment = std::env::var("BOBS_DEPLOYMENT_ENV")
+        .or_else(|_| std::env::var("POLYTOPE_ENV"))
+        .unwrap_or_else(|_| "unknown".to_string());
 
     let resource = Resource::builder()
         .with_attributes([
@@ -58,7 +62,10 @@ pub fn init_meter_provider(
 
 /// Spawn a minimal HTTP server exposing `GET /metrics` for Prometheus scraping.
 #[cfg(feature = "telemetry")]
-pub async fn serve_metrics(registry: prometheus::Registry, port: u16) {
+pub async fn serve_metrics(
+    registry: prometheus::Registry,
+    port: u16,
+) -> Result<(), std::io::Error> {
     use axum::extract::State;
     use axum::response::IntoResponse;
     use axum::{routing::get, Router};
@@ -82,15 +89,10 @@ pub async fn serve_metrics(registry: prometheus::Registry, port: u16) {
         .route("/metrics", get(handler))
         .with_state(registry);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(port, error = %e, "failed to bind metrics endpoint");
-            std::process::exit(1);
-        });
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
 
     tracing::info!(port, "prometheus /metrics endpoint listening");
-    let _ = axum::serve(listener, app).await;
+    axum::serve(listener, app).await
 }
 
 /// Deletion reason label values.
@@ -312,7 +314,7 @@ impl BobsMetrics {
             .filter(|(k, _)| self.allowed_labels.is_empty() || self.allowed_labels.contains(k))
             .map(|(k, v)| {
                 let truncated = if v.len() > self.max_label_value_length {
-                    &v[..self.max_label_value_length]
+                    &v[..v.floor_char_boundary(self.max_label_value_length)]
                 } else {
                     v.as_str()
                 };

@@ -56,14 +56,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: POLYTOPE_ENV
-              {{- if .Values.polytope.env }}
-              value: {{ .Values.polytope.env | quote }}
+            - name: BOBS_DEPLOYMENT_ENV
+              {{- if .Values.observability.deploymentEnv }}
+              value: {{ .Values.observability.deploymentEnv | quote }}
               {{- else }}
               valueFrom:
                 configMapKeyRef:
-                  name: {{ .Values.polytope.envConfigMapName | default (printf "%s-observability-env" .Release.Name) | quote }}
-                  key: {{ .Values.polytope.envConfigMapKey | default "POLYTOPE_ENV" | quote }}
+                  name: {{ .Values.observability.deploymentEnvConfigMapName | default (printf "%s-observability-env" .Release.Name) | quote }}
+                  key: {{ .Values.observability.deploymentEnvConfigMapKey | default "BOBS_DEPLOYMENT_ENV" | quote }}
+                  optional: true
               {{- end }}
             - name: BOBS_INTERNAL_BASE_URL_TEMPLATE
               {{- if .Values.internalBaseUrlTemplate }}

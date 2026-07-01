@@ -120,7 +120,9 @@ where
             "service.version".to_string(),
             Value::String(env!("CARGO_PKG_VERSION").to_string()),
         );
-        if let Ok(value) = std::env::var("POLYTOPE_ENV") {
+        if let Ok(value) =
+            std::env::var("BOBS_DEPLOYMENT_ENV").or_else(|_| std::env::var("POLYTOPE_ENV"))
+        {
             if !value.trim().is_empty() {
                 resource.insert(
                     "deployment.environment".to_string(),
@@ -454,7 +456,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: serialised by ENV_LOCK; no other threads touch the env in tests.
         unsafe {
-            std::env::set_var("POLYTOPE_ENV", "dev");
+            std::env::set_var("BOBS_DEPLOYMENT_ENV", "dev");
             std::env::set_var("K8S_NAMESPACE_NAME", "ns");
             std::env::set_var("K8S_POD_NAME", "pod");
             std::env::remove_var("RUST_LOG");

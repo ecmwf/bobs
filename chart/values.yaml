@@ -37,7 +37,7 @@ podAntiAffinityHostname: false
 
 podAnnotations:
   opensearch.org/include: "true"
-  opensearch.org/service.name: polytope
+  opensearch.org/service.name: bobs
 
 # Pod-level securityContext. Hardened by default: bobs runs non-root (image
 # USER 10001) and fsGroup makes mounted PVCs group-writable so the process can
@@ -78,13 +78,13 @@ probes:
 #   internalBaseUrlTemplate: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ .Values.headlessService.name }}:{{ .Values.service.port }}/api/v1'
 internalBaseUrlTemplate: ""
 
-polytope:
-  # Standalone BOBS deployments can set env directly. Parent polytope-server
-  # deployments leave this empty and use envConfigMapName as the value bridge
-  # from the parent's top-level polytope.env.
-  env: ""
-  envConfigMapName: ""
-  envConfigMapKey: POLYTOPE_ENV
+observability:
+  # deployment.environment OTel resource attribute.
+  # If set, injects BOBS_DEPLOYMENT_ENV directly; otherwise reads from a
+  # ConfigMap in the same namespace.
+  deploymentEnv: ""
+  deploymentEnvConfigMapName: ""
+  deploymentEnvConfigMapKey: BOBS_DEPLOYMENT_ENV
 
 config:
   host: "0.0.0.0"
@@ -93,8 +93,8 @@ config:
   # 16 MiB pages: BOBS fsyncs a metadata commit per page on write, so the old
   # 4 KiB page capped writes at ~1.2 MB/s (one fsync per 4 KiB). 16 MiB gives a
   # ~GB/s write ceiling. max_cache_bytes must be >= page_size.
-  page_size: 16777216
-  max_cache_bytes: 268435456
+  page_size: 4096
+  max_cache_bytes: 1048576
   # Admission limit: max spools concurrently holding an in-memory page cache
   # (created but not yet fully read). create blocks until a slot frees, applying
   # backpressure to writers instead of growing memory without bound.
