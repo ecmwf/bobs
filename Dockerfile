@@ -1,8 +1,10 @@
 FROM docker.io/library/rust:1.90-slim AS builder
 WORKDIR /build
+ARG FEATURES=""
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release --locked --bins
+RUN cargo build --release --locked --bins \
+    $(if [ -n "$FEATURES" ]; then echo "--features $FEATURES"; fi)
 
 FROM docker.io/library/debian:bookworm-slim AS release
 RUN apt-get update \

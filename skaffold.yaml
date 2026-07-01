@@ -10,6 +10,8 @@ build:
       docker:
         dockerfile: ./Dockerfile
         target: release
+        buildArgs:
+          FEATURES: '{{default "telemetry" .BOBS_FEATURES}}'
 
   tagPolicy:
     customTemplate:
