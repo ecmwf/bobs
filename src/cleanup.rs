@@ -4,7 +4,7 @@ use crate::manager::{DeleteReason, SpoolManager};
 use crate::metadata::MetadataStore;
 use crate::spool::SpoolState;
 use crate::time::now_secs;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
@@ -29,6 +29,10 @@ where
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
     let mut interval = time::interval(Duration::from_secs(config.cleanup_sweep_interval_secs));
+    // Guards against overlapping disk-usage measurements: at most one walk is
+    // ever in flight. Set to true while a spawned measurement task is running;
+    // the task clears it when done.
+    let disk_measuring = Arc::new(AtomicBool::new(false));
 
     loop {
         interval.tick().await;
@@ -134,10 +138,22 @@ where
             "cleanup run completed"
         );
 
-        // Measure disk usage after cleanup. This is intentionally coarse
-        // (once per sweep interval) to avoid expensive stat syscalls.
-        if let Ok(usage) = measure_disk_usage(&config.data_dir).await {
-            manager.metrics.record_disk_usage(usage);
+        // Measure disk usage after cleanup. Spawned so the loop is not
+        // blocked on spawn_blocking I/O between sweeps. The AtomicBool gate
+        // ensures at most one walk is in flight at a time: if the previous
+        // measurement is still running we skip rather than queue another task
+        // (which would contend for I/O and cause unbounded task growth on a
+        // slow or busy filesystem).
+        let m = Arc::clone(&disk_measuring);
+        if !m.swap(true, Ordering::AcqRel) {
+            let metrics_ref = Arc::clone(&manager.metrics);
+            let data_dir_ref = config.data_dir.clone();
+            tokio::spawn(async move {
+                if let Ok(usage) = measure_disk_usage(&data_dir_ref).await {
+                    metrics_ref.record_disk_usage(usage);
+                }
+                m.store(false, Ordering::Release);
+            });
         }
     }
 }

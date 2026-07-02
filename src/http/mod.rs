@@ -2451,13 +2451,10 @@ mod tests {
         spool.last_read_activity_at.store(1, Ordering::SeqCst);
 
         tokio::time::advance(Duration::from_secs(3)).await;
-        // The cleanup loop's measure_disk_usage (post-merge) performs multiple
-        // spawn_blocking I/O operations; each requires a separate poll cycle
-        // under paused time. Yield enough for the loop to finish outstanding
-        // I/O, return to interval.tick(), and execute the deletion sweep.
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        // measure_disk_usage is now spawned fire-and-forget, so the cleanup
+        // loop returns to interval.tick() without blocking on spawn_blocking
+        // I/O.  A single yield is enough for the deletion sweep to run.
+        tokio::task::yield_now().await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),
