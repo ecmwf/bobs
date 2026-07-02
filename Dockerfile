@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1.90-slim AS builder
+FROM docker.io/library/rust:1.93-slim-bookworm AS builder
 WORKDIR /build
 ARG FEATURES=""
 COPY Cargo.toml Cargo.lock ./
