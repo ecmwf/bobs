@@ -646,7 +646,7 @@ where
             self.metrics.record_read_duration(
                 &self.labels,
                 self.mode,
-                crate::metrics::outcome::SUCCESS,
+                crate::metrics::outcome::CLIENT_GONE,
                 self.started_at.elapsed().as_secs_f64(),
             );
         }
@@ -691,7 +691,7 @@ where
         state.metrics.record_reader_acquired(&read_labels);
         let read_start = Instant::now();
 
-        let lease = ReaderLease {
+        let mut lease = ReaderLease {
             spool: Arc::clone(&spool),
             metrics: Arc::clone(&state.metrics),
             labels: read_labels.clone(),
@@ -739,9 +739,15 @@ where
         .await
     {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(ApiError(e)),
+        Ok(Err(e)) => {
+            lease.duration_recorded = true;
+            state.metrics.record_read_duration(&read_labels, read_mode, crate::metrics::outcome::ERROR, read_start.elapsed().as_secs_f64());
+            return Err(ApiError(e));
+        }
         Err(_) => {
             tracing::warn!("event.name" = "bobs.spool.read.timeout", "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "error", "spool read timed out");
+            lease.duration_recorded = true;
+            state.metrics.record_read_duration(&read_labels, read_mode, crate::metrics::outcome::TIMEOUT, read_start.elapsed().as_secs_f64());
             return Ok(long_poll_redirect(&key, &headers));
         }
     };
@@ -756,7 +762,7 @@ where
         let mut lease = lease;
         let mut offset = start;
         let mut bytes_served = 0_u64;
-        let mut outcome = "success";
+        let mut outcome = crate::metrics::outcome::SUCCESS;
         let mut prefetched = first_page;
 
         loop {
@@ -783,17 +789,20 @@ where
                 ).await {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
-                        outcome = "error";
+                        outcome = crate::metrics::outcome::ERROR;
                         yield Err::<Bytes, BobsError>(e);
                         break;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        outcome = crate::metrics::outcome::TIMEOUT;
+                        break;
+                    }
                 }
             } else {
                 match spool.read_page(page_idx).await {
                     Ok(v) => v,
                     Err(e) => {
-                        outcome = "error";
+                        outcome = crate::metrics::outcome::ERROR;
                         yield Err::<Bytes, BobsError>(e);
                         break;
                     }

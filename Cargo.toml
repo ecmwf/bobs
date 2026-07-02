@@ -7,7 +7,7 @@ edition = "2021"
 default = []
 # Opt in to the existing Tokio/blocking filesystem path for baseline benchmarking.
 tokio-fileio-fallback = []
-# OpenTelemetry metrics export via OTLP.
+# OpenTelemetry metrics export via Prometheus scrape endpoint.
 telemetry = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-prometheus", "prometheus"]
 
 [dependencies]

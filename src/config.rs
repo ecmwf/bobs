@@ -191,7 +191,7 @@ impl Config {
             .filter(|(k, _)| allowed.is_empty() || allowed.contains(k))
             .map(|(k, v)| {
                 let truncated = if v.len() > max_len {
-                    v[..max_len].to_string()
+                    v[..v.floor_char_boundary(max_len)].to_string()
                 } else {
                     v.clone()
                 };

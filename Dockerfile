@@ -3,8 +3,11 @@ WORKDIR /build
 ARG FEATURES=""
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release --locked --bins \
-    $(if [ -n "$FEATURES" ]; then echo "--features $FEATURES"; fi)
+RUN if [ -n "$FEATURES" ]; then \
+    cargo build --release --locked --bins --features "$FEATURES"; \
+  else \
+    cargo build --release --locked --bins; \
+  fi
 
 FROM docker.io/library/debian:bookworm-slim AS release
 RUN apt-get update \

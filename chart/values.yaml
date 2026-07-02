@@ -90,9 +90,8 @@ config:
   host: "0.0.0.0"
   port: 3000
   data_dir: "/var/lib/bobs"
-  # 16 MiB pages: BOBS fsyncs a metadata commit per page on write, so the old
-  # 4 KiB page capped writes at ~1.2 MB/s (one fsync per 4 KiB). 16 MiB gives a
-  # ~GB/s write ceiling. max_cache_bytes must be >= page_size.
+  # Spool write page size. BOBS fsyncs a metadata commit per page on write, so
+  # larger pages amortise fsync cost over more data. max_cache_bytes must be >= page_size.
   page_size: 4096
   max_cache_bytes: 1048576
   # Admission limit: max spools concurrently holding an in-memory page cache
