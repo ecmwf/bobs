@@ -843,6 +843,23 @@ where
                     meta.last_read_at = Some(now);
                 }
 
+                // 4. If this chunk completes a bounded read, record duration
+                //    NOW before yielding. hyper drops the response body
+                //    without a final poll once Content-Length is satisfied,
+                //    so the post-loop cleanup would never execute.
+                if end.is_some_and(|e| offset >= e) && !lease.duration_recorded {
+                    let completion_span = request_span(
+                        stream_job_id.as_deref(),
+                        Some(&stream_key),
+                        None,
+                        Some(&stream_range),
+                    );
+                    let _guard = completion_span.enter();
+                    tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
+                    lease.duration_recorded = true;
+                    stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
+                }
+
                 yield Ok::<Bytes, BobsError>(chunk);
             } else if follow {
                 // Page exists but has no data at our offset yet. Check if the
@@ -861,16 +878,21 @@ where
                 break;
             }
         }
-        let completion_span = request_span(
-            stream_job_id.as_deref(),
-            Some(&stream_key),
-            None,
-            Some(&stream_range),
-        );
-        let _completion_span_guard = completion_span.enter();
-        tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
-        lease.duration_recorded = true;
-        stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
+        // Post-loop fallback for chunked responses (follow mode on
+        // in-progress spools) where Content-Length is not set and hyper
+        // polls the stream to completion normally.
+        if !lease.duration_recorded {
+            let completion_span = request_span(
+                stream_job_id.as_deref(),
+                Some(&stream_key),
+                None,
+                Some(&stream_range),
+            );
+            let _completion_span_guard = completion_span.enter();
+            tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
+            lease.duration_recorded = true;
+            stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
+        }
     };
 
     let mut response = Body::from_stream(stream).into_response();
