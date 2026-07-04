@@ -34,6 +34,9 @@ data:
     {{- if .Values.config.metrics }}
     metrics:
       enabled: {{ .Values.config.metrics.enabled }}
+      {{- if .Values.config.metrics.bind_address }}
+      bind_address: {{ .Values.config.metrics.bind_address | quote }}
+      {{- end }}
       {{- if .Values.config.metrics.port }}
       port: {{ .Values.config.metrics.port }}
       {{- end }}

@@ -2,7 +2,7 @@
 
 BOBS exposes Prometheus metrics when built with the `telemetry` Cargo feature and
 configured with `metrics.enabled: true`. Metrics are served on a dedicated HTTP
-port (default `9090`) separate from the main data port.
+port (default `9464`) separate from the main data port.
 
 ## Enabling metrics
 
@@ -17,7 +17,8 @@ Add a `metrics:` section to your config:
 ```yaml
 metrics:
   enabled: true
-  port: 9090                    # separate from the main data port
+  bind_address: "127.0.0.1"     # loopback only; use 0.0.0.0 in k8s
+  port: 9464                    # separate from the main data port
   allowed_labels: []            # empty = all caller labels pass through
   max_label_value_length: 128   # truncate long label values
 ```
@@ -46,7 +47,7 @@ scrape_configs:
         action: keep
       - source_labels: [__address__]
         regex: (.+):\d+
-        replacement: ${1}:9090
+        replacement: ${1}:9464
         target_label: __address__
 ```
 
@@ -95,7 +96,8 @@ from arbitrary client input:
 ```yaml
 metrics:
   enabled: true
-  port: 9090
+  bind_address: "0.0.0.0"
+  port: 9464
   allowed_labels:
     - collection
   max_label_value_length: 64

@@ -188,7 +188,7 @@ mod tests {
             page_size,
             Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(0))),
             metadata_store,
-            Arc::new(crate::metrics::BobsMetrics::new(false, vec![], 128)),
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }
@@ -241,7 +241,7 @@ mod tests {
                 cache_bytes,
             ))),
             metadata_store,
-            Arc::new(crate::metrics::BobsMetrics::new(false, vec![], 128)),
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }

@@ -108,9 +108,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "telemetry")]
     let _meter_provider = if config.metrics.enabled {
         let (provider, registry) = init_meter_provider(&hostname);
+        let metrics_bind_address = config.metrics.bind_address.clone();
         let metrics_port = config.metrics.port;
         tokio::spawn(async move {
-            if let Err(e) = serve_metrics(registry, metrics_port).await {
+            if let Err(e) = serve_metrics(registry, &metrics_bind_address, metrics_port).await {
                 tracing::error!(port = metrics_port, error = %e, "metrics server failed");
             }
         });
@@ -125,11 +126,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let metrics = Arc::new(BobsMetrics::new(
-        config.metrics.enabled,
-        config.metrics.allowed_labels.clone(),
-        config.metrics.max_label_value_length,
-    ));
+    let metrics = Arc::new(BobsMetrics::new(config.metrics.enabled));
 
     let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
         DefaultMetadataStore::new(&config.data_dir),

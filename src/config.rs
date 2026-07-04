@@ -42,6 +42,8 @@ pub struct Config {
 pub struct MetricsConfig {
     /// Enable OpenTelemetry metrics export.
     pub enabled: bool,
+    /// Bind address for the Prometheus `/metrics` scrape endpoint.
+    pub bind_address: String,
     /// Port for the Prometheus `/metrics` scrape endpoint.
     pub port: u16,
     /// Only these label keys are propagated as metric attributes.
@@ -55,7 +57,8 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         MetricsConfig {
             enabled: false,
-            port: 9090,
+            bind_address: "127.0.0.1".to_string(),
+            port: 9464,
             allowed_labels: Vec::new(),
             max_label_value_length: 128,
         }

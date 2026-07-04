@@ -64,6 +64,7 @@ pub fn init_meter_provider(
 #[cfg(feature = "telemetry")]
 pub async fn serve_metrics(
     registry: prometheus::Registry,
+    bind_address: &str,
     port: u16,
 ) -> Result<(), std::io::Error> {
     use axum::extract::State;
@@ -89,7 +90,7 @@ pub async fn serve_metrics(
         .route("/metrics", get(handler))
         .with_state(registry);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    let listener = tokio::net::TcpListener::bind(format!("{bind_address}:{port}")).await?;
 
     tracing::info!(port, "prometheus /metrics endpoint listening");
     axum::serve(listener, app).await
@@ -132,17 +133,6 @@ pub mod state {
 pub struct BobsMetrics {
     #[cfg(feature = "telemetry")]
     inner: Option<InnerMetrics>,
-    #[cfg(feature = "telemetry")]
-    allowed_labels: Vec<String>,
-    #[cfg(feature = "telemetry")]
-    max_label_value_length: usize,
-    // Keep fields accessible for tests even without telemetry
-    #[cfg(not(feature = "telemetry"))]
-    #[allow(dead_code)]
-    allowed_labels: Vec<String>,
-    #[cfg(not(feature = "telemetry"))]
-    #[allow(dead_code)]
-    max_label_value_length: usize,
 }
 
 #[cfg(feature = "telemetry")]
@@ -176,7 +166,7 @@ struct InnerMetrics {
 impl BobsMetrics {
     /// Create metrics instruments. If the `telemetry` feature is disabled or
     /// `enabled` is false, returns a no-op instance.
-    pub fn new(enabled: bool, allowed_labels: Vec<String>, max_label_value_length: usize) -> Self {
+    pub fn new(enabled: bool) -> Self {
         #[cfg(feature = "telemetry")]
         {
             let inner = if enabled {
@@ -185,19 +175,12 @@ impl BobsMetrics {
             } else {
                 None
             };
-            BobsMetrics {
-                inner,
-                allowed_labels,
-                max_label_value_length,
-            }
+            BobsMetrics { inner }
         }
         #[cfg(not(feature = "telemetry"))]
         {
             let _ = enabled;
-            BobsMetrics {
-                allowed_labels,
-                max_label_value_length,
-            }
+            BobsMetrics {}
         }
     }
 
@@ -305,21 +288,16 @@ impl BobsMetrics {
         }
     }
 
-    /// Convert caller-provided labels into OTel KeyValue attributes,
-    /// respecting the allowlist and max value length.
+    /// Convert caller-provided labels into OTel `KeyValue` attributes.
+    ///
+    /// Labels are expected to be **already filtered and truncated** by
+    /// [`Config::filter_labels`] at the HTTP boundary, so this method
+    /// performs a simple 1-to-1 conversion with no additional filtering.
     #[cfg(feature = "telemetry")]
-    fn caller_attrs(&self, labels: &HashMap<String, String>) -> Vec<KeyValue> {
+    fn caller_attrs(labels: &HashMap<String, String>) -> Vec<KeyValue> {
         labels
             .iter()
-            .filter(|(k, _)| self.allowed_labels.is_empty() || self.allowed_labels.contains(k))
-            .map(|(k, v)| {
-                let truncated = if v.len() > self.max_label_value_length {
-                    &v[..v.floor_char_boundary(self.max_label_value_length)]
-                } else {
-                    v.as_str()
-                };
-                KeyValue::new(k.clone(), truncated.to_string())
-            })
+            .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
             .collect()
     }
 
@@ -329,7 +307,7 @@ impl BobsMetrics {
     pub fn record_spool_created(&self, labels: &HashMap<String, String>) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let attrs = self.caller_attrs(labels);
+            let attrs = Self::caller_attrs(labels);
             inner.spools_created.add(1, &attrs);
         }
     }
@@ -338,7 +316,7 @@ impl BobsMetrics {
     pub fn record_spool_completed(&self, labels: &HashMap<String, String>) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let attrs = self.caller_attrs(labels);
+            let attrs = Self::caller_attrs(labels);
             inner.spools_completed.add(1, &attrs);
         }
     }
@@ -347,7 +325,7 @@ impl BobsMetrics {
     pub fn record_spool_deleted(&self, labels: &HashMap<String, String>, reason: &str) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let mut attrs = self.caller_attrs(labels);
+            let mut attrs = Self::caller_attrs(labels);
             attrs.push(KeyValue::new("reason", reason.to_string()));
             inner.spools_deleted.add(1, &attrs);
         }
@@ -359,7 +337,7 @@ impl BobsMetrics {
     pub fn record_write_bytes(&self, labels: &HashMap<String, String>, bytes: u64) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let attrs = self.caller_attrs(labels);
+            let attrs = Self::caller_attrs(labels);
             inner.write_bytes.add(bytes, &attrs);
         }
     }
@@ -373,7 +351,7 @@ impl BobsMetrics {
     ) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let mut attrs = self.caller_attrs(labels);
+            let mut attrs = Self::caller_attrs(labels);
             attrs.push(KeyValue::new("outcome", outcome.to_string()));
             inner.write_duration.record(seconds, &attrs);
         }
@@ -388,7 +366,7 @@ impl BobsMetrics {
     ) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let mut attrs = self.caller_attrs(labels);
+            let mut attrs = Self::caller_attrs(labels);
             attrs.push(KeyValue::new("outcome", outcome.to_string()));
             inner.create_duration.record(seconds, &attrs);
         }
@@ -403,7 +381,7 @@ impl BobsMetrics {
     ) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let mut attrs = self.caller_attrs(labels);
+            let mut attrs = Self::caller_attrs(labels);
             attrs.push(KeyValue::new("outcome", outcome.to_string()));
             inner.complete_duration.record(seconds, &attrs);
         }
@@ -415,7 +393,7 @@ impl BobsMetrics {
     pub fn record_read_bytes(&self, labels: &HashMap<String, String>, mode: &str, bytes: u64) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let mut attrs = self.caller_attrs(labels);
+            let mut attrs = Self::caller_attrs(labels);
             attrs.push(KeyValue::new("mode", mode.to_string()));
             inner.read_bytes.add(bytes, &attrs);
         }
@@ -431,7 +409,7 @@ impl BobsMetrics {
     ) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let mut attrs = self.caller_attrs(labels);
+            let mut attrs = Self::caller_attrs(labels);
             attrs.push(KeyValue::new("mode", mode.to_string()));
             attrs.push(KeyValue::new("outcome", outcome.to_string()));
             inner.read_duration.record(seconds, &attrs);
@@ -442,7 +420,7 @@ impl BobsMetrics {
     pub fn record_reader_acquired(&self, labels: &HashMap<String, String>) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let attrs = self.caller_attrs(labels);
+            let attrs = Self::caller_attrs(labels);
             inner.read_active.add(1, &attrs);
         }
     }
@@ -451,7 +429,7 @@ impl BobsMetrics {
     pub fn record_reader_released(&self, labels: &HashMap<String, String>) {
         #[cfg(feature = "telemetry")]
         if let Some(inner) = &self.inner {
-            let attrs = self.caller_attrs(labels);
+            let attrs = Self::caller_attrs(labels);
             inner.read_active.add(-1, &attrs);
         }
     }
@@ -514,7 +492,7 @@ mod tests {
 
     #[test]
     fn noop_metrics_do_not_panic() {
-        let metrics = BobsMetrics::new(false, vec![], 128);
+        let metrics = BobsMetrics::new(false);
         let labels: HashMap<String, String> =
             [("collection".into(), "era5".into())].into_iter().collect();
 
@@ -536,8 +514,8 @@ mod tests {
     }
 
     #[test]
-    fn allowed_labels_empty_passes_all() {
-        let metrics = BobsMetrics::new(false, vec![], 128);
+    fn multiple_labels_all_converted() {
+        let metrics = BobsMetrics::new(false);
         let labels: HashMap<String, String> = [
             ("collection".into(), "era5".into()),
             ("user".into(), "alice".into()),
@@ -545,13 +523,7 @@ mod tests {
         .into_iter()
         .collect();
 
+        // Should not panic — all labels pass through without filtering.
         metrics.record_spool_created(&labels);
-    }
-
-    #[test]
-    fn max_label_value_length_is_stored() {
-        let metrics = BobsMetrics::new(false, vec!["collection".into()], 64);
-        assert_eq!(metrics.max_label_value_length, 64);
-        assert_eq!(metrics.allowed_labels, vec!["collection".to_string()]);
     }
 }

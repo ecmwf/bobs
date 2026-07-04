@@ -114,7 +114,8 @@ config:
   route_name: "download"
   metrics:
     enabled: false
-    port: 9090
+    bind_address: "0.0.0.0"
+    port: 9464
     allowed_labels:
       - collection
     max_label_value_length: 128

@@ -94,7 +94,7 @@ where
             page_size,
             max_cache_bytes,
             page_cache,
-            metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
+            metrics: Arc::new(BobsMetrics::new(false)),
             admission: Arc::new(Semaphore::new(max_live_spools)),
         })
     }
@@ -421,6 +421,15 @@ where
             }
 
             self.spools.insert(key, spool);
+
+            // Count recovered spool in the active gauge.
+            let recovered_label = match meta_state_for_init {
+                SpoolState::Writing | SpoolState::Creating => crate::metrics::state::WRITING,
+                SpoolState::WriteLocked => crate::metrics::state::WRITE_LOCKED,
+                SpoolState::Complete | SpoolState::Deleting => crate::metrics::state::COMPLETE,
+                SpoolState::Readable => crate::metrics::state::READABLE,
+            };
+            self.metrics.record_state_transition(None, recovered_label);
         }
 
         stale_keys.sort();

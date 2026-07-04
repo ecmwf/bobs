@@ -76,7 +76,7 @@ async fn app() -> axum::Router {
         hostname: "bobs-0".into(),
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
-        metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
+        metrics: Arc::new(BobsMetrics::new(false)),
     });
     router::<DefaultFileIO, DefaultMetadataStore>().with_state(state)
 }

@@ -472,6 +472,7 @@ where
     mode: &'static str,
     started_at: Instant,
     duration_recorded: bool,
+    bytes_served: u64,
 }
 
 fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
@@ -643,6 +644,8 @@ where
         self.spool.release_reader();
         self.metrics.record_reader_released(&self.labels);
         if !self.duration_recorded {
+            self.metrics
+                .record_read_bytes(&self.labels, self.mode, self.bytes_served);
             self.metrics.record_read_duration(
                 &self.labels,
                 self.mode,
@@ -698,6 +701,7 @@ where
             mode: read_mode,
             started_at: read_start,
             duration_recorded: false,
+            bytes_served: 0,
         };
         let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
         let page_size = spool.page_size as u64;
@@ -824,7 +828,7 @@ where
                 let chunk_len = chunk.len() as u64;
                 offset += chunk_len;
                 bytes_served += chunk_len;
-                stream_metrics.record_read_bytes(&stream_labels, stream_mode, chunk_len);
+                lease.bytes_served = bytes_served;
                 let chunk_end = offset;
 
                 // 1. Refresh activity timestamp (atomic, lock-free).
@@ -857,6 +861,7 @@ where
                     let _guard = completion_span.enter();
                     tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
                     lease.duration_recorded = true;
+                    stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
                     stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
                 }
 
@@ -891,6 +896,7 @@ where
             let _completion_span_guard = completion_span.enter();
             tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
             lease.duration_recorded = true;
+            stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
             stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
         }
     };
@@ -1182,7 +1188,7 @@ mod tests {
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
-            metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
+            metrics: Arc::new(BobsMetrics::new(false)),
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
@@ -1209,7 +1215,7 @@ mod tests {
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
-            metrics: Arc::new(BobsMetrics::new(false, vec![], 128)),
+            metrics: Arc::new(BobsMetrics::new(false)),
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
