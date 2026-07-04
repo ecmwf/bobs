@@ -42,6 +42,10 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `host_prefix` | `""` | External download host prefix used when generating read URLs. |
 | `domain` | `""` | External download domain used when generating read URLs. |
 | `route_name` | `""` | External download route prefix, for example `download`. |
+| `metrics.enabled` | `false` | Enable OpenTelemetry metrics export. Requires a build with `--features telemetry`; has no effect without that feature. |
+| `metrics.port` | `9090` | Port for the Prometheus `/metrics` scrape endpoint. Runs on a separate port from the main data port. |
+| `metrics.allowed_labels` | `[]` | Caller-provided label keys forwarded as metric attributes. Empty list means all caller labels pass through. Set to a non-empty list to restrict label cardinality. |
+| `metrics.max_label_value_length` | `128` | Maximum byte length for label values. Values exceeding this limit are truncated before recording. |
 
 ## Example
 
@@ -62,6 +66,11 @@ io_uring_shards: 4              # optional; omit to use max(1, num_cpus / 4) on 
 host_prefix: polytope-example
 domain: example.com
 route_name: download
+metrics:
+  enabled: false         # requires --features telemetry; see Metrics page
+  port: 9090             # separate Prometheus scrape port
+  allowed_labels: []     # empty = all caller labels; set a list to restrict cardinality
+  max_label_value_length: 128
 ```
 
 Only the fields you want to override need to be present:
