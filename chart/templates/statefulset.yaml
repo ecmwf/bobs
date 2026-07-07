@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/name: '{{ include "bobs.name" . }}'
     app.kubernetes.io/instance: '{{ .Release.Name }}'
 spec:
-  serviceName: '{{ .Values.headlessService.name }}'
+  serviceName: '{{ include "bobs.fullname" . }}-svc'
   replicas: {{ .Values.replicaCount }}
   podManagementPolicy: Parallel
   persistentVolumeClaimRetentionPolicy:
@@ -18,28 +18,74 @@ spec:
       app.kubernetes.io/instance: '{{ .Release.Name }}'
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         app.kubernetes.io/name: '{{ include "bobs.name" . }}'
         app.kubernetes.io/instance: '{{ .Release.Name }}'
     spec:
-      {{- include "bobs.imagePullSecrets" . | nindent 6 }}
+      # BOBS runs non-root (image USER 10001); fsGroup makes mounted PVCs
+      # group-writable so the process can write its spool data + sidecar metadata.
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- toYaml (.Values.podSecurityContext | default (dict "fsGroup" 10001)) | nindent 8 }}
+      {{- if .Values.podAntiAffinityHostname }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: '{{ include "bobs.name" . }}'
+                  app.kubernetes.io/instance: '{{ .Release.Name }}'
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- include "bobs.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: bobs
           image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'
           imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: K8S_NAMESPACE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: BOBS_DEPLOYMENT_ENV
+              {{- if .Values.observability.deploymentEnv }}
+              value: {{ .Values.observability.deploymentEnv | quote }}
+              {{- else }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ .Values.observability.deploymentEnvConfigMapName | default (printf "%s-observability-env" .Release.Name) | quote }}
+                  key: {{ .Values.observability.deploymentEnvConfigMapKey | default "BOBS_DEPLOYMENT_ENV" | quote }}
+                  optional: true
+              {{- end }}
+            - name: BOBS_INTERNAL_BASE_URL_TEMPLATE
+              {{- if .Values.internalBaseUrlTemplate }}
+              value: {{ tpl .Values.internalBaseUrlTemplate . | quote }}
+              {{- else }}
+              value: 'http://{{ include "bobs.fullname" . }}-{ordinal}:{{ .Values.service.port }}/api/v1'
+              {{- end }}
           command: ["bobs"]
           args: ["/etc/bobs/config.yaml"]
           ports:
             - name: http
               containerPort: {{ .Values.config.port }}
               protocol: TCP
-          env:
-            - name: BOBS_INTERNAL_BASE_URL_TEMPLATE
-              value: {{ tpl .Values.internalBaseUrlTemplate . | quote }}
+            {{- if .Values.config.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.config.metrics.port }}
+              protocol: TCP
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.probes.enabled }}
           readinessProbe:
             httpGet:
               path: /api/v1/health
@@ -52,8 +98,11 @@ spec:
               port: http
             initialDelaySeconds: 15
             periodSeconds: 20
+          {{- end }}
+          {{- with .Values.containerSecurityContext }}
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/bobs

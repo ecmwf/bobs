@@ -124,6 +124,7 @@ mod tests {
     use crate::io::{FileIO, TokioFileIO};
     use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
     use crate::spool::SpoolMetadata;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -151,6 +152,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -165,6 +167,7 @@ mod tests {
                 page_size * 256,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }

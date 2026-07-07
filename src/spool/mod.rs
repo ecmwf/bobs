@@ -1,5 +1,6 @@
 use crate::io::FileIO;
 use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
+use crate::metrics::BobsMetrics;
 use bytes::BytesMut;
 use std::marker::PhantomData;
 use std::path::PathBuf;
@@ -45,6 +46,8 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub last_read_activity_at: Arc<AtomicU64>,
     /// Unix secs when full-object coverage was first detected. 0 = not yet.
     pub full_object_read_at: Arc<AtomicU64>,
+    /// Metrics handle for cache hit/miss recording.
+    pub metrics: Arc<BobsMetrics>,
     /// Admission permit held while this spool can retain first-read cache memory.
     /// Released at the full-read transition, or on deletion/drop if that happens first.
     admission_permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
@@ -62,6 +65,7 @@ where
         page_size: usize,
         page_cache: Arc<Mutex<PageCache>>,
         metadata_store: M,
+        metrics: Arc<BobsMetrics>,
     ) -> Self {
         Self::new_with_admission(
             metadata,
@@ -69,6 +73,7 @@ where
             page_size,
             page_cache,
             metadata_store,
+            metrics,
             None,
         )
         .await
@@ -80,6 +85,7 @@ where
         page_size: usize,
         page_cache: Arc<Mutex<PageCache>>,
         metadata_store: M,
+        metrics: Arc<BobsMetrics>,
         admission_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         let data_path = metadata.data_path.clone();
@@ -100,6 +106,7 @@ where
             missing_ranges: Arc::new(Mutex::new(MissingRanges::new(1024))),
             last_read_activity_at: Arc::new(AtomicU64::new(0)),
             full_object_read_at: Arc::new(AtomicU64::new(0)),
+            metrics,
             admission_permit: std::sync::Mutex::new(admission_permit),
             _phantom: PhantomData,
         }

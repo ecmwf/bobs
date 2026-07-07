@@ -4,7 +4,7 @@ use crate::manager::{DeleteReason, SpoolManager};
 use crate::metadata::MetadataStore;
 use crate::spool::SpoolState;
 use crate::time::now_secs;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
@@ -29,6 +29,10 @@ where
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
     let mut interval = time::interval(Duration::from_secs(config.cleanup_sweep_interval_secs));
+    // Guards against overlapping disk-usage measurements: at most one walk is
+    // ever in flight. Set to true while a spawned measurement task is running;
+    // the task clears it when done.
+    let disk_measuring = Arc::new(AtomicBool::new(false));
 
     loop {
         interval.tick().await;
@@ -86,18 +90,34 @@ where
             };
 
             if writer_inactive || full_read_expired || idle_expired {
-                to_delete.push(key);
+                let reason = if writer_inactive {
+                    crate::metrics::reason::WRITER_TIMEOUT
+                } else if full_read_expired {
+                    crate::metrics::reason::FULL_READ_TTL
+                } else {
+                    crate::metrics::reason::IDLE_TTL
+                };
+                to_delete.push((key, reason));
             }
         }
 
         let mut deleted = 0_u64;
         let mut failed_delete = 0_u64;
-        for key in to_delete {
+        for (key, reason) in to_delete {
+            // Capture labels before deletion removes the spool.
+            let labels = if let Some(spool) = manager.get_spool(&key) {
+                spool.metadata.lock().await.labels.clone()
+            } else {
+                std::collections::HashMap::new()
+            };
             match manager
                 .delete_spool_with_reason(&key, DeleteReason::Ttl, None)
                 .await
             {
-                Ok(()) => deleted += 1,
+                Ok(()) => {
+                    deleted += 1;
+                    manager.metrics.record_spool_deleted(&labels, reason);
+                }
                 Err(err) => {
                     failed_delete += 1;
                     tracing::debug!(%key, error = %err, "cleanup delete failed");
@@ -117,6 +137,24 @@ where
             },
             "cleanup run completed"
         );
+
+        // Measure disk usage after cleanup. Spawned so the loop is not
+        // blocked on spawn_blocking I/O between sweeps. The AtomicBool gate
+        // ensures at most one walk is in flight at a time: if the previous
+        // measurement is still running we skip rather than queue another task
+        // (which would contend for I/O and cause unbounded task growth on a
+        // slow or busy filesystem).
+        let m = Arc::clone(&disk_measuring);
+        if !m.swap(true, Ordering::AcqRel) {
+            let metrics_ref = Arc::clone(&manager.metrics);
+            let data_dir_ref = config.data_dir.clone();
+            tokio::spawn(async move {
+                if let Ok(usage) = measure_disk_usage(&data_dir_ref).await {
+                    metrics_ref.record_disk_usage(usage);
+                }
+                m.store(false, Ordering::Release);
+            });
+        }
     }
 }
 
@@ -131,12 +169,30 @@ where
     tokio::spawn(run_cleanup_loop(manager, config))
 }
 
+/// Walk the data directory and sum file sizes to estimate disk usage.
+async fn measure_disk_usage(data_dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut read_dir = tokio::fs::read_dir(data_dir).await?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            let mut sub_dir = tokio::fs::read_dir(entry.path()).await?;
+            while let Some(sub_entry) = sub_dir.next_entry().await? {
+                if let Ok(meta) = sub_entry.metadata().await {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::TokioFileIO;
     use crate::metadata::MetadataStore;
     use crate::spool::SpoolMetadata;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     fn test_config() -> Arc<Config> {
@@ -159,6 +215,7 @@ mod tests {
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
+            ..Config::default()
         })
     }
 
@@ -203,7 +260,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -241,7 +298,7 @@ mod tests {
             let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 256)
                 .expect("manager init");
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
@@ -295,7 +352,7 @@ mod tests {
             let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 256)
                 .expect("manager init");
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
@@ -352,7 +409,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -388,7 +445,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -424,7 +481,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -462,7 +519,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -497,7 +554,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -532,7 +589,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -583,7 +640,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -624,7 +681,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -655,7 +712,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");
@@ -689,7 +746,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool = manager.get_spool(&key).expect("spool exists");

@@ -1,10 +1,20 @@
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
+use crate::metrics;
 use crate::spool::types::SpoolState;
 use crate::time::now_secs;
 use std::sync::atomic::Ordering;
 
 use super::Spool;
+
+fn state_label(state: &SpoolState) -> &'static str {
+    match state {
+        SpoolState::Writing | SpoolState::Creating => metrics::state::WRITING,
+        SpoolState::WriteLocked => metrics::state::WRITE_LOCKED,
+        SpoolState::Complete | SpoolState::Deleting => metrics::state::COMPLETE,
+        SpoolState::Readable => metrics::state::READABLE,
+    }
+}
 
 impl<F, M> Spool<F, M>
 where
@@ -85,7 +95,20 @@ where
 
         {
             let mut meta = self.metadata.lock().await;
+            if let Some(expected) = expected_size {
+                if candidate.total_bytes_written != expected {
+                    return Err(BobsError::SizeMismatch {
+                        expected,
+                        actual: candidate.total_bytes_written,
+                    });
+                }
+            }
+            let old_state = meta.state.clone();
             *meta = candidate;
+            self.metrics.record_state_transition(
+                Some(state_label(&old_state)),
+                crate::metrics::state::COMPLETE,
+            );
         }
 
         // Initialize coverage tracking and detect immediate full-coverage
@@ -143,9 +166,17 @@ where
             meta.write_locked = locked;
             if locked && meta.state == SpoolState::Writing {
                 meta.state = SpoolState::WriteLocked;
+                self.metrics.record_state_transition(
+                    Some(crate::metrics::state::WRITING),
+                    crate::metrics::state::WRITE_LOCKED,
+                );
             } else if !locked && meta.state == SpoolState::WriteLocked {
                 meta.state = SpoolState::Readable;
                 meta.readable_at.get_or_insert_with(now_secs);
+                self.metrics.record_state_transition(
+                    Some(crate::metrics::state::WRITE_LOCKED),
+                    crate::metrics::state::READABLE,
+                );
             }
 
             if meta.state != old_state || meta.write_locked != old_locked {
@@ -188,6 +219,7 @@ mod tests {
     use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
     use crate::spool::types::SpoolMetadata;
     use bytes::Bytes;
+    use std::collections::HashMap;
     use std::fs::{self, File};
     use std::future::Future;
     use std::io::{self, Write};
@@ -568,6 +600,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -582,6 +615,7 @@ mod tests {
                 page_size * 256,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }
@@ -626,6 +660,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -640,6 +675,7 @@ mod tests {
                 page_size * 256,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }
@@ -669,6 +705,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -683,6 +720,7 @@ mod tests {
                 page_size * 256,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }
@@ -711,6 +749,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -725,6 +764,7 @@ mod tests {
                 page_size * 256,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }
@@ -766,6 +806,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
         metadata_store
             .write(&meta)
@@ -784,6 +825,7 @@ mod tests {
                 page_size * 256,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }
@@ -971,6 +1013,7 @@ mod tests {
                 total_pages: 0,
                 final_page_size: None,
                 data_path: path,
+                labels: HashMap::new(),
             };
             metadata_store
                 .write(&meta)
@@ -984,6 +1027,7 @@ mod tests {
                     4096 * 256,
                 ))),
                 metadata_store,
+                Arc::new(crate::metrics::BobsMetrics::new(false)),
             )
             .await;
             routed_spool
@@ -1079,7 +1123,7 @@ mod tests {
                 SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 16 * page_size, 256)
                     .expect("manager init");
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");

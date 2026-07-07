@@ -11,6 +11,7 @@ use bobs::manager::SpoolManager;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use bobs::metadata::UringSidecarMetadataStore;
 use bobs::metadata::{DefaultMetadataStore, SyncSidecarMetadataStore};
+use bobs::metrics::BobsMetrics;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -93,6 +94,7 @@ where
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "download".into(),
+        ..Config::default()
     });
     let manager = Arc::new(
         SpoolManager::<F, M>::with_metadata_store(
@@ -111,6 +113,7 @@ where
         hostname: "bobs-0".into(),
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
+        metrics: Arc::new(BobsMetrics::new(false)),
     });
     let app: Router = router::<F, M>().with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

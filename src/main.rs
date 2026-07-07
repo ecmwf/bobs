@@ -4,6 +4,7 @@ use bobs::http::{router, AppState};
 use bobs::io::DefaultFileIO;
 use bobs::manager::SpoolManager;
 use bobs::metadata::DefaultMetadataStore;
+use bobs::metrics::BobsMetrics;
 use bobs::shutdown;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -11,6 +12,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tower::ServiceExt;
+
+#[cfg(feature = "telemetry")]
+use bobs::metrics::{init_meter_provider, serve_metrics};
 
 fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
     let (_, ordinal) = hostname.rsplit_once('-').ok_or_else(|| {
@@ -101,15 +105,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let manager = Arc::new(
-        SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-            DefaultMetadataStore::new(&config.data_dir),
-            &config.data_dir,
-            config.page_size,
-            config.max_cache_bytes,
-            config.max_live_spools,
-        )?,
-    );
+    #[cfg(feature = "telemetry")]
+    let _meter_provider = if config.metrics.enabled {
+        let (provider, registry) = init_meter_provider(&hostname);
+        let metrics_bind_address = config.metrics.bind_address.clone();
+        let metrics_port = config.metrics.port;
+        tokio::spawn(async move {
+            if let Err(e) = serve_metrics(registry, &metrics_bind_address, metrics_port).await {
+                tracing::error!(port = metrics_port, error = %e, "metrics server failed");
+            }
+        });
+        tracing::info!(
+            "event.name" = "startup.metrics.enabled",
+            outcome = "success",
+            port = metrics_port,
+            "prometheus /metrics scrape endpoint enabled"
+        );
+        Some(provider)
+    } else {
+        None
+    };
+
+    let metrics = Arc::new(BobsMetrics::new(config.metrics.enabled));
+
+    let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+        DefaultMetadataStore::new(&config.data_dir),
+        &config.data_dir,
+        config.page_size,
+        config.max_cache_bytes,
+        config.max_live_spools,
+    )?;
+    manager.set_metrics(Arc::clone(&metrics));
+    let manager = Arc::new(manager);
 
     manager.recover().await?;
     let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
@@ -120,6 +147,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         hostname: hostname.clone(),
         ordinal: ordinal.clone(),
         internal_base_url,
+        metrics,
     });
     let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
@@ -195,6 +223,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             None => tracing::warn!(
                 "io_uring production ring pool was still shared during shutdown; dropping global reference"
             ),
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    if let Some(provider) = _meter_provider {
+        if let Err(e) = provider.shutdown() {
+            tracing::warn!(error = %e, "failed to shut down meter provider");
         }
     }
 

@@ -1,10 +1,11 @@
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
 use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
+use crate::metrics::BobsMetrics;
 use crate::spool::{PageCache, Spool, SpoolMetadata, SpoolState};
 use crate::time::now_secs;
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> 
     pub page_size: usize,
     pub max_cache_bytes: usize,
     pub page_cache: Arc<Mutex<PageCache>>,
+    pub metrics: Arc<BobsMetrics>,
     /// Bounds spools concurrently holding first-read cache memory.
     pub admission: Arc<Semaphore>,
 }
@@ -92,8 +94,14 @@ where
             page_size,
             max_cache_bytes,
             page_cache,
+            metrics: Arc::new(BobsMetrics::new(false)),
             admission: Arc::new(Semaphore::new(max_live_spools)),
         })
+    }
+
+    /// Set the metrics handle (replaces the default no-op).
+    pub fn set_metrics(&mut self, metrics: Arc<BobsMetrics>) {
+        self.metrics = metrics;
     }
 
     pub async fn create_spool(
@@ -102,6 +110,7 @@ where
         content_type: Option<String>,
         content_encoding: Option<String>,
         write_locked: bool,
+        labels: HashMap<String, String>,
     ) -> Result<()> {
         let permit = Arc::clone(&self.admission)
             .acquire_owned()
@@ -136,6 +145,7 @@ where
             total_pages: 0,
             final_page_size: None,
             data_path,
+            labels,
         };
 
         self.metadata_store.write(&metadata).await?;
@@ -147,11 +157,20 @@ where
                 self.page_size,
                 Arc::clone(&self.page_cache),
                 self.metadata_store.clone(),
+                Arc::clone(&self.metrics),
                 Some(permit),
             )
             .await,
         );
         self.spools.insert(key.clone(), spool);
+
+        // Record initial state for the active spool gauge.
+        let initial_state = if write_locked {
+            crate::metrics::state::WRITE_LOCKED
+        } else {
+            crate::metrics::state::WRITING
+        };
+        self.metrics.record_state_transition(None, initial_state);
 
         Ok(())
     }
@@ -207,10 +226,20 @@ where
                 key: key.to_string(),
             })?;
 
-        {
+        let old_state = {
             let mut meta = spool.metadata.lock().await;
+            let old = meta.state.clone();
             meta.state = SpoolState::Deleting;
-        }
+            old
+        };
+        // Decrement the active spool gauge — spool is being removed.
+        let old_label = match &old_state {
+            SpoolState::Writing | SpoolState::Creating => crate::metrics::state::WRITING,
+            SpoolState::WriteLocked => crate::metrics::state::WRITE_LOCKED,
+            SpoolState::Complete | SpoolState::Deleting => crate::metrics::state::COMPLETE,
+            SpoolState::Readable => crate::metrics::state::READABLE,
+        };
+        self.metrics.record_spool_removed(old_label);
         spool.cancel.cancel();
 
         self.spools.remove(key);
@@ -357,6 +386,7 @@ where
                     self.page_size,
                     Arc::clone(&self.page_cache),
                     self.metadata_store.clone(),
+                    Arc::clone(&self.metrics),
                     permit,
                 )
                 .await,
@@ -391,6 +421,15 @@ where
             }
 
             self.spools.insert(key, spool);
+
+            // Count recovered spool in the active gauge.
+            let recovered_label = match meta_state_for_init {
+                SpoolState::Writing | SpoolState::Creating => crate::metrics::state::WRITING,
+                SpoolState::WriteLocked => crate::metrics::state::WRITE_LOCKED,
+                SpoolState::Complete | SpoolState::Deleting => crate::metrics::state::COMPLETE,
+                SpoolState::Readable => crate::metrics::state::READABLE,
+            };
+            self.metrics.record_state_transition(None, recovered_label);
         }
 
         stale_keys.sort();
@@ -575,6 +614,7 @@ mod tests {
             total_pages,
             final_page_size,
             data_path: data_dir.join(key).join("spool.dat"),
+            labels: HashMap::new(),
         }
     }
 
@@ -630,11 +670,11 @@ mod tests {
             SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 8192, 256).expect("manager init");
 
         manager
-            .create_spool("a".to_string(), None, None, false)
+            .create_spool("a".to_string(), None, None, false, HashMap::new())
             .await
             .expect("create spool a");
         manager
-            .create_spool("b".to_string(), None, None, false)
+            .create_spool("b".to_string(), None, None, false, HashMap::new())
             .await
             .expect("create spool b");
 
@@ -667,11 +707,11 @@ mod tests {
         let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4, 8, 256).expect("manager init");
 
         manager
-            .create_spool("a".to_string(), None, None, false)
+            .create_spool("a".to_string(), None, None, false, HashMap::new())
             .await
             .expect("create spool a");
         manager
-            .create_spool("b".to_string(), None, None, false)
+            .create_spool("b".to_string(), None, None, false, HashMap::new())
             .await
             .expect("create spool b");
 
@@ -744,13 +784,16 @@ mod tests {
         );
 
         manager
-            .create_spool("a".into(), None, None, false)
+            .create_spool("a".into(), None, None, false, HashMap::new())
             .await
             .expect("first create succeeds");
 
         let manager2 = Arc::clone(&manager);
-        let mut create2 =
-            tokio::spawn(async move { manager2.create_spool("b".into(), None, None, false).await });
+        let mut create2 = tokio::spawn(async move {
+            manager2
+                .create_spool("b".into(), None, None, false, HashMap::new())
+                .await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             !create2.is_finished(),
@@ -774,7 +817,7 @@ mod tests {
             SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 1).expect("manager init");
 
         manager
-            .create_spool("a".into(), None, None, false)
+            .create_spool("a".into(), None, None, false, HashMap::new())
             .await
             .expect("first create succeeds");
         let spool = manager.get_spool("a").expect("spool a exists");
@@ -782,7 +825,7 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            manager.create_spool("b".into(), None, None, false),
+            manager.create_spool("b".into(), None, None, false, HashMap::new()),
         )
         .await
         .expect("create must not block after full-read transition releases admission")
@@ -806,6 +849,7 @@ mod tests {
                 Some("application/octet-stream".into()),
                 None,
                 false,
+                HashMap::new(),
             )
             .await
             .expect("create spool");
@@ -826,7 +870,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         let spool_dir = data_dir.join(&key);
@@ -864,7 +908,7 @@ mod tests {
 
             let key = uuid::Uuid::new_v4().to_string();
             manager1
-                .create_spool(key.clone(), None, None, true)
+                .create_spool(key.clone(), None, None, true, HashMap::new())
                 .await
                 .expect("create spool");
             key
@@ -890,7 +934,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
 
@@ -932,7 +976,7 @@ mod tests {
                 .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
@@ -997,7 +1041,7 @@ mod tests {
                 .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
@@ -1055,7 +1099,7 @@ mod tests {
 
             let key = uuid::Uuid::new_v4().to_string();
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
 
@@ -1094,7 +1138,7 @@ mod tests {
                 .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
-                .create_spool(key.clone(), None, None, true) // WriteLocked
+                .create_spool(key.clone(), None, None, true, HashMap::new()) // WriteLocked
                 .await
                 .expect("create spool");
             key
@@ -1125,7 +1169,7 @@ mod tests {
                 .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
@@ -1382,7 +1426,7 @@ mod tests {
                     .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
-                .create_spool(key.clone(), None, None, false)
+                .create_spool(key.clone(), None, None, false, HashMap::new())
                 .await
                 .expect("create spool");
             let spool = manager.get_spool(&key).expect("spool exists");
@@ -1419,7 +1463,7 @@ mod tests {
 
         let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(key.clone(), None, None, false)
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
             .expect("create spool");
         {

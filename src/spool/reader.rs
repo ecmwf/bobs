@@ -30,6 +30,7 @@ where
             {
                 let cache = self.page_cache.lock().await;
                 if let Some(page) = cache.get(&self.key, page_idx) {
+                    self.metrics.record_cache_hit();
                     return Ok(Some(page));
                 }
             }
@@ -60,6 +61,7 @@ where
                     )
                     .await
                     .map_err(BobsError::IoError)?;
+                    self.metrics.record_cache_miss();
                     return Ok(Some(disk_buf));
                 }
             }
@@ -90,6 +92,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -176,6 +179,7 @@ mod tests {
             total_pages: 1,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
 
         Spool::new(
@@ -184,6 +188,7 @@ mod tests {
             page_size,
             Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(0))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }
@@ -220,6 +225,7 @@ mod tests {
             total_pages: 0,
             final_page_size: None,
             data_path: path,
+            labels: HashMap::new(),
         };
 
         metadata_store
@@ -235,6 +241,7 @@ mod tests {
                 cache_bytes,
             ))),
             metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
         .await
     }

@@ -2,6 +2,10 @@
 {{- $fullName := include "bobs.fullname" . -}}
 {{- $routeName := required "config.route_name must be set" .Values.config.route_name -}}
 {{- $port := .Values.service.port -}}
+{{- $host := printf "%s.%s" .Values.config.host_prefix .Values.config.domain -}}
+{{- $userAnnotations := .Values.ingress.annotations | default dict -}}
+{{- $controller := include "bobs.ingressController" . -}}
+{{- if eq $controller "nginx-inc" }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -12,6 +16,7 @@ metadata:
   annotations:
     nginx.org/mergeable-ingress-type: minion
     nginx.org/location-snippets: |
+      {{- if .Values.ingress.forwardedPrefix.enabled }}
       # Preserve the external route prefix for BOBS long-poll redirects. In-cluster
       # callers can also set X-Forwarded-Prefix directly; the app validates it as
       # a short relative path prefix before using it in Location.
@@ -26,10 +31,11 @@ metadata:
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
+      {{- end }}
       rewrite ^/{{ $routeName }}-\d+/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
       rewrite ^/{{ $routeName }}-\d+/api/v1/read/([^/]+)$ /api/v1/read/$1 break;
       rewrite ^/{{ $routeName }}-\d+/api/v1/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
-    {{- with .Values.ingress.annotations }}
+    {{- with $userAnnotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
@@ -37,7 +43,7 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   {{- end }}
   rules:
-    - host: {{ printf "%s.%s" $.Values.config.host_prefix $.Values.config.domain | quote }}
+    - host: {{ $host | quote }}
       http:
         paths:
           {{- range $i, $e := until (int $.Values.replicaCount) }}
@@ -53,4 +59,57 @@ spec:
   tls:
     {{- toYaml .Values.ingress.tls | nindent 4 }}
   {{- end }}
+{{- else if eq $controller "nginx-community" }}
+{{- /*
+Community ingress-nginx (kubernetes/ingress-nginx). One Ingress with N path
+rules — one per bobs replica. End-anchored regex `([0-9a-fA-F-]+)$` captures
+only UUID-shaped strings; the trailing $ matches the existing NGINX Inc
+location-snippet behaviour and prevents `/{route}-0/{uuid}/anything` from
+silently dropping the tail.
+
+TLS lives on the frontend Ingress for the same host (community nginx
+terminates SNI once per host). ssl-redirect + force-ssl-redirect are emitted
+as chart defaults so port-80 traffic to `/download-N/<uuid>` 308s to HTTPS
+before any data is served.
+*/ -}}
+{{- /* Strip NGINX Inc / Bologna-only annotation keys so they don't leak into the community ingress. */ -}}
+{{- $filtered := dict -}}
+{{- range $k, $v := $userAnnotations -}}
+  {{- if not (or (hasPrefix "nginx.org/" $k) (hasPrefix "dns.operators.ecmwf.int/" $k)) -}}
+    {{- $_ := set $filtered $k $v -}}
+  {{- end -}}
+{{- end -}}
+{{- $secureDefaults := dict
+  "nginx.ingress.kubernetes.io/ssl-redirect" "true"
+  "nginx.ingress.kubernetes.io/force-ssl-redirect" "true"
+  "nginx.ingress.kubernetes.io/use-regex" "true"
+  "nginx.ingress.kubernetes.io/rewrite-target" "/api/v1/read/$1" }}
+{{- $annotations := mergeOverwrite (deepCopy $secureDefaults) $filtered }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: '{{ $fullName }}'
+  labels:
+    app.kubernetes.io/name: '{{ include "bobs.name" . }}'
+    app.kubernetes.io/instance: '{{ .Release.Name }}'
+  annotations:
+    {{- toYaml $annotations | nindent 4 }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- range $i, $e := until (int $.Values.replicaCount) }}
+          - path: '/{{ $routeName }}-{{ $i }}/([0-9a-fA-F-]+)$'
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: '{{ $fullName }}-{{ $i }}'
+                port:
+                  number: {{ $port }}
+          {{- end }}
+{{- end }}
 {{- end }}

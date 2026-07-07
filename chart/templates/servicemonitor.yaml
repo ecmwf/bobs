@@ -1,0 +1,19 @@
+{{- if and .Values.config.metrics.enabled .Values.config.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "bobs.fullname" . }}
+  labels:
+    {{- include "bobs.labels" . | nindent 4 }}
+    {{- with .Values.config.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "bobs.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.config.metrics.serviceMonitor.interval }}
+{{- end }}

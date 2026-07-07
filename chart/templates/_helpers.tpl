@@ -2,6 +2,21 @@
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/*
+Resolve and validate the ingress controller flavour for the bobs subchart.
+The parent chart's `global.ingress.controller` propagates to subcharts via
+Helm's standard `global:` mechanism. Standalone bobs renders fall back to
+the subchart's own `global.ingress.controller` default.
+*/}}
+{{- define "bobs.ingressController" -}}
+{{- $c := (((.Values.global).ingress).controller) | default "nginx-inc" -}}
+{{- $supported := list "nginx-inc" "nginx-community" -}}
+{{- if not (has $c $supported) -}}
+{{- fail (printf "global.ingress.controller=%q is not supported in bobs subchart. Supported values: %v" $c $supported) -}}
+{{- end -}}
+{{- $c -}}
+{{- end -}}
+
 {{- define "bobs.fullname" -}}
 {{- if .Values.fullnameOverride -}}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
@@ -35,7 +50,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
     {{- $secrets = append $secrets . -}}
   {{- end -}}
   {{- if .Values.global.imageCredentials -}}
-    {{- $secrets = append $secrets (dict "name" "polytope-registry-cred") -}}
+    {{- $secrets = append $secrets (dict "name" (printf "%s-registry-cred" .Release.Name)) -}}
   {{- end -}}
 {{- end -}}
 {{- range .Values.imagePullSecrets | default list -}}

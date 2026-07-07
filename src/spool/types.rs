@@ -1,5 +1,6 @@
 use crate::error::{BobsError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +68,10 @@ pub struct SpoolMetadata {
     pub total_pages: u64,
     pub final_page_size: Option<u64>, // size of last (partial) page after complete
     pub data_path: PathBuf,
+    /// Caller-provided labels propagated to metrics as OTel attributes.
+    /// Bobs does not interpret these — they are pass-through dimensions.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use crate::error::BobsError;
 use crate::io::FileIO;
 use crate::manager::SpoolManager;
 use crate::metadata::MetadataStore;
+use crate::metrics::BobsMetrics;
 use crate::time::now_secs;
 use async_stream::stream;
 use axum::body::{Body, Bytes};
@@ -13,9 +14,10 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -172,6 +174,7 @@ pub struct AppState<F: FileIO, M: MetadataStore> {
     pub hostname: String,
     pub ordinal: String,
     pub internal_base_url: String,
+    pub metrics: Arc<BobsMetrics>,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +269,9 @@ struct CreateRequest {
     content_encoding: Option<String>,
     #[serde(default)]
     write_locked: bool,
+    /// Caller-provided labels propagated to metrics as OTel attributes.
+    #[serde(default)]
+    labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -298,18 +304,32 @@ where
             serde_json::from_slice::<CreateRequest>(&body)
                 .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
         };
+        let labels = state.config.filter_labels(&req.labels);
         let key = Uuid::new_v4().to_string();
-        state
+        let create_start = Instant::now();
+        let create_result = state
             .manager
             .create_spool(
                 key.clone(),
                 req.content_type.clone(),
                 req.content_encoding.clone(),
                 req.write_locked,
+                labels.clone(),
             )
-            .await
-            .map_err(ApiError)?;
-        tracing::info!("event.name" = "bobs.spool.created", "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
+            .await;
+        state.metrics.record_create_duration(
+            &labels,
+            if create_result.is_ok() { crate::metrics::outcome::SUCCESS } else { crate::metrics::outcome::ERROR },
+            create_start.elapsed().as_secs_f64(),
+        );
+        create_result.map_err(ApiError)?;
+        state.metrics.record_spool_created(&labels);
+        tracing::Span::current().record("bobs.spool.key", key.as_str());
+        if let Some(job_id) = &job_id {
+            tracing::info!("event.name" = "bobs.spool.created", "job.id" = %job_id, "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
+        } else {
+            tracing::info!("event.name" = "bobs.spool.created", "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
+        }
         let read_url = format!(
             "https://{}.{}/{}-{}/{}",
             state.config.host_prefix, state.config.domain, state.config.route_name, state.ordinal, key
@@ -344,33 +364,54 @@ where
             .manager
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
+        let labels = spool.metadata.lock().await.labels.clone();
+        let write_start = Instant::now();
         let write_batch_size = state.config.page_size;
         let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
         let mut write_offset = offset;
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
-            if let Ok(data) = frame.into_data() {
-                let mut cursor = 0;
-                while cursor < data.len() {
-                    let remaining_batch_space = write_batch_size - pending.len();
-                    let take = remaining_batch_space.min(data.len() - cursor);
-                    pending.extend_from_slice(&data[cursor..cursor + take]);
-                    cursor += take;
-                    if pending.len() == write_batch_size {
-                        let batch = std::mem::replace(&mut pending, bytes::BytesMut::with_capacity(write_batch_size)).freeze();
-                        let batch_len = batch.len();
-                        spool.write(write_offset, batch).await.map_err(ApiError)?;
-                        write_offset += batch_len as u64;
+        let write_result: std::result::Result<(), crate::error::BobsError> = async {
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
+                if let Ok(data) = frame.into_data() {
+                    let mut cursor = 0;
+                    while cursor < data.len() {
+                        let remaining_batch_space = write_batch_size - pending.len();
+                        let take = remaining_batch_space.min(data.len() - cursor);
+                        pending.extend_from_slice(&data[cursor..cursor + take]);
+                        cursor += take;
+                        if pending.len() == write_batch_size {
+                            let batch = std::mem::replace(&mut pending, bytes::BytesMut::with_capacity(write_batch_size)).freeze();
+                            let batch_len = batch.len();
+                            spool.write(write_offset, batch).await?;
+                            write_offset += batch_len as u64;
+                        }
                     }
                 }
             }
+            if !pending.is_empty() {
+                let batch_len = pending.len();
+                spool.write(write_offset, std::mem::take(&mut pending).freeze()).await?;
+                write_offset += batch_len as u64;
+            }
+            Ok(())
         }
-        if !pending.is_empty() {
-            let batch_len = pending.len();
-            spool.write(write_offset, pending.freeze()).await.map_err(ApiError)?;
-            write_offset += batch_len as u64;
+        .await;
+        let write_elapsed = write_start.elapsed().as_secs_f64();
+        let total_written = write_offset.saturating_sub(offset);
+        if write_result.is_ok() {
+            state.metrics.record_write_bytes(&labels, total_written);
         }
-        tracing::debug!("event.name" = "bobs.spool.write.completed", "bobs.spool.key" = %key, offset = offset, bytes = write_offset.saturating_sub(offset), outcome = "success", "spool write completed");
+        state.metrics.record_write_duration(
+            &labels,
+            if write_result.is_ok() { crate::metrics::outcome::SUCCESS } else { crate::metrics::outcome::ERROR },
+            write_elapsed,
+        );
+        write_result.map_err(ApiError)?;
+        if let Some(job_id) = &job_id {
+            tracing::debug!("event.name" = "bobs.spool.write.completed", "job.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
+        } else {
+            tracing::debug!("event.name" = "bobs.spool.write.completed", "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
+        }
         Ok(StatusCode::OK.into_response())
     }.instrument(span).await
 }
@@ -398,9 +439,22 @@ where
             .manager
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
-        spool.complete(req.expected_size).await.map_err(ApiError)?;
+        let labels = spool.metadata.lock().await.labels.clone();
+        let complete_start = Instant::now();
+        let complete_result = spool.complete(req.expected_size).await;
+        state.metrics.record_complete_duration(
+            &labels,
+            if complete_result.is_ok() { crate::metrics::outcome::SUCCESS } else { crate::metrics::outcome::ERROR },
+            complete_start.elapsed().as_secs_f64(),
+        );
+        complete_result.map_err(ApiError)?;
+        state.metrics.record_spool_completed(&labels);
         let meta = spool.metadata.lock().await;
-        tracing::info!("event.name" = "bobs.spool.completed", "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
+        if let Some(job_id) = &job_id {
+            tracing::info!("event.name" = "bobs.spool.completed", "job.id" = %job_id, "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
+        } else {
+            tracing::info!("event.name" = "bobs.spool.completed", "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
+        }
         Ok(StatusCode::OK.into_response())
     }.instrument(span).await
 }
@@ -413,6 +467,12 @@ where
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
     spool: Arc<crate::spool::Spool<F, M>>,
+    metrics: Arc<BobsMetrics>,
+    labels: HashMap<String, String>,
+    mode: &'static str,
+    started_at: Instant,
+    duration_recorded: bool,
+    bytes_served: u64,
 }
 
 fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
@@ -582,6 +642,17 @@ where
 {
     fn drop(&mut self) {
         self.spool.release_reader();
+        self.metrics.record_reader_released(&self.labels);
+        if !self.duration_recorded {
+            self.metrics
+                .record_read_bytes(&self.labels, self.mode, self.bytes_served);
+            self.metrics.record_read_duration(
+                &self.labels,
+                self.mode,
+                crate::metrics::outcome::CLIENT_GONE,
+                self.started_at.elapsed().as_secs_f64(),
+            );
+        }
     }
 }
 
@@ -614,8 +685,23 @@ where
         }
         spool.acquire_reader();
 
-        let lease = ReaderLease {
+        let read_labels = spool.metadata.lock().await.labels.clone();
+        let read_mode = if matches!(request_range, ReadRequestRange::Follow) {
+            crate::metrics::mode::FOLLOW
+        } else {
+            crate::metrics::mode::RANGE
+        };
+        state.metrics.record_reader_acquired(&read_labels);
+        let read_start = Instant::now();
+
+        let mut lease = ReaderLease {
             spool: Arc::clone(&spool),
+            metrics: Arc::clone(&state.metrics),
+            labels: read_labels.clone(),
+            mode: read_mode,
+            started_at: read_start,
+            duration_recorded: false,
+            bytes_served: 0,
         };
         let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
         let page_size = spool.page_size as u64;
@@ -657,9 +743,15 @@ where
         .await
     {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(ApiError(e)),
+        Ok(Err(e)) => {
+            lease.duration_recorded = true;
+            state.metrics.record_read_duration(&read_labels, read_mode, crate::metrics::outcome::ERROR, read_start.elapsed().as_secs_f64());
+            return Err(ApiError(e));
+        }
         Err(_) => {
             tracing::warn!("event.name" = "bobs.spool.read.timeout", "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "error", "spool read timed out");
+            lease.duration_recorded = true;
+            state.metrics.record_read_duration(&read_labels, read_mode, crate::metrics::outcome::TIMEOUT, read_start.elapsed().as_secs_f64());
             return Ok(long_poll_redirect(&key, &headers));
         }
     };
@@ -667,11 +759,14 @@ where
     let stream_job_id = job_id.clone();
     let stream_key = key.clone();
     let stream_range = raw_range.clone();
+    let stream_metrics = Arc::clone(&state.metrics);
+    let stream_labels = read_labels.clone();
+    let stream_mode = read_mode;
     let stream = stream! {
-        let _lease = lease;
+        let mut lease = lease;
         let mut offset = start;
         let mut bytes_served = 0_u64;
-        let mut outcome = "success";
+        let mut outcome = crate::metrics::outcome::SUCCESS;
         let mut prefetched = first_page;
 
         loop {
@@ -698,17 +793,20 @@ where
                 ).await {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
-                        outcome = "error";
+                        outcome = crate::metrics::outcome::ERROR;
                         yield Err::<Bytes, BobsError>(e);
                         break;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        outcome = crate::metrics::outcome::TIMEOUT;
+                        break;
+                    }
                 }
             } else {
                 match spool.read_page(page_idx).await {
                     Ok(v) => v,
                     Err(e) => {
-                        outcome = "error";
+                        outcome = crate::metrics::outcome::ERROR;
                         yield Err::<Bytes, BobsError>(e);
                         break;
                     }
@@ -730,6 +828,7 @@ where
                 let chunk_len = chunk.len() as u64;
                 offset += chunk_len;
                 bytes_served += chunk_len;
+                lease.bytes_served = bytes_served;
                 let chunk_end = offset;
 
                 // 1. Refresh activity timestamp (atomic, lock-free).
@@ -746,6 +845,24 @@ where
                 {
                     let mut meta = spool.metadata.lock().await;
                     meta.last_read_at = Some(now);
+                }
+
+                // 4. If this chunk completes a bounded read, record duration
+                //    NOW before yielding. hyper drops the response body
+                //    without a final poll once Content-Length is satisfied,
+                //    so the post-loop cleanup would never execute.
+                if end.is_some_and(|e| offset >= e) && !lease.duration_recorded {
+                    let completion_span = request_span(
+                        stream_job_id.as_deref(),
+                        Some(&stream_key),
+                        None,
+                        Some(&stream_range),
+                    );
+                    let _guard = completion_span.enter();
+                    tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
+                    lease.duration_recorded = true;
+                    stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
+                    stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
                 }
 
                 yield Ok::<Bytes, BobsError>(chunk);
@@ -766,14 +883,22 @@ where
                 break;
             }
         }
-        let completion_span = request_span(
-            stream_job_id.as_deref(),
-            Some(&stream_key),
-            None,
-            Some(&stream_range),
-        );
-        let _completion_span_guard = completion_span.enter();
-        tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
+        // Post-loop fallback for chunked responses (follow mode on
+        // in-progress spools) where Content-Length is not set and hyper
+        // polls the stream to completion normally.
+        if !lease.duration_recorded {
+            let completion_span = request_span(
+                stream_job_id.as_deref(),
+                Some(&stream_key),
+                None,
+                Some(&stream_range),
+            );
+            let _completion_span_guard = completion_span.enter();
+            tracing::info!("event.name" = "bobs.spool.read.completed", bytes = bytes_served, outcome = outcome, "spool read completed");
+            lease.duration_recorded = true;
+            stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
+            stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
+        }
     };
 
     let mut response = Body::from_stream(stream).into_response();
@@ -905,6 +1030,17 @@ where
     let job_id = extract_job_id(&headers);
     let span = request_span(job_id.as_deref(), Some(&key), None, None);
     async move {
+        // Capture labels before deletion removes the spool from memory.
+        let delete_labels = state.manager.get_spool(&key).map(|s| {
+            // We can't async-lock inside a sync map ref, so clone the Arc.
+            s
+        });
+        let labels = if let Some(spool) = &delete_labels {
+            spool.metadata.lock().await.labels.clone()
+        } else {
+            std::collections::HashMap::new()
+        };
+        drop(delete_labels);
         state
             .manager
             .delete_spool_with_reason(
@@ -914,6 +1050,9 @@ where
             )
             .await
             .map_err(ApiError)?;
+        state
+            .metrics
+            .record_spool_deleted(&labels, crate::metrics::reason::CLIENT);
         Ok(StatusCode::OK.into_response())
     }
     .instrument(span)
@@ -966,6 +1105,7 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use crate::cleanup::start_cleanup_task;
+    use crate::config::MetricsConfig;
     use crate::error::BobsError;
     use crate::io::DefaultFileIO;
     use crate::metadata::DefaultMetadataStore;
@@ -995,6 +1135,7 @@ mod tests {
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
+            metrics: MetricsConfig::default(),
         })
     }
 
@@ -1021,6 +1162,7 @@ mod tests {
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
+            metrics: MetricsConfig::default(),
         })
     }
 
@@ -1046,6 +1188,7 @@ mod tests {
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
+            metrics: Arc::new(BobsMetrics::new(false)),
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
@@ -1072,6 +1215,7 @@ mod tests {
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
+            metrics: Arc::new(BobsMetrics::new(false)),
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
@@ -2335,6 +2479,9 @@ mod tests {
         spool.last_read_activity_at.store(1, Ordering::SeqCst);
 
         tokio::time::advance(Duration::from_secs(3)).await;
+        // measure_disk_usage is now spawned fire-and-forget, so the cleanup
+        // loop returns to interval.tick() without blocking on spawn_blocking
+        // I/O.  A single yield is enough for the deletion sweep to run.
         tokio::task::yield_now().await;
 
         assert!(

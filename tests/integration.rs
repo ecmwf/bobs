@@ -9,6 +9,7 @@ use bobs::manager::SpoolManager;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use bobs::metadata::UringSidecarMetadataStore;
 use bobs::metadata::{DefaultMetadataStore, SyncSidecarMetadataStore};
+use bobs::metrics::BobsMetrics;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +102,7 @@ async fn start_server() -> TestServer {
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     });
     start_server_with_config(config).await
 }
@@ -149,6 +151,7 @@ async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path
         hostname: "bobs-0".into(),
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
+        metrics: Arc::new(BobsMetrics::new(false)),
     });
     let app: Router =
         router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
@@ -217,6 +220,7 @@ async fn assert_http_restart_continues_from_acknowledged_offset(
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     });
 
     let client = reqwest::Client::new();
@@ -315,6 +319,7 @@ async fn test_http_restart_persists_write_locked_and_readable_metadata_sidecar()
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     });
     let client = reqwest::Client::new();
 
@@ -925,6 +930,7 @@ async fn test_many_active_spools_share_global_cache_cap() {
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     });
     let server = start_server_with_config(config).await;
     let client = reqwest::Client::new();
@@ -1088,6 +1094,7 @@ fn config_short_full_read_ttl() -> Arc<Config> {
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     })
 }
 
@@ -1112,6 +1119,7 @@ fn config_short_idle_ttl() -> Arc<Config> {
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     })
 }
 
@@ -1250,6 +1258,7 @@ async fn test_idle_ttl_not_anchored_on_created_at() {
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     });
     let server = start_server_with_config(config).await;
     let client = reqwest::Client::new();
@@ -1332,6 +1341,7 @@ async fn test_slow_reader_receiving_bytes_not_cleaned_up() {
         host_prefix: "test".into(),
         domain: "example.com".into(),
         route_name: "bobs".into(),
+        ..Config::default()
     });
     let server = start_server_with_config(config).await;
 

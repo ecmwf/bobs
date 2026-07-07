@@ -1,5 +1,11 @@
 replicaCount: 1
 
+# Default fallback for standalone bobs renders. When deployed as a subchart of
+# polytope-chart, the parent's `global.ingress.controller` propagates here.
+global:
+  ingress:
+    controller: nginx-inc
+
 imagePullSecrets: []
 
 image:
@@ -11,20 +17,40 @@ service:
   type: ClusterIP
   port: 3000
 
-resources:
-  requests:
-    memory: 16Gi
-    cpu: "4"
-  limits:
-    memory: 16Gi
-    cpu: "8"
+# Empty by default (matches the deployed/vendored chart, which sets no resource
+# requests or limits). bobs/chart historically shipped the following explicit
+# defaults; uncomment to restore them (recommended for production with large
+# page_size / cache settings, ideally together with podAntiAffinityHostname):
+# resources:
+#   requests:
+#     memory: 16Gi
+#     cpu: "4"
+#   limits:
+#     memory: 16Gi
+#     cpu: "8"
+resources: {}
 
+# When true, add a required hostname pod-anti-affinity so no two BOBS pods in
+# this release schedule on the same node (avoids memory-overcommit OOMs when
+# requests==limits are large).
+podAntiAffinityHostname: false
+
+podAnnotations:
+  opensearch.org/include: "true"
+  opensearch.org/service.name: bobs
+
+# Pod-level securityContext. Hardened by default: bobs runs non-root (image
+# USER 10001) and fsGroup makes mounted PVCs group-writable so the process can
+# write its spool data + sidecar metadata. Set to {} to fall back to fsGroup-only.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 10001
   runAsGroup: 10001
   fsGroup: 10001
 
+# Container-level securityContext. Hardened by default. bobs writes only to its
+# data_dir PVC and reads its config read-only, so a read-only root filesystem is
+# safe (the historic bobs/chart shipped exactly this). Set to {} to disable.
 containerSecurityContext:
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
@@ -38,14 +64,44 @@ containerSecurityContext:
   # seccompProfile:
   #   type: RuntimeDefault
 
-internalBaseUrlTemplate: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ .Values.headlessService.name }}:{{ .Values.service.port }}/api/v1'
+# HTTP health probes against /api/v1/health. Disabled by default (parity with
+# the deployed/vendored chart, which ships no probes). Set enabled: true to add
+# the readiness/liveness probes bobs/chart historically shipped.
+probes:
+  enabled: false
+
+# Internal base URL template bobs uses to build per-ordinal pod URLs. Leave empty
+# to use the default derived from the release fullname and service port:
+#   http://<fullname>-{ordinal}:<service.port>/api/v1
+# Set to override (tpl-rendered; `{ordinal}` is substituted by bobs at runtime),
+# e.g. to route via the headless service:
+#   internalBaseUrlTemplate: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ .Values.headlessService.name }}:{{ .Values.service.port }}/api/v1'
+internalBaseUrlTemplate: ""
+
+observability:
+  # deployment.environment OTel resource attribute.
+  # If set, injects BOBS_DEPLOYMENT_ENV directly; otherwise reads from a
+  # ConfigMap in the same namespace.
+  deploymentEnv: ""
+  deploymentEnvConfigMapName: ""
+  deploymentEnvConfigMapKey: BOBS_DEPLOYMENT_ENV
 
 config:
   host: "0.0.0.0"
   port: 3000
   data_dir: "/var/lib/bobs"
+  # Spool write page size. BOBS fsyncs a metadata commit per page on write, so
+  # larger pages amortise fsync cost over more data. max_cache_bytes must be >= page_size.
   page_size: 4096
   max_cache_bytes: 1048576
+  # Admission limit: max spools concurrently holding an in-memory page cache
+  # (created but not yet fully read). create blocks until a slot frees, applying
+  # backpressure to writers instead of growing memory without bound.
+  max_live_spools: 4096
+  # io_uring tuning. When unset, BOBS auto-resolves shards = (num_cpus/4).max(1)
+  # and a queue capacity of 1024. Override for higher per-volume write parallelism.
+  # io_uring_shards: 8
+  # io_uring_queue_capacity: 4096
   writer_inactivity_timeout_secs: 300
   read_idle_ttl_secs: 600
   full_read_complete_ttl_secs: 30
@@ -53,11 +109,20 @@ config:
   unread_ttl_secs: 3600
   cleanup_sweep_interval_secs: 30
   long_poll_timeout_ms: 25000
-  io_uring_shards: null
-  io_uring_queue_capacity: 1024
   host_prefix: ""
   domain: ""
   route_name: "download"
+  metrics:
+    enabled: false
+    bind_address: "0.0.0.0"
+    port: 9464
+    allowed_labels:
+      - collection
+    max_label_value_length: 128
+    serviceMonitor:
+      enabled: false
+      interval: 30s
+      labels: {}
 
 persistence:
   enabled: true
@@ -69,6 +134,12 @@ ingress:
   className: nginx
   annotations: {}
   tls: []
+  # X-Forwarded-Prefix location snippet for the nginx-inc ingress. Off by default
+  # (parity with the deployed/vendored chart). When enabled, the ingress preserves
+  # the external route prefix (/{route_name}-N) for BOBS long-poll redirects and
+  # re-asserts the standard forwarded headers explicitly.
+  forwardedPrefix:
+    enabled: false
 
 headlessService:
   enabled: true

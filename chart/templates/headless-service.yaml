@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: '{{ .Values.headlessService.name }}'
+  name: '{{ include "bobs.fullname" . }}-svc'
   labels:
     app.kubernetes.io/name: '{{ include "bobs.name" . }}'
     app.kubernetes.io/instance: '{{ .Release.Name }}'

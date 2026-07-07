@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +33,36 @@ pub struct Config {
     pub host_prefix: String,
     pub domain: String,
     pub route_name: String,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Enable OpenTelemetry metrics export.
+    pub enabled: bool,
+    /// Bind address for the Prometheus `/metrics` scrape endpoint.
+    pub bind_address: String,
+    /// Port for the Prometheus `/metrics` scrape endpoint.
+    pub port: u16,
+    /// Only these label keys are propagated as metric attributes.
+    /// If empty, ALL caller-provided labels are propagated.
+    pub allowed_labels: Vec<String>,
+    /// Maximum length for label values. Values exceeding this are truncated.
+    pub max_label_value_length: usize,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            enabled: false,
+            bind_address: "127.0.0.1".to_string(),
+            port: 9464,
+            allowed_labels: Vec::new(),
+            max_label_value_length: 128,
+        }
+    }
 }
 
 impl Default for Config {
@@ -60,6 +91,7 @@ impl Default for Config {
             host_prefix: String::new(),
             domain: String::new(),
             route_name: String::new(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -150,6 +182,25 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Filter and truncate caller-provided labels according to config.
+    pub fn filter_labels(&self, labels: &HashMap<String, String>) -> HashMap<String, String> {
+        let max_len = self.metrics.max_label_value_length;
+        let allowed = &self.metrics.allowed_labels;
+
+        labels
+            .iter()
+            .filter(|(k, _)| allowed.is_empty() || allowed.contains(k))
+            .map(|(k, v)| {
+                let truncated = if v.len() > max_len {
+                    v[..v.floor_char_boundary(max_len)].to_string()
+                } else {
+                    v.clone()
+                };
+                (k.clone(), truncated)
+            })
+            .collect()
     }
 }
 
