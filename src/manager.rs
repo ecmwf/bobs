@@ -201,14 +201,14 @@ where
         match &result {
             Ok(()) => {
                 if let Some(job_id) = job_id {
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "job.id" = %job_id, reason = reason.as_str(), outcome = "success", "spool deleted");
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "request.id" = %job_id, reason = reason.as_str(), outcome = "success", "spool deleted");
                 } else {
                     tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "success", "spool deleted");
                 }
             }
             Err(error) => {
                 if let Some(job_id) = job_id {
-                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "job.id" = %job_id, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
+                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "request.id" = %job_id, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
                 } else {
                     tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
                 }
@@ -463,8 +463,8 @@ where
                 tracing::warn!(orphan = %name, "recovery: skipping non-directory entry during orphan sweep");
                 continue;
             }
-            if uuid::Uuid::parse_str(&name).is_err() {
-                tracing::warn!(orphan = %name, "recovery: skipping non-UUID directory during orphan sweep");
+            if !is_recognised_spool_key(&name) {
+                tracing::warn!(orphan = %name, "recovery: skipping unrecognised directory during orphan sweep");
                 continue;
             }
             if recovered_keys.contains(&name)
@@ -475,13 +475,13 @@ where
             }
 
             let entry_path = entry.path();
-            // UUID-named empty directories are preserved: they may be unrelated
-            // operator data, or a future spool shape, and are not safe orphans
-            // unless they contain a known spool marker.
+            // Recognised-key directories without spool markers are preserved:
+            // they may be unrelated operator data, or a future spool shape, and
+            // are not safe orphans unless they contain a known spool marker.
             let shaped_like_spool =
                 entry_path.join("spool.dat").exists() || entry_path.join("meta.json").exists();
             if !shaped_like_spool {
-                tracing::warn!(orphan = %name, "recovery: skipping UUID directory without spool markers during orphan sweep");
+                tracing::warn!(orphan = %name, "recovery: skipping spool-key directory without spool markers during orphan sweep");
                 continue;
             }
 
@@ -539,6 +539,26 @@ struct InProgressProgress {
     trailing_partial_len: u64,
 }
 
+/// A data-directory entry is a recognised spool key if it is a UUID (anonymous
+/// spools) or a 26-character Crockford base32 request ID (spools keyed by the
+/// originating request, see the `/create` handler). The orphan sweep only
+/// touches recognised keys, so unrelated operator directories are left alone.
+pub(crate) fn is_recognised_spool_key(name: &str) -> bool {
+    uuid::Uuid::parse_str(name).is_ok() || is_request_id_key(name)
+}
+
+/// True for a 26-character lower-case Crockford base32 request ID (the format
+/// BITS mints and clients quote). Crockford base32 excludes i, l, o and u.
+pub(crate) fn is_request_id_key(name: &str) -> bool {
+    name.len() == 26
+        && name.bytes().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z'
+            )
+        })
+}
+
 fn in_progress_progress_from_file(file_size: u64, page_size: usize) -> InProgressProgress {
     let page_size = page_size as u64;
     InProgressProgress {
@@ -573,6 +593,19 @@ mod tests {
     use crate::io::TokioFileIO;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[test]
+    fn recognised_spool_keys_accept_uuid_and_request_id() {
+        // Anonymous UUID spools and request-ID-keyed spools are both recognised.
+        assert!(is_recognised_spool_key(&uuid::Uuid::new_v4().to_string()));
+        assert!(is_recognised_spool_key("0123456789abcdefghjkmnpqrs"));
+        assert!(is_request_id_key("0123456789abcdefghjkmnpqrs"));
+        // Junk directory names are not recognised (orphan sweep leaves them).
+        assert!(!is_recognised_spool_key("not-a-key"));
+        assert!(!is_request_id_key("0123456789abcdefghjkmnpqr")); // 25 chars
+        assert!(!is_request_id_key("0123456789abcdefghijklmnop")); // i, l, o excluded
+        assert!(!is_request_id_key("0123456789ABCDEFGHJKMNPQRS")); // upper-case excluded
+    }
 
     async fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {
         manager

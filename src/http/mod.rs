@@ -25,14 +25,7 @@ const JOB_ID_HEADER: &str = "X-Polytope-Job-Id";
 
 fn extract_job_id(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(JOB_ID_HEADER)?.to_str().ok()?;
-    if value.len() != 26 {
-        return None;
-    }
-    if value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z')) {
-        Some(value.to_string())
-    } else {
-        None
-    }
+    crate::manager::is_request_id_key(value).then(|| value.to_string())
 }
 
 fn request_span(
@@ -44,112 +37,112 @@ fn request_span(
     match (job_id, key, offset, range) {
         (None, None, None, None) => tracing::info_span!(
             "bobs.request",
-            "job.id" = tracing::field::Empty,
+            "request.id" = tracing::field::Empty,
             "bobs.spool.key" = tracing::field::Empty,
             offset = tracing::field::Empty,
             range = tracing::field::Empty,
         ),
         (Some(job_id), None, None, None) => tracing::info_span!(
             "bobs.request",
-            "job.id" = job_id,
+            "request.id" = job_id,
             "bobs.spool.key" = tracing::field::Empty,
             offset = tracing::field::Empty,
             range = tracing::field::Empty,
         ),
         (None, Some(key), None, None) => tracing::info_span!(
             "bobs.request",
-            "job.id" = tracing::field::Empty,
+            "request.id" = tracing::field::Empty,
             "bobs.spool.key" = key,
             offset = tracing::field::Empty,
             range = tracing::field::Empty,
         ),
         (Some(job_id), Some(key), None, None) => tracing::info_span!(
             "bobs.request",
-            "job.id" = job_id,
+            "request.id" = job_id,
             "bobs.spool.key" = key,
             offset = tracing::field::Empty,
             range = tracing::field::Empty,
         ),
         (None, None, Some(offset), None) => tracing::info_span!(
             "bobs.request",
-            "job.id" = tracing::field::Empty,
+            "request.id" = tracing::field::Empty,
             "bobs.spool.key" = tracing::field::Empty,
             offset = offset,
             range = tracing::field::Empty,
         ),
         (Some(job_id), None, Some(offset), None) => tracing::info_span!(
             "bobs.request",
-            "job.id" = job_id,
+            "request.id" = job_id,
             "bobs.spool.key" = tracing::field::Empty,
             offset = offset,
             range = tracing::field::Empty,
         ),
         (None, Some(key), Some(offset), None) => tracing::info_span!(
             "bobs.request",
-            "job.id" = tracing::field::Empty,
+            "request.id" = tracing::field::Empty,
             "bobs.spool.key" = key,
             offset = offset,
             range = tracing::field::Empty,
         ),
         (Some(job_id), Some(key), Some(offset), None) => tracing::info_span!(
             "bobs.request",
-            "job.id" = job_id,
+            "request.id" = job_id,
             "bobs.spool.key" = key,
             offset = offset,
             range = tracing::field::Empty,
         ),
         (None, None, None, Some(range)) => tracing::info_span!(
             "bobs.request",
-            "job.id" = tracing::field::Empty,
+            "request.id" = tracing::field::Empty,
             "bobs.spool.key" = tracing::field::Empty,
             offset = tracing::field::Empty,
             range = range,
         ),
         (Some(job_id), None, None, Some(range)) => tracing::info_span!(
             "bobs.request",
-            "job.id" = job_id,
+            "request.id" = job_id,
             "bobs.spool.key" = tracing::field::Empty,
             offset = tracing::field::Empty,
             range = range,
         ),
         (None, Some(key), None, Some(range)) => tracing::info_span!(
             "bobs.request",
-            "job.id" = tracing::field::Empty,
+            "request.id" = tracing::field::Empty,
             "bobs.spool.key" = key,
             offset = tracing::field::Empty,
             range = range,
         ),
         (Some(job_id), Some(key), None, Some(range)) => tracing::info_span!(
             "bobs.request",
-            "job.id" = job_id,
+            "request.id" = job_id,
             "bobs.spool.key" = key,
             offset = tracing::field::Empty,
             range = range,
         ),
         (None, None, Some(offset), Some(range)) => tracing::info_span!(
             "bobs.request",
-            "job.id" = tracing::field::Empty,
+            "request.id" = tracing::field::Empty,
             "bobs.spool.key" = tracing::field::Empty,
             offset = offset,
             range = range,
         ),
         (Some(job_id), None, Some(offset), Some(range)) => tracing::info_span!(
             "bobs.request",
-            "job.id" = job_id,
+            "request.id" = job_id,
             "bobs.spool.key" = tracing::field::Empty,
             offset = offset,
             range = range,
         ),
         (None, Some(key), Some(offset), Some(range)) => tracing::info_span!(
             "bobs.request",
-            "job.id" = tracing::field::Empty,
+            "request.id" = tracing::field::Empty,
             "bobs.spool.key" = key,
             offset = offset,
             range = range,
         ),
         (Some(job_id), Some(key), Some(offset), Some(range)) => tracing::info_span!(
             "bobs.request",
-            "job.id" = job_id,
+            "request.id" = job_id,
             "bobs.spool.key" = key,
             offset = offset,
             range = range,
@@ -305,7 +298,13 @@ where
                 .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
         };
         let labels = state.config.filter_labels(&req.labels);
-        let key = Uuid::new_v4().to_string();
+        // Key the spool by the originating request ID when the caller supplies
+        // one (X-Polytope-Job-Id), so spool directories, read URLs and logs all
+        // line up with the request ID users quote. Callers without a request ID
+        // (e.g. ad-hoc tooling) still get an anonymous UUID.
+        let key = job_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let create_start = Instant::now();
         let create_result = state
             .manager
@@ -326,7 +325,7 @@ where
         state.metrics.record_spool_created(&labels);
         tracing::Span::current().record("bobs.spool.key", key.as_str());
         if let Some(job_id) = &job_id {
-            tracing::info!("event.name" = "bobs.spool.created", "job.id" = %job_id, "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
+            tracing::info!("event.name" = "bobs.spool.created", "request.id" = %job_id, "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
         } else {
             tracing::info!("event.name" = "bobs.spool.created", "bobs.spool.key" = %key, content_type = ?req.content_type, content_encoding = ?req.content_encoding, write_locked = req.write_locked, outcome = "success", "spool created");
         }
@@ -408,7 +407,7 @@ where
         );
         write_result.map_err(ApiError)?;
         if let Some(job_id) = &job_id {
-            tracing::debug!("event.name" = "bobs.spool.write.completed", "job.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
+            tracing::debug!("event.name" = "bobs.spool.write.completed", "request.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
         } else {
             tracing::debug!("event.name" = "bobs.spool.write.completed", "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
         }
@@ -451,7 +450,7 @@ where
         state.metrics.record_spool_completed(&labels);
         let meta = spool.metadata.lock().await;
         if let Some(job_id) = &job_id {
-            tracing::info!("event.name" = "bobs.spool.completed", "job.id" = %job_id, "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
+            tracing::info!("event.name" = "bobs.spool.completed", "request.id" = %job_id, "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
         } else {
             tracing::info!("event.name" = "bobs.spool.completed", "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
         }
@@ -1031,10 +1030,7 @@ where
     let span = request_span(job_id.as_deref(), Some(&key), None, None);
     async move {
         // Capture labels before deletion removes the spool from memory.
-        let delete_labels = state.manager.get_spool(&key).map(|s| {
-            // We can't async-lock inside a sync map ref, so clone the Arc.
-            s
-        });
+        let delete_labels = state.manager.get_spool(&key);
         let labels = if let Some(spool) = &delete_labels {
             spool.metadata.lock().await.labels.clone()
         } else {
@@ -1438,6 +1434,42 @@ mod tests {
             .to_bytes();
         let v: Value = serde_json::from_slice(&body).expect("json parse");
         v["key"].as_str().expect("key string").to_string()
+    }
+
+    #[tokio::test]
+    async fn create_uses_request_id_header_as_spool_key() {
+        let app = app().await;
+        let request_id = "0123456789abcdefghjkmnpqrs"; // 26-char Crockford base32
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, request_id)
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.clone().oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["key"].as_str().unwrap(), request_id);
+        // The read URL is keyed by the request ID too.
+        assert!(v["read_url"].as_str().unwrap().ends_with(request_id));
+    }
+
+    #[tokio::test]
+    async fn create_falls_back_to_uuid_without_valid_request_id() {
+        let app = app().await;
+        // Wrong length -> not a valid request ID -> anonymous UUID key.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, "too-short")
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.clone().oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(uuid::Uuid::parse_str(v["key"].as_str().unwrap()).is_ok());
     }
 
     #[test]

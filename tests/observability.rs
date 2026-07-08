@@ -187,7 +187,7 @@ async fn observability_valid_job_flow_emits_spool_events() {
         assert!(
             logs.events_named(name)
                 .iter()
-                .any(|event| event["attributes"]["job.id"] == VALID_JOB_ID),
+                .any(|event| event["attributes"]["request.id"] == VALID_JOB_ID),
             "missing job.id on {name}: {}",
             logs.raw()
         );
@@ -222,7 +222,7 @@ async fn observability_no_header_flow_succeeds_without_job_id() {
         assert!(logs
             .events_named(name)
             .iter()
-            .all(|event| event["attributes"].get("job.id").is_none()));
+            .all(|event| event["attributes"].get("request.id").is_none()));
     }
 }
 
@@ -298,11 +298,11 @@ async fn observability_header_validation_and_redaction() {
     let read_events = logs.events_named("bobs.spool.read.started");
     assert!(read_events
         .iter()
-        .any(|event| event["attributes"]["job.id"] == VALID_JOB_ID));
+        .any(|event| event["attributes"]["request.id"] == VALID_JOB_ID));
     assert!(
         read_events
             .iter()
-            .filter(|event| event["attributes"].get("job.id").is_none())
+            .filter(|event| event["attributes"].get("request.id").is_none())
             .count()
             >= 3
     );

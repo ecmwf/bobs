@@ -465,7 +465,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!(
                 "request",
-                "job.id" = "0123456789abcdefghjkmnpqrs",
+                "request.id" = "0123456789abcdefghjkmnpqrs",
                 "bobs.spool.key" = "key-1"
             );
             let _enter = span.enter();
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(line["resource"]["service.name"], json!("bobs"));
         assert_eq!(line["resource"]["deployment.environment"], json!("dev"));
         assert_eq!(
-            line["attributes"]["job.id"],
+            line["attributes"]["request.id"],
             json!("0123456789abcdefghjkmnpqrs")
         );
         assert_eq!(line["attributes"]["bobs.spool.key"], json!("key-1"));
