@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Standalone BOBS benchmark
 
 The `bobs-benchmark` binary drives complete BOBS object lifecycles directly over the BOBS HTTP API:

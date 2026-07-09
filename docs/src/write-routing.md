@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Write Routing
 
 BOBS supports horizontal scaling of writes across a StatefulSet. Each pod owns the spools it created, and clients are directed to the owning pod for all body-path operations via the `write_url` returned at create time.

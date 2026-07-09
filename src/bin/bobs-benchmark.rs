@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use bobs::benchmark::config::{BenchmarkConfig, ParseOutcome};
 use bobs::benchmark::run::run_benchmark;
 use bobs::benchmark::summary::{render_human, render_summary_line};

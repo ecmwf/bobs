@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "bobs"
+abstract: "A streaming spool service that buffers large single-writer byte streams for slow or remote consumers, with byte-range addressable reads and automatic cleanup."
+authors:
+  - name: "European Centre for Medium-Range Weather Forecasts (ECMWF)"
+    website: "https://www.ecmwf.int"
+version: "0.1.0"
+date-released: "2026-07-09"
+repository-code: "https://github.com/ecmwf/bobs"
+url: "https://github.com/ecmwf/bobs"
+license: Apache-2.0
+keywords:
+  - "streaming"
+  - "spool"
+  - "buffering"
+  - "kubernetes"
+  - "rust"

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use axum::Router;
 use bobs::cleanup::start_cleanup_task;
 use bobs::config::Config;
