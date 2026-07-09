@@ -32,9 +32,9 @@ metadata:
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
       {{- end }}
-      rewrite ^/{{ $routeName }}-\d+/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
+      rewrite ^/{{ $routeName }}-\d+/([0-9a-zA-Z-]+)$ /api/v1/read/$1 break;
       rewrite ^/{{ $routeName }}-\d+/api/v1/read/([^/]+)$ /api/v1/read/$1 break;
-      rewrite ^/{{ $routeName }}-\d+/api/v1/([0-9a-fA-F-]+)$ /api/v1/read/$1 break;
+      rewrite ^/{{ $routeName }}-\d+/api/v1/([0-9a-zA-Z-]+)$ /api/v1/read/$1 break;
     {{- with $userAnnotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -62,14 +62,14 @@ spec:
 {{- else if eq $controller "nginx-community" }}
 {{- /*
 Community ingress-nginx (kubernetes/ingress-nginx). One Ingress with N path
-rules — one per bobs replica. End-anchored regex `([0-9a-fA-F-]+)$` captures
-only UUID-shaped strings; the trailing $ matches the existing NGINX Inc
+rules — one per bobs replica. End-anchored regex `([0-9a-zA-Z-]+)$` captures
+spool keys (ULID request-ids or anonymous UUIDs); the trailing $ matches the existing NGINX Inc
 location-snippet behaviour and prevents `/{route}-0/{uuid}/anything` from
 silently dropping the tail.
 
 TLS lives on the frontend Ingress for the same host (community nginx
 terminates SNI once per host). ssl-redirect + force-ssl-redirect are emitted
-as chart defaults so port-80 traffic to `/download-N/<uuid>` 308s to HTTPS
+as chart defaults so port-80 traffic to `/download-N/<key>` 308s to HTTPS
 before any data is served.
 */ -}}
 {{- /* Strip NGINX Inc / Bologna-only annotation keys so they don't leak into the community ingress. */ -}}
@@ -103,7 +103,7 @@ spec:
       http:
         paths:
           {{- range $i, $e := until (int $.Values.replicaCount) }}
-          - path: '/{{ $routeName }}-{{ $i }}/([0-9a-fA-F-]+)$'
+          - path: '/{{ $routeName }}-{{ $i }}/([0-9a-zA-Z-]+)$'
             pathType: ImplementationSpecific
             backend:
               service:
