@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+#
+# SPDX-License-Identifier: Apache-2.0
+
+version = 1
+
+# Human-facing LICENSE and NOTICE files (outside LICENSES/) and metadata files
+# that carry no comment syntax.
+[[annotations]]
+path = ["LICENSE", "NOTICE", "CITATION.cff", "chart/templates/_helpers.tpl"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 European Centre for Medium-Range Weather Forecasts (ECMWF)"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Generated lockfile (carries an auto-generated "do not edit" banner).
+[[annotations]]
+path = "Cargo.lock"
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 European Centre for Medium-Range Weather Forecasts (ECMWF)"
+SPDX-License-Identifier = "Apache-2.0"

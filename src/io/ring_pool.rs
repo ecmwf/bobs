@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Linux io_uring ring-pool support.
 //!
 //! This module starts with hash-routing tests so the stable key-to-shard

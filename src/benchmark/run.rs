@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use super::config::BenchmarkConfig;
 use super::http_client::BobsHttpClient;
 use super::schedule::{build_schedule, extract_ordinal_from_read_url, ObjectPlan};

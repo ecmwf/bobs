@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+#
+# SPDX-License-Identifier: Apache-2.0
+
 FROM docker.io/library/rust:1.93-slim-bookworm AS builder
 WORKDIR /build
 ARG FEATURES=""

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+#
+# SPDX-License-Identifier: Apache-2.0
+
 /target
 .env
 .sisyphus/evidence/
@@ -6,3 +10,8 @@ skaffold.env
 .weave/
 /docs/book
 profiles/
+.venv/
+__pycache__/
+*.pyc
+.claude/
+.omc/

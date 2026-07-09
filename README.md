@@ -1,6 +1,17 @@
+<!--
+SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # BOBS — Big-Object Buffered Storage
 
 A streaming spool service for buffering large producer responses for slow consumers.
+
+[![Static Badge](https://github.com/ecmwf/codex/raw/refs/heads/main/Project%20Maturity/incubating_badge.svg)](https://github.com/ecmwf/codex/raw/refs/heads/main/Project%20Maturity#incubating)
+
+> [!IMPORTANT]
+> This software is **Incubating** and subject to ECMWF's guidelines on [Software Maturity](https://github.com/ecmwf/codex/raw/refs/heads/main/Project%20Maturity).
 
 ## Overview
 
@@ -46,6 +57,7 @@ Example:
 Follow this lifecycle to create, write, read, and delete a spool.
 
 ### 1. Create a spool
+
 The service returns a unique key for the new spool.
 
 ```bash
@@ -54,6 +66,7 @@ curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "applicatio
 ```
 
 ### 2. Write data
+
 Append data at a specific offset. Offset must match the current total bytes written.
 
 ```bash
@@ -61,6 +74,7 @@ curl -X POST http://localhost:3000/api/v1/write/unique-spool-key/0 --data-binary
 ```
 
 ### 3. Complete the spool
+
 Finalize the spool to signal readers that no more data is coming. Optional size verification ensures integrity.
 
 ```bash
@@ -70,16 +84,19 @@ curl -X POST http://localhost:3000/api/v1/complete/unique-spool-key -d '{"expect
 ### 4. Read data
 
 **Bounded read**: Request a specific byte range via a standard HTTP `Range` header.
+
 ```bash
 curl http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=0-1048575"
 ```
 
 **Follow mode**: Stream data as it's written (no `Range` header).
+
 ```bash
 curl http://localhost:3000/api/v1/read/unique-spool-key
 ```
 
 ### 5. Parallel reads
+
 Multiple readers can consume different ranges simultaneously.
 
 ```bash
@@ -91,6 +108,7 @@ curl http://localhost:3000/api/v1/read/unique-spool-key -H "Range: bytes=524288-
 ```
 
 ### 6. Delete the spool
+
 Manually remove a spool when finished.
 
 ```bash
@@ -116,7 +134,7 @@ BOBS is configured via a YAML file passed as a CLI argument. All fields have sen
 ```
 
 | Field | Default | Description |
-|-------|---------|-------------|
+| ------- | --------- | ------------- |
 | `host` | `0.0.0.0` | Address to listen on. |
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
@@ -142,4 +160,4 @@ bob_id: bobs-1
 
 ## License
 
-See the LICENSE file for details.
+[Apache License 2.0](LICENSE) In applying this licence, ECMWF does not waive the privileges and immunities granted to it by virtue of its status as an intergovernmental organisation nor does it submit to any jurisdiction.

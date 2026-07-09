@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+//
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(not(unix))]
 compile_error!(
     "TokioFileIO requires Unix positional file APIs; add an explicit non-Unix backend before building on this platform"

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Introduction
 
 BOBS (Big-Object Buffered Storage) is a streaming spool service designed to buffer large producer responses for consumption by slow or remote readers.

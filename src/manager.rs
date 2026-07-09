@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
 use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
