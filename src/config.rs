@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 const DEFAULT_PAGE_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
-// Keep the established workload admission ceiling. This is not a cache-entry
-// count: the independently byte-bounded global cache evicts pages as needed.
-const DEFAULT_MAX_LIVE_SPOOLS: usize = 4096;
+fn derived_max_live_spools(page_size: usize, max_cache_bytes: usize) -> usize {
+    max_cache_bytes.checked_div(page_size).unwrap_or(0).max(1)
+}
 // The chart's default PVC is 10 GiB; reserve 20% for sidecars and headroom.
 const DEFAULT_MAX_SPOOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -23,8 +23,8 @@ pub struct Config {
     pub page_size: usize,
     pub max_cache_bytes: usize,
     /// Maximum number of spools admitted before their first complete read.
-    /// This bounds workflow fan-out independently of the byte-bounded global cache;
-    /// explicit overrides are preserved for workloads with different concurrency.
+    /// When omitted from YAML, this is derived from `max_cache_bytes / page_size`
+    /// (with a minimum of one). Explicit operator overrides are preserved.
     pub max_live_spools: usize,
     /// Maximum bytes accepted for one spool across all write requests.
     pub max_spool_bytes: u64,
@@ -90,12 +90,12 @@ impl Default for Config {
             host: "0.0.0.0".to_string(),
             port: 3000,
             data_dir: PathBuf::from("./data"),
-            // 16 MiB pages amortise metadata persistence. The global 256 MiB
-            // page cache remains byte-bounded independently of the established
-            // 4096-spool workflow admission ceiling.
+            // 16 MiB pages and a global 256 MiB page cache admit 16 live
+            // spools by default. YAML that changes either setting and omits
+            // max_live_spools derives a matching admission limit at load time.
             page_size: DEFAULT_PAGE_SIZE,
             max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
-            max_live_spools: DEFAULT_MAX_LIVE_SPOOLS,
+            max_live_spools: derived_max_live_spools(DEFAULT_PAGE_SIZE, DEFAULT_MAX_CACHE_BYTES),
             max_spool_bytes: DEFAULT_MAX_SPOOL_BYTES,
             create_admission_timeout_ms: 5000,
             writer_inactivity_timeout_secs: 300,
@@ -118,9 +118,21 @@ impl Default for Config {
 
 impl Config {
     pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        #[derive(Deserialize)]
+        struct AdmissionOverride {
+            max_live_spools: Option<usize>,
+        }
+
         let contents = std::fs::read_to_string(path)?;
-        serde_norway::from_str(&contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let mut config: Config = serde_norway::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let admission: AdmissionOverride = serde_norway::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if admission.max_live_spools.is_none() {
+            config.max_live_spools =
+                derived_max_live_spools(config.page_size, config.max_cache_bytes);
+        }
+        Ok(config)
     }
 
     pub fn validate(&self) -> std::io::Result<()> {
@@ -273,7 +285,7 @@ mod tests {
         assert_eq!(config.data_dir, PathBuf::from("./data"));
         assert_eq!(config.page_size, DEFAULT_PAGE_SIZE);
         assert_eq!(config.max_cache_bytes, DEFAULT_MAX_CACHE_BYTES);
-        assert_eq!(config.max_live_spools, 4096);
+        assert_eq!(config.max_live_spools, 16);
         assert_eq!(config.max_spool_bytes, DEFAULT_MAX_SPOOL_BYTES);
         assert_eq!(config.create_admission_timeout_ms, 5000);
         assert_eq!(config.writer_inactivity_timeout_secs, 300);
@@ -617,7 +629,7 @@ route_name: z
         // Current fields get defaults.
         assert_eq!(cfg.read_idle_ttl_secs, 600);
         assert_eq!(cfg.full_read_complete_ttl_secs, 30);
-        assert_eq!(cfg.max_live_spools, 4096);
+        assert_eq!(cfg.max_live_spools, 16);
         assert_eq!(cfg.io_uring_shards, None);
         assert_eq!(cfg.io_uring_queue_capacity, 1024);
         // Old fields still parsed.
@@ -626,18 +638,42 @@ route_name: z
     }
 
     #[test]
-    fn test_from_file_partial_yaml() {
+    fn test_from_file_partial_yaml_derives_admission_from_effective_cache_capacity() {
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("partial.yaml");
-        std::fs::write(&path, "page_size: 8192\n").expect("write yaml");
+        std::fs::write(&path, "page_size: 8192\nmax_cache_bytes: 65536\n").expect("write yaml");
 
         let cfg = Config::from_file(&path).expect("parse yaml");
         assert_eq!(cfg.page_size, 8192);
+        assert_eq!(cfg.max_cache_bytes, 65536);
+        assert_eq!(cfg.max_live_spools, 8);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 3000);
-        assert_eq!(cfg.max_cache_bytes, DEFAULT_MAX_CACHE_BYTES);
-        assert_eq!(cfg.max_live_spools, 4096);
         assert_eq!(cfg.io_uring_shards, None);
         assert_eq!(cfg.io_uring_queue_capacity, 1024);
+    }
+
+    #[test]
+    fn test_from_file_preserves_explicit_admission_override() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("explicit-admission.yaml");
+        std::fs::write(
+            &path,
+            "page_size: 4096\nmax_cache_bytes: 1048576\nmax_live_spools: 73\n",
+        )
+        .expect("write yaml");
+
+        let cfg = Config::from_file(&path).expect("parse yaml");
+        assert_eq!(cfg.max_live_spools, 73);
+    }
+
+    #[test]
+    fn test_from_file_derives_minimum_one_when_cache_cannot_hold_a_page() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("uncached.yaml");
+        std::fs::write(&path, "page_size: 4096\nmax_cache_bytes: 0\n").expect("write yaml");
+
+        let cfg = Config::from_file(&path).expect("parse yaml");
+        assert_eq!(cfg.max_live_spools, 1);
     }
 }

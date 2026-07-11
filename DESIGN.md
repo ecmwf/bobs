@@ -60,7 +60,7 @@ Accepted write bytes are appended to `spool.dat` before `/write` returns, but th
 
 ## Paging and cache
 
-The byte stream is divided into fixed-size pages (`page_size`, default 4096 bytes).
+The byte stream is divided into fixed-size pages (`page_size`). The Rust binary defaults to 16 MiB; the Helm chart overrides this to 4 KiB.
 
 Write path:
 

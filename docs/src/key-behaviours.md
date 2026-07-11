@@ -10,7 +10,7 @@ Understanding these behaviours is crucial for effectively using BOBS.
 
 ### 1. Page-based Streaming
 
-Data is organized into fixed-size pages, configured via `page_size` and defaulting to `4096`. A successful `/write` has already accepted the bytes into `<data_dir>/<key>/spool.dat` before it returns, including any trailing partial page.
+Data is organized into fixed-size pages configured via `page_size`. The Rust binary defaults to 16 MiB, while the Helm chart overrides this to 4 KiB for lower streaming latency. A successful `/write` has already accepted the bytes into `<data_dir>/<key>/spool.dat` before it returns, including any trailing partial page.
 
 Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in `spool.dat` but are not visible to readers until more writes complete the page or the writer calls `/complete` to finalize the spool. This ensures readers always receive consistent, non-torn data.
 

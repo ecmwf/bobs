@@ -377,6 +377,22 @@ where
             if write_result.is_ok() { crate::metrics::outcome::SUCCESS } else { crate::metrics::outcome::ERROR },
             write_elapsed,
         );
+        if matches!(write_result, Err(BobsError::SpoolTooLarge { .. })) {
+            // A chunked body can cross the limit after full pages have already
+            // reached disk. Commit a durable deletion before reporting 413 so
+            // the partial object cannot reappear after restart and its admission
+            // slot is reusable. A cleanup failure is a server error, not a safe
+            // payload rejection.
+            state
+                .manager
+                .delete_spool_with_reason(
+                    &key,
+                    crate::manager::DeleteReason::Oversize,
+                    job_id.as_deref(),
+                )
+                .await
+                .map_err(ApiError)?;
+        }
         write_result.map_err(ApiError)?;
         if let Some(job_id) = &job_id {
             tracing::debug!("event.name" = "bobs.spool.write.completed", "request.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
@@ -1101,8 +1117,8 @@ mod tests {
     use crate::cleanup::start_cleanup_task;
     use crate::config::MetricsConfig;
     use crate::error::BobsError;
-    use crate::io::DefaultFileIO;
-    use crate::metadata::DefaultMetadataStore;
+    use crate::io::{DefaultFileIO, TokioFileIO};
+    use crate::metadata::{DefaultMetadataStore, SyncSidecarMetadataStore};
     use axum::http::Request;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
@@ -1203,14 +1219,16 @@ mod tests {
         app_with_config(|_| {}).await
     }
 
-    /// Like `app_with_state` but uses `test_config_ttl` (short sweep + TTL values).
-    async fn app_with_ttl_config() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+    /// Like `app_with_state` but uses short TTLs and the synchronous sidecar
+    /// backend so paused-time tests do not depend on io_uring completion timing.
+    async fn app_with_ttl_config() -> (Router, Arc<AppState<TokioFileIO, SyncSidecarMetadataStore>>)
+    {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
         let data_dir = root.join("data");
         let manager = Arc::new(
-            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-                DefaultMetadataStore::new(&data_dir),
+            SpoolManager::<TokioFileIO, SyncSidecarMetadataStore>::with_metadata_store(
+                SyncSidecarMetadataStore::new(&data_dir),
                 &data_dir,
                 4096,
                 65536,
@@ -1226,7 +1244,7 @@ mod tests {
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
             metrics: Arc::new(BobsMetrics::new(false)),
         });
-        let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
+        let app = router::<TokioFileIO, SyncSidecarMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
     }
 
@@ -1237,6 +1255,19 @@ mod tests {
     // -----------------------------------------------------------------------
     // Shared test helpers
     // -----------------------------------------------------------------------
+
+    async fn wait_for_spool_removal(
+        manager: &SpoolManager<TokioFileIO, SyncSidecarMetadataStore>,
+        key: &str,
+    ) {
+        for _ in 0..100 {
+            if manager.get_spool(key).is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("spool {key} was not removed after cleanup was scheduled");
+    }
 
     #[test]
     fn read_page_chunk_uses_zero_copy_slice() {
@@ -1553,18 +1584,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_rejects_spools_over_configured_maximum() {
-        let (app, state) = app_with_config(|config| config.max_spool_bytes = 4).await;
+    async fn chunked_oversize_write_deletes_partial_spool_and_releases_admission() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
         let key = create_key(&app).await;
+        let spool_dir = state.config.data_dir.join(&key);
+        let (first_page_written_tx, first_page_written_rx) = tokio::sync::oneshot::channel();
+        let (send_overflow_tx, send_overflow_rx) = tokio::sync::oneshot::channel();
+
+        let body_stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"1234"));
+            let _ = first_page_written_tx.send(());
+            let _ = send_overflow_rx.await;
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"567"));
+        };
         let req = Request::builder()
             .method("POST")
             .uri(format!("/api/v1/write/{key}/0"))
-            .body(Body::from("12345"))
+            .body(Body::from_stream(body_stream))
             .expect("request build");
-        let resp = app.oneshot(req).await.expect("oneshot");
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let write_app = app.clone();
+        let write_task =
+            tokio::spawn(async move { write_app.oneshot(req).await.expect("oneshot") });
+
+        first_page_written_rx
+            .await
+            .expect("body polled for the overflow frame");
         let spool = state.manager.get_spool(&key).expect("spool exists");
-        assert_eq!(spool.metadata.lock().await.total_bytes_written, 0);
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
+        assert!(spool_dir.join("spool.dat").exists());
+
+        send_overflow_tx.send(()).expect("send overflow frame");
+        let resp = write_task.await.expect("write task");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(
+            !spool_dir.exists(),
+            "partial spool directory must be removed"
+        );
+
+        // max_live_spools=1: a successful create proves the rejected spool's
+        // admission permit was released before the 413 response.
+        let replacement_key = create_key(&app).await;
+        assert_ne!(replacement_key, key);
     }
 
     #[tokio::test]
@@ -2591,7 +2657,7 @@ mod tests {
         let task = start_cleanup_task(state.manager.clone(), state.config.clone());
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::task::yield_now().await;
+        wait_for_spool_removal(&state.manager, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),
@@ -2623,7 +2689,7 @@ mod tests {
         let task = start_cleanup_task(state.manager.clone(), state.config.clone());
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::task::yield_now().await;
+        wait_for_spool_removal(&state.manager, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),
@@ -2674,10 +2740,9 @@ mod tests {
         spool.last_read_activity_at.store(1, Ordering::SeqCst);
 
         tokio::time::advance(Duration::from_secs(3)).await;
-        // measure_disk_usage is now spawned fire-and-forget, so the cleanup
-        // loop returns to interval.tick() without blocking on spawn_blocking
-        // I/O.  A single yield is enough for the deletion sweep to run.
-        tokio::task::yield_now().await;
+        // Durable deletion now persists a tombstone before removing the live
+        // spool, so allow the async metadata commit to finish.
+        wait_for_spool_removal(&state.manager, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),

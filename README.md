@@ -44,7 +44,7 @@ Operational requirements:
 
 - `HOSTNAME` must be set and include a pod ordinal like `bobs-0`
 - `page_size` must be greater than `0`
-- `max_cache_bytes` must be at least `page_size`
+- `BOBS_INTERNAL_BASE_URL_TEMPLATE` must be set and non-empty
 
 Example:
 
@@ -127,7 +127,7 @@ For direct BOBS throughput validation, see the mdBook page: `docs/src/standalone
 
 ## Configuration
 
-BOBS is configured via a YAML file passed as a CLI argument. All fields have sensible defaults — a partial file is fine, missing fields use defaults.
+BOBS reads an optional YAML file passed as a CLI argument. Most fields have Rust defaults, but startup still requires `host_prefix`, `domain`, and `route_name`, plus the routing environment described above.
 
 ```bash
 ./target/release/bobs config.yaml
@@ -138,8 +138,9 @@ BOBS is configured via a YAML file passed as a CLI argument. All fields have sen
 | `host` | `0.0.0.0` | Address to listen on. |
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
-| `page_size` | `4096` | Size of individual data pages in bytes. |
-| `max_cache_bytes` | `1048576` | Max in-memory cache size per spool in bytes. |
+| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of individual data pages in bytes. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global in-memory cache budget across all spools. |
+| `max_live_spools` | binary: derived from cache/page capacity (16); chart: `256` | Admission limit; explicit YAML overrides are preserved. |
 | `writer_inactivity_timeout_secs` | `300` | Seconds of writer silence before cleanup. |
 | `reader_done_ttl_secs` | `60` | TTL after spool completion and reader finishes. |
 | `unread_ttl_secs` | `3600` | TTL for completed spools that were never read. |

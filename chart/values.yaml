@@ -94,13 +94,14 @@ config:
   host: "0.0.0.0"
   port: 3000
   data_dir: "/var/lib/bobs"
-  # Spool write page size. BOBS fsyncs a metadata commit per page on write, so
-  # larger pages amortise fsync cost over more data. max_cache_bytes must be >= page_size.
+  # The chart favours lower streaming latency than the Rust binary defaults:
+  # it overrides 16 MiB/256 MiB with 4 KiB/1 MiB. Pages larger than the cache
+  # bypass it, so max_cache_bytes does not need to be >= page_size.
   page_size: 4096
   max_cache_bytes: 1048576
-  # Admission limit for not-yet-fully-read spools. This bounds workflow fan-out
-  # independently of the global byte-bounded cache.
-  max_live_spools: 4096
+  # Explicit chart admission limit matching max_cache_bytes / page_size.
+  # Operators can still override this independently for their workload.
+  max_live_spools: 256
   # Per-spool write limit. 8 GiB leaves headroom on the default 10 GiB PVC.
   max_spool_bytes: 8589934592
   # Bound create admission waits; exhausted capacity returns HTTP 503.

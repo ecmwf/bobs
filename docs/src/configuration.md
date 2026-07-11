@@ -6,16 +6,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # Configuration
 
-BOBS is configured via a YAML file passed as a CLI argument. All fields have sensible defaults — a partial file is fine, missing fields use defaults.
+BOBS reads an optional YAML file passed as a CLI argument. Most fields have Rust defaults, so a partial file is fine, but startup validation requires `host_prefix`, `domain`, and `route_name`. The service also requires `HOSTNAME` with a StatefulSet-style numeric ordinal and a non-empty `BOBS_INTERNAL_BASE_URL_TEMPLATE`. The binary therefore does not run from its default configuration alone.
 
 ```bash
+HOSTNAME=bobs-0 \
+BOBS_INTERNAL_BASE_URL_TEMPLATE='http://bobs-{ordinal}:3000/api/v1' \
 ./target/release/bobs config.yaml
-```
-
-Without a config file, BOBS runs with defaults:
-
-```bash
-./target/release/bobs
 ```
 
 Backend selection is build-feature based, not a YAML option: Linux builds without extra features use the `io_uring` FileIO and sidecar metadata backend; builds with `--features tokio-fileio-fallback`, and non-Linux builds, use the Tokio/blocking fallback backend with the same on-disk `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json` layout. These backend settings do not change the HTTP API and do not require an on-disk migration.
@@ -30,14 +26,16 @@ cargo build --release --bins --features tokio-fileio-fallback
 
 ## Fields
 
+The table distinguishes Rust defaults from chart overrides where they differ. Other listed defaults apply to both unless the chart's `values.yaml` says otherwise.
+
 | Field | Default | Description |
 | ------- | --------- | ------------- |
 | `host` | `0.0.0.0` | Address for the HTTP server to bind to. |
 | `port` | `3000` | Port for the HTTP server to listen on. |
-| `data_dir` | `./data` | File system path for storing spool files. |
-| `page_size` | `4096` | Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. |
-| `max_cache_bytes` | `1048576` | Global byte budget for the in-memory page cache across all spools. Set to `0` to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk. |
-| `max_live_spools` | `4096` | Admission limit for spools not yet fully read. This bounds workflow fan-out independently of the byte-bounded global cache; explicit overrides are preserved. |
+| `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. |
+| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global byte budget for the in-memory page cache across all spools. Set to `0` to disable caching. Pages larger than this cap bypass the cache and remain readable from disk. |
+| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (16); chart: `256` | Admission limit for spools not yet fully read. YAML omission derives it from the effective page/cache settings; explicit operator values are preserved. The chart value matches its 1 MiB/4 KiB capacity. |
 | `max_spool_bytes` | `8589934592` | Maximum bytes accepted for one spool across write requests. The default leaves headroom on the chart's default 10 GiB volume. |
 | `create_admission_timeout_ms` | `5000` | Maximum time `/create` waits for a `max_live_spools` admission slot before returning `503 Service Unavailable`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
@@ -66,7 +64,7 @@ port: 3000
 data_dir: /data/bobs
 page_size: 4096
 max_cache_bytes: 1048576          # global page-cache byte budget; set to 0 to disable caching
-max_live_spools: 4096             # workflow admission cap; independent of cache page capacity
+# max_live_spools omitted: derives 256 from this page/cache combination
 max_spool_bytes: 8589934592       # 8 GiB per spool
 create_admission_timeout_ms: 5000 # return 503 rather than waiting indefinitely
 writer_inactivity_timeout_secs: 300
@@ -117,7 +115,7 @@ Future optimizations not implemented in the current backend are `IORING_REGISTER
 
 ## Page size tuning
 
-The default `page_size` is intentionally kept at `4096`. It is a correctness-neutral default and should not be changed just because in-progress metadata commits have been removed from the write hot path.
+The Rust binary defaults to `16777216` (16 MiB); the Helm chart deliberately overrides this to `4096` (4 KiB) for lower streaming latency. Treat either value as a deployment choice and benchmark representative workloads before changing it.
 
 Larger pages such as `1048576` (1 MiB), `4194304` (4 MiB), and `16777216` (16 MiB) may improve write/read throughput by reducing per-page overhead, but they change streaming behaviour:
 
@@ -125,6 +123,6 @@ Larger pages such as `1048576` (1 MiB), `4194304` (4 MiB), and `16777216` (16 Mi
 - larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless `max_cache_bytes` is increased;
 - benchmark representative object sizes and write chunk sizes before changing production defaults.
 
-`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work.
+`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; set it explicitly when workflow concurrency should differ from cache page capacity.
 
 See the standalone benchmark guide for page-size comparison commands.

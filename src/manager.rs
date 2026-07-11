@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteReason {
     Explicit,
+    Oversize,
     Ttl,
     Orphan,
     Corrupt,
@@ -28,6 +29,7 @@ impl DeleteReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
+            Self::Oversize => "oversize",
             Self::Ttl => "ttl",
             Self::Orphan => "orphan",
             Self::Corrupt => "corrupt",
@@ -274,13 +276,29 @@ where
                 key: key.to_string(),
             })?;
 
-        let old_state = {
+        let (old_state, deleting_meta) = {
             let mut meta = spool.metadata.lock().await;
             let old = meta.state.clone();
             meta.state = SpoolState::Deleting;
-            old
+            (old, meta.clone())
         };
-        // Decrement the active spool gauge — spool is being removed.
+
+        // Persist the tombstone before making the deletion visible in memory or
+        // releasing admission. If this fails, restore the live state: callers
+        // must not receive a successful deletion response for a spool that can
+        // be recovered after restart.
+        if let Err(error) = self.metadata_store.write(&deleting_meta).await {
+            spool.metadata.lock().await.state = old_state.clone();
+            return Err(error);
+        }
+
+        spool.cancel.cancel();
+        self.spools.remove(key);
+        spool.release_admission();
+        self.page_cache.lock().await.remove_spool(key);
+
+        // Decrement the active spool gauge only after the durable tombstone has
+        // committed and the spool has been removed from the live registry.
         let old_label = match &old_state {
             SpoolState::Writing | SpoolState::Creating => crate::metrics::state::WRITING,
             SpoolState::WriteLocked => crate::metrics::state::WRITE_LOCKED,
@@ -288,14 +306,10 @@ where
             SpoolState::Readable => crate::metrics::state::READABLE,
         };
         self.metrics.record_spool_removed(old_label);
-        spool.cancel.cancel();
 
-        self.spools.remove(key);
-        spool.release_admission();
-        self.page_cache.lock().await.remove_spool(key);
-
-        let deleting_meta = { spool.metadata.lock().await.clone() };
-        self.metadata_store.write(&deleting_meta).await?;
+        // Once the tombstone is durable, any later failure is safe: recovery
+        // removes Deleting spools, and metadata deletion makes a remaining data
+        // directory an orphan that recovery also removes.
         self.metadata_store.delete(key).await?;
 
         let spool_dir = self.data_dir.join(key);
@@ -1565,5 +1579,43 @@ mod tests {
 
         assert!(manager.get_spool(&key).is_none());
         assert!(!manager.page_cache.lock().await.contains(&key, 0));
+    }
+
+    #[tokio::test]
+    async fn test_delete_persistence_failure_keeps_spool_and_admission() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 8192, 1).expect("manager init");
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+
+        // Replace the spool directory with a file so persisting the Deleting
+        // tombstone fails deterministically at create_dir_all.
+        let spool_dir = data_dir.join(&key);
+        tokio::fs::remove_dir_all(&spool_dir)
+            .await
+            .expect("remove spool directory");
+        tokio::fs::write(&spool_dir, b"blocks-directory-creation")
+            .await
+            .expect("create blocking file");
+
+        manager
+            .delete_spool_with_reason(&key, DeleteReason::Oversize, None)
+            .await
+            .expect_err("tombstone persistence must fail");
+
+        let spool = manager
+            .get_spool(&key)
+            .expect("failed durable deletion must remain live");
+        assert_eq!(spool.metadata.lock().await.state, SpoolState::Writing);
+        assert_eq!(
+            manager.admission.available_permits(),
+            0,
+            "admission must not be reused while cleanup is not durable"
+        );
     }
 }

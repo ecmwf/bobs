@@ -72,7 +72,7 @@ Appends binary data to the spool.
 
 **Response (200 OK)**: Empty body on success.
 
-Writes that would take a spool beyond `max_spool_bytes` return `413 Payload Too Large`. Download responses force `Content-Disposition: attachment` because producer-controlled content shares a deployment origin. They also include `X-Content-Type-Options: nosniff`; active document types receive a restrictive sandbox policy as defence in depth.
+Writes that would take a spool beyond `max_spool_bytes` return `413 Payload Too Large`. If a chunked upload crosses the limit after pages were written, BOBS durably deletes the partial spool and releases its admission slot before returning `413`; a cleanup failure returns a server error instead. Download responses force `Content-Disposition: attachment` because producer-controlled content shares a deployment origin. They also include `X-Content-Type-Options: nosniff`; active document types receive a restrictive sandbox policy as defence in depth.
 
 **Error Cases**:
 
