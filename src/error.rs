@@ -27,6 +27,9 @@ pub enum BobsError {
     #[error("range not satisfiable: {reason}")]
     RangeNotSatisfiable { total: Option<u64>, reason: String },
 
+    #[error("configuration error: {0}")]
+    ConfigurationError(String),
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 

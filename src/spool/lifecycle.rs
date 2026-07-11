@@ -7,7 +7,6 @@ use crate::io::FileIO;
 use crate::metrics;
 use crate::spool::types::SpoolState;
 use crate::time::now_secs;
-use std::sync::atomic::Ordering;
 
 use super::Spool;
 
@@ -15,8 +14,8 @@ fn state_label(state: &SpoolState) -> &'static str {
     match state {
         SpoolState::Writing | SpoolState::Creating => metrics::state::WRITING,
         SpoolState::WriteLocked => metrics::state::WRITE_LOCKED,
-        SpoolState::Complete | SpoolState::Deleting => metrics::state::COMPLETE,
         SpoolState::Readable => metrics::state::READABLE,
+        SpoolState::Complete | SpoolState::Deleting => metrics::state::COMPLETE,
     }
 }
 
@@ -29,34 +28,36 @@ where
     /// disk, fsync, and transition to Complete. Notifies all waiting readers so
     /// they can see the final data and detect end-of-stream.
     pub async fn complete(&self, expected_size: Option<u64>) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let mut buf = self.write_buffer.lock().await;
 
         let terminal_metadata = {
             let meta = self.metadata.lock().await;
-            if matches!(meta.state, SpoolState::Complete | SpoolState::Deleting) {
-                Some(meta.clone())
-            } else {
-                if let Some(expected) = expected_size {
-                    if meta.total_bytes_written != expected {
-                        return Err(BobsError::SizeMismatch {
-                            expected,
-                            actual: meta.total_bytes_written,
-                        });
-                    }
-                }
-                None
+            if meta.state == SpoolState::Deleting {
+                return Err(BobsError::SpoolNotFound {
+                    key: self.key.clone(),
+                });
             }
+            if let Some(expected) = expected_size {
+                if meta.total_bytes_written != expected {
+                    return Err(BobsError::SizeMismatch {
+                        expected,
+                        actual: meta.total_bytes_written,
+                    });
+                }
+            }
+            (meta.state == SpoolState::Complete).then(|| meta.clone())
         };
 
         if let Some(meta) = terminal_metadata {
-            let durable = self.metadata_store.read(&self.key).await?;
-            let durable_is_terminal = durable.as_ref().is_some_and(|metadata| {
-                matches!(metadata.state, SpoolState::Complete | SpoolState::Deleting)
-            });
-            if durable_is_terminal {
-                return Ok(());
+            let durable_is_complete = self
+                .metadata_store
+                .read(&self.key)
+                .await?
+                .is_some_and(|metadata| metadata.state == SpoolState::Complete);
+            if !durable_is_complete {
+                self.persist_metadata(&meta).await?;
             }
-            self.persist_metadata(&meta).await?;
             return Ok(());
         }
 
@@ -96,14 +97,6 @@ where
 
         {
             let mut meta = self.metadata.lock().await;
-            if let Some(expected) = expected_size {
-                if candidate.total_bytes_written != expected {
-                    return Err(BobsError::SizeMismatch {
-                        expected,
-                        actual: candidate.total_bytes_written,
-                    });
-                }
-            }
             let old_state = meta.state.clone();
             *meta = candidate;
             self.metrics.record_state_transition(
@@ -111,17 +104,14 @@ where
                 crate::metrics::state::COMPLETE,
             );
         }
+        self.record_readable();
 
         // Initialize coverage tracking and detect immediate full-coverage
         // (zero-byte objects or objects whose bytes were all served pre-complete).
         let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.initialize(total_size);
-            mr.is_complete()
-                && self
-                    .full_object_read_at
-                    .compare_exchange(0, now_secs(), Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            mr.is_complete() && self.record_fully_read()
         };
         if became_fully_read {
             self.on_fully_read().await;
@@ -134,16 +124,11 @@ where
 
     /// Record that a byte range has been served and run the first full-read
     /// transition exactly once when coverage reaches the complete object.
-    pub async fn mark_served_and_maybe_fully_read(&self, start: u64, end: u64, now: u64) {
+    pub async fn mark_served_and_maybe_fully_read(&self, start: u64, end: u64) {
         let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.mark_served(start, end);
-            mr.is_complete()
-                && self.full_object_read_at.load(Ordering::Relaxed) == 0
-                && self
-                    .full_object_read_at
-                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            mr.is_complete() && self.record_fully_read()
         };
 
         if became_fully_read {
@@ -159,16 +144,22 @@ where
     }
 
     pub async fn set_write_locked(&self, locked: bool) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let updated = {
             let mut meta = self.metadata.lock().await;
+            if meta.state == SpoolState::Deleting {
+                return Err(BobsError::SpoolNotFound {
+                    key: self.key.clone(),
+                });
+            }
             let old_state = meta.state.clone();
             let old_locked = meta.write_locked;
 
             meta.write_locked = locked;
-            if locked && meta.state == SpoolState::Writing {
+            if locked && matches!(meta.state, SpoolState::Writing | SpoolState::Readable) {
                 meta.state = SpoolState::WriteLocked;
                 self.metrics.record_state_transition(
-                    Some(crate::metrics::state::WRITING),
+                    Some(state_label(&old_state)),
                     crate::metrics::state::WRITE_LOCKED,
                 );
             } else if !locked && meta.state == SpoolState::WriteLocked {
@@ -189,6 +180,9 @@ where
 
         if let Some(meta) = updated {
             self.persist_metadata(&meta).await?;
+            if meta.state == SpoolState::Readable {
+                self.record_readable();
+            }
         }
         Ok(())
     }
@@ -222,10 +216,8 @@ mod tests {
     use bytes::Bytes;
     use std::collections::HashMap;
     use std::fs::{self, File};
-    use std::future::Future;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use tempfile::tempdir;
@@ -441,24 +433,26 @@ mod tests {
     }
 
     impl MetadataStore for CountingMetadataStore {
-        type WriteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-        type ReadFuture<'a> =
-            Pin<Box<dyn Future<Output = Result<Option<SpoolMetadata>>> + Send + 'a>>;
-        type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-        type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
-
-        fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
-            Box::pin(async move { self.write_sync(metadata) })
+        async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+            let store = self.clone();
+            let metadata = metadata.clone();
+            tokio::task::spawn_blocking(move || store.write_sync(&metadata))
+                .await
+                .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
-            Box::pin(async move { self.read_sync(key) })
+        async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+            let store = self.clone();
+            let key = key.to_owned();
+            tokio::task::spawn_blocking(move || store.read_sync(&key))
+                .await
+                .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
-            Box::pin(async move {
-                let meta_path = self.meta_path(key);
-                let tmp_path = self.tmp_path(key);
+        async fn delete(&self, key: &str) -> Result<()> {
+            let meta_path = self.meta_path(key);
+            let tmp_path = self.tmp_path(key);
+            tokio::task::spawn_blocking(move || {
                 match fs::remove_file(meta_path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -471,10 +465,12 @@ mod tests {
                 }
                 Ok(())
             })
+            .await
+            .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        fn list(&self) -> Result<Self::ListIter> {
-            Ok(Vec::new().into_iter())
+        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+            Ok(Vec::new())
         }
     }
 
@@ -498,35 +494,27 @@ mod tests {
     }
 
     impl MetadataStore for FailFirstCompleteMetadataStore {
-        type WriteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-        type ReadFuture<'a> =
-            Pin<Box<dyn Future<Output = Result<Option<SpoolMetadata>>> + Send + 'a>>;
-        type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-        type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
-
-        fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
-            Box::pin(async move {
-                if metadata.state == SpoolState::Complete
-                    && !self.failed_once.swap(true, AtomicOrdering::SeqCst)
-                {
-                    return Err(storage_error(io::Error::other(
-                        "injected complete metadata write failure",
-                    )));
-                }
-                self.inner.write(metadata).await
-            })
+        async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+            if metadata.state == SpoolState::Complete
+                && !self.failed_once.swap(true, AtomicOrdering::SeqCst)
+            {
+                return Err(storage_error(io::Error::other(
+                    "injected complete metadata write failure",
+                )));
+            }
+            self.inner.write(metadata).await
         }
 
-        fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
-            Box::pin(async move { self.inner.read(key).await })
+        async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+            self.inner.read(key).await
         }
 
-        fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
-            Box::pin(async move { self.inner.delete(key).await })
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
         }
 
-        fn list(&self) -> Result<Self::ListIter> {
-            Ok(Vec::new().into_iter())
+        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+            Ok(Vec::new())
         }
     }
 
@@ -597,6 +585,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
@@ -656,6 +645,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
@@ -700,6 +690,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
@@ -743,6 +734,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
@@ -799,6 +791,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
@@ -1005,6 +998,7 @@ mod tests {
                 last_write_at: 0,
                 last_read_at: None,
                 readable_at: None,
+                page_size: 4096,
                 total_bytes_written: 0,
                 total_pages: 0,
                 final_page_size: None,
@@ -1164,21 +1158,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_lock_blocks_reads_until_close() {
-        let dir = tempdir().expect("create tempdir");
-        let spool = make_spool(dir.path(), 4096).await;
-
-        spool
-            .set_write_locked(true)
-            .await
-            .expect("set write locked");
-        assert!(!spool.is_readable().await);
-
-        spool.complete(None).await.expect("complete succeeds");
-        assert!(spool.is_readable().await);
-    }
-
-    #[tokio::test]
     async fn test_complete_with_wrong_expected_size() {
         let dir = tempdir().expect("create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
@@ -1318,51 +1297,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_set_write_locked_toggle() {
+    async fn test_idempotent_complete_validates_expected_size() {
         let dir = tempdir().expect("create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
+        let data = bytes::Bytes::from_static(b"complete once");
 
-        // Initially Writing + unlocked
-        {
-            let meta = spool.metadata.lock().await;
-            assert_eq!(meta.state, SpoolState::Writing);
-            assert!(!meta.write_locked);
-        }
-
-        // Lock it
+        spool.write(0, data.clone()).await.expect("write succeeds");
         spool
-            .set_write_locked(true)
+            .complete(Some(data.len() as u64))
             .await
-            .expect("set write locked");
-        {
-            let meta = spool.metadata.lock().await;
-            assert_eq!(meta.state, SpoolState::WriteLocked);
-            assert!(meta.write_locked);
-        }
-        assert!(!spool.is_readable().await);
+            .expect("first complete succeeds");
 
-        // Unlock it — this releases the spool for reading.
-        spool
-            .set_write_locked(false)
-            .await
-            .expect("release write lock");
-        {
-            let meta = spool.metadata.lock().await;
-            assert_eq!(meta.state, SpoolState::Readable);
-            assert!(!meta.write_locked);
-            assert!(meta.readable_at.is_some());
-        }
-        assert!(spool.is_readable().await);
-
-        let persisted = spool
-            .metadata_store
-            .read("test-key")
-            .await
-            .expect("read metadata")
-            .expect("metadata entry");
-        assert_eq!(persisted.state, SpoolState::Readable);
-        assert!(!persisted.write_locked);
-        assert!(persisted.readable_at.is_some());
+        let result = spool.complete(Some(data.len() as u64 + 1)).await;
+        assert!(matches!(
+            result,
+            Err(BobsError::SizeMismatch {
+                expected,
+                actual
+            }) if expected == data.len() as u64 + 1 && actual == data.len() as u64
+        ));
     }
 
     #[tokio::test]

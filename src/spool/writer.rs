@@ -20,9 +20,9 @@ where
     /// published to the cache from the owned input bytes where possible; the write
     /// buffer is only used to assemble pages that span multiple write calls.
     pub async fn write(&self, offset: u64, data: Bytes) -> Result<()> {
-        // This lock is the spool's write/delete linearization gate. Deletion takes
-        // it before publishing Deleting, so a write is either fully accepted before
-        // deletion starts or observes the terminal state and fails.
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        // This lock is the spool's write/delete linearization gate. A write is
+        // either fully published before deletion starts or observes Deleting.
         let mut buf = self.write_buffer.lock().await;
 
         {
@@ -91,6 +91,7 @@ where
 
         self.publish_write(completed_pages, offset + data.len() as u64, now_secs())
             .await;
+        self.record_write_activity();
 
         Ok(())
     }
@@ -98,9 +99,17 @@ where
     /// Refresh the writer-inactivity anchor when HTTP receives a body frame, even
     /// when the frame is too small to flush the request's pending write batch.
     pub async fn refresh_write_activity(&self) {
-        let mut meta = self.metadata.lock().await;
-        if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
-            meta.last_write_at = now_secs();
+        let active = {
+            let mut meta = self.metadata.lock().await;
+            if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
+                meta.last_write_at = now_secs();
+                true
+            } else {
+                false
+            }
+        };
+        if active {
+            self.record_write_activity();
         }
     }
 
@@ -159,6 +168,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,

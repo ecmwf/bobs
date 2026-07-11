@@ -19,7 +19,6 @@ use axum::{Json, Router};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -700,10 +699,17 @@ where
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
 
-        if !spool.is_readable().await {
-            return Err(ApiError(BobsError::SpoolLocked));
+        {
+            let _lifecycle_guard = spool.lifecycle_lock.lock().await;
+            let meta = spool.metadata.lock().await;
+            if meta.state == crate::spool::SpoolState::Deleting {
+                return Err(ApiError(BobsError::SpoolNotFound { key: key.clone() }));
+            }
+            if !meta.state.is_readable() || (meta.state == crate::spool::SpoolState::Writing && meta.write_locked) {
+                return Err(ApiError(BobsError::SpoolLocked));
+            }
+            spool.acquire_reader();
         }
-        spool.acquire_reader();
 
         let read_labels = spool.metadata.lock().await.labels.clone();
         let read_mode = if matches!(request_range, ReadRequestRange::Follow) {
@@ -727,10 +733,7 @@ where
         let page_size = spool.page_size as u64;
         let metadata = {
             let meta = spool.metadata.lock().await;
-            let is_complete = matches!(
-                meta.state,
-                crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting
-            );
+            let is_complete = meta.state == crate::spool::SpoolState::Complete;
             let complete_size = if is_complete {
                 Some(meta.total_bytes_written)
             } else {
@@ -801,9 +804,9 @@ where
             let page_start = page_idx * page_size;
             let page_end = page_start + page_size;
 
-            // First iteration uses the pre-fetched page; subsequent iterations
-            // long-poll via read_page with a timeout. Mid-stream timeouts just
-            // end the stream (the connection was recently active, not idle).
+            // First iteration uses the pre-fetched page; subsequent follow-mode
+            // reads long-poll with a timeout. Once response bytes have been sent,
+            // a timeout must abort the chunked body rather than look like clean EOF.
             let maybe_page = if let Some(page) = prefetched.take() {
                 Some(page)
             } else if follow {
@@ -819,6 +822,14 @@ where
                     }
                     Err(_) => {
                         outcome = crate::metrics::outcome::TIMEOUT;
+                        tracing::warn!("event.name" = "bobs.spool.read.timeout", "bobs.spool.key" = %stream_key, range = %stream_range, start = start, end = ?end, follow = follow, bytes = bytes_served, outcome = "error", "spool read timed out mid-stream");
+                        lease.duration_recorded = true;
+                        stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
+                        stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
+                        yield Err::<Bytes, BobsError>(BobsError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "follow read long-poll timed out",
+                        )));
                         break;
                     }
                 }
@@ -851,14 +862,14 @@ where
                 lease.bytes_served = bytes_served;
                 let chunk_end = offset;
 
-                // 1. Refresh activity timestamp (atomic, lock-free).
+                // 1. Refresh the monotonic cleanup activity anchor.
+                spool.record_read_activity();
                 let now = now_secs();
-                spool.last_read_activity_at.store(now, Ordering::Relaxed);
 
                 // 2. Record coverage and run the full-read transition when this
                 // chunk completes first coverage of the whole object.
                 spool
-                    .mark_served_and_maybe_fully_read(chunk_start, chunk_end, now)
+                    .mark_served_and_maybe_fully_read(chunk_start, chunk_end)
                     .await;
 
                 // 3. Keep legacy last_read_at for observability (not used in new cleanup).
@@ -892,7 +903,7 @@ where
                 // loop back and long-poll for more data.
                 let done = {
                     let meta = spool.metadata.lock().await;
-                    matches!(meta.state, crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting)
+                    meta.state == crate::spool::SpoolState::Complete
                         && offset >= meta.total_bytes_written
                 };
                 if done {
@@ -1130,6 +1141,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use serde_json::Value;
+    use std::sync::atomic::Ordering;
     use tower::ServiceExt;
 
     fn test_config(dir: &std::path::Path) -> Arc<Config> {
@@ -1183,9 +1195,10 @@ mod tests {
         })
     }
 
-    /// Returns both the `Router` and the shared `AppState` so tests can inspect
-    /// spool fields (e.g. `full_object_read_at`) after HTTP round-trips.
-    async fn app_with_state() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+    async fn app_with_options(
+        long_poll_timeout_ms: u64,
+        metrics: Arc<BobsMetrics>,
+    ) -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
         let data_dir = root.join("data");
@@ -1199,16 +1212,25 @@ mod tests {
             )
             .expect("manager init"),
         );
+        let config = Arc::new(Config {
+            long_poll_timeout_ms,
+            ..(*test_config(&data_dir)).clone()
+        });
         let state = Arc::new(AppState {
             manager,
-            config: test_config(&data_dir),
+            config,
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
-            metrics: Arc::new(BobsMetrics::new(false)),
+            metrics,
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
+    }
+
+    /// Returns both the `Router` and shared state so tests can inspect cleanup anchors.
+    async fn app_with_state() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+        app_with_options(25_000, Arc::new(BobsMetrics::new(false))).await
     }
 
     /// Like `app_with_state` but uses `test_config_ttl` (short sweep + TTL values).
@@ -1457,6 +1479,18 @@ mod tests {
         v["key"].as_str().expect("key string").to_string()
     }
 
+    async fn write_in_progress_page(app: &Router, byte: u8) -> String {
+        let key = create_key(app).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(vec![byte; 4096]))
+            .expect("build write request");
+        let resp = app.clone().oneshot(req).await.expect("write oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        key
+    }
+
     #[tokio::test]
     async fn create_uses_request_id_header_as_spool_key() {
         let app = app().await;
@@ -1629,6 +1663,22 @@ mod tests {
             .expect("request build");
         let resp = app.oneshot(req).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_read_deleting_spool_returns_not_found() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        spool.metadata.lock().await.state = crate::spool::SpoolState::Deleting;
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1821,6 +1871,110 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn first_page_long_poll_timeout_still_redirects() {
+        let (app, _state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
+        let key = create_key(&app).await;
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("build follow request");
+
+        let response = app.oneshot(req).await.expect("follow read oneshot");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("/api/v1/read/{key}").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_follow_timeout_aborts_chunked_body() {
+        let (app, state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
+        let key = write_in_progress_page(&app, 0x5a).await;
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("build follow request");
+        let response = app.oneshot(req).await.expect("follow read oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .is_none(),
+            "in-progress follow response must be chunked"
+        );
+
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("first body frame")
+            .expect("first frame succeeds")
+            .into_data()
+            .expect("first frame contains data");
+        assert_eq!(first, Bytes::from(vec![0x5a; 4096]));
+        let timeout_frame = body.frame().await.expect("timeout error frame");
+        assert!(
+            timeout_frame.is_err(),
+            "mid-stream timeout must abort the transfer, not return clean EOF"
+        );
+        drop(body);
+
+        let spool = state.manager.get_spool(&key).expect("spool remains");
+        assert_eq!(spool.reader_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn mid_stream_follow_timeout_records_timeout_metrics_once() {
+        use prometheus::Encoder;
+
+        let (_provider, registry) = crate::metrics::init_meter_provider("timeout-test");
+        let metrics = Arc::new(BobsMetrics::new(true));
+        let (app, _state) = app_with_options(10, metrics).await;
+        let key = write_in_progress_page(&app, 0x33).await;
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("build follow request");
+        let response = app.oneshot(req).await.expect("follow read oneshot");
+        assert!(response.into_body().collect().await.is_err());
+
+        let mut encoded = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&registry.gather(), &mut encoded)
+            .expect("encode metrics");
+        let scrape = String::from_utf8(encoded).expect("metrics are UTF-8");
+        let count_lines: Vec<_> = scrape
+            .lines()
+            .filter(|line| line.starts_with("bobs_read_duration_seconds_count"))
+            .collect();
+        assert!(
+            count_lines
+                .iter()
+                .any(|line| line.contains("mode=\"follow\"")
+                    && line.contains("outcome=\"timeout\"")
+                    && line.ends_with(" 1")),
+            "missing timeout metric: {scrape}"
+        );
+        assert!(
+            count_lines
+                .iter()
+                .all(|line| !line.contains("outcome=\"success\"")
+                    && !line.contains("outcome=\"client_gone\"")),
+            "timeout must not also record success/client_gone: {scrape}"
+        );
     }
 
     #[tokio::test]
@@ -2212,11 +2366,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_slow_body_frame_refreshes_writer_activity_before_batch_flush() {
+    async fn test_slow_body_frame_refreshes_monotonic_writer_activity_before_batch_flush() {
         let (app, state) = app_with_state().await;
         let key = create_key(&app).await;
         let spool = state.manager.get_spool(&key).expect("spool exists");
         spool.metadata.lock().await.last_write_at = 1;
+        let stale_anchor = Instant::now() - Duration::from_secs(60);
+        spool
+            .cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_write_at = stale_anchor;
 
         let (frame_processed_tx, frame_processed_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
@@ -2241,13 +2401,17 @@ mod tests {
         let metadata = spool.metadata.lock().await;
         assert!(
             metadata.last_write_at > 1,
-            "every received frame must refresh inactivity before a page-sized batch is flushed"
+            "every received frame must refresh wall-clock activity before a batch is flushed"
         );
         assert_eq!(
             metadata.total_bytes_written, 0,
             "sub-page frame remains pending"
         );
         drop(metadata);
+        assert!(
+            spool.cleanup_anchors().last_write_at > stale_anchor,
+            "every received frame must refresh the monotonic cleanup anchor before a batch is flushed"
+        );
 
         finish_tx.send(()).expect("write task still waiting");
         assert_eq!(
@@ -2257,11 +2421,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Read-coverage tracking — full_object_read_at and last_read_activity_at
+    // Read-coverage tracking — monotonic full-read and read-activity anchors
     // -----------------------------------------------------------------------
 
     /// A single Range request that covers the entire 8 KiB object must set
-    /// `full_object_read_at` after the response body is fully drained.
+    /// the full-object cleanup anchor after the response body is fully drained.
     #[tokio::test]
     async fn test_full_range_sets_full_object_read_at() {
         let (app, state) = app_with_state().await;
@@ -2272,7 +2436,7 @@ mod tests {
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "full-range read must set full_object_read_at"
         );
         let cache = spool.page_cache.lock().await;
@@ -2282,8 +2446,8 @@ mod tests {
         );
     }
 
-    /// A partial Range request leaves bytes un-served; `full_object_read_at`
-    /// must remain 0.
+    /// A partial Range request leaves bytes un-served; the full-object cleanup
+    /// anchor must remain unset.
     #[tokio::test]
     async fn test_partial_range_does_not_set_full_object_read_at() {
         let (app, state) = app_with_state().await;
@@ -2293,10 +2457,9 @@ mod tests {
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.full_object_read_at.load(Ordering::Relaxed),
-            0,
-            "partial range must not set full_object_read_at"
+        assert!(
+            spool.cleanup_anchors().full_object_read_at.is_none(),
+            "partial range must not set the full-object cleanup anchor"
         );
         let cache = spool.page_cache.lock().await;
         assert!(
@@ -2306,7 +2469,7 @@ mod tests {
     }
 
     /// Two non-overlapping ranges that together cover the full 8 KiB object
-    /// must set `full_object_read_at` after the second request completes.
+    /// must set the full-object cleanup anchor after the second request.
     #[tokio::test]
     async fn test_two_ranges_covering_full_object_sets_flag() {
         let (app, state) = app_with_state().await;
@@ -2315,23 +2478,21 @@ mod tests {
         // First half — coverage incomplete.
         range_read_drain(&app, &key, "bytes=0-4095").await;
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.full_object_read_at.load(Ordering::Relaxed),
-            0,
-            "after first half: full_object_read_at must still be 0"
+        assert!(
+            spool.cleanup_anchors().full_object_read_at.is_none(),
+            "after first half: full-object cleanup anchor must still be unset"
         );
 
         // Second half — now fully covered.
         range_read_drain(&app, &key, "bytes=4096-8191").await;
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "after second half: full_object_read_at must be set"
         );
     }
 
-    /// Out-of-order ranges: serve the second half first, then the first half.
-    /// `full_object_read_at` must be 0 after the first request and > 0 only
-    /// after the second.
+    /// Out-of-order ranges set the full-object cleanup anchor only once all bytes
+    /// have been covered.
     #[tokio::test]
     async fn test_out_of_order_ranges_set_flag_on_completion() {
         let (app, state) = app_with_state().await;
@@ -2340,22 +2501,21 @@ mod tests {
         // Second half first.
         range_read_drain(&app, &key, "bytes=4096-8191").await;
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.full_object_read_at.load(Ordering::Relaxed),
-            0,
-            "only second half served: full_object_read_at must be 0"
+        assert!(
+            spool.cleanup_anchors().full_object_read_at.is_none(),
+            "only second half served: full-object cleanup anchor must be unset"
         );
 
         // First half — completes coverage.
         range_read_drain(&app, &key, "bytes=0-4095").await;
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "after first half served: full_object_read_at must be set"
         );
     }
 
     /// Overlapping ranges must not double-count bytes. Two overlapping requests
-    /// that together cover a 4 KiB object must set `full_object_read_at`.
+    /// that together cover a 4 KiB object must set the full-object cleanup anchor.
     #[tokio::test]
     async fn test_overlapping_ranges_do_not_double_count() {
         let (app, state) = app_with_state().await;
@@ -2365,22 +2525,21 @@ mod tests {
         // bytes 0-3000 (first request).
         range_read_drain(&app, &key, "bytes=0-3000").await;
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.full_object_read_at.load(Ordering::Relaxed),
-            0,
-            "bytes 3001-4095 still missing: flag must be 0"
+        assert!(
+            spool.cleanup_anchors().full_object_read_at.is_none(),
+            "bytes 3001-4095 still missing: cleanup anchor must be unset"
         );
 
         // bytes 2000-4095 — overlaps [0,3001) and covers [3001,4096).
         range_read_drain(&app, &key, "bytes=2000-4095").await;
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "overlapping second range completes coverage: flag must be set"
         );
     }
 
     /// A follow-GET (no Range header) that consumes the entire body must set
-    /// `full_object_read_at`.
+    /// the full-object cleanup anchor.
     #[tokio::test]
     async fn test_follow_read_sets_full_object_read_at() {
         let (app, state) = app_with_state().await;
@@ -2391,7 +2550,7 @@ mod tests {
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "follow-GET must set full_object_read_at after all bytes are served"
         );
     }
@@ -2427,37 +2586,40 @@ mod tests {
         assert_eq!(body, data);
     }
 
-    /// Any read that yields at least one chunk must update `last_read_activity_at`.
+    /// Any read that yields at least one chunk must update the read-activity anchor.
     #[tokio::test]
     async fn test_last_read_activity_updated_on_chunk_yield() {
         let (app, state) = app_with_state().await;
         let key = write_and_complete(&app, vec![1u8; 4096]).await;
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.last_read_activity_at.load(Ordering::Relaxed),
-            0,
-            "no reads yet: last_read_activity_at must be 0"
+        assert!(
+            spool.cleanup_anchors().last_read_activity_at.is_none(),
+            "no reads yet: read-activity anchor must be unset"
         );
 
         range_read_drain(&app, &key, "bytes=0-4095").await;
 
         assert!(
-            spool.last_read_activity_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().last_read_activity_at.is_some(),
             "after range read: last_read_activity_at must be updated"
         );
     }
 
+    async fn wait_for_spool_removal(
+        state: &AppState<DefaultFileIO, DefaultMetadataStore>,
+        key: &str,
+    ) {
+        for _ in 0..10_000 {
+            if state.manager.get_spool(key).is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     // -----------------------------------------------------------------------
-    // Cleanup TTL integration — HTTP read → cleanup deletion
-    //
-    // NOTE on wall-clock vs tokio time:
-    // `crate::time::now_secs()` uses `SystemTime::now()` (wall clock).
-    // `tokio::time::advance()` only advances
-    // the tokio virtual clock, which controls `tokio::time::interval` sweeps.
-    // To make a TTL condition fire we set the stored timestamp to `1` (a value
-    // in 1970 that is always >> any TTL seconds behind the current wall clock).
-    // `tokio::time::advance()` is used solely to trigger the cleanup sweep.
+    // Cleanup TTL integration — HTTP read → monotonic cleanup deletion
     // -----------------------------------------------------------------------
 
     /// Full-range HTTP read sets `full_object_read_at`; cleanup deletes the
@@ -2474,21 +2636,27 @@ mod tests {
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "HTTP read path must set full_object_read_at after full coverage"
         );
 
-        // Simulate that full-read and the latest byte-serving activity happened
-        // long ago so the short-TTL comparison fires. Wall clock can't be
-        // advanced by tokio::time, so use an old epoch value.
-        spool.full_object_read_at.store(1, Ordering::SeqCst);
-        spool.last_read_activity_at.store(1, Ordering::SeqCst);
+        // Age both monotonic anchors beyond the short TTL.
+        {
+            let mut anchors = spool
+                .cleanup_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let old = Instant::now() - Duration::from_secs(10);
+            anchors.full_object_read_at = Some(old);
+            anchors.last_read_activity_at = Some(old);
+        }
 
         let task = start_cleanup_task(state.manager.clone(), state.config.clone());
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&state, &key).await;
         assert!(
             state.manager.get_spool(&key).is_none(),
             "spool must be deleted after full-read TTL expires"
@@ -2505,15 +2673,14 @@ mod tests {
         let key = write_and_complete(&app, vec![5u8; 4096]).await;
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        // No reads: last_read_activity_at must be 0.
-        assert_eq!(spool.last_read_activity_at.load(Ordering::Relaxed), 0);
+        assert!(spool.cleanup_anchors().last_read_activity_at.is_none());
 
-        // Set readable_at to an old epoch value so the idle TTL fires.
-        // (complete() sets readable_at = now_secs(); we override to simulate an
-        // old spool whose idle TTL has clearly expired.)
         {
-            let mut meta = spool.metadata.lock().await;
-            meta.readable_at = Some(1);
+            let mut anchors = spool
+                .cleanup_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            anchors.readable_at = Some(Instant::now() - Duration::from_secs(10));
         }
 
         let task = start_cleanup_task(state.manager.clone(), state.config.clone());
@@ -2521,6 +2688,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&state, &key).await;
         assert!(
             state.manager.get_spool(&key).is_none(),
             "unread spool must be deleted after idle TTL expires"
@@ -2538,23 +2706,24 @@ mod tests {
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
 
-        // Make readable_at old so that, without activity, idle TTL would fire.
+        // Make the readable anchor old so that, without activity, idle TTL would fire.
         {
-            let mut meta = spool.metadata.lock().await;
-            meta.readable_at = Some(1);
+            let mut anchors = spool
+                .cleanup_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            anchors.readable_at = Some(Instant::now() - Duration::from_secs(10));
         }
 
-        // Perform a range read — this stores last_read_activity_at = now_secs().
+        // Perform a range read, which refreshes the monotonic activity anchor.
         let status = range_read_drain(&app, &key, "bytes=0-4095").await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         assert!(
-            spool.last_read_activity_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().last_read_activity_at.is_some(),
             "range read must update last_read_activity_at"
         );
 
-        // Advance tokio time to trigger several cleanup sweeps. Because
-        // last_read_activity_at ≈ now_secs(), the idle check
-        // (now - last_activity ≈ 0 < 2) must NOT delete the spool.
+        // Trigger several cleanup sweeps; recent monotonic activity protects the spool.
         let task = start_cleanup_task(state.manager.clone(), state.config.clone());
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
@@ -2565,15 +2734,17 @@ mod tests {
             "spool with recent read activity must NOT be deleted"
         );
 
-        // Simulate that activity has now stopped (reset to old epoch value).
-        // idle_anchor = last_read_activity_at = 1 → now - 1 >> 2 → idle fires.
-        spool.last_read_activity_at.store(1, Ordering::SeqCst);
+        // Age the activity anchor beyond the idle TTL.
+        spool
+            .cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_read_activity_at = Some(Instant::now() - Duration::from_secs(10));
 
         tokio::time::advance(Duration::from_secs(3)).await;
-        // measure_disk_usage is now spawned fire-and-forget, so the cleanup
-        // loop returns to interval.tick() without blocking on spawn_blocking
-        // I/O.  A single yield is enough for the deletion sweep to run.
+        // Deletion now stays visible until metadata and directory removal finish.
         tokio::task::yield_now().await;
+        wait_for_spool_removal(&state, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),
