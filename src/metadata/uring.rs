@@ -4,8 +4,8 @@
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use super::{
-    remove_file_if_present, storage_error, BoxMetadataFuture, MetadataStore,
-    SyncSidecarMetadataStore, UringSidecarMetadataStore, META_FILE, TMP_FILE,
+    remove_file_if_present, storage_error, MetadataStore, SyncSidecarMetadataStore,
+    UringSidecarMetadataStore, META_FILE, TMP_FILE,
 };
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use crate::error::{BobsError, Result};
@@ -111,25 +111,23 @@ impl UringSidecarMetadataStore {
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 impl MetadataStore for UringSidecarMetadataStore {
-    type WriteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ReadFuture<'a> = BoxMetadataFuture<'a, Option<SpoolMetadata>>;
-    type DeleteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
-
-    fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
-        Box::pin(async move { self.write_uring(metadata).await })
+    async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+        self.write_uring(metadata).await
     }
 
-    fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
-        Box::pin(async move { self.sync_store().read_sync(key) })
+    async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+        let store = self.sync_store();
+        store.read(key).await
     }
 
-    fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
-        Box::pin(async move { self.sync_store().delete_sync(key) })
+    async fn delete(&self, key: &str) -> Result<()> {
+        let store = self.sync_store();
+        store.delete(key).await
     }
 
-    fn list(&self) -> Result<Self::ListIter> {
-        self.sync_store().list()
+    async fn list(&self) -> Result<Vec<Result<SpoolMetadata>>> {
+        let store = self.sync_store();
+        store.list().await
     }
 }
 
@@ -564,7 +562,9 @@ mod tests {
 
         let listed = store
             .list()
+            .await
             .expect("list metadata")
+            .into_iter()
             .collect::<Result<Vec<_>>>()
             .expect("listed metadata parses");
         assert_eq!(listed.len(), 1);

@@ -269,7 +269,7 @@ where
         let mut corrupt_deleted = 0_u64;
         let mut orphan_deleted = 0_u64;
 
-        for meta in self.metadata_store.list()? {
+        for meta in self.metadata_store.list().await? {
             match meta {
                 Ok(meta) => recovered.push((meta.key.clone(), meta)),
                 Err(error) => {
