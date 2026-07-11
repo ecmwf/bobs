@@ -2413,6 +2413,18 @@ mod tests {
         );
     }
 
+    async fn wait_for_spool_removal(
+        state: &AppState<DefaultFileIO, DefaultMetadataStore>,
+        key: &str,
+    ) {
+        for _ in 0..10_000 {
+            if state.manager.get_spool(key).is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Cleanup TTL integration — HTTP read → cleanup deletion
     //
@@ -2454,6 +2466,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&state, &key).await;
         assert!(
             state.manager.get_spool(&key).is_none(),
             "spool must be deleted after full-read TTL expires"
@@ -2486,6 +2499,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&state, &key).await;
         assert!(
             state.manager.get_spool(&key).is_none(),
             "unread spool must be deleted after idle TTL expires"
