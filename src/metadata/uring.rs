@@ -4,8 +4,8 @@
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use super::{
-    remove_file_if_present, storage_error, BoxMetadataFuture, MetadataStore,
-    SyncSidecarMetadataStore, UringSidecarMetadataStore, META_FILE, TMP_FILE,
+    remove_file_if_present, storage_error, MetadataStore, SyncSidecarMetadataStore,
+    UringSidecarMetadataStore, META_FILE, TMP_FILE,
 };
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use crate::error::{BobsError, Result};
@@ -111,25 +111,23 @@ impl UringSidecarMetadataStore {
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 impl MetadataStore for UringSidecarMetadataStore {
-    type WriteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ReadFuture<'a> = BoxMetadataFuture<'a, Option<SpoolMetadata>>;
-    type DeleteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ListIter = std::vec::IntoIter<(String, Result<SpoolMetadata>)>;
-
-    fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
-        Box::pin(async move { self.write_uring(metadata).await })
+    async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+        self.write_uring(metadata).await
     }
 
-    fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
-        Box::pin(async move { self.sync_store().read_sync(key) })
+    async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+        let store = self.sync_store();
+        store.read(key).await
     }
 
-    fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
-        Box::pin(async move { self.sync_store().delete_sync(key) })
+    async fn delete(&self, key: &str) -> Result<()> {
+        let store = self.sync_store();
+        store.delete(key).await
     }
 
-    fn list(&self) -> Result<Self::ListIter> {
-        self.sync_store().list()
+    async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+        let store = self.sync_store();
+        store.list().await
     }
 }
 
@@ -180,6 +178,7 @@ pub(crate) struct RecordedCompletion {
     performed: bool,
     cancelled: bool,
     result: Option<io::ErrorKind>,
+    bytes_written: Option<usize>,
 }
 
 #[cfg(test)]
@@ -231,9 +230,12 @@ pub(crate) fn commit_hot_metadata_on_shard<S: MetadataCommitSubmitter>(
 
     let payload = serde_json::to_vec(metadata)
         .map_err(|error| BobsError::SerializationError(error.to_string()))?;
+    let payload_len = payload.len();
     let tmp_path = spool_dir.join(TMP_FILE);
     let meta_path = spool_dir.join(META_FILE);
 
+    // Phase one makes the complete temporary file durable. A positive short
+    // write does not break an IO_LINK chain, so rename must not be queued yet.
     submitter
         .push(
             MetadataSqe::Write {
@@ -248,9 +250,25 @@ pub(crate) fn commit_hot_metadata_on_shard<S: MetadataCommitSubmitter>(
             MetadataSqe::Fdatasync {
                 path: tmp_path.clone(),
             },
-            true,
+            false,
         )
         .map_err(storage_error)?;
+    let write_completions = submitter.submit_and_wait().map_err(storage_error)?;
+    check_completion_errors(&write_completions)?;
+    let bytes_written = write_completions
+        .iter()
+        .find(|completion| completion.kind == MetadataOpKind::Write)
+        .and_then(|completion| completion.bytes_written)
+        .ok_or_else(|| storage_error(io::Error::other("metadata write completion missing")))?;
+    if bytes_written != payload_len {
+        return Err(storage_error(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("metadata io_uring short write: wrote {bytes_written} of {payload_len} bytes"),
+        )));
+    }
+
+    // Phase two can replace the durable old sidecar only after phase one was
+    // checked in userspace. The directory fsync then makes that rename durable.
     submitter
         .push(
             MetadataSqe::Rename {
@@ -263,8 +281,12 @@ pub(crate) fn commit_hot_metadata_on_shard<S: MetadataCommitSubmitter>(
     submitter
         .push(MetadataSqe::DirectoryFsync { path: spool_dir }, false)
         .map_err(storage_error)?;
+    let rename_completions = submitter.submit_and_wait().map_err(storage_error)?;
+    check_completion_errors(&rename_completions)
+}
 
-    let completions = submitter.submit_and_wait().map_err(storage_error)?;
+#[cfg(test)]
+fn check_completion_errors(completions: &[RecordedCompletion]) -> Result<()> {
     for completion in completions {
         if let Some(kind) = completion.result {
             if !completion.cancelled {
@@ -284,7 +306,9 @@ struct FakeLinkedSubmitter {
     queued: Vec<(MetadataSqe, bool)>,
     recorded: Vec<RecordedSqe>,
     completions: Vec<RecordedCompletion>,
+    submit_batches: Vec<Vec<MetadataOpKind>>,
     fail: Option<MetadataOpKind>,
+    short_write_len: Option<usize>,
     fds: HashMap<PathBuf, i32>,
     next_fd: i32,
     invoked_shards: Vec<usize>,
@@ -293,19 +317,25 @@ struct FakeLinkedSubmitter {
 #[cfg(test)]
 impl FakeLinkedSubmitter {
     fn successful() -> Self {
-        Self::new(None)
+        Self::new(None, None)
     }
 
     fn fail_on(kind: MetadataOpKind) -> Self {
-        Self::new(Some(kind))
+        Self::new(Some(kind), None)
     }
 
-    fn new(fail: Option<MetadataOpKind>) -> Self {
+    fn short_write(len: usize) -> Self {
+        Self::new(None, Some(len))
+    }
+
+    fn new(fail: Option<MetadataOpKind>, short_write_len: Option<usize>) -> Self {
         Self {
             queued: Vec::new(),
             recorded: Vec::new(),
             completions: Vec::new(),
+            submit_batches: Vec::new(),
             fail,
+            short_write_len,
             fds: HashMap::new(),
             next_fd: 10,
             invoked_shards: Vec::new(),
@@ -356,12 +386,20 @@ impl FakeLinkedSubmitter {
         self.recorded.push(recorded);
     }
 
-    fn apply(sqe: &MetadataSqe) -> io::Result<()> {
+    fn apply(&mut self, sqe: &MetadataSqe) -> io::Result<Option<usize>> {
         match sqe {
-            MetadataSqe::Write { path, payload } => fs::write(path, payload),
-            MetadataSqe::Fdatasync { .. } => Ok(()),
-            MetadataSqe::Rename { from, to } => fs::rename(from, to),
-            MetadataSqe::DirectoryFsync { .. } => Ok(()),
+            MetadataSqe::Write { path, payload } => {
+                let len = self.short_write_len.take().unwrap_or(payload.len());
+                let len = len.min(payload.len());
+                fs::write(path, &payload[..len])?;
+                Ok(Some(len))
+            }
+            MetadataSqe::Fdatasync { .. } => Ok(None),
+            MetadataSqe::Rename { from, to } => {
+                fs::rename(from, to)?;
+                Ok(None)
+            }
+            MetadataSqe::DirectoryFsync { .. } => Ok(None),
         }
     }
 }
@@ -380,41 +418,47 @@ impl MetadataCommitSubmitter for FakeLinkedSubmitter {
     }
 
     fn submit_and_wait(&mut self) -> io::Result<Vec<RecordedCompletion>> {
+        let batch_kinds = self.queued.iter().map(|(sqe, _)| sqe.kind()).collect();
+        self.submit_batches.push(batch_kinds);
+
+        let mut batch_completions = Vec::new();
         let mut cancel_rest = false;
-        for (sqe, linked) in self.queued.drain(..) {
+        let queued = std::mem::take(&mut self.queued);
+        for (sqe, linked) in queued {
             let kind = sqe.kind();
-            if cancel_rest {
-                self.completions.push(RecordedCompletion {
+            let completion = if cancel_rest {
+                RecordedCompletion {
                     kind,
                     performed: false,
                     cancelled: true,
                     result: Some(io::ErrorKind::Interrupted),
-                });
-                continue;
-            }
-
-            if self.fail == Some(kind) {
-                self.completions.push(RecordedCompletion {
+                    bytes_written: None,
+                }
+            } else if self.fail == Some(kind) {
+                if linked {
+                    cancel_rest = true;
+                }
+                RecordedCompletion {
                     kind,
                     performed: true,
                     cancelled: false,
                     result: Some(io::ErrorKind::Other),
-                });
-                if linked {
-                    cancel_rest = true;
+                    bytes_written: None,
                 }
-                continue;
-            }
-
-            Self::apply(&sqe)?;
-            self.completions.push(RecordedCompletion {
-                kind,
-                performed: true,
-                cancelled: false,
-                result: None,
-            });
+            } else {
+                let bytes_written = self.apply(&sqe)?;
+                RecordedCompletion {
+                    kind,
+                    performed: true,
+                    cancelled: false,
+                    result: None,
+                    bytes_written,
+                }
+            };
+            batch_completions.push(completion.clone());
+            self.completions.push(completion);
         }
-        Ok(self.completions.clone())
+        Ok(batch_completions)
     }
 }
 
@@ -513,8 +557,16 @@ mod tests {
                     .iter()
                     .map(|sqe| sqe.linked)
                     .collect::<Vec<_>>(),
-                vec![true, true, true, false],
-                "unexpected link flags for shard {shard_index}"
+                vec![true, false, true, false],
+                "each durability phase must be a separate linked pair for shard {shard_index}"
+            );
+            assert_eq!(
+                fake.submit_batches,
+                vec![
+                    vec![MetadataOpKind::Write, MetadataOpKind::Fdatasync],
+                    vec![MetadataOpKind::Rename, MetadataOpKind::DirectoryFsync],
+                ],
+                "rename must be submitted only after write completion is verified"
             );
             assert_eq!(fake.recorded[0].path.as_deref(), Some(tmp_path.as_path()));
             assert_eq!(fake.recorded[1].path.as_deref(), Some(tmp_path.as_path()));
@@ -542,8 +594,8 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     #[tokio::test]
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     async fn uring_store_write_read_delete_and_list() {
         let dir = tempdir().expect("create tempdir");
         let store = UringSidecarMetadataStore::new(dir.path());
@@ -565,7 +617,9 @@ mod tests {
 
         let listed: Vec<_> = store
             .list()
+            .await
             .expect("list metadata")
+            .into_iter()
             .map(|(key, metadata)| (key, metadata.expect("listed metadata parses")))
             .collect();
         assert_eq!(listed.len(), 1);
@@ -581,8 +635,8 @@ mod tests {
             .is_none());
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     #[tokio::test]
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     async fn ring_pool_metadata_commit_routes_by_key() {
         use crate::io::ring_pool::{scoped_test_ring_pool_override, RingPool, RingPoolOptions};
         use std::sync::Arc;
@@ -613,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn io_uring_linked_chain_fdatasync_error_cancels_rename_and_directory_fsync() {
+    fn io_uring_fdatasync_error_never_submits_rename_and_preserves_old_metadata() {
         for shard_index in [0, LINKED_CHAIN_TEST_SHARDS - 1] {
             let dir = tempdir().expect("create tempdir");
             let old = metadata_for_shard(shard_index, LINKED_CHAIN_TEST_SHARDS, 1);
@@ -636,44 +690,58 @@ mod tests {
             assert_eq!(fake.invoked_shards, vec![shard_index]);
             assert_eq!(
                 fake.recorded.iter().map(|sqe| sqe.kind).collect::<Vec<_>>(),
-                vec![
-                    MetadataOpKind::Write,
-                    MetadataOpKind::Fdatasync,
-                    MetadataOpKind::Rename,
-                    MetadataOpKind::DirectoryFsync,
-                ],
-                "unexpected SQE order for shard {shard_index}"
+                vec![MetadataOpKind::Write, MetadataOpKind::Fdatasync],
+                "rename must not be queued before fdatasync succeeds"
             );
             assert_eq!(
-                fake.recorded
-                    .iter()
-                    .map(|sqe| sqe.linked)
-                    .collect::<Vec<_>>(),
-                vec![true, true, true, false],
-                "unexpected link flags for shard {shard_index}"
-            );
-            assert_eq!(
-                fake.completions
-                    .iter()
-                    .map(|completion| (completion.kind, completion.performed, completion.cancelled))
-                    .collect::<Vec<_>>(),
-                vec![
-                    (MetadataOpKind::Write, true, false),
-                    (MetadataOpKind::Fdatasync, true, false),
-                    (MetadataOpKind::Rename, false, true),
-                    (MetadataOpKind::DirectoryFsync, false, true),
-                ],
-                "fdatasync failure should cancel linked tail for shard {shard_index}"
+                fake.submit_batches,
+                vec![vec![MetadataOpKind::Write, MetadataOpKind::Fdatasync]],
             );
             assert_eq!(
                 fs::read(&meta_path).expect("read meta.json after failed commit"),
                 old_bytes,
-                "linked cancellation must leave final meta.json at old value for shard {shard_index}"
+                "fdatasync failure must leave final meta.json at its old durable value"
             );
             let persisted: SpoolMetadata =
                 serde_json::from_slice(&fs::read(meta_path).expect("read persisted old metadata"))
                     .expect("deserialize old metadata");
             assert_metadata_eq(persisted, &old);
         }
+    }
+
+    #[test]
+    fn io_uring_short_metadata_write_never_submits_rename_and_preserves_old_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let old = metadata_for_key_generation("short-write-key".to_owned(), 1);
+        let mut new = metadata_for_key_generation(old.key.clone(), 2);
+        new.data_path = old.data_path.with_extension("new.data");
+        let sync_store = crate::metadata::SyncSidecarMetadataStore::new(dir.path());
+        sync_store.write_sync(&old).expect("seed old metadata");
+        let spool_dir = dir.path().join(&old.key);
+        let meta_path = spool_dir.join(META_FILE);
+        let old_bytes = fs::read(&meta_path).expect("read old meta.json");
+        let mut fake = FakeLinkedSubmitter::short_write(7);
+
+        let err = commit_hot_metadata(&mut fake, dir.path(), &new)
+            .expect_err("short metadata write must fail before rename");
+
+        assert!(matches!(err, BobsError::StorageError(_)));
+        assert_eq!(
+            fake.recorded.iter().map(|sqe| sqe.kind).collect::<Vec<_>>(),
+            vec![MetadataOpKind::Write, MetadataOpKind::Fdatasync],
+        );
+        assert_eq!(
+            fake.submit_batches,
+            vec![vec![MetadataOpKind::Write, MetadataOpKind::Fdatasync]],
+        );
+        assert_eq!(
+            fs::read(&meta_path).expect("read meta.json after short write"),
+            old_bytes,
+            "a partial temporary file must never replace durable metadata"
+        );
+        assert_eq!(
+            fs::read(spool_dir.join(TMP_FILE)).expect("read partial tmp"),
+            serde_json::to_vec(&new).expect("serialize new metadata")[..7],
+        );
     }
 }

@@ -111,6 +111,12 @@ impl FileIO for UringFileIO {
     }
 
     async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> Result<Bytes> {
+        if len > u32::MAX as usize {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "io_uring reads are limited to u32::MAX bytes",
+            ));
+        }
         let (tx, rx) = oneshot::channel();
         let pool = Arc::clone(&handle.pool);
         #[cfg(test)]
