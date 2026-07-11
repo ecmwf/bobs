@@ -90,10 +90,6 @@ impl PageCache {
             .retain(|key| key.spool_key.as_str() != spool_key);
     }
 
-    pub fn remove_spool(&mut self, spool_key: &str) {
-        self.free_spool(spool_key);
-    }
-
     pub fn current_bytes(&self) -> usize {
         self.current_bytes
     }

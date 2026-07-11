@@ -30,14 +30,14 @@ pub enum BobsError {
     #[error("size mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
 
-    #[error("writer is inactive")]
-    WriterInactive,
-
     #[error("invalid range header: {0}")]
     InvalidRange(String),
 
     #[error("range not satisfiable: {reason}")]
     RangeNotSatisfiable { total: Option<u64>, reason: String },
+
+    #[error("configuration error: {0}")]
+    ConfigurationError(String),
 
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),

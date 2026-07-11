@@ -123,6 +123,6 @@ Larger pages such as `1048576` (1 MiB), `4194304` (4 MiB), and `16777216` (16 Mi
 - larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless `max_cache_bytes` is increased;
 - benchmark representative object sizes and write chunk sizes before changing production defaults.
 
-`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; set it explicitly when workflow concurrency should differ from cache page capacity.
+`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; set it explicitly when workflow concurrency should differ from cache page capacity. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
 
 See the standalone benchmark guide for page-size comparison commands.

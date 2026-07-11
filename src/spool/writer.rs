@@ -20,6 +20,9 @@ where
     /// published to the cache from the owned input bytes where possible; the write
     /// buffer is only used to assemble pages that span multiple write calls.
     pub async fn write(&self, offset: u64, data: Bytes) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        // This lock is the spool's write/delete linearization gate. A write is
+        // either fully published before deletion starts or observes Deleting.
         let mut buf = self.write_buffer.lock().await;
 
         {
@@ -48,23 +51,18 @@ where
             return Ok(());
         }
 
-        {
-            let handle_guard = self.file_handle.lock().await;
-            let Some(handle) = handle_guard.as_ref() else {
-                return Err(BobsError::WriterInactive);
-            };
-            let written = F::write_at(handle, offset, data.clone())
-                .await
-                .map_err(BobsError::IoError)?;
-            if written != data.len() {
-                return Err(BobsError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    format!("short write: wrote {written} of {} bytes", data.len()),
-                )));
-            }
+        let written = F::write_at(&self.file_handle, offset, data.clone())
+            .await
+            .map_err(BobsError::IoError)?;
+        if written != data.len() {
+            return Err(BobsError::IoError(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!("short write: wrote {written} of {} bytes", data.len()),
+            )));
         }
 
         let mut cursor = 0;
+        let mut completed_pages = Vec::new();
 
         // If a previous call left a partial page, copy only enough incoming bytes
         // to finish that page. Complete pages wholly contained in `data` are
@@ -76,49 +74,68 @@ where
             cursor += take;
 
             if buf.len() == self.page_size {
-                let page_bytes = buf.split_to(self.page_size).freeze();
-                self.publish_page(page_bytes).await;
+                completed_pages.push(buf.split_to(self.page_size).freeze());
             }
         }
 
         // Publish full pages from the incoming owned buffer without cloning their
         // contents. Only cross-call partial pages use `write_buffer` assembly.
-        while cursor + self.page_size <= data.len() {
-            let page_bytes = data.slice(cursor..cursor + self.page_size);
-            cursor += self.page_size;
-            self.publish_page(page_bytes).await;
+        while data.len() - cursor >= self.page_size {
+            let end = cursor + self.page_size;
+            completed_pages.push(data.slice(cursor..end));
+            cursor = end;
         }
 
         if cursor < data.len() {
             buf.extend_from_slice(&data[cursor..]);
         }
 
-        {
-            let mut meta = self.metadata.lock().await;
-            meta.total_bytes_written = offset + data.len() as u64;
-            meta.last_write_at = now_secs();
-        }
+        self.publish_write(completed_pages, offset + data.len() as u64, now_secs())
+            .await;
+        self.record_write_activity();
 
         Ok(())
     }
 
-    async fn publish_page(&self, page_bytes: Bytes) {
-        let page_idx = {
-            let meta = self.metadata.lock().await;
-            meta.total_pages
-        };
-
-        {
-            let mut cache = self.page_cache.lock().await;
-            cache.insert(&self.key, page_idx, page_bytes);
-        }
-
-        {
+    /// Refresh the writer-inactivity anchor when HTTP receives a body frame, even
+    /// when the frame is too small to flush the request's pending write batch.
+    pub async fn refresh_write_activity(&self) {
+        let active = {
             let mut meta = self.metadata.lock().await;
-            meta.total_pages += 1;
+            if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
+                meta.last_write_at = now_secs();
+                true
+            } else {
+                false
+            }
+        };
+        if active {
+            self.record_write_activity();
+        }
+    }
+
+    /// Publish all metadata for one accepted disk append under one metadata lock.
+    /// Readers can therefore never observe new pages with a stale byte count.
+    async fn publish_write(&self, pages: Vec<Bytes>, total_bytes_written: u64, now: u64) {
+        let published_pages = !pages.is_empty();
+        let mut meta = self.metadata.lock().await;
+
+        if published_pages {
+            let mut cache = self.page_cache.lock().await;
+            for page_bytes in pages {
+                let page_idx = meta.total_pages;
+                cache.insert(&self.key, page_idx, page_bytes);
+                meta.total_pages += 1;
+            }
         }
 
-        self.notify.notify_waiters();
+        meta.total_bytes_written = total_bytes_written;
+        meta.last_write_at = now;
+        drop(meta);
+
+        if published_pages {
+            self.notify.notify_waiters();
+        }
     }
 }
 
@@ -152,6 +169,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
@@ -168,12 +186,11 @@ mod tests {
             handle,
             page_size,
             Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                page_size * 256,
+                page_size.saturating_mul(256),
             ))),
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
-        .await
     }
 
     async fn persisted_metadata(spool: &Spool<TokioFileIO>) -> SpoolMetadata {
@@ -219,6 +236,45 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 4);
         assert_eq!(meta.total_bytes_written, 16384);
+    }
+
+    #[tokio::test]
+    async fn test_page_and_byte_publication_share_one_metadata_lock() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = Arc::new(make_spool(dir.path(), 4096).await);
+        let cache_guard = spool.page_cache.lock().await;
+        let writer_spool = Arc::clone(&spool);
+        let write_task =
+            tokio::spawn(async move { writer_spool.write(0, Bytes::from(vec![0xCD; 4096])).await });
+
+        // The disk append precedes publication. Once it is visible, give the writer
+        // time to reach the deliberately blocked cache insertion.
+        loop {
+            let len = tokio::fs::metadata(&spool.data_path)
+                .await
+                .expect("stat spool data")
+                .len();
+            if len == 4096 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), spool.metadata.lock())
+                .await
+                .is_err(),
+            "metadata must stay locked while page cache publication is pending"
+        );
+
+        drop(cache_guard);
+        write_task
+            .await
+            .expect("write task join")
+            .expect("write succeeds");
+        let metadata = spool.metadata.lock().await;
+        assert_eq!(metadata.total_pages, 1);
+        assert_eq!(metadata.total_bytes_written, 4096);
     }
 
     #[tokio::test]
@@ -314,9 +370,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_empty_is_noop() {
+    async fn test_write_empty_validates_without_refreshing_activity() {
         let dir = tempdir().expect("failed to create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
+        let activity_before = spool.cleanup_anchors().last_write_at;
 
         spool
             .write(0, bytes::Bytes::new())
@@ -326,21 +383,35 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 0);
         assert_eq!(meta.total_bytes_written, 0);
+        drop(meta);
+        assert_eq!(spool.cleanup_anchors().last_write_at, activity_before);
+
+        assert!(matches!(
+            spool.write(1, bytes::Bytes::new()).await,
+            Err(BobsError::OffsetMismatch {
+                expected: 0,
+                got: 1
+            })
+        ));
+        spool.metadata.lock().await.state = SpoolState::Complete;
+        assert!(matches!(
+            spool.write(0, bytes::Bytes::new()).await,
+            Err(BobsError::SpoolClosed)
+        ));
     }
 
     #[tokio::test]
-    async fn test_write_when_file_handle_none() {
+    async fn test_huge_page_size_does_not_allocate_page_sized_staging() {
         let dir = tempdir().expect("failed to create tempdir");
-        let spool = make_spool(dir.path(), 4096).await;
+        let spool = make_spool(dir.path(), usize::MAX).await;
 
-        {
-            let mut handle = spool.file_handle.lock().await;
-            *handle = None;
-        }
+        spool
+            .write(0, bytes::Bytes::from_static(b"tiny"))
+            .await
+            .expect("small write with huge page size should not panic or allocate eagerly");
 
-        let data = vec![0xFFu8; 4096];
-        let result = spool.write(0, bytes::Bytes::copy_from_slice(&data)).await;
-        assert!(matches!(result, Err(BobsError::WriterInactive)));
+        assert_eq!(spool.write_buffer.lock().await.as_ref(), b"tiny");
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
     }
 
     #[tokio::test]

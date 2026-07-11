@@ -150,6 +150,16 @@ impl Config {
             ));
         }
 
+        if self.max_live_spools > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "max_live_spools must not exceed {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
+            ));
+        }
+
         if self.max_spool_bytes == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -432,6 +442,21 @@ route_name: test-route
     }
 
     #[test]
+    fn test_validate_rejects_max_live_spools_above_semaphore_limit() {
+        let config = Config {
+            max_live_spools: tokio::sync::Semaphore::MAX_PERMITS + 1,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("max_live_spools"));
+    }
+
+    #[test]
     fn test_validate_rejects_zero_http_resource_limits() {
         for config in [
             Config {
@@ -675,5 +700,29 @@ route_name: z
 
         let cfg = Config::from_file(&path).expect("parse yaml");
         assert_eq!(cfg.max_live_spools, 1);
+    }
+
+    #[test]
+    fn test_from_file_rejects_derived_admission_above_semaphore_limit() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("derived-too-large.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "page_size: 1\nmax_cache_bytes: {}\nhost_prefix: x\ndomain: y\nroute_name: z\n",
+                tokio::sync::Semaphore::MAX_PERMITS + 1
+            ),
+        )
+        .expect("write yaml");
+
+        let config = Config::from_file(&path).expect("parse yaml");
+        assert_eq!(
+            config.max_live_spools,
+            tokio::sync::Semaphore::MAX_PERMITS + 1
+        );
+        let err = config
+            .validate()
+            .expect_err("derived admission above semaphore limit must fail");
+        assert!(err.to_string().contains("max_live_spools"));
     }
 }
