@@ -32,7 +32,10 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub page_cache: Arc<Mutex<PageCache>>,
     /// Accumulates incoming bytes until a full page is ready for flush.
     pub write_buffer: Arc<Mutex<BytesMut>>,
-    pub file_handle: Arc<Mutex<Option<F::Handle>>>,
+    /// Shared positional-I/O handle. Cloning this `Arc` keeps the handle alive for
+    /// each in-flight operation; it closes naturally when the final spool/operation
+    /// reference is dropped.
+    pub file_handle: Arc<F::Handle>,
     pub metadata_store: M,
     /// Writer notifies after each completed page; readers long-poll on this.
     pub notify: Arc<Notify>,
@@ -63,7 +66,7 @@ where
     F: FileIO,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
-    pub async fn new(
+    pub fn new(
         metadata: SpoolMetadata,
         file_handle: F::Handle,
         page_size: usize,
@@ -80,10 +83,9 @@ where
             metrics,
             None,
         )
-        .await
     }
 
-    pub async fn new_with_admission(
+    pub fn new_with_admission(
         metadata: SpoolMetadata,
         file_handle: F::Handle,
         page_size: usize,
@@ -100,7 +102,7 @@ where
             metadata: Arc::new(Mutex::new(metadata)),
             page_cache,
             write_buffer: Arc::new(Mutex::new(BytesMut::new())),
-            file_handle: Arc::new(Mutex::new(Some(file_handle))),
+            file_handle: Arc::new(file_handle),
             metadata_store,
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),

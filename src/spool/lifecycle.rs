@@ -82,12 +82,9 @@ where
             (candidate, total_size)
         };
 
-        {
-            let handle_guard = self.file_handle.lock().await;
-            if let Some(handle) = handle_guard.as_ref() {
-                F::sync_data(handle).await.map_err(BobsError::IoError)?;
-            }
-        }
+        F::sync_data(&self.file_handle)
+            .await
+            .map_err(BobsError::IoError)?;
 
         self.persist_metadata(&candidate).await?;
 
@@ -621,7 +618,6 @@ mod tests {
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
-        .await
     }
 
     async fn persisted_metadata<F, M>(spool: &Spool<F, M>) -> SpoolMetadata
@@ -681,7 +677,6 @@ mod tests {
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
-        .await
     }
 
     async fn make_fail_first_metadata_spool(
@@ -726,7 +721,6 @@ mod tests {
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
-        .await
     }
 
     async fn make_counting_spool(dir: &std::path::Path, page_size: usize) -> Spool<CountingFileIO> {
@@ -770,7 +764,6 @@ mod tests {
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
-        .await
     }
 
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
@@ -831,7 +824,6 @@ mod tests {
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
-        .await
     }
 
     #[tokio::test]
@@ -1032,8 +1024,7 @@ mod tests {
                 ))),
                 metadata_store,
                 Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await;
+            );
             routed_spool
                 .write(0, bytes::Bytes::copy_from_slice(&data))
                 .await

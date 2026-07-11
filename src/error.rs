@@ -21,9 +21,6 @@ pub enum BobsError {
     #[error("size mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
 
-    #[error("writer is inactive")]
-    WriterInactive,
-
     #[error("invalid range header: {0}")]
     InvalidRange(String),
 

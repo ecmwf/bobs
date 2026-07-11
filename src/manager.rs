@@ -154,18 +154,15 @@ where
 
         self.metadata_store.write(&metadata).await?;
 
-        let spool = Arc::new(
-            Spool::new_with_admission(
-                metadata,
-                handle,
-                self.page_size,
-                Arc::clone(&self.page_cache),
-                self.metadata_store.clone(),
-                Arc::clone(&self.metrics),
-                Some(permit),
-            )
-            .await,
-        );
+        let spool = Arc::new(Spool::new_with_admission(
+            metadata,
+            handle,
+            self.page_size,
+            Arc::clone(&self.page_cache),
+            self.metadata_store.clone(),
+            Arc::clone(&self.metrics),
+            Some(permit),
+        ));
         self.spools.insert(key.clone(), spool);
 
         // Record initial state for the active spool gauge.
@@ -230,6 +227,11 @@ where
                 key: key.to_string(),
             })?;
 
+        // Serialize the Deleting transition with writes/completion. Once this gate
+        // is acquired, all earlier writes have fully published and all later writes
+        // will observe Deleting rather than returning a false success.
+        let _write_gate = spool.write_buffer.lock().await;
+
         let old_state = {
             let mut meta = spool.metadata.lock().await;
             let old = meta.state.clone();
@@ -248,7 +250,7 @@ where
 
         self.spools.remove(key);
         spool.release_admission();
-        self.page_cache.lock().await.remove_spool(key);
+        self.page_cache.lock().await.free_spool(key);
 
         let deleting_meta = { spool.metadata.lock().await.clone() };
         self.metadata_store.write(&deleting_meta).await?;
@@ -383,26 +385,25 @@ where
             let meta_total_bytes_for_init = meta.total_bytes_written;
             let permit = Arc::clone(&self.admission).try_acquire_owned().ok();
 
-            let spool = Arc::new(
-                Spool::new_with_admission(
-                    meta,
-                    handle,
-                    self.page_size,
-                    Arc::clone(&self.page_cache),
-                    self.metadata_store.clone(),
-                    Arc::clone(&self.metrics),
-                    permit,
-                )
-                .await,
-            );
+            let spool = Arc::new(Spool::new_with_admission(
+                meta,
+                handle,
+                self.page_size,
+                Arc::clone(&self.page_cache),
+                self.metadata_store.clone(),
+                Arc::clone(&self.metrics),
+                permit,
+            ));
 
             if trailing_partial_len > 0 {
-                let partial = read_exact_logical_range::<F>(
+                let partial = read_exact_at::<F>(
                     &spool.file_handle,
                     meta_total_bytes_for_init - trailing_partial_len,
                     trailing_partial_len as usize,
+                    "loading trailing partial page",
                 )
-                .await?;
+                .await
+                .map_err(BobsError::IoError)?;
                 spool.write_buffer.lock().await.extend_from_slice(&partial);
             }
 
@@ -572,31 +573,82 @@ fn in_progress_progress_from_file(file_size: u64, page_size: usize) -> InProgres
     }
 }
 
-async fn read_exact_logical_range<F: FileIO>(
-    file_handle: &Arc<tokio::sync::Mutex<Option<F::Handle>>>,
-    offset: u64,
-    len: usize,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(len);
-    let handle_guard = file_handle.lock().await;
-    let Some(handle) = handle_guard.as_ref() else {
-        return Err(BobsError::WriterInactive);
-    };
-
-    let buf = read_exact_at::<F>(handle, offset, len, "loading trailing partial page")
-        .await
-        .map_err(BobsError::IoError)?;
-    out.extend_from_slice(&buf);
-
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::TokioFileIO;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct BlockingWriteFileIO;
+
+    struct BlockingWriteHandle {
+        inner: <TokioFileIO as FileIO>::Handle,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    static BLOCKING_WRITE_CONTROL: std::sync::OnceLock<(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    )> = std::sync::OnceLock::new();
+
+    impl FileIO for BlockingWriteFileIO {
+        type Handle = BlockingWriteHandle;
+
+        async fn create(path: &Path) -> std::io::Result<Self::Handle> {
+            let (entered, release) = BLOCKING_WRITE_CONTROL
+                .get()
+                .expect("blocking write control initialized");
+            Ok(BlockingWriteHandle {
+                inner: TokioFileIO::create(path).await?,
+                entered: Arc::clone(entered),
+                release: Arc::clone(release),
+            })
+        }
+
+        async fn open(path: &Path) -> std::io::Result<Self::Handle> {
+            let (entered, release) = BLOCKING_WRITE_CONTROL
+                .get()
+                .expect("blocking write control initialized");
+            Ok(BlockingWriteHandle {
+                inner: TokioFileIO::open(path).await?,
+                entered: Arc::clone(entered),
+                release: Arc::clone(release),
+            })
+        }
+
+        async fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: bytes::Bytes,
+        ) -> std::io::Result<usize> {
+            handle.entered.notify_one();
+            handle.release.notified().await;
+            TokioFileIO::write_at(&handle.inner, offset, data).await
+        }
+
+        async fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> std::io::Result<bytes::Bytes> {
+            TokioFileIO::read_at(&handle.inner, offset, len).await
+        }
+
+        async fn sync_data(handle: &Self::Handle) -> std::io::Result<()> {
+            TokioFileIO::sync_data(&handle.inner).await
+        }
+
+        async fn close(handle: Self::Handle) -> std::io::Result<()> {
+            TokioFileIO::close(handle.inner).await
+        }
+
+        async fn remove(path: &Path) -> std::io::Result<()> {
+            TokioFileIO::remove(path).await
+        }
+    }
 
     #[test]
     fn recognised_spool_keys_accept_uuid_and_request_id() {
@@ -916,6 +968,66 @@ mod tests {
         manager.delete_spool(&key).await.expect("delete spool");
         assert!(manager.get_spool(&key).is_none());
         assert!(!spool_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_serializes_with_in_flight_and_queued_writes() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        BLOCKING_WRITE_CONTROL
+            .set((Arc::clone(&entered), Arc::clone(&release)))
+            .expect("blocking write control set once");
+
+        let dir = tempdir().expect("create tempdir");
+        let manager = Arc::new(
+            SpoolManager::<BlockingWriteFileIO>::new(dir.path(), 4096, 16 * 4096, 256)
+                .expect("manager init"),
+        );
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+
+        let first_spool = Arc::clone(&spool);
+        let first_write = tokio::spawn(async move {
+            first_spool
+                .write(0, bytes::Bytes::from(vec![1; 4096]))
+                .await
+        });
+        entered.notified().await;
+
+        let delete_manager = Arc::clone(&manager);
+        let delete_key = key.clone();
+        let delete_task =
+            tokio::spawn(async move { delete_manager.delete_spool(&delete_key).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !delete_task.is_finished(),
+            "deletion must wait for the earlier write to finish publication"
+        );
+
+        let queued_spool = Arc::clone(&spool);
+        let queued_write = tokio::spawn(async move {
+            queued_spool
+                .write(4096, bytes::Bytes::from(vec![2; 4096]))
+                .await
+        });
+        release.notify_one();
+
+        first_write
+            .await
+            .expect("first write task join")
+            .expect("write linearized before deletion succeeds");
+        delete_task
+            .await
+            .expect("delete task join")
+            .expect("delete succeeds");
+        assert!(matches!(
+            queued_write.await.expect("queued write task join"),
+            Err(BobsError::InvalidState { .. })
+        ));
     }
 
     #[tokio::test]

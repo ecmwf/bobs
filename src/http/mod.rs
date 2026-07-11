@@ -370,30 +370,47 @@ where
         let labels = spool.metadata.lock().await.labels.clone();
         let write_start = Instant::now();
         let write_batch_size = state.config.page_size;
-        let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
+        // Start empty: the common full-frame path can pass zero-copy Bytes slices
+        // directly to Spool::write without eagerly allocating a 16 MiB staging buffer.
+        let mut pending = bytes::BytesMut::new();
         let mut write_offset = offset;
         let write_result: std::result::Result<(), crate::error::BobsError> = async {
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
+                // Receipt itself is writer activity. In particular, sub-page frames
+                // may remain pending for a long time without reaching Spool::write.
+                spool.refresh_write_activity().await;
                 if let Ok(data) = frame.into_data() {
                     let mut cursor = 0;
-                    while cursor < data.len() {
-                        let remaining_batch_space = write_batch_size - pending.len();
-                        let take = remaining_batch_space.min(data.len() - cursor);
-                        pending.extend_from_slice(&data[cursor..cursor + take]);
-                        cursor += take;
+
+                    if !pending.is_empty() {
+                        let take = (write_batch_size - pending.len()).min(data.len());
+                        pending.extend_from_slice(&data[..take]);
+                        cursor = take;
                         if pending.len() == write_batch_size {
-                            let batch = std::mem::replace(&mut pending, bytes::BytesMut::with_capacity(write_batch_size)).freeze();
+                            let batch = pending.split().freeze();
                             let batch_len = batch.len();
                             spool.write(write_offset, batch).await?;
                             write_offset += batch_len as u64;
                         }
                     }
+
+                    // Full pages already owned by the body frame need no staging copy.
+                    while cursor + write_batch_size <= data.len() {
+                        let batch = data.slice(cursor..cursor + write_batch_size);
+                        cursor += write_batch_size;
+                        spool.write(write_offset, batch).await?;
+                        write_offset += write_batch_size as u64;
+                    }
+
+                    if cursor < data.len() {
+                        pending.extend_from_slice(&data[cursor..]);
+                    }
                 }
             }
             if !pending.is_empty() {
                 let batch_len = pending.len();
-                spool.write(write_offset, std::mem::take(&mut pending).freeze()).await?;
+                spool.write(write_offset, pending.freeze()).await?;
                 write_offset += batch_len as u64;
             }
             Ok(())
@@ -1544,13 +1561,6 @@ mod tests {
     }
 
     #[test]
-    fn test_api_error_writer_inactive() {
-        let err = ApiError(BobsError::WriterInactive);
-        let resp = err.into_response();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
     fn test_api_error_invalid_range() {
         let err = ApiError(BobsError::InvalidRange("bad range".to_string()));
         let resp = err.into_response();
@@ -2199,6 +2209,51 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 2);
         assert_eq!(meta.total_bytes_written, 8192);
+    }
+
+    #[tokio::test]
+    async fn test_slow_body_frame_refreshes_writer_activity_before_batch_flush() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        spool.metadata.lock().await.last_write_at = 1;
+
+        let (frame_processed_tx, frame_processed_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let body_stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"));
+            let _ = frame_processed_tx.send(());
+            let _ = finish_rx.await;
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from_stream(body_stream))
+            .expect("request build");
+        let write_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.oneshot(request).await.expect("write oneshot") }
+        });
+
+        frame_processed_rx
+            .await
+            .expect("handler should process the first frame before waiting");
+        let metadata = spool.metadata.lock().await;
+        assert!(
+            metadata.last_write_at > 1,
+            "every received frame must refresh inactivity before a page-sized batch is flushed"
+        );
+        assert_eq!(
+            metadata.total_bytes_written, 0,
+            "sub-page frame remains pending"
+        );
+        drop(metadata);
+
+        finish_tx.send(()).expect("write task still waiting");
+        assert_eq!(
+            write_task.await.expect("write task join").status(),
+            StatusCode::OK
+        );
     }
 
     // -----------------------------------------------------------------------
