@@ -14,7 +14,6 @@ fn state_label(state: &SpoolState) -> &'static str {
     match state {
         SpoolState::Writing | SpoolState::Creating => metrics::state::WRITING,
         SpoolState::WriteLocked => metrics::state::WRITE_LOCKED,
-        SpoolState::Readable => metrics::state::READABLE,
         SpoolState::Complete | SpoolState::Deleting => metrics::state::COMPLETE,
     }
 }
@@ -143,55 +142,11 @@ where
         self.release_admission();
     }
 
-    pub async fn set_write_locked(&self, locked: bool) -> Result<()> {
-        let _lifecycle_guard = self.lifecycle_lock.lock().await;
-        let updated = {
-            let mut meta = self.metadata.lock().await;
-            if meta.state == SpoolState::Deleting {
-                return Err(BobsError::SpoolNotFound {
-                    key: self.key.clone(),
-                });
-            }
-            let old_state = meta.state.clone();
-            let old_locked = meta.write_locked;
-
-            meta.write_locked = locked;
-            if locked && matches!(meta.state, SpoolState::Writing | SpoolState::Readable) {
-                meta.state = SpoolState::WriteLocked;
-                self.metrics.record_state_transition(
-                    Some(state_label(&old_state)),
-                    crate::metrics::state::WRITE_LOCKED,
-                );
-            } else if !locked && meta.state == SpoolState::WriteLocked {
-                meta.state = SpoolState::Readable;
-                meta.readable_at.get_or_insert_with(now_secs);
-                self.metrics.record_state_transition(
-                    Some(crate::metrics::state::WRITE_LOCKED),
-                    crate::metrics::state::READABLE,
-                );
-            }
-
-            if meta.state != old_state || meta.write_locked != old_locked {
-                Some(meta.clone())
-            } else {
-                None
-            }
-        };
-
-        if let Some(meta) = updated {
-            self.persist_metadata(&meta).await?;
-            if meta.state == SpoolState::Readable {
-                self.record_readable();
-            }
-        }
-        Ok(())
-    }
-
     pub async fn is_readable(&self) -> bool {
         let meta = self.metadata.lock().await;
         match meta.state {
             SpoolState::Writing => !meta.write_locked,
-            SpoolState::Complete | SpoolState::Readable => true,
+            SpoolState::Complete => true,
             _ => false,
         }
     }

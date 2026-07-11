@@ -20,7 +20,7 @@ use tokio::time::{self, Duration};
 ///   the spool is still in Writing or WriteLocked state.
 /// - **Full-read TTL**: every byte of the object has been served at least once and
 ///   `full_read_complete_ttl_secs` has elapsed since the most recent read activity.
-/// - **Idle TTL**: spool is Complete/Readable and no bytes have been served for
+/// - **Idle TTL**: spool is Complete and no bytes have been served for
 ///   `read_idle_ttl_secs`. All TTL decisions use process-local monotonic `Instant`
 ///   anchors; persisted wall-clock timestamps are observability data only.
 ///
@@ -80,7 +80,7 @@ where
             // Newly completed and recovered readable spools are seeded with a fresh
             // readable anchor. The fallback remains conservative for manually
             // constructed or legacy in-memory state.
-            let idle_expired = matches!(state, SpoolState::Complete | SpoolState::Readable) && {
+            let idle_expired = state == SpoolState::Complete && {
                 let anchor = anchors
                     .last_read_activity_at
                     .or(anchors.readable_at)
