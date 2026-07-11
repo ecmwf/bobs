@@ -212,23 +212,20 @@ where
     ) -> Result<()> {
         let result = self.delete_spool_inner(key).await;
         match &result {
-            Ok(()) => tracing::info!(
-                "event.name" = "bobs.spool.deleted",
-                "bobs.spool.key" = %key,
-                "request.id" = job_id.unwrap_or_default(),
-                reason = reason.as_str(),
-                outcome = "success",
-                "spool deleted"
-            ),
-            Err(error) => tracing::error!(
-                "event.name" = "bobs.spool.deleted",
-                "bobs.spool.key" = %key,
-                "request.id" = job_id.unwrap_or_default(),
-                reason = reason.as_str(),
-                outcome = "error",
-                error = %error,
-                "spool deletion failed"
-            ),
+            Ok(()) => {
+                if let Some(job_id) = job_id {
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "request.id" = %job_id, reason = reason.as_str(), outcome = "success", "spool deleted");
+                } else {
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "success", "spool deleted");
+                }
+            }
+            Err(error) => {
+                if let Some(job_id) = job_id {
+                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "request.id" = %job_id, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
+                } else {
+                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
+                }
+            }
         }
         result
     }
