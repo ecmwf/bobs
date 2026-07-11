@@ -24,15 +24,15 @@ The API is served under `/api/v1`.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | Health check. |
-| `GET`/`HEAD` | `/status` | Status check. |
-| `PUT` | `/create` | Create a spool and return its request-ID or fallback UUIDv4 key plus `read_url` and `write_url`. Optional JSON fields include `content_type`, `content_encoding`, `write_locked`, and `labels`. |
-| `POST` | `/write/{key}/{offset}` | Append request-body bytes. `offset` must equal the current write head; gaps and overwrites are rejected. |
-| `POST` | `/complete/{key}` | Finalize the spool. Optional `expected_size` rejects completion if the written length differs. |
-| `GET` | `/read/{key}` | Stream bytes. No `Range` header follows the stream; `bytes=X-Y` and `bytes=X-` are bounded range reads. |
-| `DELETE` | `/delete/{key}` | Delete a spool early. |
+| `GET` | `/api/v1/health` | Health check. |
+| `GET`/`HEAD` | `/api/v1/status` | Status check. |
+| `PUT` | `/api/v1/create` | Create a spool and return its request-ID or fallback UUIDv4 key plus `read_url` and `write_url`. Optional JSON fields include `content_type`, `content_encoding`, `write_locked`, and `labels`. |
+| `POST` | `/api/v1/write/{key}/{offset}` | Append request-body bytes. `offset` must equal the current write head; gaps and overwrites are rejected. |
+| `POST` | `/api/v1/complete/{key}` | Idempotently finalize the spool. Optional `expected_size` is validated on both initial and repeated completion calls. |
+| `GET` | `/api/v1/read/{key}` | Stream bytes. No `Range` header follows the stream; `bytes=X-Y` and `bytes=X-` are bounded range reads. |
+| `DELETE` | `/api/v1/delete/{key}` | Delete a spool early. |
 
-`/complete` is the writer finalization endpoint.
+`/api/v1/complete/{key}` is the writer finalization endpoint.
 
 ## On-disk layout and metadata
 
@@ -48,7 +48,7 @@ Each spool is stored in its own directory:
 
 Sidecar metadata commits are atomic at the file level: BOBS writes `meta.json.tmp`, syncs that file, renames it over `meta.json`, and syncs the spool directory. Recovery ignores leftover temporary metadata files.
 
-Ordinary `/write` calls do not persist a metadata high-water mark. For in-progress spools, `spool.dat` is authoritative after a BOBS process restart; recovery recomputes length and page state from the data file.
+Ordinary `/api/v1/write/{key}/{offset}` calls do not persist a metadata high-water mark. For in-progress spools, `spool.dat` is authoritative after a BOBS process restart; recovery recomputes length and page state from the data file.
 
 ## File I/O
 
@@ -56,7 +56,7 @@ BOBS uses positional file I/O through a `FileIO` abstraction.
 
 On Linux, the default backend is a sharded `io_uring` pool. `io_uring_shards` defaults to unset, which resolves to `max(1, num_cpus / 4)`, and must be greater than `0` when configured. `io_uring_queue_capacity` defaults to `1024` per shard and must be greater than `0`. Non-Linux builds, and builds with the `tokio-fileio-fallback` feature, use the Tokio/blocking file backend and ignore those settings. Both backends read and write by explicit offset rather than a shared cursor.
 
-Accepted write bytes are appended to `spool.dat` before `/write` returns, but they are not forced to stable storage per page. `/complete` syncs the data file before committing final complete metadata.
+Accepted write bytes are appended to `spool.dat` before `/api/v1/write/{key}/{offset}` returns, but they are not forced to stable storage per page. `/api/v1/complete/{key}` syncs the data file before committing final complete metadata.
 
 ## Paging and cache
 
@@ -71,9 +71,9 @@ Write path:
 
 The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget (binary default 268435456 bytes / 256 MiB; current Helm chart value 1048576 bytes / 1 MiB). `max_cache_bytes` may be smaller than `page_size`: setting it to `0` disables caching, and pages larger than the cap bypass the cache while remaining readable from disk. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 
-`max_live_spools` (default 4096) limits the number of spools in the first-read cache phase. Create requests wait for an admission slot when the limit is reached. It must be greater than `0`.
+`max_live_spools` limits the number of spools in the first-read cache phase. When omitted, it derives as `max(1, max_cache_bytes / page_size)`, which is 16 with the 16 MiB/256 MiB binary defaults. Explicit values are preserved; the chart sets 256 for its 4 KiB/1 MiB profile. `/api/v1/create` waits up to `create_admission_timeout_ms` (default 5000) for a slot, then returns `503 Service Unavailable`.
 
-A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/complete` publishes it as the final page.
+A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/api/v1/complete/{key}` publishes it as the final page. A spool accepts at most `max_spool_bytes` (default 8 GiB); an upload that crosses the limit is durably deleted before the server returns `413 Payload Too Large`.
 
 ## Read behaviour
 
@@ -89,13 +89,13 @@ Range reads update aggregate read-coverage tracking so cleanup can detect when t
 
 ## Write-locked spools
 
-A spool can be created with `write_locked: true`. In this state writes are accepted, but reads return `423 Locked` until the spool is completed or made readable by a lifecycle transition. Completing a write-locked spool makes the final object readable.
+A spool can be created with `write_locked: true`. In this state writes are accepted, but reads return `423 Locked` until `/api/v1/complete/{key}` succeeds. Completion makes the final object readable; there is no separate unlock or `Readable` lifecycle transition.
 
 The write-lock state is lifecycle metadata in `meta.json` and is recovered on restart.
 
 ## Completion and durability boundary
 
-`/complete` validates the optional expected size before publishing final state. It then publishes any trailing partial page, syncs `spool.dat`, commits final metadata to `meta.json`, updates in-memory state/cache, and notifies readers.
+`/api/v1/complete/{key}` validates the optional expected size before publishing final state. Repeating completion is idempotent, but any supplied `expected_size` is still checked against the completed length. Initial completion publishes any trailing partial page, syncs `spool.dat`, commits final metadata to `meta.json`, updates in-memory state/cache, and notifies readers.
 
 After successful completion, `meta.json` is the durable completed-object record. Before completion, BOBS provides process-restart recovery from `spool.dat`, not stable-storage durability for each acknowledged page.
 
@@ -118,6 +118,10 @@ Current cleanup triggers are:
 - read-idle TTL for readable spools that have not served bytes recently, with never-read spools anchored at `readable_at` (`read_idle_ttl_secs`, default 600);
 - full-read-complete TTL once aggregate coverage shows every byte has been served at least once (`full_read_complete_ttl_secs`, default 30).
 
-The legacy `reader_done_ttl_secs` and `unread_ttl_secs` fields are still parsed for config-file compatibility but no longer drive cleanup.
+The legacy `reader_done_ttl_secs` and `unread_ttl_secs` fields are still parsed for config-file compatibility but no longer drive cleanup. `cleanup_sweep_interval_secs` defaults to 30 and must not exceed `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, or `full_read_complete_ttl_secs`.
 
 Slow readers keep a spool alive only while they continue making read progress. Stalled connections do not protect a spool forever.
+
+## HTTP content safety
+
+`content_type` and `content_encoding` supplied to `/api/v1/create` must be valid HTTP header values; malformed values and unknown JSON fields return `400 Bad Request`. Downloads always use `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff`; active document types also receive a restrictive sandbox policy. The unauthenticated `/debug/pprof/profile` endpoint is disabled by default through `enable_pprof: false`.

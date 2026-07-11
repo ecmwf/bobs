@@ -10,9 +10,9 @@ Understanding these behaviours is crucial for effectively using BOBS.
 
 ### 1. Page-based Streaming
 
-Data is organized into fixed-size pages configured via `page_size`. The Rust binary default is `16777216` bytes (16 MiB); the Helm chart intentionally overrides it with `4096` bytes for lower reader-visible latency. A successful `/write` has already accepted the bytes into `<data_dir>/<key>/spool.dat` before it returns, including any trailing partial page.
+Data is organized into fixed-size pages configured via `page_size`. The Rust binary default is `16777216` bytes (16 MiB); the Helm chart intentionally overrides it with `4096` bytes for lower reader-visible latency. A successful `/api/v1/write/{key}/{offset}` has accepted the bytes into `<data_dir>/<key>/spool.dat` before it returns, including any trailing partial page.
 
-Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in `spool.dat` but are not visible to readers until more writes complete the page or the writer calls `/complete` to finalize the spool. This ensures readers always receive consistent, non-torn data.
+Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is full. Trailing partial-page bytes remain on disk but are not visible until more writes complete the page or `/api/v1/complete/{key}` finalizes the spool.
 
 Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they also delay reader visibility until that larger page is full. They consume more of the global cache budget per cached page, so cache reach can fall unless `max_cache_bytes` is increased alongside `page_size`. Setting `max_cache_bytes` to `0` disables caching entirely; if a full page is larger than the cache cap, that page simply bypasses the cache and reads fall back to disk. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.
 
@@ -26,9 +26,9 @@ Only a read request without a `Range` header enters follow mode, starting at byt
 
 ### 4. Write-locked Mode
 
-A spool can be created with `write_locked: true`. In this state, any attempt to read results in a `423 Locked` error until the writer calls `/complete` or otherwise makes the spool readable. This is useful for preventing consumers from seeing any data until the payload is ready for consumption.
+A spool created with `write_locked: true` returns `423 Locked` to readers until `/api/v1/complete/{key}` succeeds. Completion is the only transition that makes a write-locked spool readable.
 
-The write-locked/readable state is lifecycle metadata and is committed to `<data_dir>/<key>/meta.json` when it changes. If BOBS restarts while the spool is still `WriteLocked` or `Writing`, byte-derived metadata in the sidecar may be stale; recovery inspects `spool.dat` to determine the current length, page counts, and final page size.
+The `WriteLocked` state is lifecycle metadata committed to `<data_dir>/<key>/meta.json`. If BOBS restarts while a spool is `WriteLocked` or `Writing`, recovery inspects `spool.dat` to reconstruct current byte state.
 
 ### 5. Parallel Reads
 
@@ -36,9 +36,9 @@ BOBS supports a single consumer opening multiple concurrent connections for the 
 
 ### 6. Sequential Writes
 
-Writes must be strictly sequential. The `offset` provided in the `/write` request must exactly match the total number of bytes currently stored in the spool. Random-access writes or overwrites are not supported.
+Writes must be strictly sequential. The offset in `/api/v1/write/{key}/{offset}` must exactly match the bytes currently stored. Random-access writes and overwrites are unsupported.
 
-A successful `/write` means BOBS accepted the bytes into `spool.dat` through the kernel/file handle before returning. It does not mean the data has been forced to stable storage with `sync_data()`: the in-progress spool contract is designed for BOBS restart recovery from `spool.dat`, not for a node or storage crash before completion. `/complete` remains the durability boundary and syncs `spool.dat` data before committing final metadata to `meta.json`.
+A successful write means BOBS accepted bytes through the kernel/file handle; it does not mean `sync_data()` forced them to stable storage. `/api/v1/complete/{key}` is the durability boundary and syncs `spool.dat` before committing final metadata. `max_spool_bytes` defaults to 8 GiB; a request that crosses it returns `413` only after the partial spool is durably removed.
 
 ### 7. Atomic Sidecar Metadata
 
@@ -52,11 +52,11 @@ On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. 
 
 A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 
-- **Writer Inactivity**: The producer stopped writing without completing the spool.
-- **Read Idle TTL**: The spool is readable but has not served bytes for `read_idle_ttl_secs`. For never-read spools, this timer starts when the spool becomes readable.
-- **Full Read TTL**: BOBS has served every byte of the object at least once, possibly across multiple range requests, and `full_read_complete_ttl_secs` has elapsed since the latest read activity.
+- **Writer Inactivity**: The producer stopped writing without completing the spool (`writer_inactivity_timeout_secs`, default 300).
+- **Read Idle TTL**: The spool has not served bytes for `read_idle_ttl_secs` (default 600); never-read spools are anchored when they become readable.
+- **Full Read TTL**: Every byte has been served and `full_read_complete_ttl_secs` (default 30) has elapsed since the latest read activity.
 
-Cleanup TTL semantics are unchanged by sidecar metadata. Expired cleanup removes the key directory, including `spool.dat`, `meta.json`, and any interrupted `meta.json.tmp`.
+`cleanup_sweep_interval_secs` defaults to 30 and must not exceed any active cleanup timeout. The deprecated `reader_done_ttl_secs` and `unread_ttl_secs` fields remain parseable but do not drive cleanup. Expiry removes the key directory, including `spool.dat`, `meta.json`, and interrupted `meta.json.tmp`.
 
 Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.
 

@@ -12,17 +12,18 @@ BOBS exposes a RESTful API under `/api/v1`. Routes below are relative to that ba
 
 | Method | Route | Description |
 | -------- | ------- | ------------- |
-| GET | `/health` | Health check returning status and hostname. |
-| GET/HEAD | `/status` | Status check; GET returns status and hostname. |
-| PUT | `/create` | Create a new spool. |
-| POST | `/write/{key}/{offset}` | Append data to a spool. |
-| POST | `/complete/{key}` | Finalize a spool. |
-| GET | `/read/{key}` | Read or stream data. |
-| DELETE | `/delete/{key}` | Delete a spool. |
+| GET | `/api/v1/health` | Health check returning status and hostname. |
+| GET/HEAD | `/api/v1/status` | Status check; GET returns status and hostname. |
+| PUT | `/api/v1/create` | Create a new spool. |
+| POST | `/api/v1/write/{key}/{offset}` | Append data to a spool. |
+| POST | `/api/v1/complete/{key}` | Finalize a spool. |
+| GET | `/api/v1/read/{key}` | Read or stream data. |
+| DELETE | `/api/v1/delete/{key}` | Delete a spool. |
+| GET | `/debug/pprof/profile` | CPU profile, only when `enable_pprof: true`; this route is outside `/api/v1`. |
 
 ---
 
-### GET /status
+### GET /api/v1/status
 
 Returns the health status and hostname of the instance.
 
@@ -37,7 +38,7 @@ Returns the health status and hostname of the instance.
 
 ---
 
-### PUT /create
+### PUT /api/v1/create
 
 Creates a new spool. A valid `X-Polytope-Job-Id` header—a 26-character, lower-case Crockford base32 request ID—is used as the key; otherwise BOBS generates a UUIDv4 key.
 
@@ -47,6 +48,8 @@ Creates a new spool. A valid `X-Polytope-Job-Id` header—a 26-character, lower-
 - `content_encoding` (string, optional): Optional encoding header for readers.
 - `write_locked` (boolean, optional): Default `false`. If `true`, reads return `423 Locked` until the spool is completed.
 - `labels` (object of string values, optional): Caller labels filtered and propagated to metrics.
+
+BOBS rejects unknown JSON fields and `content_type` or `content_encoding` values that cannot safely be represented as HTTP headers with `400 Bad Request`.
 
 **Example**:
 
@@ -66,7 +69,7 @@ curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "text/plain
 
 ---
 
-### POST /write/{key}/{offset}
+### POST /api/v1/write/{key}/{offset}
 
 Appends binary data to the spool.
 
@@ -75,17 +78,20 @@ Appends binary data to the spool.
 
 **Response (200 OK)**: Empty body on success.
 
+A write that would exceed `max_spool_bytes` returns `413 Payload Too Large`. If a chunked body crosses the limit after bytes have been written, BOBS durably deletes the partial spool and releases its admission slot before returning `413`; failure to complete that cleanup returns a server error.
+
 **Error Cases**:
 
+- `400 Bad Request`: Offset mismatch (for example, writing at 100 when only 50 bytes exist).
 - `404 Not Found`: Spool does not exist.
-- `400 Bad Request`: Offset mismatch (e.g., trying to write at 100 when only 50 bytes were written).
-- `409 Conflict`: Spool is already marked as complete.
+- `409 Conflict`: Spool is already complete.
+- `413 Payload Too Large`: The write would exceed `max_spool_bytes`; the spool is no longer available.
 
 ---
 
-### POST /complete/{key}
+### POST /api/v1/complete/{key}
 
-Finalizes the spool. After this, no more writes are allowed.
+Idempotently finalizes the spool. After this, no more writes are allowed. Repeated completion requests succeed, but a supplied `expected_size` is always checked against the actual completed size.
 
 **Request Body (Optional)**:
 
@@ -101,11 +107,11 @@ curl -X POST http://localhost:3000/api/v1/complete/YOUR_KEY -d '{"expected_size"
 
 **Error Cases**:
 
-- `400 Bad Request`: Size mismatch between `expected_size` and actual bytes written.
+- `400 Bad Request`: `expected_size` differs from the actual bytes written, including on an otherwise idempotent repeated request.
 
 ---
 
-### GET /read/{key}
+### GET /api/v1/read/{key}
 
 Reads a bounded range or follows a live stream using the standard HTTP `Range` header.
 
@@ -116,15 +122,18 @@ Range behavior:
 - `Range: bytes=X-`: bounded read from `X` through the bytes currently servable when the request is resolved (`206 Partial Content`); it does not wait for future writes.
 - `Range: bytes=-N`: suffix read of the final `N` bytes; requires a completed spool.
 
-In follow mode, BOBS streams pages as they become visible. If no first page arrives within `long_poll_timeout_ms`, BOBS may issue a `307 Temporary Redirect` to the same `/read/{key}` URL for long-poll refresh. A timeout after streaming begins ends the response rather than redirecting it.
+In follow mode, BOBS streams pages as they become visible. If no first page arrives within `long_poll_timeout_ms`, BOBS may issue a `307 Temporary Redirect` to the same `/api/v1/read/{key}` URL for long-poll refresh. A timeout after streaming begins ends the response rather than redirecting it.
 
 **Response Headers**:
 
 - `Accept-Ranges: bytes`: Advertises byte-range support.
 - `Content-Range: bytes X-Y/*` for bounded reads (or `bytes X-Y/TOTAL` once complete).
-- `Content-Type`: As defined during creation.
-- `Content-Encoding`: As defined during creation (if provided).
-- `X-Accel-Buffering`: `no` (disables proxy buffering).
+- `Content-Type`: Validated value supplied during creation, otherwise `application/octet-stream`.
+- `Content-Encoding`: Validated value supplied during creation, if any.
+- `Content-Disposition: attachment`: Forces download rather than inline rendering of producer-controlled content.
+- `X-Content-Type-Options: nosniff`: Prevents content sniffing.
+- `Content-Security-Policy: sandbox`: Added for active document content types as defence in depth.
+- `X-Accel-Buffering: no`: Disables proxy buffering.
 
 Examples:
 
@@ -147,7 +156,7 @@ curl http://localhost:3000/api/v1/read/YOUR_KEY -H "Range: bytes=1048576-"
 
 ---
 
-### DELETE /delete/{key}
+### DELETE /api/v1/delete/{key}
 
 Manually deletes the spool and its associated data files.
 

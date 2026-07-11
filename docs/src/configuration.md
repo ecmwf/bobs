@@ -6,13 +6,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # Configuration
 
-BOBS is configured via a YAML file passed as a CLI argument. Missing fields use the binary defaults below, but `host_prefix`, `domain`, and `route_name` must be set to non-empty values for startup validation to succeed. The Helm chart intentionally overrides several binary defaults; those chart values are noted separately.
+BOBS reads an optional YAML file. Most fields have Rust defaults, but startup validation requires non-empty `host_prefix`, `domain`, and `route_name` values. The service also requires `HOSTNAME` with a StatefulSet-style numeric ordinal and a non-empty `BOBS_INTERNAL_BASE_URL_TEMPLATE`; the binary therefore cannot start from its default configuration alone.
 
 ```bash
-./target/release/bobs config.yaml
+HOSTNAME=bobs-0 \
+BOBS_INTERNAL_BASE_URL_TEMPLATE='http://bobs-{ordinal}:3000/api/v1' \
+  ./target/release/bobs config.yaml
 ```
-
-Without a config file, BOBS still loads binary defaults, but startup validation fails until the required routing fields are supplied in a config file.
 
 Backend selection is build-feature based, not a YAML option: Linux builds without extra features use the `io_uring` FileIO and sidecar metadata backend; builds with `--features tokio-fileio-fallback`, and non-Linux builds, use the Tokio/blocking fallback backend with the same on-disk `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json` layout. These backend settings do not change the HTTP API and do not require an on-disk migration.
 
@@ -31,21 +31,24 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `host` | `0.0.0.0` | Address for the HTTP server to bind to. |
 | `port` | `3000` | Port for the HTTP server to listen on. |
 | `data_dir` | `./data` | File system path for storing spool files. |
-| `page_size` | `16777216` (16 MiB) | Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. Must be greater than `0`. |
-| `max_cache_bytes` | `268435456` (256 MiB) | Global byte budget for the in-memory FIFO page cache across all spools. Set to `0` to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk. |
-| `max_live_spools` | `4096` | Maximum spools in the first-read cache phase. Create requests wait for an admission slot when this limit is reached. Must be greater than `0`. |
-| `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
-| `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. Must be greater than `0`. |
-| `full_read_complete_ttl_secs` | `30` | Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served. Must be greater than `0`. |
-| `reader_done_ttl_secs` | `60` | Deprecated compatibility field. Parsed but no longer drives cleanup; use `read_idle_ttl_secs`. |
-| `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup; use `read_idle_ttl_secs`. |
-| `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. Must be greater than `0`. |
-| `long_poll_timeout_ms` | `25000` | Maximum time in ms to wait for new data during a follow read. Must be greater than `0`. |
-| `io_uring_shards` | unset | Linux default-backend ring-pool shard count. Leave unset to resolve to `max(1, num_cpus / 4)`. Keys are mapped to shards with stable hashing. Must be greater than `0` when set. Ignored by fallback builds. |
+| `page_size` | `16777216` (16 MiB) | Size of internal data pages. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. Must be greater than `0`. |
+| `max_cache_bytes` | `268435456` (256 MiB) | Global FIFO page-cache budget. `0` disables caching; a page larger than the cap bypasses the cache. |
+| `max_live_spools` | derived as `max(1, max_cache_bytes / page_size)` (`16` with binary defaults) | Admission limit for spools not yet fully read. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. |
+| `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests. Must be greater than `0`. |
+| `create_admission_timeout_ms` | `5000` | Maximum time `/api/v1/create` waits for a `max_live_spools` slot before returning `503 Service Unavailable`. Must be greater than `0`. |
+| `writer_inactivity_timeout_secs` | `300` | Cleanup timeout for an unfinished spool whose writer has stopped sending data. Must be greater than `0`. |
+| `enable_pprof` | `false` | Exposes unauthenticated `/debug/pprof/profile` on the main listener. Enable only for controlled profiling. |
+| `read_idle_ttl_secs` | `600` | TTL for readable spools with no served bytes, anchored when they become readable and refreshed on read progress. Must be greater than `0`. |
+| `full_read_complete_ttl_secs` | `30` | Short TTL after aggregate coverage reaches every byte, refreshed by subsequent read activity. Must be greater than `0`. |
+| `reader_done_ttl_secs` | `60` | Deprecated compatibility field. Parsed but ignored by cleanup; use `read_idle_ttl_secs`. |
+| `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but ignored by cleanup; use `read_idle_ttl_secs`. |
+| `cleanup_sweep_interval_secs` | `30` | Cleanup scan interval. Must be greater than `0` and must not exceed any active cleanup timeout. |
+| `long_poll_timeout_ms` | `25000` | Maximum wait for new data during a follow read before redirecting. Must be greater than `0`. |
+| `io_uring_shards` | unset | Linux ring-pool shard count. Omission resolves to `max(1, num_cpus / 4)`; an explicit value must be greater than `0`. Ignored by fallback builds. |
 | `io_uring_queue_capacity` | `1024` | Submission queue capacity for each Linux `io_uring` shard. Must be greater than `0`. Ignored by fallback builds. |
-| `host_prefix` | `""` | External download host prefix used when generating read URLs. Must be set to a non-empty value. |
-| `domain` | `""` | External download domain used when generating read URLs. Must be set to a non-empty value. |
-| `route_name` | `""` | External download route prefix, for example `download`. Must be set to a non-empty value. |
+| `host_prefix` | `""` | External download host prefix used in `read_url`. Must be non-empty. |
+| `domain` | `""` | External download domain used in `read_url`. Must be non-empty. |
+| `route_name` | `""` | External download route prefix. Must be non-empty. |
 | `metrics.enabled` | `false` | Enable OpenTelemetry metrics export. Requires a build with `--features telemetry`; has no effect without that feature. |
 | `metrics.bind_address` | `127.0.0.1` | Bind address for the Prometheus `/metrics` scrape endpoint. Use `0.0.0.0` in Kubernetes so the pod is scrapable. |
 | `metrics.port` | `9464` | Port for the Prometheus `/metrics` scrape endpoint (the conventional OTel Prometheus exporter port). Runs on a separate port from the main data port. |
@@ -60,12 +63,18 @@ port: 3000
 data_dir: /data/bobs
 page_size: 16777216
 max_cache_bytes: 268435456      # global page-cache byte budget; set to 0 to disable caching
-max_live_spools: 4096
+# max_live_spools omitted: derives 16 from this page/cache combination
+max_spool_bytes: 8589934592   # 8 GiB per spool
+create_admission_timeout_ms: 5000
 writer_inactivity_timeout_secs: 300
+enable_pprof: false            # only enable for controlled, trusted profiling
 read_idle_ttl_secs: 600
 full_read_complete_ttl_secs: 30
+reader_done_ttl_secs: 60       # deprecated compatibility field
+unread_ttl_secs: 3600          # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
+io_uring_shards: 4             # optional; omit for max(1, num_cpus / 4)
 io_uring_queue_capacity: 1024
 host_prefix: polytope-example
 domain: example.com
@@ -78,7 +87,7 @@ metrics:
   max_label_value_length: 128
 ```
 
-After the required routing fields are present, only values you want to override need to be added:
+After the required routing fields are present, only values you want to override need to be added. If `max_live_spools` is omitted, it is re-derived from the effective page/cache settings; an explicit value remains unchanged:
 
 ```yaml
 data_dir: /mnt/ssd/bobs
@@ -106,7 +115,7 @@ Future optimizations not implemented in the current backend are `IORING_REGISTER
 
 ## Page size tuning
 
-The binary default `page_size` is `16777216` (16 MiB), paired with a `268435456`-byte (256 MiB) binary cache default. The Helm chart intentionally uses a lower-latency profile of `page_size: 4096` and `max_cache_bytes: 1048576`; these are chart overrides, not Rust `Config::default()` values.
+The binary default `page_size` is `16777216` (16 MiB), paired with a `268435456`-byte (256 MiB) cache and a derived `max_live_spools` of 16. The Helm chart intentionally overrides these with a lower-latency profile of `page_size: 4096`, `max_cache_bytes: 1048576`, and explicit `max_live_spools: 256`. These are chart overrides, not Rust `Config::default()` values.
 
 Page size changes streaming behaviour:
 
@@ -114,6 +123,6 @@ Page size changes streaming behaviour:
 - larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless `max_cache_bytes` is increased;
 - benchmark representative object sizes and write chunk sizes before changing either deployment profile.
 
-`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work.
+`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching. A page larger than the cap bypasses the cache while disk-backed reads continue to work. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; set it explicitly when workflow concurrency should differ from cache page capacity. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
 
 See the standalone benchmark guide for page-size comparison commands.

@@ -34,7 +34,7 @@ export BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1
 ./target/release/bobs config.yaml
 ```
 
-`HOSTNAME` must end with a numeric ordinal. The URL template is returned as `write_url` after replacing any `{ordinal}` placeholder. Other omitted fields use the Rust binary defaults; see [Configuration](configuration.md).
+`HOSTNAME` must end with a numeric ordinal, and `BOBS_INTERNAL_BASE_URL_TEMPLATE` must be non-empty. The URL template is returned as `write_url` after replacing any `{ordinal}` placeholder. Other omitted fields use the Rust binary defaults; see [Configuration](configuration.md).
 
 ## Walkthrough
 
@@ -48,7 +48,17 @@ curl -X PUT http://localhost:3000/api/v1/create \
      -d '{"content_type": "application/octet-stream"}'
 ```
 
-**Write-Locked Mode**: If you want to prevent anyone from reading the spool until it is complete, set `write_locked` to `true`.
+A successful response includes every URL needed for subsequent traffic:
+
+```json
+{
+  "key": "550e8400-e29b-41d4-a716-446655440000",
+  "read_url": "https://bobs.example.com/download-0/550e8400-e29b-41d4-a716-446655440000",
+  "write_url": "http://localhost:3000/api/v1"
+}
+```
+
+**Write-Locked Mode**: To prevent reads until `/api/v1/complete/{key}` succeeds, set `write_locked` to `true`. There is no separate unlock operation.
 
 ```bash
 curl -X PUT http://localhost:3000/api/v1/create \
@@ -66,7 +76,7 @@ curl -X POST http://localhost:3000/api/v1/write/YOUR_KEY/1024 --data-binary @par
 
 ### 3. Complete the Spool
 
-Signal that the upload is finished. You can optionally provide an `expected_size` for server-side verification.
+Signal that the upload is finished. You can optionally provide an `expected_size` for server-side verification. Completion is idempotent, but repeated requests still reject a mismatched `expected_size`.
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/complete/YOUR_KEY \

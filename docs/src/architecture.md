@@ -15,7 +15,7 @@ BOBS is built around one directory per object key and an asynchronous filesystem
 - **FileIO**: An abstraction for asynchronous disk I/O. On Linux, the default backend uses a sharded `io_uring` ring pool. It requires a Linux 5.11+ kernel because BOBS submits operations against raw file descriptors, plus a runtime policy that permits `io_uring_setup`. Builds with the `tokio-fileio-fallback` Cargo feature, and non-Linux builds, use the Tokio/blocking positional-file backend instead and ignore the `io_uring` tuning fields.
 - **Metadata store**: Sidecar metadata is committed atomically by writing `meta.json.tmp`, syncing that temporary file's data, atomically renaming it over `meta.json`, and syncing the spool directory. Startup recovery ignores leftover temporary files and reads only complete sidecars.
 - **SpoolManager**: A central registry, using `DashMap`, that tracks active spools and reconstructs them from sidecar files during startup.
-- **Page Cache**: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it is written. Entries are keyed by `(spool_key, page_idx)`, and `max_cache_bytes` is the total cache budget across all spools. Setting `max_cache_bytes` to `0` disables caching; pages larger than the byte cap are valid but bypass the cache. `max_live_spools` limits spools in the first-read cache phase and applies create backpressure when all admission slots are occupied.
+- **Page Cache**: A global byte-capped FIFO cache for hot data. `max_cache_bytes` is shared across all spools; `0` disables caching and oversized pages bypass it. Omitted `max_live_spools` derives as `max(1, max_cache_bytes / page_size)` (16 with binary defaults), while the chart explicitly sets 256 for its 4 KiB/1 MiB profile. `/api/v1/create` waits at most `create_admission_timeout_ms` (default 5000) for admission.
 
 ### Linux `io_uring` routing
 
@@ -32,24 +32,24 @@ Future Linux optimizations that are intentionally not implemented yet include `I
 ### Data Flow
 
 1. **Create**: BOBS uses a valid `X-Polytope-Job-Id` request ID as the key or generates a fallback UUIDv4, creates `<data_dir>/<key>/`, opens `<data_dir>/<key>/spool.dat`, and commits an initial `<data_dir>/<key>/meta.json` sidecar.
-2. **Write**: Data arrives via POST. Accepted bytes are appended to `spool.dat` through the selected FileIO backend before `/write` returns. In-memory state tracks page assembly, but the data file is the source of truth for accepted bytes.
-3. **Page visibility**: Once enough accepted bytes form a complete page, that page becomes reader-visible, is offered to the global FIFO page cache, and any parked reader requests are notified.
-4. **Read**: Reader requests a visible range -> check page cache -> if miss, read from `spool.dat` -> stream bytes to the HTTP response. Trailing partial-page bytes may already be present in `spool.dat`, but they are not reader-visible until they become a complete page or `/complete` finalizes the spool.
-5. **Complete**: `/complete` publishes any trailing partial page, syncs `spool.dat` data, then commits final completed metadata to `meta.json` with the sidecar atomic commit protocol.
-6. **Lifecycle**: Spool moves from `Creating` -> `Writing` (or `WriteLocked`) -> `Complete` -> `Deleting`.
+2. **Write**: Data arrives through `/api/v1/write/{key}/{offset}`. Accepted bytes are appended to `spool.dat` before the request returns; the data file is authoritative for in-progress bytes.
+3. **Page visibility**: Complete pages become reader-visible, enter the global FIFO cache when they fit, and notify parked readers.
+4. **Read**: `/api/v1/read/{key}` checks the page cache and then `spool.dat`. A trailing partial page remains hidden until it fills or completion finalizes it.
+5. **Complete**: `/api/v1/complete/{key}` validates any `expected_size`, including on idempotent retries. Initial completion publishes the trailing partial page, syncs data, and atomically commits completed metadata.
+6. **Lifecycle**: A spool moves from `Creating` to `Writing` (or `WriteLocked`), then `Complete`, then `Deleting`. A write-locked spool becomes readable only through completion.
 
 ### Persistence Contract
 
 BOBS persists two things with different authority:
 
 - `spool.dat` stores accepted bytes. For in-progress `Writing` and `WriteLocked` spools, it is authoritative after a BOBS restart.
-- `meta.json` stores lifecycle metadata and completed-object byte metadata. It is committed atomically at lifecycle boundaries such as create, write-lock/readable transitions, complete, and delete.
+- `meta.json` stores lifecycle and completed-object byte metadata. It is committed atomically at creation, completion, and deletion.
 
 Ordinary writes deliberately do not update a durable high-water mark, and completed pages do not commit per-page metadata. Adding a mandatory per-write or per-page checkpoint would put metadata commits back on the write hot path, which this design avoids.
 
 While a spool is still `Writing` or `WriteLocked`, persisted byte-derived metadata such as `total_bytes_written`, `total_pages`, and `final_page_size` is advisory and may be stale. Recovery derives those values from `spool.dat`: the logical accepted length comes from the data file length, and page counts and partial-page state are reconstructed from that length.
 
-The in-progress durability invariant is recovery from a BOBS restart, not survival of a node or storage crash before `/complete`. A successful `/write` therefore requires the bytes to have been accepted by the kernel/file handle before the handler returns, but it does not require `sync_data()`. `/complete` is the durability boundary for a finished object: BOBS syncs `spool.dat` data before committing final completed metadata.
+The in-progress durability invariant is recovery from a BOBS restart, not survival of a node or storage crash before `/api/v1/complete/{key}`. A successful `/api/v1/write/{key}/{offset}` requires kernel/file-handle acceptance but not `sync_data()`. Completion is the finished-object durability boundary.
 
 Completed metadata is durable through the sidecar protocol: write `meta.json.tmp`, sync it, rename it to `meta.json`, and sync the parent directory. Recovery treats `meta.json` as all-or-nothing and ignores any leftover `meta.json.tmp` from an interrupted commit.
 
@@ -59,7 +59,7 @@ Startup recovery scans `<data_dir>` for key directories with `meta.json`. In-pro
 
 The layout is friendly to shared filesystems and multi-BOBS deployments because each object has its own directory and sidecar, and each spool has a single writer. Independent keys can be created, completed, recovered, and deleted without a global metadata database or cross-key write serialization. Correct routing is still required: create, write, complete, and read traffic for a key must reach a BOBS instance that can see the same `<data_dir>/<key>` files.
 
-Cleanup TTL behaviour is preserved with sidecar metadata. Writer inactivity, read-idle, and full-read-complete cleanup still remove both `spool.dat` and `meta.json` for expired keys; TTL timestamps are committed at lifecycle boundaries and reconstructed conservatively on recovery.
+Cleanup removes expired `spool.dat` and `meta.json` files after writer inactivity, read-idle, or full-read-complete deadlines. `cleanup_sweep_interval_secs` must not exceed any active cleanup timeout; deprecated `reader_done_ttl_secs` and `unread_ttl_secs` values remain parseable but do not drive cleanup.
 
 ### Metadata backend
 

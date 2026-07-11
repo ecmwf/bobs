@@ -35,7 +35,7 @@ export BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1
 ./target/release/bobs config.yaml
 ```
 
-`HOSTNAME` must end with a numeric StatefulSet ordinal such as `bobs-0`. BOBS substitutes that ordinal for every `{ordinal}` placeholder in `BOBS_INTERNAL_BASE_URL_TEMPLATE` and returns the resulting base URL as `write_url` from `/create`. Both environment variables must be set; the URL template must be non-empty.
+`HOSTNAME` must end with a numeric StatefulSet ordinal such as `bobs-0`. BOBS substitutes that ordinal for every `{ordinal}` placeholder in `BOBS_INTERNAL_BASE_URL_TEMPLATE` and returns the resulting base URL as `write_url` from `/api/v1/create`. Both environment variables must be set; the URL template must be non-empty.
 
 Required config fields:
 
@@ -45,8 +45,9 @@ Required config fields:
 
 Operational constraints:
 
-- `page_size`, `max_live_spools`, `read_idle_ttl_secs`, `full_read_complete_ttl_secs`, `cleanup_sweep_interval_secs`, `long_poll_timeout_ms`, and `io_uring_queue_capacity` must be greater than `0`.
-- `io_uring_shards`, when set, must be greater than `0`.
+- `page_size`, `max_live_spools`, `max_spool_bytes`, `create_admission_timeout_ms`, `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, `full_read_complete_ttl_secs`, `cleanup_sweep_interval_secs`, `long_poll_timeout_ms`, and `io_uring_queue_capacity` must be greater than `0`.
+- `io_uring_shards`, when set, must be greater than `0`; omitted shards resolve to `max(1, num_cpus / 4)`.
+- `cleanup_sweep_interval_secs` must not exceed any active cleanup timeout.
 - `max_cache_bytes` may be smaller than `page_size`; `0` disables caching.
 
 ## Usage Example
@@ -72,7 +73,7 @@ curl -X POST http://localhost:3000/api/v1/write/unique-spool-key/0 --data-binary
 
 ### 3. Complete the spool
 
-Finalize the spool to signal readers that no more data is coming. Optional size verification ensures integrity.
+Finalize the spool to signal readers that no more data is coming. Optional `expected_size` verification ensures integrity. Completion is idempotent, but a repeated request still rejects an `expected_size` that differs from the completed size.
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/complete/unique-spool-key -d '{"expected_size": 1048576}'
@@ -126,10 +127,12 @@ For direct BOBS throughput validation, see the mdBook page: `docs/src/standalone
 
 ## Configuration
 
-BOBS is configured via a YAML file passed as a CLI argument. Missing fields use the binary defaults below, but `host_prefix`, `domain`, and `route_name` must be set to non-empty values for validation to succeed.
+BOBS reads an optional YAML file. Missing fields use the binary defaults below, but startup requires non-empty `host_prefix`, `domain`, and `route_name` values plus the routing environment variables shown in Quick Start.
 
 ```bash
-./target/release/bobs config.yaml
+HOSTNAME=bobs-0 \
+BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
+  ./target/release/bobs config.yaml
 ```
 
 | Field | Binary default | Description |
@@ -137,17 +140,20 @@ BOBS is configured via a YAML file passed as a CLI argument. Missing fields use 
 | `host` | `0.0.0.0` | Address to listen on. |
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
-| `page_size` | `16777216` (16 MiB) | Size of individual data pages. In-progress readers see a page only once it is full; `/complete` publishes the final partial page. Must be greater than `0`. |
+| `page_size` | `16777216` (16 MiB) | Size of individual data pages. In-progress readers see a page only once it is full; `/api/v1/complete/{key}` publishes the final partial page. Must be greater than `0`. |
 | `max_cache_bytes` | `268435456` (256 MiB) | Global FIFO page-cache budget across all spools. `0` disables caching. A page larger than the budget bypasses the cache and remains readable from disk. |
-| `max_live_spools` | `4096` | Maximum spools in the first-read cache phase. Create requests wait for a slot when the limit is reached. Must be greater than `0`. |
-| `writer_inactivity_timeout_secs` | `300` | Writer-silence interval after which an unfinished spool is eligible for cleanup. |
+| `max_live_spools` | derived as `max(1, max_cache_bytes / page_size)` (`16` with binary defaults) | Admission limit for spools not yet fully read. Omitted values derive from effective page/cache settings; explicit values are preserved. |
+| `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
+| `create_admission_timeout_ms` | `5000` | Maximum `/api/v1/create` admission wait before `503 Service Unavailable`. |
+| `writer_inactivity_timeout_secs` | `300` | Writer-silence interval after which an unfinished spool is eligible for cleanup. Must be greater than `0`. |
+| `enable_pprof` | `false` | Enables unauthenticated `/debug/pprof/profile` on the main listener; use only in a controlled environment. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools, anchored when the spool becomes readable and refreshed whenever bytes are served. Must be greater than `0`. |
 | `full_read_complete_ttl_secs` | `30` | Short TTL after aggregate read coverage reaches every byte, refreshed by subsequent read activity. Must be greater than `0`. |
 | `reader_done_ttl_secs` | `60` | Deprecated compatibility field; parsed but ignored by cleanup. Use `read_idle_ttl_secs`. |
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field; parsed but ignored by cleanup. Use `read_idle_ttl_secs`. |
-| `cleanup_sweep_interval_secs` | `30` | Frequency of the background cleanup task. Must be greater than `0`. |
+| `cleanup_sweep_interval_secs` | `30` | Cleanup scan frequency. Must be greater than `0` and no longer than any active cleanup timeout. |
 | `long_poll_timeout_ms` | `25000` | Maximum wait for new data during a follow read. Must be greater than `0`. |
-| `io_uring_shards` | unset | Linux default-backend ring count. Unset resolves to `max(1, num_cpus / 4)`; a configured value must be greater than `0`. Ignored by fallback builds. |
+| `io_uring_shards` | unset | Linux ring count. Unset resolves to `max(1, num_cpus / 4)`; an explicit value must be greater than `0`. Ignored by fallback builds. |
 | `io_uring_queue_capacity` | `1024` | Submission queue capacity for each Linux `io_uring` shard. Must be greater than `0`. Ignored by fallback builds. |
 | `host_prefix` | `""` | External download host prefix used to build `read_url`; must be set. |
 | `domain` | `""` | External download domain used to build `read_url`; must be set. |
@@ -158,7 +164,7 @@ BOBS is configured via a YAML file passed as a CLI argument. Missing fields use 
 | `metrics.allowed_labels` | `[]` | Caller label keys allowed as metric attributes. Empty allows all keys. |
 | `metrics.max_label_value_length` | `128` | Maximum label-value byte length; longer values are truncated. |
 
-The Helm chart currently overrides the binary's page/cache defaults with `page_size: 4096` and `max_cache_bytes: 1048576`. There is no requirement that `max_cache_bytes` be at least `page_size`.
+The Helm chart overrides the binary profile with `page_size: 4096` (4 KiB), `max_cache_bytes: 1048576` (1 MiB), and an explicit `max_live_spools: 256`. There is no requirement that `max_cache_bytes` be at least `page_size`.
 
 Example `config.yaml`:
 
@@ -168,8 +174,11 @@ port: 3000
 data_dir: /data/bobs
 page_size: 16777216
 max_cache_bytes: 268435456
-max_live_spools: 4096
+# max_live_spools omitted: derives 16 from this page/cache combination
+max_spool_bytes: 8589934592
+create_admission_timeout_ms: 5000
 writer_inactivity_timeout_secs: 300
+enable_pprof: false
 read_idle_ttl_secs: 600
 full_read_complete_ttl_secs: 30
 cleanup_sweep_interval_secs: 30
