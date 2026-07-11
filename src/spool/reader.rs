@@ -30,6 +30,11 @@ where
     /// Resolution order: page cache → disk → long-poll (wait for writer).
     pub async fn read_page(&self, page_idx: u64) -> Result<Option<Bytes>> {
         loop {
+            if self.metadata.lock().await.state == SpoolState::Deleting {
+                return Err(BobsError::SpoolNotFound {
+                    key: self.key.clone(),
+                });
+            }
             // 1. Check in-memory page cache (recently written pages).
             {
                 let cache = self.page_cache.lock().await;
@@ -44,8 +49,7 @@ where
                 let meta = self.metadata.lock().await;
                 if page_idx < meta.total_pages {
                     let is_final_partial =
-                        matches!(meta.state, SpoolState::Complete | SpoolState::Deleting)
-                            && page_idx + 1 == meta.total_pages;
+                        meta.state == SpoolState::Complete && page_idx + 1 == meta.total_pages;
                     let page_len = if is_final_partial {
                         meta.final_page_size.unwrap_or(self.page_size as u64) as usize
                     } else {
@@ -73,9 +77,7 @@ where
             // 3. No more pages to read and writer is done.
             {
                 let meta = self.metadata.lock().await;
-                if matches!(meta.state, SpoolState::Complete | SpoolState::Deleting)
-                    && page_idx >= meta.total_pages
-                {
+                if meta.state == SpoolState::Complete && page_idx >= meta.total_pages {
                     return Ok(None);
                 }
             }
@@ -179,6 +181,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: page_size as u64,
             total_pages: 1,
             final_page_size: None,
@@ -225,6 +228,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,

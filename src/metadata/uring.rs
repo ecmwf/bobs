@@ -114,7 +114,7 @@ impl MetadataStore for UringSidecarMetadataStore {
     type WriteFuture<'a> = BoxMetadataFuture<'a, ()>;
     type ReadFuture<'a> = BoxMetadataFuture<'a, Option<SpoolMetadata>>;
     type DeleteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
+    type ListIter = std::vec::IntoIter<(String, Result<SpoolMetadata>)>;
 
     fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
         Box::pin(async move { self.write_uring(metadata).await })
@@ -442,6 +442,7 @@ mod tests {
             last_write_at: 20 + generation,
             last_read_at: None,
             readable_at: Some(30 + generation),
+            page_size: 4096,
             total_bytes_written: generation * 4096,
             total_pages: generation,
             final_page_size: if generation == 0 { None } else { Some(4096) },
@@ -562,13 +563,15 @@ mod tests {
             &meta,
         );
 
-        let listed = store
+        let listed: Vec<_> = store
             .list()
             .expect("list metadata")
-            .collect::<Result<Vec<_>>>()
-            .expect("listed metadata parses");
+            .map(|(key, metadata)| (key, metadata.expect("listed metadata parses")))
+            .collect();
         assert_eq!(listed.len(), 1);
-        assert_metadata_eq(listed.into_iter().next().expect("listed metadata"), &meta);
+        let (key, listed_metadata) = listed.into_iter().next().expect("listed metadata");
+        assert_eq!(key, meta.key);
+        assert_metadata_eq(listed_metadata, &meta);
 
         store.delete(&meta.key).await.expect("delete metadata");
         assert!(store

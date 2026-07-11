@@ -683,10 +683,17 @@ where
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
 
-        if !spool.is_readable().await {
-            return Err(ApiError(BobsError::SpoolLocked));
+        {
+            let _lifecycle_guard = spool.lifecycle_lock.lock().await;
+            let meta = spool.metadata.lock().await;
+            if meta.state == crate::spool::SpoolState::Deleting {
+                return Err(ApiError(BobsError::SpoolNotFound { key: key.clone() }));
+            }
+            if !meta.state.is_readable() || (meta.state == crate::spool::SpoolState::Writing && meta.write_locked) {
+                return Err(ApiError(BobsError::SpoolLocked));
+            }
+            spool.acquire_reader();
         }
-        spool.acquire_reader();
 
         let read_labels = spool.metadata.lock().await.labels.clone();
         let read_mode = if matches!(request_range, ReadRequestRange::Follow) {
@@ -710,10 +717,7 @@ where
         let page_size = spool.page_size as u64;
         let metadata = {
             let meta = spool.metadata.lock().await;
-            let is_complete = matches!(
-                meta.state,
-                crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting
-            );
+            let is_complete = meta.state == crate::spool::SpoolState::Complete;
             let complete_size = if is_complete {
                 Some(meta.total_bytes_written)
             } else {
@@ -875,7 +879,7 @@ where
                 // loop back and long-poll for more data.
                 let done = {
                     let meta = spool.metadata.lock().await;
-                    matches!(meta.state, crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting)
+                    meta.state == crate::spool::SpoolState::Complete
                         && offset >= meta.total_bytes_written
                 };
                 if done {
@@ -1619,6 +1623,22 @@ mod tests {
             .expect("request build");
         let resp = app.oneshot(req).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_read_deleting_spool_returns_not_found() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        spool.metadata.lock().await.state = crate::spool::SpoolState::Deleting;
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

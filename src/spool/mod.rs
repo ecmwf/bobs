@@ -38,6 +38,8 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub notify: Arc<Notify>,
     /// Fired on spool deletion to unblock any waiting readers.
     pub cancel: CancellationToken,
+    /// Serializes terminal lifecycle operations so completion cannot race deletion.
+    pub(crate) lifecycle_lock: Mutex<()>,
     pub page_size: usize,
     pub data_path: PathBuf,
     /// Number of active reader connections.
@@ -104,6 +106,7 @@ where
             metadata_store,
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
+            lifecycle_lock: Mutex::new(()),
             page_size,
             data_path,
             reader_count: Arc::new(AtomicUsize::new(0)),
