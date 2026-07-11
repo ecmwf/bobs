@@ -2549,10 +2549,9 @@ mod tests {
         spool.last_read_activity_at.store(1, Ordering::SeqCst);
 
         tokio::time::advance(Duration::from_secs(3)).await;
-        // measure_disk_usage is now spawned fire-and-forget, so the cleanup
-        // loop returns to interval.tick() without blocking on spawn_blocking
-        // I/O.  A single yield is enough for the deletion sweep to run.
+        // Deletion now stays visible until metadata and directory removal finish.
         tokio::task::yield_now().await;
+        wait_for_spool_removal(&state, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),
