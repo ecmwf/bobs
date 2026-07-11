@@ -4,17 +4,20 @@
 
 replicaCount: 1
 
-# Default fallback for standalone bobs renders. When deployed as a subchart of
-# polytope-chart, the parent's `global.ingress.controller` propagates here.
+# Defaults for standalone BOBS renders. Values under `global` can be supplied by
+# a parent chart and propagate here through Helm's standard global mechanism.
 global:
+  imageRegistry: ""
   ingress:
     controller: nginx-inc
 
 imagePullSecrets: []
 
 image:
-  repository: bobs
-  tag: latest
+  registry: eccr.ecmwf.int
+  repository: polytope/bobs
+  tag: "0.1.0"
+  digest: ""
   pullPolicy: IfNotPresent
 
 service:
@@ -82,6 +85,9 @@ probes:
 #   internalBaseUrlTemplate: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ .Values.headlessService.name }}:{{ .Values.service.port }}/api/v1'
 internalBaseUrlTemplate: ""
 
+# tracing-subscriber filter used by the BOBS process.
+rustLog: info
+
 observability:
   # deployment.environment OTel resource attribute.
   # If set, injects BOBS_DEPLOYMENT_ENV directly; otherwise reads from a
@@ -132,6 +138,16 @@ persistence:
   enabled: true
   size: 10Gi
   storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  annotations: {}
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete
+  emptyDir:
+    medium: ""
+    sizeLimit: 10Gi
 
 ingress:
   enabled: false

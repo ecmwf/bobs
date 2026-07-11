@@ -7,7 +7,7 @@ version = 1
 # Human-facing LICENSE and NOTICE files (outside LICENSES/) and metadata files
 # that carry no comment syntax.
 [[annotations]]
-path = ["LICENSE", "NOTICE", "CITATION.cff", "chart/templates/_helpers.tpl"]
+path = ["LICENSE", "NOTICE", "CITATION.cff", "chart/templates/_helpers.tpl", "chart/values.schema.json"]
 precedence = "closest"
 SPDX-FileCopyrightText = "2026 European Centre for Medium-Range Weather Forecasts (ECMWF)"
 SPDX-License-Identifier = "Apache-2.0"

@@ -43,6 +43,50 @@ app.kubernetes.io/name: {{ include "bobs.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
+{{/*
+Build the BOBS image reference. global.imageRegistry overrides image.registry.
+A qualified repository is split before applying the global override, avoiding
+references such as registry.example/eccr.example/project/bobs.
+*/}}
+{{- define "bobs.image" -}}
+{{- $globalRegistry := "" -}}
+{{- if .Values.global -}}
+  {{- $globalRegistry = .Values.global.imageRegistry | default "" | trimSuffix "/" -}}
+{{- end -}}
+{{- $imageRegistry := .Values.image.registry | default "" | trimSuffix "/" -}}
+{{- $repository := required "image.repository must be set" .Values.image.repository | trimPrefix "/" -}}
+{{- $parts := splitList "/" $repository -}}
+{{- $repositoryRegistry := "" -}}
+{{- $repositoryPath := $repository -}}
+{{- if gt (len $parts) 1 -}}
+  {{- $first := index $parts 0 -}}
+  {{- if or (eq $first "localhost") (contains "." $first) (contains ":" $first) -}}
+    {{- $repositoryRegistry = $first -}}
+    {{- $repositoryPath = rest $parts | join "/" -}}
+  {{- end -}}
+{{- end -}}
+{{- $registry := $imageRegistry -}}
+{{- if $repositoryRegistry -}}
+  {{- $registry = $repositoryRegistry -}}
+{{- end -}}
+{{- if $globalRegistry -}}
+  {{- $registry = $globalRegistry -}}
+{{- end -}}
+{{- $image := $repositoryPath -}}
+{{- if $registry -}}
+  {{- $image = printf "%s/%s" $registry $repositoryPath -}}
+{{- end -}}
+{{- $digest := .Values.image.digest | default "" -}}
+{{- $tag := .Values.image.tag | default "" -}}
+{{- if $digest -}}
+{{- printf "%s@%s" $image $digest -}}
+{{- else if $tag -}}
+{{- printf "%s:%s" $image $tag -}}
+{{- else -}}
+{{- fail "image.tag or image.digest must be set" -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "bobs.imagePullSecrets" -}}
 {{- $secrets := list -}}
 {{- if .Values.global -}}
