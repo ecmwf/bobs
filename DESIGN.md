@@ -14,7 +14,7 @@ BOBS is not long-term object storage. It has no replication layer, no authentica
 
 BOBS runs as a set of pods. Producers create and write through the internal API. Reader URLs can route through ingress to the pod/route that owns or can see the key.
 
-A create request allocates a UUIDv4 key. Keys do not include a host prefix. Routing information is carried in the returned URLs, not embedded in the key.
+A create request uses a valid `X-Polytope-Job-Id` value as the spool key. Valid request IDs are 26-character, lower-case Crockford base32 strings; if the header is absent or invalid, BOBS allocates a UUIDv4 key instead. Keys do not include a host prefix. Routing information is carried in the returned URLs, not embedded in the key.
 
 Correct routing remains important: create, write, complete, delete, and read traffic for a key must reach a BOBS instance that can access the key's directory under `data_dir`.
 
@@ -26,10 +26,10 @@ The API is served under `/api/v1`.
 | --- | --- | --- |
 | `GET` | `/health` | Health check. |
 | `GET`/`HEAD` | `/status` | Status check. |
-| `PUT` | `/create` | Create a spool and return its UUIDv4 key plus read/write URLs. Optional JSON fields include `content_type`, `content_encoding`, and `write_locked`. |
+| `PUT` | `/create` | Create a spool and return its request-ID or fallback UUIDv4 key plus `read_url` and `write_url`. Optional JSON fields include `content_type`, `content_encoding`, `write_locked`, and `labels`. |
 | `POST` | `/write/{key}/{offset}` | Append request-body bytes. `offset` must equal the current write head; gaps and overwrites are rejected. |
 | `POST` | `/complete/{key}` | Finalize the spool. Optional `expected_size` rejects completion if the written length differs. |
-| `GET` | `/read/{key}` | Stream bytes. Supports HTTP `Range`; no range or `bytes=X-` follows the stream. |
+| `GET` | `/read/{key}` | Stream bytes. No `Range` header follows the stream; `bytes=X-Y` and `bytes=X-` are bounded range reads. |
 | `DELETE` | `/delete/{key}` | Delete a spool early. |
 
 `/complete` is the writer finalization endpoint.
@@ -54,22 +54,24 @@ Ordinary `/write` calls do not persist a metadata high-water mark. For in-progre
 
 BOBS uses positional file I/O through a `FileIO` abstraction.
 
-On Linux, the default backend is a sharded `io_uring` pool. Non-Linux builds, and builds with the `tokio-fileio-fallback` feature, use the Tokio/blocking file backend. Both backends read and write by explicit offset rather than a shared cursor.
+On Linux, the default backend is a sharded `io_uring` pool. `io_uring_shards` defaults to unset, which resolves to `max(1, num_cpus / 4)`, and must be greater than `0` when configured. `io_uring_queue_capacity` defaults to `1024` per shard and must be greater than `0`. Non-Linux builds, and builds with the `tokio-fileio-fallback` feature, use the Tokio/blocking file backend and ignore those settings. Both backends read and write by explicit offset rather than a shared cursor.
 
 Accepted write bytes are appended to `spool.dat` before `/write` returns, but they are not forced to stable storage per page. `/complete` syncs the data file before committing final complete metadata.
 
 ## Paging and cache
 
-The byte stream is divided into fixed-size pages (`page_size`, default 4096 bytes).
+The byte stream is divided into fixed-size pages (`page_size`, binary default 16777216 bytes / 16 MiB). The Helm chart currently overrides this with 4096-byte pages. `page_size` must be greater than `0`.
 
 Write path:
 
 1. HTTP body bytes are accepted at the required sequential offset.
 2. Bytes are written to `spool.dat` through `FileIO`.
 3. Full pages become reader-visible.
-4. Visible pages are inserted into a global FIFO page cache and waiting readers are notified.
+4. Visible pages are offered to the global FIFO page cache and waiting readers are notified.
 
-The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Setting `max_cache_bytes` to `0` disables caching. Pages larger than the cap bypass the cache. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
+The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget (binary default 268435456 bytes / 256 MiB; current Helm chart value 1048576 bytes / 1 MiB). `max_cache_bytes` may be smaller than `page_size`: setting it to `0` disables caching, and pages larger than the cap bypass the cache while remaining readable from disk. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
+
+`max_live_spools` (default 4096) limits the number of spools in the first-read cache phase. Create requests wait for an admission slot when the limit is reached. It must be greater than `0`.
 
 A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/complete` publishes it as the final page.
 
@@ -77,9 +79,11 @@ A trailing partial page may already be present in `spool.dat`, but it is not rea
 
 Reads first check the global page cache. Cache misses read the required page bytes from `spool.dat` using positional I/O.
 
-A request without `Range`, or with `Range: bytes=X-`, enters follow mode. If the requested byte has not been written yet, BOBS parks the request until more data arrives, the spool completes, the spool is deleted, or the long-poll timeout fires.
+Only a request without `Range` enters follow mode, starting at byte 0. If the next page has not been written yet, BOBS parks the request until more data arrives, the spool completes, the spool is deleted, or the long-poll timeout fires.
 
-When the long-poll timeout fires, BOBS returns `307 Temporary Redirect` to a read URL for the same key. If a trusted ingress supplies a valid `X-Forwarded-Prefix`, the redirect preserves that external prefix; otherwise it falls back to `/api/v1/read/{key}`. The redirect is temporary and includes `Cache-Control: no-store` because the location can depend on request headers.
+`Range: bytes=X-Y` and `Range: bytes=X-` are bounded requests and return `206 Partial Content`. An open-ended range snapshots its upper bound from the bytes currently servable when the request is resolved, so it does not wait for future writes. For an in-progress spool, a trailing partial page is not servable. Suffix ranges (`bytes=-N`) require a completed spool.
+
+If the follow-mode timeout fires before the first page is available, BOBS returns `307 Temporary Redirect` to a read URL for the same key. If a trusted ingress supplies a valid `X-Forwarded-Prefix`, the redirect preserves that external prefix; otherwise it falls back to `/api/v1/read/{key}`. The redirect includes `Cache-Control: no-store` because the location can depend on request headers. A timeout after streaming has begun ends that response rather than redirecting it.
 
 Range reads update aggregate read-coverage tracking so cleanup can detect when the whole object has been served, even across multiple range requests.
 
@@ -102,7 +106,7 @@ Startup recovery scans `data_dir` for spool directories with `meta.json` sidecar
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
 - Interrupted metadata temp files are ignored.
-- Unsafe or unrelated directories are not blindly removed. Orphan cleanup is restricted to UUID-shaped spool directories that look like BOBS spool directories.
+- Unsafe or unrelated directories are not blindly removed. Orphan cleanup is restricted to recognised UUID or 26-character request-ID directories that contain BOBS spool markers.
 
 ## Cleanup rules
 
@@ -110,8 +114,10 @@ A background cleanup task removes expired spools and their key directories, incl
 
 Current cleanup triggers are:
 
-- writer inactivity for producers that stop writing without completing;
-- read-idle TTL for readable spools that have not served bytes recently, with never-read spools anchored at `readable_at`;
-- full-read-complete TTL once aggregate coverage shows every byte has been served at least once.
+- writer inactivity for producers that stop writing without completing (`writer_inactivity_timeout_secs`, default 300);
+- read-idle TTL for readable spools that have not served bytes recently, with never-read spools anchored at `readable_at` (`read_idle_ttl_secs`, default 600);
+- full-read-complete TTL once aggregate coverage shows every byte has been served at least once (`full_read_complete_ttl_secs`, default 30).
+
+The legacy `reader_done_ttl_secs` and `unread_ttl_secs` fields are still parsed for config-file compatibility but no longer drive cleanup.
 
 Slow readers keep a spool alive only while they continue making read progress. Stalled connections do not protect a spool forever.
