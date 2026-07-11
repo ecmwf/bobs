@@ -38,7 +38,6 @@ fn metric_state_label(state: &SpoolState) -> &'static str {
     match state {
         SpoolState::Creating | SpoolState::Writing => crate::metrics::state::WRITING,
         SpoolState::WriteLocked => crate::metrics::state::WRITE_LOCKED,
-        SpoolState::Readable => crate::metrics::state::READABLE,
         SpoolState::Complete | SpoolState::Deleting => crate::metrics::state::COMPLETE,
     }
 }
@@ -333,10 +332,7 @@ where
                     let _ = tokio::fs::remove_dir_all(&spool_dir).await;
                     continue;
                 }
-                SpoolState::Writing
-                | SpoolState::WriteLocked
-                | SpoolState::Complete
-                | SpoolState::Readable => {}
+                SpoolState::Writing | SpoolState::WriteLocked | SpoolState::Complete => {}
             }
 
             let spool_page_size = usize::try_from(meta.page_size)
@@ -370,9 +366,7 @@ where
 
             // Backfill readable_at for spools that were persisted before this
             // field existed. Grants a full idle-TTL grace period after upgrade.
-            if matches!(meta.state, SpoolState::Complete | SpoolState::Readable)
-                && meta.readable_at.is_none()
-            {
+            if meta.state == SpoolState::Complete && meta.readable_at.is_none() {
                 meta.readable_at = Some(now_secs());
                 metadata_corrected = true;
             }

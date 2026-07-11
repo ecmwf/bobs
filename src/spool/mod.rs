@@ -104,11 +104,8 @@ where
         let data_path = metadata.data_path.clone();
         let key = metadata.key.clone();
         let now = Instant::now();
-        let readable_at = matches!(
-            metadata.state,
-            SpoolState::Complete | SpoolState::Readable | SpoolState::Deleting
-        )
-        .then_some(now);
+        let readable_at =
+            matches!(metadata.state, SpoolState::Complete | SpoolState::Deleting).then_some(now);
         Self {
             key,
             metadata: Arc::new(Mutex::new(metadata)),
