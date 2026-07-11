@@ -19,6 +19,8 @@ const TMP_FILE: &str = "meta.json.tmp";
 /// Axum/Tokio callers. Implementations must keep blocking filesystem work off
 /// Tokio worker threads while preserving the sidecar durability protocol.
 pub trait MetadataStore: Sync {
+    // Native `async fn` cannot express the `Send` guarantee required by generic
+    // Tokio/Axum callers; RPITIT is its allocation-free, stable equivalent.
     fn write(&self, metadata: &SpoolMetadata) -> impl Future<Output = Result<()>> + Send;
     fn read(&self, key: &str) -> impl Future<Output = Result<Option<SpoolMetadata>>> + Send;
     fn delete(&self, key: &str) -> impl Future<Output = Result<()>> + Send;
@@ -243,6 +245,8 @@ fn storage_error(error: io::Error) -> BobsError {
 #[derive(Clone, Debug)]
 pub struct UringSidecarMetadataStore {
     data_dir: PathBuf,
+    #[cfg(test)]
+    operation_hook: Option<fn()>,
 }
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
@@ -608,6 +612,21 @@ mod tests {
     fn sync_store_is_available_on_all_targets() {
         fn assert_store<T: MetadataStore>() {}
         assert_store::<SyncSidecarMetadataStore>();
+    }
+
+    #[test]
+    fn metadata_store_rpitit_futures_preserve_send_contract() {
+        fn assert_send<T: Send>(_: T) {}
+        fn assert_store_futures_are_send<M: MetadataStore>(store: &M, metadata: &SpoolMetadata) {
+            assert_send(store.write(metadata));
+            assert_send(store.read(&metadata.key));
+            assert_send(store.delete(&metadata.key));
+            assert_send(store.list());
+        }
+
+        let dir = tempdir().expect("create tempdir");
+        let store = SyncSidecarMetadataStore::new(dir.path());
+        assert_store_futures_are_send(&store, &metadata_with_generation(1));
     }
 
     #[test]
