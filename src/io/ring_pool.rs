@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 const RING_ENTRIES: u32 = 256;
 const AT_FDCWD: RawFd = -100;
 const METADATA_COMMIT_CHAIN_LEN: usize = 4;
+const METADATA_COMMIT_PHASE_LEN: usize = 2;
 const METADATA_USER_DATA_SHIFT: u64 = 56;
 const METADATA_USER_DATA_MASK: u64 = (1u64 << METADATA_USER_DATA_SHIFT) - 1;
 
@@ -113,10 +114,21 @@ pub(crate) struct RingPoolSubmissionEvent {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingPoolSafetyEvent {
+    SubmitFailed,
+    RingDropped,
+    InFlightReleased,
+    ErrorReported,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct RingPoolSubmissionInstrumentation {
     events: Arc<Mutex<Vec<RingPoolSubmissionEvent>>>,
     sequence: Arc<AtomicU64>,
+    submit_failures_remaining: Arc<AtomicUsize>,
+    safety_events: Arc<Mutex<Vec<RingPoolSafetyEvent>>>,
 }
 
 #[cfg(not(test))]
@@ -412,6 +424,24 @@ impl RingPool {
             .clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_submit_failure_for_test(&self) {
+        self.instrumentation
+            .submission
+            .submit_failures_remaining
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn safety_events(&self) -> Vec<RingPoolSafetyEvent> {
+        self.instrumentation
+            .submission
+            .safety_events
+            .lock()
+            .expect("ring-pool safety instrumentation poisoned")
+            .clone()
+    }
+
     pub fn shutdown(mut self) -> Result<RingPoolShutdown> {
         Ok(self.shutdown_inner())
     }
@@ -508,6 +538,21 @@ fn run_driver(
     driver_stopped.store(true, Ordering::SeqCst);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataCommitPhase {
+    WriteAndSync,
+    RenameAndSync,
+}
+
+impl MetadataCommitPhase {
+    fn first_chain_index(self) -> usize {
+        match self {
+            Self::WriteAndSync => 0,
+            Self::RenameAndSync => METADATA_COMMIT_PHASE_LEN,
+        }
+    }
+}
+
 enum InFlightKind {
     Open {
         path: CString,
@@ -525,6 +570,7 @@ enum InFlightKind {
     Read {
         fd: Arc<OwnedFd>,
         offset: u64,
+        len: usize,
         buf: Vec<u8>,
         tx: Option<ReadSender>,
     },
@@ -543,7 +589,8 @@ enum InFlightKind {
         tmp_name: CString,
         final_name: CString,
         payload: Bytes,
-        completed: [bool; METADATA_COMMIT_CHAIN_LEN],
+        phase: MetadataCommitPhase,
+        completed: [bool; METADATA_COMMIT_PHASE_LEN],
         failure: Option<Error>,
         tx: Option<UnitSender>,
     },
@@ -558,7 +605,7 @@ struct RingDriver {
     shard_index: usize,
     #[allow(dead_code)]
     driver_name: String,
-    ring: IoUring,
+    ring: Option<IoUring>,
     rx: mpsc::Receiver<Request>,
     in_flight: HashMap<u64, InFlight>,
     pending: VecDeque<Request>,
@@ -580,7 +627,7 @@ impl RingDriver {
         Self {
             shard_index,
             driver_name,
-            ring,
+            ring: Some(ring),
             rx,
             in_flight: HashMap::new(),
             pending: VecDeque::new(),
@@ -610,13 +657,16 @@ impl RingDriver {
 
             let (pushed, stalled_on_full_submission_queue) = self.submit_pending_batch();
             if pushed > 0 {
-                if let Err(error) = self.ring.submit() {
-                    self.fail_all(error);
-                    continue;
+                if let Err(error) = self.submit_ring(false) {
+                    self.abort_after_submit_failure(error);
+                    return;
                 }
             }
 
-            self.process_completions();
+            if let Err(error) = self.process_completions() {
+                self.abort_after_submit_failure(error);
+                return;
+            }
 
             if receiver_open {
                 receiver_open = self.drain_available_requests();
@@ -625,11 +675,14 @@ impl RingDriver {
             if (self.pending.is_empty() || stalled_on_full_submission_queue)
                 && !self.in_flight.is_empty()
             {
-                if let Err(error) = self.ring.submit_and_wait(1) {
-                    self.fail_all(error);
-                    continue;
+                if let Err(error) = self.submit_ring(true) {
+                    self.abort_after_submit_failure(error);
+                    return;
                 }
-                self.process_completions();
+                if let Err(error) = self.process_completions() {
+                    self.abort_after_submit_failure(error);
+                    return;
+                }
             }
         }
     }
@@ -697,7 +750,11 @@ impl RingDriver {
                 kind: InFlightKind::Read {
                     fd,
                     offset,
-                    buf: vec![0u8; len],
+                    len,
+                    // The kernel initializes at most `len` bytes before the CQE is
+                    // published. Length stays zero until that CQE is observed, so Rust
+                    // never exposes uninitialized memory and large reads avoid a memset.
+                    buf: allocate_read_buffer(len),
                     tx: Some(tx),
                 },
             },
@@ -723,7 +780,8 @@ impl RingDriver {
                     tmp_name,
                     final_name,
                     payload,
-                    completed: [false; METADATA_COMMIT_CHAIN_LEN],
+                    phase: MetadataCommitPhase::WriteAndSync,
+                    completed: [false; METADATA_COMMIT_PHASE_LEN],
                     failure: None,
                     tx: Some(tx),
                 },
@@ -734,7 +792,7 @@ impl RingDriver {
         self.in_flight.insert(id, in_flight);
         self.in_flight_operations.fetch_add(1, Ordering::SeqCst);
         let push_result = if is_metadata_commit {
-            self.push_metadata_commit_chain(id)
+            self.push_metadata_commit_phase(id)
         } else {
             self.push_entry(id)
         };
@@ -749,55 +807,80 @@ impl RingDriver {
         Ok(())
     }
 
-    fn resubmit_existing(&mut self, id: u64) {
+    fn resubmit_existing(&mut self, id: u64) -> Result<()> {
         loop {
             if self.push_entry(id).is_ok() {
-                if let Err(error) = self.ring.submit() {
-                    self.complete_error(id, error);
-                }
-                return;
+                self.submit_ring(false)?;
+                return Ok(());
             }
-            if let Err(error) = self.ring.submit_and_wait(1) {
-                self.complete_error(id, error);
-                return;
-            }
-            self.process_completions();
+            self.submit_ring(true)?;
+            self.process_completions()?;
             if !self.in_flight.contains_key(&id) {
-                return;
+                return Ok(());
+            }
+        }
+    }
+
+    fn resubmit_metadata_existing(&mut self, id: u64) -> Result<()> {
+        loop {
+            if self.push_metadata_commit_phase(id).is_ok() {
+                self.submit_ring(false)?;
+                return Ok(());
+            }
+            self.submit_ring(true)?;
+            self.process_completions()?;
+            if !self.in_flight.contains_key(&id) {
+                return Ok(());
             }
         }
     }
 
     fn push_entry(&mut self, id: u64) -> std::result::Result<(), ()> {
-        let entry = build_entry(id, self.in_flight.get(&id).expect("in-flight id missing"));
-        unsafe { self.ring.submission().push(&entry).map_err(|_| ())? };
+        let entry = build_entry(
+            id,
+            self.in_flight.get_mut(&id).expect("in-flight id missing"),
+        );
+        let ring = self
+            .ring
+            .as_mut()
+            .expect("ring missing before driver abort");
+        unsafe { ring.submission().push(&entry).map_err(|_| ())? };
         self.record_submission_push(id, id, 0, 1);
         Ok(())
     }
 
-    fn push_metadata_commit_chain(&mut self, id: u64) -> std::result::Result<(), ()> {
+    fn push_metadata_commit_phase(&mut self, id: u64) -> std::result::Result<(), ()> {
         {
-            let sq = self.ring.submission();
-            if sq.capacity().saturating_sub(sq.len()) < METADATA_COMMIT_CHAIN_LEN {
+            let sq = self
+                .ring
+                .as_mut()
+                .expect("ring missing before driver abort")
+                .submission();
+            if sq.capacity().saturating_sub(sq.len()) < METADATA_COMMIT_PHASE_LEN {
                 return Err(());
             }
         }
 
-        let entries = build_metadata_commit_entries(
+        let (entries, first_chain_index) = build_metadata_commit_entries(
             id,
             self.in_flight.get(&id).expect("in-flight id missing"),
         );
-        let mut sq = self.ring.submission();
+        let mut sq = self
+            .ring
+            .as_mut()
+            .expect("ring missing before driver abort")
+            .submission();
         for entry in &entries {
             unsafe { sq.push(entry).map_err(|_| ())? };
         }
         drop(sq);
 
-        for chain_index in 0..METADATA_COMMIT_CHAIN_LEN as u16 {
+        for phase_index in 0..METADATA_COMMIT_PHASE_LEN {
+            let chain_index = first_chain_index + phase_index;
             self.record_submission_push(
-                metadata_user_data(id, chain_index as usize),
+                metadata_user_data(id, chain_index),
                 id,
-                chain_index,
+                chain_index as u16,
                 METADATA_COMMIT_CHAIN_LEN as u16,
             );
         }
@@ -839,32 +922,34 @@ impl RingDriver {
         }
     }
 
-    fn process_completions(&mut self) {
+    fn process_completions(&mut self) -> Result<()> {
         let completions: Vec<_> = self
             .ring
+            .as_mut()
+            .expect("ring missing before driver abort")
             .completion()
             .map(|cqe| (cqe.user_data(), cqe.result()))
             .collect();
         for (id, res) in completions {
-            self.handle_completion(id, res);
+            self.handle_completion(id, res)?;
         }
+        Ok(())
     }
 
-    fn handle_completion(&mut self, user_data: u64, res: i32) {
+    fn handle_completion(&mut self, user_data: u64, res: i32) -> Result<()> {
         if let Some((id, chain_index)) = decode_metadata_user_data(user_data) {
-            self.handle_metadata_commit_completion(id, chain_index, res);
-            return;
+            return self.handle_metadata_commit_completion(id, chain_index, res);
         }
 
         let id = user_data;
         if res < 0 {
             self.complete_error(id, Error::from_raw_os_error(-res));
-            return;
+            return Ok(());
         }
 
         let mut in_flight = match self.in_flight.remove(&id) {
             Some(in_flight) => in_flight,
-            None => return,
+            None => return Ok(()),
         };
         self.in_flight_operations.fetch_sub(1, Ordering::SeqCst);
 
@@ -890,16 +975,30 @@ impl RingDriver {
                     if *written < data.len() {
                         self.in_flight.insert(id, in_flight);
                         self.in_flight_operations.fetch_add(1, Ordering::SeqCst);
-                        self.resubmit_existing(id);
+                        self.resubmit_existing(id)?;
                     } else {
                         send_write(tx, Ok(*written));
                     }
                 }
             }
-            InFlightKind::Read { buf, tx, .. } => {
+            InFlightKind::Read { len, buf, tx, .. } => {
                 let n = res as usize;
-                buf.truncate(n);
-                send_read(tx, Ok(Bytes::from(std::mem::take(buf))));
+                if n > *len || n > buf.capacity() {
+                    send_read(
+                        tx,
+                        Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "io_uring read completion exceeded requested buffer length",
+                        )),
+                    );
+                } else {
+                    // SAFETY: the read SQE points at this allocation for `len`
+                    // bytes, and a successful CQE of `n` means exactly those first `n`
+                    // bytes were initialized by the kernel. The allocation remains in
+                    // `in_flight` until this CQE is consumed.
+                    unsafe { buf.set_len(n) };
+                    send_read(tx, Ok(Bytes::from(std::mem::take(buf))));
+                }
             }
             InFlightKind::SyncData { tx, .. } | InFlightKind::Remove { tx, .. } => {
                 send_unit(tx, Ok(()));
@@ -908,24 +1007,40 @@ impl RingDriver {
                 unreachable!("metadata commit completions use encoded user_data")
             }
         }
+        Ok(())
     }
 
-    fn handle_metadata_commit_completion(&mut self, id: u64, chain_index: usize, res: i32) {
+    fn handle_metadata_commit_completion(
+        &mut self,
+        id: u64,
+        chain_index: usize,
+        res: i32,
+    ) -> Result<()> {
         let mut should_complete = false;
+        let mut should_submit_rename = false;
         if let Some(in_flight) = self.in_flight.get_mut(&id) {
             if let InFlightKind::MetadataCommit {
                 payload,
+                phase,
                 completed,
                 failure,
                 ..
             } = &mut in_flight.kind
             {
-                completed[chain_index] = true;
+                let phase_index = chain_index
+                    .checked_sub(phase.first_chain_index())
+                    .filter(|index| *index < METADATA_COMMIT_PHASE_LEN)
+                    .expect("metadata completion did not match active commit phase");
+                completed[phase_index] = true;
                 if res < 0 {
                     if failure.is_none() {
                         *failure = Some(Error::from_raw_os_error(-res));
                     }
-                } else if chain_index == 0 && res as usize != payload.len() && failure.is_none() {
+                } else if *phase == MetadataCommitPhase::WriteAndSync
+                    && phase_index == 0
+                    && res as usize != payload.len()
+                    && failure.is_none()
+                {
                     *failure = Some(Error::new(
                         ErrorKind::WriteZero,
                         format!(
@@ -935,7 +1050,18 @@ impl RingDriver {
                         ),
                     ));
                 }
-                should_complete = completed.iter().all(|done| *done);
+
+                if completed.iter().all(|done| *done) {
+                    if failure.is_some() || *phase == MetadataCommitPhase::RenameAndSync {
+                        should_complete = true;
+                    } else {
+                        // Durability invariant: rename is not even submitted until the
+                        // complete temporary payload and its fdatasync have both completed.
+                        *phase = MetadataCommitPhase::RenameAndSync;
+                        *completed = [false; METADATA_COMMIT_PHASE_LEN];
+                        should_submit_rename = true;
+                    }
+                }
             }
         }
 
@@ -951,12 +1077,22 @@ impl RingDriver {
                     None => send_unit(tx, Ok(())),
                 }
             }
+        } else if should_submit_rename {
+            self.resubmit_metadata_existing(id)?;
         }
+        Ok(())
     }
 
     fn complete_error(&mut self, id: u64, error: Error) {
         if let Some(mut in_flight) = self.in_flight.remove(&id) {
             self.in_flight_operations.fetch_sub(1, Ordering::SeqCst);
+            #[cfg(test)]
+            {
+                self.record_safety_event(RingPoolSafetyEvent::InFlightReleased);
+                // Record the reporting boundary before waking the receiver, so the
+                // regression observes the same happens-before ordering as callers.
+                self.record_safety_event(RingPoolSafetyEvent::ErrorReported);
+            }
             match &mut in_flight.kind {
                 InFlightKind::Open { tx, .. } => send_open(tx, Err(error)),
                 InFlightKind::Write { tx, .. } => send_write(tx, Err(error)),
@@ -968,11 +1104,74 @@ impl RingDriver {
         }
     }
 
-    fn fail_all(&mut self, error: Error) {
+    fn fail_all(&mut self, error: &Error) {
         let ids: Vec<_> = self.in_flight.keys().copied().collect();
         for id in ids {
-            self.complete_error(id, Error::new(error.kind(), error.to_string()));
+            self.complete_error(id, clone_error(error));
         }
+    }
+
+    fn submit_ring(&mut self, wait_for_completion: bool) -> Result<usize> {
+        #[cfg(test)]
+        if self
+            .submission_instrumentation
+            .submit_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.record_safety_event(RingPoolSafetyEvent::SubmitFailed);
+            return Err(Error::other("injected io_uring submit failure"));
+        }
+
+        let ring = self
+            .ring
+            .as_ref()
+            .expect("ring missing before driver abort");
+        let result = if wait_for_completion {
+            ring.submit_and_wait(1)
+        } else {
+            ring.submit()
+        };
+        #[cfg(test)]
+        if result.is_err() {
+            self.record_safety_event(RingPoolSafetyEvent::SubmitFailed);
+        }
+        result
+    }
+
+    fn abort_after_submit_failure(&mut self, error: Error) {
+        self.rx.close();
+        while let Ok(request) = self.rx.try_recv() {
+            self.pending.push_back(request);
+        }
+
+        // Fail-stop invariant: a submit error permanently terminates this shard;
+        // no queued SQE is ever retried on another ring. SQEs may have been consumed
+        // by the kernel even when io_uring_enter returned an error. Destroying the
+        // ring synchronously cancels and quiesces that kernel context; only after
+        // it returns may SQE-backed paths, FDs, and buffers in `in_flight` be
+        // released or their errors reported.
+        drop(self.ring.take());
+        #[cfg(test)]
+        self.record_safety_event(RingPoolSafetyEvent::RingDropped);
+
+        self.fail_all(&error);
+        while let Some(request) = self.pending.pop_front() {
+            #[cfg(test)]
+            self.record_safety_event(RingPoolSafetyEvent::ErrorReported);
+            fail_request(request, clone_error(&error));
+        }
+    }
+
+    #[cfg(test)]
+    fn record_safety_event(&self, event: RingPoolSafetyEvent) {
+        self.submission_instrumentation
+            .safety_events
+            .lock()
+            .expect("ring-pool safety instrumentation poisoned")
+            .push(event);
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -985,8 +1184,12 @@ impl RingDriver {
     }
 }
 
-fn build_entry(id: u64, in_flight: &InFlight) -> squeue::Entry {
-    let entry = match &in_flight.kind {
+fn allocate_read_buffer(len: usize) -> Vec<u8> {
+    Vec::with_capacity(len)
+}
+
+fn build_entry(id: u64, in_flight: &mut InFlight) -> squeue::Entry {
+    let entry = match &mut in_flight.kind {
         InFlightKind::Open {
             path, flags, mode, ..
         } => opcode::OpenAt::new(types::Fd(AT_FDCWD), path.as_ptr())
@@ -1007,14 +1210,17 @@ fn build_entry(id: u64, in_flight: &InFlight) -> squeue::Entry {
         .offset(*offset + *written as u64)
         .build(),
         InFlightKind::Read {
-            fd, offset, buf, ..
-        } => opcode::Read::new(
-            types::Fd(fd.as_raw_fd()),
-            buf.as_ptr() as *mut u8,
-            buf.len() as u32,
-        )
-        .offset(*offset)
-        .build(),
+            fd,
+            offset,
+            len,
+            buf,
+            ..
+        } => {
+            debug_assert!(buf.capacity() >= *len);
+            opcode::Read::new(types::Fd(fd.as_raw_fd()), buf.as_mut_ptr(), *len as u32)
+                .offset(*offset)
+                .build()
+        }
         InFlightKind::SyncData { fd, .. } => opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
             .flags(types::FsyncFlags::DATASYNC)
             .build(),
@@ -1022,7 +1228,7 @@ fn build_entry(id: u64, in_flight: &InFlight) -> squeue::Entry {
             opcode::UnlinkAt::new(types::Fd(AT_FDCWD), path.as_ptr()).build()
         }
         InFlightKind::MetadataCommit { .. } => {
-            unreachable!("metadata commits are submitted as a four-SQE linked chain")
+            unreachable!("metadata commits are submitted as two linked durability phases")
         }
     };
     entry.user_data(id)
@@ -1045,47 +1251,53 @@ fn decode_metadata_user_data(user_data: u64) -> Option<(u64, usize)> {
 fn build_metadata_commit_entries(
     id: u64,
     in_flight: &InFlight,
-) -> [squeue::Entry; METADATA_COMMIT_CHAIN_LEN] {
+) -> ([squeue::Entry; METADATA_COMMIT_PHASE_LEN], usize) {
     let InFlightKind::MetadataCommit {
         tmp_fd,
         parent_fd,
         tmp_name,
         final_name,
         payload,
+        phase,
         ..
     } = &in_flight.kind
     else {
         unreachable!("metadata chain requested for non-metadata request")
     };
 
-    [
-        opcode::Write::new(
-            types::Fd(tmp_fd.as_raw_fd()),
-            payload.as_ptr(),
-            payload.len() as u32,
-        )
-        .offset(0)
-        .build()
-        .user_data(metadata_user_data(id, 0))
-        .flags(squeue::Flags::IO_LINK),
-        opcode::Fsync::new(types::Fd(tmp_fd.as_raw_fd()))
-            .flags(types::FsyncFlags::DATASYNC)
+    let first_chain_index = phase.first_chain_index();
+    let entries = match phase {
+        MetadataCommitPhase::WriteAndSync => [
+            opcode::Write::new(
+                types::Fd(tmp_fd.as_raw_fd()),
+                payload.as_ptr(),
+                payload.len() as u32,
+            )
+            .offset(0)
             .build()
-            .user_data(metadata_user_data(id, 1))
+            .user_data(metadata_user_data(id, first_chain_index))
             .flags(squeue::Flags::IO_LINK),
-        opcode::RenameAt::new(
-            types::Fd(parent_fd.as_raw_fd()),
-            tmp_name.as_ptr(),
-            types::Fd(parent_fd.as_raw_fd()),
-            final_name.as_ptr(),
-        )
-        .build()
-        .user_data(metadata_user_data(id, 2))
-        .flags(squeue::Flags::IO_LINK),
-        opcode::Fsync::new(types::Fd(parent_fd.as_raw_fd()))
+            opcode::Fsync::new(types::Fd(tmp_fd.as_raw_fd()))
+                .flags(types::FsyncFlags::DATASYNC)
+                .build()
+                .user_data(metadata_user_data(id, first_chain_index + 1)),
+        ],
+        MetadataCommitPhase::RenameAndSync => [
+            opcode::RenameAt::new(
+                types::Fd(parent_fd.as_raw_fd()),
+                tmp_name.as_ptr(),
+                types::Fd(parent_fd.as_raw_fd()),
+                final_name.as_ptr(),
+            )
             .build()
-            .user_data(metadata_user_data(id, 3)),
-    ]
+            .user_data(metadata_user_data(id, first_chain_index))
+            .flags(squeue::Flags::IO_LINK),
+            opcode::Fsync::new(types::Fd(parent_fd.as_raw_fd()))
+                .build()
+                .user_data(metadata_user_data(id, first_chain_index + 1)),
+        ],
+    };
+    (entries, first_chain_index)
 }
 
 impl InFlight {
@@ -1117,12 +1329,13 @@ impl InFlight {
             InFlightKind::Read {
                 fd,
                 offset,
-                buf,
+                len,
                 mut tx,
+                ..
             } => Request::Read {
                 fd,
                 offset,
-                len: buf.len(),
+                len,
                 tx: tx.take().expect("read sender missing"),
             },
             InFlightKind::SyncData { fd, mut tx } => Request::SyncData {
@@ -1151,6 +1364,29 @@ impl InFlight {
                 payload,
                 tx: tx.take().expect("metadata commit sender missing"),
             },
+        }
+    }
+}
+
+fn clone_error(error: &Error) -> Error {
+    Error::new(error.kind(), error.to_string())
+}
+
+fn fail_request(request: Request, error: Error) {
+    match request {
+        Request::Open { tx, .. } => {
+            let _ = tx.send(Err(error));
+        }
+        Request::Write { tx, .. } => {
+            let _ = tx.send(Err(error));
+        }
+        Request::Read { tx, .. } => {
+            let _ = tx.send(Err(error));
+        }
+        Request::SyncData { tx, .. }
+        | Request::Remove { tx, .. }
+        | Request::MetadataCommit { tx, .. } => {
+            let _ = tx.send(Err(error));
         }
     }
 }
@@ -1436,7 +1672,7 @@ mod tests {
     use super::{
         global_ring_pool, init_global_ring_pool, ring_index_for_key,
         scoped_test_ring_pool_override, shutdown_global_ring_pool_for_exit, Request, RingPool,
-        RingPoolOptions,
+        RingPoolOptions, RingPoolSafetyEvent,
     };
     use std::collections::{HashMap, HashSet};
     use std::env;
@@ -1843,6 +2079,75 @@ mod tests {
             .await
             .expect("second send should complete after capacity is drained")
             .expect("receiver should remain open");
+    }
+
+    #[tokio::test]
+    async fn submit_failure_quiesces_ring_before_releasing_buffers_or_reporting_errors() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(temp_dir.path().join("submit-failure.dat"))
+            .expect("submit-failure test file should open");
+        let fd = Arc::new(OwnedFd::from(file));
+        let pool = Arc::new(
+            RingPool::new_for_test(explicit_test_options(1))
+                .expect("submit-failure test pool should start"),
+        );
+        pool.inject_submit_failure_for_test();
+
+        let (tx, rx) = oneshot::channel();
+        pool.submit_to_ring(
+            0,
+            Request::Write {
+                fd: Arc::clone(&fd),
+                offset: 0,
+                data: bytes::Bytes::from(vec![0xA5; 1024 * 1024]),
+                tx,
+            },
+        )
+        .await
+        .expect("driver should accept injected-failure request");
+        let error = timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("submit failure should be reported promptly")
+            .expect("driver should report an explicit submit error")
+            .expect_err("injected submit must fail");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        assert_eq!(
+            pool.safety_events(),
+            vec![
+                RingPoolSafetyEvent::SubmitFailed,
+                RingPoolSafetyEvent::RingDropped,
+                RingPoolSafetyEvent::InFlightReleased,
+                RingPoolSafetyEvent::ErrorReported,
+            ],
+            "the ring must quiesce before SQE-backed storage is released or callers are notified"
+        );
+        assert_eq!(pool.in_flight_operations(), 0);
+
+        let (later_tx, _later_rx) = oneshot::channel();
+        let later_error = pool
+            .submit_to_ring(0, Request::SyncData { fd, tx: later_tx })
+            .await
+            .expect_err("a failed shard must remain fail-stop");
+        assert_eq!(later_error.kind(), io::ErrorKind::BrokenPipe);
+
+        drop(pool);
+    }
+
+    #[test]
+    fn large_read_buffers_skip_initialization_until_kernel_completion() {
+        let requested = 16 * 1024 * 1024;
+        let buffer = super::allocate_read_buffer(requested);
+        assert_eq!(buffer.len(), 0, "read allocation must not initialize bytes");
+        assert!(
+            buffer.capacity() >= requested,
+            "read allocation must reserve the full kernel-visible range"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
