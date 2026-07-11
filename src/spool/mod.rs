@@ -8,8 +8,9 @@ use crate::metrics::BobsMetrics;
 use bytes::BytesMut;
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +27,14 @@ pub use coverage::MissingRanges;
 /// multiple readers can consume byte ranges in parallel. Pages are flushed to disk when
 /// full (page_size bytes) and cached in memory for fast reads. The writer signals readers
 /// via `notify` after each completed page; readers long-poll until data is available.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CleanupAnchors {
+    pub last_write_at: Instant,
+    pub readable_at: Option<Instant>,
+    pub last_read_activity_at: Option<Instant>,
+    pub full_object_read_at: Option<Instant>,
+}
+
 pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub key: String,
     pub metadata: Arc<Mutex<SpoolMetadata>>,
@@ -45,11 +54,9 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     /// Tracks which byte ranges have not yet been served to any client.
     /// Never persisted — reset to `[0, total_size)` on every restart.
     pub missing_ranges: Arc<Mutex<MissingRanges>>,
-    /// Unix secs of the last byte-served event. 0 = never served since last restart.
-    /// Updated on the read hot-path with `Ordering::Relaxed`.
-    pub last_read_activity_at: Arc<AtomicU64>,
-    /// Unix secs when full-object coverage was first detected. 0 = not yet.
-    pub full_object_read_at: Arc<AtomicU64>,
+    /// In-memory monotonic anchors used by cleanup TTL rules.
+    /// Persisted wall-clock timestamps remain metadata/observability only.
+    pub(crate) cleanup_anchors: Arc<StdMutex<CleanupAnchors>>,
     /// Metrics handle for cache hit/miss recording.
     pub metrics: Arc<BobsMetrics>,
     /// Admission permit held while this spool can retain first-read cache memory.
@@ -94,7 +101,12 @@ where
     ) -> Self {
         let data_path = metadata.data_path.clone();
         let key = metadata.key.clone();
-
+        let now = Instant::now();
+        let readable_at = matches!(
+            metadata.state,
+            SpoolState::Complete | SpoolState::Readable | SpoolState::Deleting
+        )
+        .then_some(now);
         Self {
             key,
             metadata: Arc::new(Mutex::new(metadata)),
@@ -108,11 +120,56 @@ where
             data_path,
             reader_count: Arc::new(AtomicUsize::new(0)),
             missing_ranges: Arc::new(Mutex::new(MissingRanges::new(1024))),
-            last_read_activity_at: Arc::new(AtomicU64::new(0)),
-            full_object_read_at: Arc::new(AtomicU64::new(0)),
+            cleanup_anchors: Arc::new(StdMutex::new(CleanupAnchors {
+                last_write_at: now,
+                readable_at,
+                last_read_activity_at: None,
+                full_object_read_at: None,
+            })),
             metrics,
             admission_permit: std::sync::Mutex::new(admission_permit),
             _phantom: PhantomData,
+        }
+    }
+
+    pub(crate) fn cleanup_anchors(&self) -> CleanupAnchors {
+        *self
+            .cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn record_write_activity(&self) {
+        self.cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_write_at = Instant::now();
+    }
+
+    pub(crate) fn record_readable(&self) {
+        self.cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .readable_at = Some(Instant::now());
+    }
+
+    pub(crate) fn record_read_activity(&self) {
+        self.cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_read_activity_at = Some(Instant::now());
+    }
+
+    pub(crate) fn record_fully_read(&self) -> bool {
+        let mut anchors = self
+            .cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if anchors.full_object_read_at.is_some() {
+            false
+        } else {
+            anchors.full_object_read_at = Some(Instant::now());
+            true
         }
     }
 

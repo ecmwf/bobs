@@ -7,7 +7,6 @@ use crate::io::FileIO;
 use crate::metrics;
 use crate::spool::types::SpoolState;
 use crate::time::now_secs;
-use std::sync::atomic::Ordering;
 
 use super::Spool;
 
@@ -114,17 +113,14 @@ where
                 crate::metrics::state::COMPLETE,
             );
         }
+        self.record_readable();
 
         // Initialize coverage tracking and detect immediate full-coverage
         // (zero-byte objects or objects whose bytes were all served pre-complete).
         let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.initialize(total_size);
-            mr.is_complete()
-                && self
-                    .full_object_read_at
-                    .compare_exchange(0, now_secs(), Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            mr.is_complete() && self.record_fully_read()
         };
         if became_fully_read {
             self.on_fully_read().await;
@@ -137,16 +133,11 @@ where
 
     /// Record that a byte range has been served and run the first full-read
     /// transition exactly once when coverage reaches the complete object.
-    pub async fn mark_served_and_maybe_fully_read(&self, start: u64, end: u64, now: u64) {
+    pub async fn mark_served_and_maybe_fully_read(&self, start: u64, end: u64) {
         let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.mark_served(start, end);
-            mr.is_complete()
-                && self.full_object_read_at.load(Ordering::Relaxed) == 0
-                && self
-                    .full_object_read_at
-                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            mr.is_complete() && self.record_fully_read()
         };
 
         if became_fully_read {

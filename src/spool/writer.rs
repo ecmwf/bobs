@@ -98,6 +98,7 @@ where
             meta.total_bytes_written = offset + data.len() as u64;
             meta.last_write_at = now_secs();
         }
+        self.record_write_activity();
 
         Ok(())
     }
