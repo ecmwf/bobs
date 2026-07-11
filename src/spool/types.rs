@@ -23,17 +23,17 @@ impl SpoolState {
         matches!(
             (self, target),
             (Creating, Writing)
-            | (Creating, WriteLocked)
-            | (Writing, WriteLocked)
-            | (Writing, Complete)
-            | (Writing, Deleting)
-            | (WriteLocked, Readable)
-            | (WriteLocked, Complete)   // complete releases write-lock
-            | (WriteLocked, Deleting)
-            | (Readable, WriteLocked)
-            | (Readable, Complete)
-            | (Complete, Deleting)
-            | (Readable, Deleting)
+                | (Creating, WriteLocked)
+                | (Writing, WriteLocked)
+                | (Writing, Complete)
+                | (Writing, Deleting)
+                | (WriteLocked, Readable)
+                | (WriteLocked, Complete)
+                | (WriteLocked, Deleting)
+                | (Readable, WriteLocked)
+                | (Readable, Complete)
+                | (Readable, Deleting)
+                | (Complete, Deleting)
         )
     }
 
@@ -68,6 +68,10 @@ pub struct SpoolMetadata {
     pub last_read_at: Option<u64>,
     #[serde(default)]
     pub readable_at: Option<u64>, // unix secs; set when spool first becomes readable
+    /// Page size fixed when this spool was created. Zero means legacy metadata
+    /// written before page sizes were persisted and is rejected during recovery.
+    #[serde(default)]
+    pub page_size: u64,
     pub total_bytes_written: u64,
     pub total_pages: u64,
     pub final_page_size: Option<u64>, // size of last (partial) page after complete

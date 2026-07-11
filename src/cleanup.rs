@@ -89,8 +89,11 @@ where
                     > Duration::from_secs(config.read_idle_ttl_secs)
             };
 
-            if writer_inactive || full_read_expired || idle_expired {
-                let reason = if writer_inactive {
+            let deletion_retry = state == SpoolState::Deleting;
+            if deletion_retry || writer_inactive || full_read_expired || idle_expired {
+                let reason = if deletion_retry {
+                    crate::metrics::reason::DELETE_RETRY
+                } else if writer_inactive {
                     crate::metrics::reason::WRITER_TIMEOUT
                 } else if full_read_expired {
                     crate::metrics::reason::FULL_READ_TTL
@@ -227,6 +230,15 @@ mod tests {
         )
     }
 
+    async fn wait_for_spool_removal(manager: &SpoolManager<TokioFileIO>, key: &str) {
+        for _ in 0..10_000 {
+            if manager.get_spool(key).is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     async fn rewrite_persisted_metadata<F: FileIO>(
         manager: &SpoolManager<F>,
         key: &str,
@@ -288,6 +300,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&manager, &key).await;
         assert!(
             manager.get_spool(&key).is_none(),
             "inactive writer should be cleaned up"
@@ -440,6 +453,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&manager, &key).await;
         assert!(
             manager.get_spool(&key).is_none(),
             "spool with expired readable_at and no activity should be cleaned up"
@@ -474,6 +488,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&manager, &key).await;
         assert!(
             manager.get_spool(&key).is_none(),
             "wall-clock metadata must not affect monotonic idle expiry"
@@ -572,6 +587,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&manager, &key).await;
         assert!(
             manager.get_spool(&key).is_none(),
             "stalled reader with no served bytes must not prevent idle cleanup"
@@ -618,6 +634,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&manager, &key).await;
         assert!(
             manager.get_spool(&key).is_none(),
             "once activity stops and readable_at is old, idle TTL should fire"
@@ -626,7 +643,7 @@ mod tests {
     }
 
     /// A Writing spool must not be deleted by the idle TTL rule, which only applies
-    /// to Complete/Readable state.
+    /// to Complete state.
     #[tokio::test]
     async fn test_writing_spool_not_deleted_by_idle() {
         tokio::time::pause();
@@ -687,6 +704,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&manager, &key).await;
         assert!(
             manager.get_spool(&key).is_none(),
             "spool should be deleted after full-read TTL expires"

@@ -8,35 +8,21 @@ use std::fs::{self, File};
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
+use tokio::task;
 
 const META_FILE: &str = "meta.json";
 const TMP_FILE: &str = "meta.json.tmp";
 
-type BoxMetadataFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
-
 /// Metadata persistence backend.
 ///
-/// Writes, reads, and deletes return futures so async callers can use the same
-/// interface for synchronous and io_uring implementations. `list` is
-/// deliberately synchronous because it is used during startup recovery before
-/// serving requests.
-pub trait MetadataStore {
-    type WriteFuture<'a>: Future<Output = Result<()>> + Send + 'a
-    where
-        Self: 'a;
-    type ReadFuture<'a>: Future<Output = Result<Option<SpoolMetadata>>> + Send + 'a
-    where
-        Self: 'a;
-    type DeleteFuture<'a>: Future<Output = Result<()>> + Send + 'a
-    where
-        Self: 'a;
-    type ListIter: Iterator<Item = Result<SpoolMetadata>>;
-
-    fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a>;
-    fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a>;
-    fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a>;
-    fn list(&self) -> Result<Self::ListIter>;
+/// All operations are asynchronous and return `Send` futures for generic
+/// Axum/Tokio callers. Implementations must keep blocking filesystem work off
+/// Tokio worker threads while preserving the sidecar durability protocol.
+pub trait MetadataStore: Sync {
+    fn write(&self, metadata: &SpoolMetadata) -> impl Future<Output = Result<()>> + Send;
+    fn read(&self, key: &str) -> impl Future<Output = Result<Option<SpoolMetadata>>> + Send;
+    fn delete(&self, key: &str) -> impl Future<Output = Result<()>> + Send;
+    fn list(&self) -> impl Future<Output = Result<Vec<(String, Result<SpoolMetadata>)>>> + Send;
 }
 
 /// Synchronous sidecar metadata backend selected for fallback benchmarking and
@@ -49,6 +35,8 @@ pub trait MetadataStore {
 pub struct SyncSidecarMetadataStore {
     data_dir: PathBuf,
     sync_directory: fn(&Path) -> io::Result<()>,
+    #[cfg(test)]
+    operation_hook: Option<fn()>,
 }
 
 impl Default for SyncSidecarMetadataStore {
@@ -62,6 +50,8 @@ impl SyncSidecarMetadataStore {
         Self {
             data_dir: data_dir.into(),
             sync_directory,
+            #[cfg(test)]
+            operation_hook: None,
         }
     }
 
@@ -74,6 +64,16 @@ impl SyncSidecarMetadataStore {
         Self {
             data_dir: data_dir.into(),
             sync_directory: |_| Err(io::Error::other("injected directory fsync failure")),
+            operation_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_operation_hook(data_dir: impl Into<PathBuf>, operation_hook: fn()) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            sync_directory,
+            operation_hook: Some(operation_hook),
         }
     }
 
@@ -89,7 +89,18 @@ impl SyncSidecarMetadataStore {
         self.spool_dir(key).join(TMP_FILE)
     }
 
+    #[cfg(test)]
+    fn invoke_operation_hook(&self) {
+        if let Some(hook) = self.operation_hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn invoke_operation_hook(&self) {}
+
     fn write_sync(&self, metadata: &SpoolMetadata) -> Result<()> {
+        self.invoke_operation_hook();
         let spool_dir = self.spool_dir(&metadata.key);
         fs::create_dir_all(&spool_dir).map_err(storage_error)?;
 
@@ -110,6 +121,7 @@ impl SyncSidecarMetadataStore {
     }
 
     fn read_sync(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+        self.invoke_operation_hook();
         match fs::read(self.meta_path(key)) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
@@ -120,6 +132,7 @@ impl SyncSidecarMetadataStore {
     }
 
     fn delete_sync(&self, key: &str) -> Result<()> {
+        self.invoke_operation_hook();
         let meta_path = self.meta_path(key);
         let tmp_path = self.tmp_path(key);
         let mut removed_any = false;
@@ -136,32 +149,12 @@ impl SyncSidecarMetadataStore {
 
         Ok(())
     }
-}
 
-impl MetadataStore for SyncSidecarMetadataStore {
-    type WriteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ReadFuture<'a> = BoxMetadataFuture<'a, Option<SpoolMetadata>>;
-    type DeleteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
-
-    fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
-        Box::pin(async move { self.write_sync(metadata) })
-    }
-
-    fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
-        Box::pin(async move { self.read_sync(key) })
-    }
-
-    fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
-        Box::pin(async move { self.delete_sync(key) })
-    }
-
-    fn list(&self) -> Result<Self::ListIter> {
+    fn list_sync(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+        self.invoke_operation_hook();
         let entries = match fs::read_dir(&self.data_dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(Vec::new().into_iter())
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(storage_error(error)),
         };
 
@@ -173,19 +166,56 @@ impl MetadataStore for SyncSidecarMetadataStore {
                 continue;
             }
 
+            let key = entry.file_name().to_string_lossy().to_string();
             let meta_path = entry.path().join(META_FILE);
             match fs::read(meta_path) {
-                Ok(bytes) => metadata.push(
+                Ok(bytes) => metadata.push((
+                    key,
                     serde_json::from_slice(&bytes)
                         .map_err(|error| BobsError::SerializationError(error.to_string())),
-                ),
+                )),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => metadata.push(Err(storage_error(error))),
+                Err(error) => metadata.push((key, Err(storage_error(error)))),
             }
         }
 
-        Ok(metadata.into_iter())
+        Ok(metadata)
     }
+}
+
+impl MetadataStore for SyncSidecarMetadataStore {
+    async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+        let store = self.clone();
+        let metadata = metadata.clone();
+        run_blocking(move || store.write_sync(&metadata)).await
+    }
+
+    async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+        let store = self.clone();
+        let key = key.to_owned();
+        run_blocking(move || store.read_sync(&key)).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let store = self.clone();
+        let key = key.to_owned();
+        run_blocking(move || store.delete_sync(&key)).await
+    }
+
+    async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+        let store = self.clone();
+        run_blocking(move || store.list_sync()).await
+    }
+}
+
+async fn run_blocking<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    task::spawn_blocking(operation)
+        .await
+        .map_err(|error| BobsError::StorageError(Box::new(error)))?
 }
 
 fn remove_file_if_present(path: &Path) -> Result<bool> {
@@ -378,6 +408,7 @@ mod tests {
             last_write_at: 20 + generation,
             last_read_at: None,
             readable_at: Some(30 + generation),
+            page_size: 4096,
             total_bytes_written: generation * 4096,
             total_pages: generation,
             final_page_size: if generation == 0 { None } else { Some(4096) },
@@ -403,13 +434,17 @@ mod tests {
             &meta,
         );
 
-        let listed = store
+        let listed: Vec<_> = store
             .list()
+            .await
             .expect("list metadata")
-            .collect::<Result<Vec<_>>>()
-            .expect("listed metadata parses");
+            .into_iter()
+            .map(|(key, metadata)| (key, metadata.expect("listed metadata parses")))
+            .collect();
         assert_eq!(listed.len(), 1);
-        assert_metadata_eq(listed.into_iter().next().expect("listed metadata"), &meta);
+        let (key, listed_metadata) = listed.into_iter().next().expect("listed metadata");
+        assert_eq!(key, meta.key);
+        assert_metadata_eq(listed_metadata, &meta);
 
         store.delete(&meta.key).await.expect("delete metadata");
         assert!(store
@@ -417,7 +452,7 @@ mod tests {
             .await
             .expect("read after delete")
             .is_none());
-        assert!(store.list().expect("list after delete").next().is_none());
+        assert!(store.list().await.expect("list after delete").is_empty());
     }
 
     #[tokio::test]
@@ -486,10 +521,15 @@ mod tests {
             store.read(&meta.key).await,
             Err(BobsError::SerializationError(_))
         ));
-        assert!(matches!(
-            store.list().expect("start list").next(),
-            Some(Err(BobsError::SerializationError(_)))
-        ));
+        let (key, result) = store
+            .list()
+            .await
+            .expect("start list")
+            .into_iter()
+            .next()
+            .expect("entry");
+        assert_eq!(key, meta.key);
+        assert!(matches!(result, Err(BobsError::SerializationError(_))));
     }
 
     #[tokio::test]
@@ -502,6 +542,66 @@ mod tests {
             store.write(&meta).await,
             Err(BobsError::StorageError(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn sync_store_operations_leave_tokio_worker_thread() {
+        use std::sync::OnceLock;
+        use std::thread::{self, ThreadId};
+
+        static ASYNC_WORKER_THREAD: OnceLock<ThreadId> = OnceLock::new();
+
+        fn assert_on_blocking_thread() {
+            assert_ne!(
+                thread::current().id(),
+                *ASYNC_WORKER_THREAD
+                    .get()
+                    .expect("async worker thread recorded"),
+                "blocking metadata operation ran on the Tokio worker thread"
+            );
+        }
+
+        ASYNC_WORKER_THREAD
+            .set(thread::current().id())
+            .expect("worker thread is recorded once");
+        let dir = tempdir().expect("create tempdir");
+        let store =
+            SyncSidecarMetadataStore::with_operation_hook(dir.path(), assert_on_blocking_thread);
+        let meta = metadata_with_generation(1);
+
+        store.write(&meta).await.expect("write metadata");
+        store.read(&meta.key).await.expect("read metadata");
+        store.list().await.expect("list metadata");
+        store.delete(&meta.key).await.expect("delete metadata");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_store_blocking_work_does_not_stall_worker_progress() {
+        use std::time::{Duration, Instant};
+
+        fn slow_blocking_operation() {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
+        let dir = tempdir().expect("create tempdir");
+        let store =
+            SyncSidecarMetadataStore::with_operation_hook(dir.path(), slow_blocking_operation);
+        let meta = metadata_with_generation(1);
+        let started = Instant::now();
+
+        let (heartbeat_elapsed, write_result) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                started.elapsed()
+            },
+            store.write(&meta),
+        );
+
+        write_result.expect("write metadata");
+        assert!(
+            heartbeat_elapsed < Duration::from_millis(150),
+            "Tokio worker heartbeat was delayed by blocking metadata I/O: {heartbeat_elapsed:?}"
+        );
     }
 
     #[test]

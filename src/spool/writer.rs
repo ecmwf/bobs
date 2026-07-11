@@ -20,6 +20,7 @@ where
     /// published to the cache from the owned input bytes where possible; the write
     /// buffer is only used to assemble pages that span multiple write calls.
     pub async fn write(&self, offset: u64, data: Bytes) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let mut buf = self.write_buffer.lock().await;
 
         {
@@ -153,6 +154,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
