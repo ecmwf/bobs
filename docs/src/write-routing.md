@@ -12,7 +12,7 @@ BOBS supports horizontal scaling of writes across a StatefulSet. Each pod owns t
 
 ## Key Format
 
-A valid `X-Polytope-Job-Id` header is used as the spool key. Valid request IDs are 26-character, lower-case Crockford base32 strings. If the header is absent or invalid, BOBS generates an opaque UUIDv4 key, for example:
+A valid `X-Polytope-Job-Id` header is used as the spool key. Valid request IDs are 26-character Crockford base32 strings in either case; uppercase input is accepted and normalized to the lowercase canonical key. If the header is absent or invalid, BOBS generates an opaque UUIDv4 key, for example:
 
 ```
 550e8400-e29b-41d4-a716-446655440000

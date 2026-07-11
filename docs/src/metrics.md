@@ -68,7 +68,7 @@ scrape_configs:
 - `reason`: deletion reason — `client`, `idle_ttl`, `full_read_ttl`, `writer_timeout`.
 - `mode`: read mode — `follow` (stream until completion), `range` (bounded HTTP range read).
 - `outcome`: read outcome — `success`, `error`, `timeout`, `client_gone`.
-- `state`: active spool state — `writing`, `write_locked`, `complete`, `readable`.
+- `state`: active spool state — `writing`, `write_locked`, `complete`.
 
 ## Metrics reference
 

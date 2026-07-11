@@ -58,7 +58,7 @@ Follow this lifecycle to create, write, read, and delete a spool.
 
 ### 1. Create a spool
 
-Without a valid `X-Polytope-Job-Id` header, the service generates a UUIDv4 key for the new spool. A valid header—a 26-character, lower-case Crockford base32 request ID—is instead used as the key.
+Without a valid `X-Polytope-Job-Id` header, the service generates a UUIDv4 key for the new spool. A valid header is a 26-character Crockford base32 request ID in either case; uppercase input is accepted and the returned canonical key is normalized to lowercase.
 
 ```bash
 curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "application/octet-stream"}'
@@ -96,6 +96,8 @@ Both `bytes=X-Y` and `bytes=X-` are bounded reads (`206 Partial Content`). An op
 ```bash
 curl http://localhost:3000/api/v1/read/unique-spool-key
 ```
+
+If a follow read waits `long_poll_timeout_ms` before its first page, BOBS returns a `307 Temporary Redirect` for clients such as `curl -L` to retry. If that timeout occurs after bytes have started streaming, BOBS aborts the transfer with a response-body error rather than treating it as a successful end of stream.
 
 ### 5. Parallel reads
 

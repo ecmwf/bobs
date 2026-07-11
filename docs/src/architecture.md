@@ -31,7 +31,7 @@ Future Linux optimizations that are intentionally not implemented yet include `I
 
 ### Data Flow
 
-1. **Create**: BOBS uses a valid `X-Polytope-Job-Id` request ID as the key or generates a fallback UUIDv4, creates `<data_dir>/<key>/`, opens `<data_dir>/<key>/spool.dat`, and commits an initial `<data_dir>/<key>/meta.json` sidecar.
+1. **Create**: BOBS uses a valid `X-Polytope-Job-Id` request ID as the key or generates a fallback UUIDv4. Request IDs may use uppercase or lowercase Crockford base32; BOBS normalizes the canonical key to lowercase. It then creates `<data_dir>/<key>/`, opens `<data_dir>/<key>/spool.dat`, and commits an initial `<data_dir>/<key>/meta.json` sidecar.
 2. **Write**: Data arrives through `/api/v1/write/{key}/{offset}`. Accepted bytes are appended to `spool.dat` before the request returns; the data file is authoritative for in-progress bytes.
 3. **Page visibility**: Complete pages become reader-visible, enter the global FIFO cache when they fit, and notify parked readers.
 4. **Read**: `/api/v1/read/{key}` checks the page cache and then `spool.dat`. A trailing partial page remains hidden until it fills or completion finalizes it.
@@ -56,6 +56,10 @@ Completed metadata is durable through the sidecar protocol: write `meta.json.tmp
 ### Recovery and Shared Filesystems
 
 Startup recovery scans `<data_dir>` for key directories with `meta.json`. In-progress spools are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
+
+Current sidecars persist the spool's `page_size`, so a later configuration change cannot reinterpret existing page offsets. When a legacy sidecar has no page size, recovery derives it only when the recorded page layout and durable `spool.dat` length determine a safe stride. The upgraded sidecar is atomically committed before the spool is exposed or mutated. If the evidence is ambiguous or inconsistent, recovery leaves the sidecar and data intact and fails; it does not guess a stride or delete the quarantined spool.
+
+Recovery also recognizes the removed legacy `Readable` lifecycle state. It validates the durable file and page layout, reconstructs terminal byte/page metadata, changes the state to `Complete`, clears the obsolete write lock, and atomically persists that migration before serving the spool.
 
 The layout is friendly to shared filesystems and multi-BOBS deployments because each object has its own directory and sidecar, and each spool has a single writer. Independent keys can be created, completed, recovered, and deleted without a global metadata database or cross-key write serialization. Correct routing is still required: create, write, complete, and read traffic for a key must reach a BOBS instance that can see the same `<data_dir>/<key>` files.
 

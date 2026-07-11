@@ -40,7 +40,7 @@ Returns the health status and hostname of the instance.
 
 ### PUT /api/v1/create
 
-Creates a new spool. A valid `X-Polytope-Job-Id` header—a 26-character, lower-case Crockford base32 request ID—is used as the key; otherwise BOBS generates a UUIDv4 key.
+Creates a new spool. A valid `X-Polytope-Job-Id` header is a 26-character Crockford base32 request ID in either case. Uppercase input is accepted and normalized to the lowercase canonical key; otherwise BOBS generates a UUIDv4 key.
 
 **Request Body**:
 
@@ -122,7 +122,7 @@ Range behavior:
 - `Range: bytes=X-`: bounded read from `X` through the bytes currently servable when the request is resolved (`206 Partial Content`); it does not wait for future writes.
 - `Range: bytes=-N`: suffix read of the final `N` bytes; requires a completed spool.
 
-In follow mode, BOBS streams pages as they become visible. If no first page arrives within `long_poll_timeout_ms`, BOBS may issue a `307 Temporary Redirect` to the same `/api/v1/read/{key}` URL for long-poll refresh. A timeout after streaming begins ends the response rather than redirecting it.
+In follow mode, BOBS streams pages as they become visible. If no first page arrives within `long_poll_timeout_ms`, BOBS may issue a `307 Temporary Redirect` to the same `/api/v1/read/{key}` URL for long-poll refresh. If the timeout occurs after bytes have started streaming, BOBS aborts the transfer with a response-body error rather than redirecting or returning a clean end of stream.
 
 **Response Headers**:
 

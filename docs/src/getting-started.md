@@ -40,7 +40,7 @@ export BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1
 
 ### 1. Create a Spool
 
-Initialize a new spool. The response contains `key`, `read_url`, and `write_url`. Without a valid 26-character, lower-case Crockford base32 `X-Polytope-Job-Id` header, `key` is a generated UUIDv4.
+Initialize a new spool. The response contains `key`, `read_url`, and `write_url`. A valid `X-Polytope-Job-Id` is a 26-character Crockford base32 value in either case; uppercase is accepted and normalized to the lowercase canonical `key`. Without one, `key` is a generated UUIDv4.
 
 ```bash
 curl -X PUT http://localhost:3000/api/v1/create \
@@ -91,7 +91,7 @@ curl -X POST http://localhost:3000/api/v1/complete/YOUR_KEY \
 curl -L http://localhost:3000/api/v1/read/YOUR_KEY
 ```
 
-*Note: The `-L` flag is important as BOBS uses 307 redirects for long-poll timeouts.*
+*Note: The `-L` flag is important because BOBS uses 307 redirects when a long-poll timeout occurs before the first page. A timeout after streaming has begun aborts the transfer with a response-body error.*
 
 **Range Request**: Once complete, or for pages already visible while writing, request specific bytes with the standard `Range` header. Both `bytes=X-Y` and open-ended `bytes=X-` requests are bounded and do not wait for future writes.
 

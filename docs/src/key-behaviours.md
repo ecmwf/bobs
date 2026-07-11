@@ -18,11 +18,11 @@ Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they al
 
 ### 2. Long-poll with Timeout
 
-When a follow-mode reader requests a page that has not been written yet, BOBS parks the request using a notification system. If no first page arrives within `long_poll_timeout_ms`, BOBS returns a `307 Temporary Redirect`; clients such as `curl -L` automatically follow it and resume the poll. A timeout after streaming begins ends that response instead of redirecting it.
+When a follow-mode reader requests a page that has not been written yet, BOBS parks the request using a notification system. If no first page arrives within `long_poll_timeout_ms`, BOBS returns a `307 Temporary Redirect`; clients such as `curl -L` automatically follow it and resume the poll. If the timeout occurs after bytes have started streaming, BOBS aborts the transfer with a response-body error instead of redirecting or returning a clean end of stream.
 
 ### 3. Follow Mode
 
-Only a read request without a `Range` header enters follow mode, starting at byte `0`. The server pushes new pages as they become available until the spool is finalized or a mid-stream long-poll timeout ends the response. `Range: bytes=X-` is an open-ended bounded read through the bytes currently servable when the request is resolved; it does not follow later writes.
+Only a read request without a `Range` header enters follow mode, starting at byte `0`. The server pushes new pages as they become available until the spool is finalized or a mid-stream long-poll timeout aborts the transfer with a body error. `Range: bytes=X-` is an open-ended bounded read through the bytes currently servable when the request is resolved; it does not follow later writes.
 
 ### 4. Write-locked Mode
 
@@ -49,6 +49,10 @@ This protocol keeps metadata off the write hot path while still making lifecycle
 ### 8. Recovery and Cleanup
 
 On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. For in-progress `Writing` and `WriteLocked` spools, `spool.dat` is authoritative for byte state. Any persisted `total_bytes_written`, `total_pages`, or `final_page_size` for those states is advisory only and recovery recomputes it from the file.
+
+Each current sidecar records its spool's `page_size`. For a legacy sidecar without that field, recovery derives a page stride only when the sidecar and durable file length make it unambiguous, then atomically persists the migration before exposing the spool. Unsafe or inconsistent cases are quarantined: BOBS leaves `meta.json` and `spool.dat` intact and fails recovery rather than guessing a stride or deleting the bytes.
+
+The removed legacy `Readable` state is migrated to `Complete`. Recovery validates the durable layout, reconstructs terminal byte/page metadata, clears the obsolete write lock, and atomically commits the migrated sidecar before serving it.
 
 A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 

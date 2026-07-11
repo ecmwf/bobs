@@ -14,7 +14,7 @@ BOBS is not long-term object storage. It has no replication layer, no authentica
 
 BOBS runs as a set of pods. Producers create and write through the internal API. Reader URLs can route through ingress to the pod/route that owns or can see the key.
 
-A create request uses a valid `X-Polytope-Job-Id` value as the spool key. Valid request IDs are 26-character, lower-case Crockford base32 strings; if the header is absent or invalid, BOBS allocates a UUIDv4 key instead. Keys do not include a host prefix. Routing information is carried in the returned URLs, not embedded in the key.
+A create request uses a valid `X-Polytope-Job-Id` value as the spool key. Valid request IDs are 26-character Crockford base32 strings in either case; BOBS accepts uppercase input and normalizes the canonical key to lowercase. If the header is absent or invalid, BOBS allocates a UUIDv4 key instead. Keys do not include a host prefix. Routing information is carried in the returned URLs, not embedded in the key.
 
 Correct routing remains important: create, write, complete, delete, and read traffic for a key must reach a BOBS instance that can access the key's directory under `data_dir`.
 
@@ -83,7 +83,7 @@ Only a request without `Range` enters follow mode, starting at byte 0. If the ne
 
 `Range: bytes=X-Y` and `Range: bytes=X-` are bounded requests and return `206 Partial Content`. An open-ended range snapshots its upper bound from the bytes currently servable when the request is resolved, so it does not wait for future writes. For an in-progress spool, a trailing partial page is not servable. Suffix ranges (`bytes=-N`) require a completed spool.
 
-If the follow-mode timeout fires before the first page is available, BOBS returns `307 Temporary Redirect` to a read URL for the same key. If a trusted ingress supplies a valid `X-Forwarded-Prefix`, the redirect preserves that external prefix; otherwise it falls back to `/api/v1/read/{key}`. The redirect includes `Cache-Control: no-store` because the location can depend on request headers. A timeout after streaming has begun ends that response rather than redirecting it.
+If the follow-mode timeout fires before the first page is available, BOBS returns `307 Temporary Redirect` to a read URL for the same key. If a trusted ingress supplies a valid `X-Forwarded-Prefix`, the redirect preserves that external prefix; otherwise it falls back to `/api/v1/read/{key}`. The redirect includes `Cache-Control: no-store` because the location can depend on request headers. A timeout after streaming has begun aborts the transfer with a response-body error rather than redirecting or reporting a clean end of stream.
 
 Range reads update aggregate read-coverage tracking so cleanup can detect when the whole object has been served, even across multiple range requests.
 
@@ -107,6 +107,8 @@ Startup recovery scans `data_dir` for spool directories with `meta.json` sidecar
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
 - Interrupted metadata temp files are ignored.
 - Unsafe or unrelated directories are not blindly removed. Orphan cleanup is restricted to recognised UUID or 26-character request-ID directories that contain BOBS spool markers.
+- Sidecars now persist each spool's `page_size`. For a legacy sidecar without it, recovery derives a stride only when the sidecar and durable file length determine one safely, then atomically commits the upgraded sidecar before exposing or mutating the spool. If the stride is ambiguous or inconsistent, recovery leaves both `meta.json` and `spool.dat` intact and fails rather than guessing or deleting the data.
+- The removed legacy `Readable` state is migrated to terminal `Complete`: recovery validates and reconstructs terminal byte/page metadata from `spool.dat`, clears the obsolete write lock, and atomically persists the migrated sidecar before serving it.
 
 ## Cleanup rules
 
