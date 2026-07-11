@@ -60,7 +60,7 @@ Accepted write bytes are appended to `spool.dat` before `/api/v1/write/{key}/{of
 
 ## Paging and cache
 
-The byte stream is divided into fixed-size pages (`page_size`, binary default 16777216 bytes / 16 MiB). The Helm chart currently overrides this with 4096-byte pages. `page_size` must be greater than `0`.
+The byte stream is divided into fixed-size pages (`page_size`, binary default 16777216 bytes / 16 MiB). The Helm chart overrides this with 4096-byte (4 KiB) pages. `page_size` must be greater than `0`.
 
 Write path:
 
@@ -89,7 +89,7 @@ Range reads update aggregate read-coverage tracking so cleanup can detect when t
 
 ## Write-locked spools
 
-A spool can be created with `write_locked: true`. In this state writes are accepted, but reads return `423 Locked` until `/api/v1/complete/{key}` succeeds. Completion makes the final object readable; there is no separate unlock or `Readable` lifecycle transition.
+A spool can be created with `write_locked: true`. In this state writes are accepted, but reads return `423 Locked` until `/api/v1/complete/{key}` succeeds. Completion makes the final object readable.
 
 The write-lock state is lifecycle metadata in `meta.json` and is recovered on restart.
 

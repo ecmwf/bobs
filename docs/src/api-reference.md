@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # HTTP API Reference
 
-BOBS exposes a RESTful API under `/api/v1`. Routes below are relative to that base path; examples show the full path.
+BOBS exposes its spool API under `/api/v1`; every spool route below shows the full path.
 
 ## Endpoints
 

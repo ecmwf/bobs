@@ -38,7 +38,23 @@ pub async fn read_exact_at<F: FileIO>(
     len: usize,
     context: &str,
 ) -> io::Result<Bytes> {
+    if len == 0 {
+        return Ok(Bytes::new());
+    }
+
+    let first = F::read_at(handle, offset, len).await?;
+    if first.len() == len {
+        return Ok(first);
+    }
+    if first.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("expected {len} bytes while {context}, got 0"),
+        ));
+    }
+
     let mut out = BytesMut::with_capacity(len);
+    out.extend_from_slice(&first);
 
     while out.len() < len {
         let read_offset = offset + out.len() as u64;

@@ -45,6 +45,8 @@ Required config fields:
 
 Operational constraints:
 
+- `HOSTNAME` must be set and include a pod ordinal such as `bobs-0`.
+- `BOBS_INTERNAL_BASE_URL_TEMPLATE` must be set and non-empty.
 - `page_size`, `max_live_spools`, `max_spool_bytes`, `create_admission_timeout_ms`, `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, `full_read_complete_ttl_secs`, `cleanup_sweep_interval_secs`, `long_poll_timeout_ms`, and `io_uring_queue_capacity` must be greater than `0`.
 - `io_uring_shards`, when set, must be greater than `0`; omitted shards resolve to `max(1, num_cpus / 4)`.
 - `cleanup_sweep_interval_secs` must not exceed any active cleanup timeout.

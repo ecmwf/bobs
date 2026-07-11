@@ -98,15 +98,22 @@ config:
   # and a lower-latency 4 KiB page / 1 MiB global cache. max_cache_bytes may be
   # smaller than page_size; 0 disables caching and oversized pages bypass the cache.
   data_dir: "/var/lib/bobs"
+  # The chart favours lower streaming latency than the Rust binary defaults:
+  # it overrides 16 MiB/256 MiB with 4 KiB/1 MiB. Pages larger than the cache
+  # bypass it, so max_cache_bytes does not need to be >= page_size.
   page_size: 4096
   max_cache_bytes: 1048576
-  # Admission limit: max spools concurrently holding an in-memory page cache
-  # (created but not yet fully read). create blocks until a slot frees, applying
-  # backpressure to writers instead of growing memory without bound.
-  max_live_spools: 4096
-  # Linux io_uring tuning. Omitting these keys uses the binary defaults: shards
-  # resolve to max(1, num_cpus / 4), and queue capacity is 1024 per shard.
-  # Configured values must be greater than 0. Fallback builds ignore both fields.
+  # Explicit chart admission limit matching max_cache_bytes / page_size.
+  # Operators can still override this independently for their workload.
+  max_live_spools: 256
+  # Per-spool write limit. 8 GiB leaves headroom on the default 10 GiB PVC.
+  max_spool_bytes: 8589934592
+  # Bound create admission waits; exhausted capacity returns HTTP 503.
+  create_admission_timeout_ms: 5000
+  # Exposes an unauthenticated, CPU-intensive profiler on the main listener.
+  enable_pprof: false
+  # io_uring tuning. When unset, BOBS auto-resolves shards = (num_cpus/4).max(1)
+  # and a queue capacity of 1024. Override for higher per-volume write parallelism.
   # io_uring_shards: 8
   # io_uring_queue_capacity: 4096
   writer_inactivity_timeout_secs: 300

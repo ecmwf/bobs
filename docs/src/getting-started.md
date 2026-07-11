@@ -58,7 +58,7 @@ A successful response includes every URL needed for subsequent traffic:
 }
 ```
 
-**Write-Locked Mode**: To prevent reads until `/api/v1/complete/{key}` succeeds, set `write_locked` to `true`. There is no separate unlock operation.
+**Write-Locked Mode**: To prevent reads until `/api/v1/complete/{key}` succeeds, set `write_locked` to `true`.
 
 ```bash
 curl -X PUT http://localhost:3000/api/v1/create \

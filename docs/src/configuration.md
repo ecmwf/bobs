@@ -26,14 +26,16 @@ cargo build --release --bins --features tokio-fileio-fallback
 
 ## Fields
 
-| Field | Binary default | Description |
+The table distinguishes Rust defaults from chart overrides where they differ.
+
+| Field | Default | Description |
 | ------- | --------- | ------------- |
 | `host` | `0.0.0.0` | Address for the HTTP server to bind to. |
 | `port` | `3000` | Port for the HTTP server to listen on. |
-| `data_dir` | `./data` | File system path for storing spool files. |
-| `page_size` | `16777216` (16 MiB) | Size of internal data pages. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. Must be greater than `0`. |
-| `max_cache_bytes` | `268435456` (256 MiB) | Global FIFO page-cache budget. `0` disables caching; a page larger than the cap bypasses the cache. |
-| `max_live_spools` | derived as `max(1, max_cache_bytes / page_size)` (`16` with binary defaults) | Admission limit for spools not yet fully read. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. |
+| `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. |
+| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. Must be greater than `0`. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO page-cache budget. `0` disables caching; a page larger than the cap bypasses the cache. |
+| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools not yet fully read. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests. Must be greater than `0`. |
 | `create_admission_timeout_ms` | `5000` | Maximum time `/api/v1/create` waits for a `max_live_spools` slot before returning `503 Service Unavailable`. Must be greater than `0`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup timeout for an unfinished spool whose writer has stopped sending data. Must be greater than `0`. |
@@ -115,7 +117,7 @@ Future optimizations not implemented in the current backend are `IORING_REGISTER
 
 ## Page size tuning
 
-The binary default `page_size` is `16777216` (16 MiB), paired with a `268435456`-byte (256 MiB) cache and a derived `max_live_spools` of 16. The Helm chart intentionally overrides these with a lower-latency profile of `page_size: 4096`, `max_cache_bytes: 1048576`, and explicit `max_live_spools: 256`. These are chart overrides, not Rust `Config::default()` values.
+The binary default `page_size` is `16777216` (16 MiB), paired with a `268435456`-byte (256 MiB) cache and a derived `max_live_spools` of 16. The Helm chart intentionally overrides these with `page_size: 4096`, `max_cache_bytes: 1048576`, and explicit `max_live_spools: 256`.
 
 Page size changes streaming behaviour:
 
@@ -123,6 +125,6 @@ Page size changes streaming behaviour:
 - larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless `max_cache_bytes` is increased;
 - benchmark representative object sizes and write chunk sizes before changing either deployment profile.
 
-`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching. A page larger than the cap bypasses the cache while disk-backed reads continue to work. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; set it explicitly when workflow concurrency should differ from cache page capacity. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
+`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching. A page larger than the cap bypasses the cache while disk-backed reads continue to work. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; explicit values remain unchanged. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
 
 See the standalone benchmark guide for page-size comparison commands.

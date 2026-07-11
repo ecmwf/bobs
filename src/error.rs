@@ -6,6 +6,15 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BobsError {
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("spool exceeds configured maximum of {max_bytes} bytes")]
+    SpoolTooLarge { max_bytes: u64 },
+
+    #[error("timed out waiting for create admission capacity")]
+    AdmissionTimeout,
+
     #[error("spool not found: {key}")]
     SpoolNotFound { key: String },
 
@@ -21,14 +30,14 @@ pub enum BobsError {
     #[error("size mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
 
-    #[error("writer is inactive")]
-    WriterInactive,
-
     #[error("invalid range header: {0}")]
     InvalidRange(String),
 
     #[error("range not satisfiable: {reason}")]
     RangeNotSatisfiable { total: Option<u64>, reason: String },
+
+    #[error("configuration error: {0}")]
+    ConfigurationError(String),
 
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),

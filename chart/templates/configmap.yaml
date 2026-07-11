@@ -8,7 +8,7 @@ metadata:
   name: '{{ include "bobs.fullname" . }}-config'
   labels:
     app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-    app.kubernetes.io/instance: '{{ .Release.Name }}'
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
 data:
   config.yaml: |
     host: {{ .Values.config.host | quote }}
@@ -17,6 +17,9 @@ data:
     page_size: {{ int .Values.config.page_size }}
     max_cache_bytes: {{ int .Values.config.max_cache_bytes }}
     max_live_spools: {{ int .Values.config.max_live_spools }}
+    max_spool_bytes: {{ int .Values.config.max_spool_bytes }}
+    create_admission_timeout_ms: {{ int .Values.config.create_admission_timeout_ms }}
+    enable_pprof: {{ .Values.config.enable_pprof }}
     {{- if .Values.config.io_uring_shards }}
     io_uring_shards: {{ int .Values.config.io_uring_shards }}
     {{- end }}
