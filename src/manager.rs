@@ -259,20 +259,28 @@ where
         job_id: Option<&str>,
     ) -> Result<()> {
         let result = self.delete_spool_inner(key).await;
+        let deletion_span = tracing::info_span!(
+            "bobs.spool.delete",
+            "request.id" = tracing::field::Empty,
+            "bobs.spool.key" = %key,
+            reason = reason.as_str(),
+            outcome = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
+        if let Some(job_id) = job_id {
+            deletion_span.record("request.id", job_id);
+        }
         match &result {
             Ok(()) => {
-                if let Some(job_id) = job_id {
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "request.id" = %job_id, reason = reason.as_str(), outcome = "success", "spool deleted");
-                } else {
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "success", "spool deleted");
-                }
+                deletion_span.record("outcome", "success");
+                let _entered = deletion_span.enter();
+                tracing::info!("event.name" = "bobs.spool.deleted", "spool deleted");
             }
             Err(error) => {
-                if let Some(job_id) = job_id {
-                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "request.id" = %job_id, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
-                } else {
-                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
-                }
+                deletion_span.record("outcome", "error");
+                deletion_span.record("error", tracing::field::display(error));
+                let _entered = deletion_span.enter();
+                tracing::error!("event.name" = "bobs.spool.deleted", "spool deletion failed");
             }
         }
         result

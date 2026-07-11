@@ -205,7 +205,7 @@ fn enforce_content_length(
     headers: &HeaderMap,
     offset: u64,
     max_spool_bytes: u64,
-) -> std::result::Result<(), ApiError> {
+) -> std::result::Result<(), BobsError> {
     let Some(value) = headers.get(axum::http::header::CONTENT_LENGTH) else {
         return Ok(());
     };
@@ -213,14 +213,14 @@ fn enforce_content_length(
         .to_str()
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| ApiError(BobsError::InvalidRequest("invalid Content-Length".into())))?;
+        .ok_or_else(|| BobsError::InvalidRequest("invalid Content-Length".into()))?;
     if offset
         .checked_add(length)
         .is_none_or(|total| total > max_spool_bytes)
     {
-        return Err(ApiError(BobsError::SpoolTooLarge {
+        return Err(BobsError::SpoolTooLarge {
             max_bytes: max_spool_bytes,
-        }));
+        });
     }
     Ok(())
 }
@@ -315,7 +315,6 @@ where
     let job_id = extract_job_id(&headers);
     let span = request_span(job_id.as_deref(), Some(&key), Some(offset), None);
     async move {
-        enforce_content_length(&headers, offset, state.config.max_spool_bytes)?;
         let spool = state
             .manager
             .get_spool(&key)
@@ -329,6 +328,11 @@ where
         let mut write_offset = offset;
         let mut received_bytes = 0_u64;
         let write_result: std::result::Result<(), crate::error::BobsError> = async {
+            // Check a known size only after resolving the target spool so an
+            // oversized request follows the same durable cleanup path as a
+            // chunked body that crosses the limit. This still happens before
+            // polling the body.
+            enforce_content_length(&headers, offset, state.config.max_spool_bytes)?;
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
                 if let Ok(data) = frame.into_data() {
@@ -404,11 +408,12 @@ where
             write_elapsed,
         );
         if matches!(write_result, Err(BobsError::SpoolTooLarge { .. })) {
-            // A chunked body can cross the limit after full pages have already
-            // reached disk. Commit a durable deletion before reporting 413 so
-            // the partial object cannot reappear after restart and its admission
-            // slot is reusable. A cleanup failure is a server error, not a safe
-            // payload rejection.
+            // A known-length request can be rejected before polling its body,
+            // while a chunked body can cross the limit after full pages have
+            // reached disk. In either case, commit a durable deletion before
+            // reporting 413 so the object cannot reappear after restart and its
+            // admission slot is reusable. A cleanup failure is a server error,
+            // not a safe payload rejection.
             state
                 .manager
                 .delete_spool_with_reason(
@@ -1704,6 +1709,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_length_oversize_write_deletes_spool_without_reading_body() {
+        let (app, state) = app_with_config(|config| {
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let spool_dir = state.config.data_dir.join(&key);
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let body_stream = async_stream::stream! {
+            body_polled_in_stream.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .header(axum::http::header::CONTENT_LENGTH, "7")
+            .body(Body::from_stream(body_stream))
+            .expect("oversize request");
+
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("oversize response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(!spool_dir.exists());
+        assert!(
+            state
+                .manager
+                .metadata_store
+                .read(&key)
+                .await
+                .unwrap()
+                .is_none(),
+            "oversize cleanup must not leave recoverable metadata"
+        );
+
+        // max_live_spools=1: successful replacement proves the rejected
+        // spool's admission permit was released before the 413 response.
+        let replacement_key = create_key(&app).await;
+        assert_ne!(replacement_key, key);
+    }
+
+    #[tokio::test]
     async fn overflow_cleanup_serializes_with_concurrent_complete() {
         let (app, state) = app_with_config(|config| {
             config.page_size = 4;
@@ -1781,7 +1835,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overflow_cleanup_failure_returns_500_and_retains_tracked_state() {
+    async fn known_length_oversize_cleanup_serializes_with_concurrent_complete() {
+        let (app, state) = app_with_config(|config| {
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let spool_dir = state.config.data_dir.join(&key);
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let body_stream = async_stream::stream! {
+            body_polled_in_stream.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+        };
+        let write_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .header(axum::http::header::CONTENT_LENGTH, "7")
+            .body(Body::from_stream(body_stream))
+            .expect("oversize request");
+        let write_app = app.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(write_request)
+                .await
+                .expect("write response")
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let complete_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("complete request");
+        let complete_app = app.clone();
+        let complete_task = tokio::spawn(async move {
+            complete_app
+                .oneshot(complete_request)
+                .await
+                .expect("complete response")
+        });
+        drop(lifecycle_guard);
+
+        let write_response = write_task.await.expect("write task");
+        assert_eq!(write_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        let complete_status = complete_task.await.expect("complete task").status();
+        assert!(
+            matches!(complete_status, StatusCode::OK | StatusCode::NOT_FOUND),
+            "unexpected completion status: {complete_status}"
+        );
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(!spool_dir.exists());
+        assert!(
+            state
+                .manager
+                .metadata_store
+                .read(&key)
+                .await
+                .unwrap()
+                .is_none(),
+            "oversize cleanup must not leave recoverable metadata"
+        );
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn known_length_oversize_cleanup_failure_returns_500_and_retains_tracked_state() {
         let (app, state) = app_with_config(|config| {
             config.page_size = 4;
             config.max_spool_bytes = 6;
@@ -1807,12 +1932,16 @@ mod tests {
             .await
             .expect("replace metadata with directory");
 
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
         let overflow_body = async_stream::stream! {
+            body_polled_in_stream.store(true, Ordering::SeqCst);
             yield Ok::<_, std::io::Error>(Bytes::from_static(b"567"));
         };
         let overflow_request = Request::builder()
             .method("POST")
             .uri(format!("/api/v1/write/{key}/4"))
+            .header(axum::http::header::CONTENT_LENGTH, "3")
             .body(Body::from_stream(overflow_body))
             .expect("overflow request");
         let response = app
@@ -1821,6 +1950,7 @@ mod tests {
             .expect("overflow response");
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body_polled.load(Ordering::SeqCst));
         let spool = state
             .manager
             .get_spool(&key)
@@ -1907,16 +2037,22 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE
         );
 
+        assert!(state.manager.get_spool(&key).is_none());
+
+        let replacement_key = create_key(&app).await;
         let small_write = Request::builder()
             .method("POST")
-            .uri(format!("/api/v1/write/{key}/0"))
+            .uri(format!("/api/v1/write/{replacement_key}/0"))
             .body(Body::from("tiny"))
             .expect("small write request");
         assert_eq!(
             app.oneshot(small_write).await.unwrap().status(),
             StatusCode::OK
         );
-        let spool = state.manager.get_spool(&key).expect("spool remains");
+        let spool = state
+            .manager
+            .get_spool(&replacement_key)
+            .expect("replacement spool remains");
         assert_eq!(spool.write_buffer.lock().await.as_ref(), b"tiny");
         assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
     }
