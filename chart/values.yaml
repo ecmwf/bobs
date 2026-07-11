@@ -98,10 +98,15 @@ config:
   # larger pages amortise fsync cost over more data. max_cache_bytes must be >= page_size.
   page_size: 4096
   max_cache_bytes: 1048576
-  # Admission limit: max spools concurrently holding an in-memory page cache
-  # (created but not yet fully read). create blocks until a slot frees, applying
-  # backpressure to writers instead of growing memory without bound.
+  # Admission limit for not-yet-fully-read spools. This bounds workflow fan-out
+  # independently of the global byte-bounded cache.
   max_live_spools: 4096
+  # Per-spool write limit. 8 GiB leaves headroom on the default 10 GiB PVC.
+  max_spool_bytes: 8589934592
+  # Bound create admission waits; exhausted capacity returns HTTP 503.
+  create_admission_timeout_ms: 5000
+  # Exposes an unauthenticated, CPU-intensive profiler on the main listener.
+  enable_pprof: false
   # io_uring tuning. When unset, BOBS auto-resolves shards = (num_cpus/4).max(1)
   # and a queue capacity of 1024. Override for higher per-volume write parallelism.
   # io_uring_shards: 8

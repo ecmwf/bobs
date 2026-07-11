@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+const DEFAULT_PAGE_SIZE: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
+// Keep the established workload admission ceiling. This is not a cache-entry
+// count: the independently byte-bounded global cache evicts pages as needed.
+const DEFAULT_MAX_LIVE_SPOOLS: usize = 4096;
+// The chart's default PVC is 10 GiB; reserve 20% for sidecars and headroom.
+const DEFAULT_MAX_SPOOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -14,10 +22,17 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub page_size: usize,
     pub max_cache_bytes: usize,
-    /// Maximum number of spools that may concurrently hold first-read cache memory.
-    /// Writers block on create until a slot frees.
+    /// Maximum number of spools admitted before their first complete read.
+    /// This bounds workflow fan-out independently of the byte-bounded global cache;
+    /// explicit overrides are preserved for workloads with different concurrency.
     pub max_live_spools: usize,
+    /// Maximum bytes accepted for one spool across all write requests.
+    pub max_spool_bytes: u64,
+    /// Maximum time create waits for a live-spool admission slot.
+    pub create_admission_timeout_ms: u64,
     pub writer_inactivity_timeout_secs: u64,
+    /// Expose the CPU profiler on the main HTTP listener. Disabled by default.
+    pub enable_pprof: bool,
     /// Idle TTL (seconds) anchored on the time the spool became readable,
     /// refreshed whenever bytes are actually served. Default: 600.
     pub read_idle_ttl_secs: u64,
@@ -75,15 +90,16 @@ impl Default for Config {
             host: "0.0.0.0".to_string(),
             port: 3000,
             data_dir: PathBuf::from("./data"),
-            // 16 MiB pages. BOBS fsyncs a metadata commit once per page on
-            // write, so a small page (the old 4 KiB) capped writes at ~1.2 MB/s
-            // (one fsync per 4 KiB to the PVC). 16 MiB amortises the fsync over
-            // 4096x more data. Keep the cache comfortably above one page:
-            // 256 MiB holds 16 default-size pages.
-            page_size: 16 * 1024 * 1024,
-            max_cache_bytes: 256 * 1024 * 1024,
-            max_live_spools: 4096,
+            // 16 MiB pages amortise metadata persistence. The global 256 MiB
+            // page cache remains byte-bounded independently of the established
+            // 4096-spool workflow admission ceiling.
+            page_size: DEFAULT_PAGE_SIZE,
+            max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
+            max_live_spools: DEFAULT_MAX_LIVE_SPOOLS,
+            max_spool_bytes: DEFAULT_MAX_SPOOL_BYTES,
+            create_admission_timeout_ms: 5000,
             writer_inactivity_timeout_secs: 300,
+            enable_pprof: false,
             read_idle_ttl_secs: 600,
             full_read_complete_ttl_secs: 30,
             reader_done_ttl_secs: 60,
@@ -119,6 +135,27 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "max_live_spools must be greater than 0",
+            ));
+        }
+
+        if self.max_spool_bytes == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_spool_bytes must be greater than 0",
+            ));
+        }
+
+        if self.create_admission_timeout_ms == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "create_admission_timeout_ms must be greater than 0",
+            ));
+        }
+
+        if self.writer_inactivity_timeout_secs == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "writer_inactivity_timeout_secs must be greater than 0",
             ));
         }
 
@@ -161,6 +198,20 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "full_read_complete_ttl_secs must be greater than 0",
+            ));
+        }
+
+        // Cleanup policies are only meaningful when every configured deadline is
+        // sampled at least once per interval. A longer sweep would make the stated
+        // timeout impossible to honour within one additional configured window.
+        let shortest_cleanup_deadline = self
+            .writer_inactivity_timeout_secs
+            .min(self.read_idle_ttl_secs)
+            .min(self.full_read_complete_ttl_secs);
+        if self.cleanup_sweep_interval_secs > shortest_cleanup_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cleanup_sweep_interval_secs must not exceed any active cleanup timeout",
             ));
         }
 
@@ -220,10 +271,13 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3000);
         assert_eq!(config.data_dir, PathBuf::from("./data"));
-        assert_eq!(config.page_size, 16 * 1024 * 1024);
-        assert_eq!(config.max_cache_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(config.max_cache_bytes, DEFAULT_MAX_CACHE_BYTES);
         assert_eq!(config.max_live_spools, 4096);
+        assert_eq!(config.max_spool_bytes, DEFAULT_MAX_SPOOL_BYTES);
+        assert_eq!(config.create_admission_timeout_ms, 5000);
         assert_eq!(config.writer_inactivity_timeout_secs, 300);
+        assert!(!config.enable_pprof);
         assert_eq!(config.read_idle_ttl_secs, 600);
         assert_eq!(config.full_read_complete_ttl_secs, 30);
         assert_eq!(config.reader_done_ttl_secs, 60);
@@ -246,6 +300,9 @@ data_dir: /tmp/yaml-data
 page_size: 8192
 max_cache_bytes: 131072
 max_live_spools: 123
+max_spool_bytes: 987654321
+create_admission_timeout_ms: 777
+enable_pprof: true
 writer_inactivity_timeout_secs: 11
 read_idle_ttl_secs: 120
 full_read_complete_ttl_secs: 15
@@ -269,6 +326,9 @@ route_name: test-route
         assert_eq!(cfg.page_size, 8192);
         assert_eq!(cfg.max_cache_bytes, 131072);
         assert_eq!(cfg.max_live_spools, 123);
+        assert_eq!(cfg.max_spool_bytes, 987654321);
+        assert_eq!(cfg.create_admission_timeout_ms, 777);
+        assert!(cfg.enable_pprof);
         assert_eq!(cfg.writer_inactivity_timeout_secs, 11);
         assert_eq!(cfg.read_idle_ttl_secs, 120);
         assert_eq!(cfg.full_read_complete_ttl_secs, 15);
@@ -360,6 +420,29 @@ route_name: test-route
     }
 
     #[test]
+    fn test_validate_rejects_zero_http_resource_limits() {
+        for config in [
+            Config {
+                max_spool_bytes: 0,
+                host_prefix: "test".into(),
+                domain: "example.com".into(),
+                route_name: "bobs".into(),
+                ..Config::default()
+            },
+            Config {
+                create_admission_timeout_ms: 0,
+                host_prefix: "test".into(),
+                domain: "example.com".into(),
+                route_name: "bobs".into(),
+                ..Config::default()
+            },
+        ] {
+            let err = config.validate().expect_err("validation should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
     fn test_validate_rejects_missing_routing_fields() {
         let config = Config::default();
         let err = config.validate().expect_err("validation should fail");
@@ -404,6 +487,37 @@ route_name: test-route
 
         let err = config.validate().expect_err("validation should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_writer_inactivity_timeout() {
+        let config = Config {
+            writer_inactivity_timeout_secs: 0,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("writer_inactivity_timeout_secs"));
+    }
+
+    #[test]
+    fn test_validate_rejects_cleanup_sweep_longer_than_a_cleanup_deadline() {
+        let config = Config {
+            cleanup_sweep_interval_secs: 31,
+            full_read_complete_ttl_secs: 30,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("cleanup_sweep_interval_secs"));
     }
 
     #[test]
@@ -521,7 +635,7 @@ route_name: z
         assert_eq!(cfg.page_size, 8192);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 3000);
-        assert_eq!(cfg.max_cache_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.max_cache_bytes, DEFAULT_MAX_CACHE_BYTES);
         assert_eq!(cfg.max_live_spools, 4096);
         assert_eq!(cfg.io_uring_shards, None);
         assert_eq!(cfg.io_uring_queue_capacity, 1024);

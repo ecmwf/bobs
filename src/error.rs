@@ -6,6 +6,15 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BobsError {
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("spool exceeds configured maximum of {max_bytes} bytes")]
+    SpoolTooLarge { max_bytes: u64 },
+
+    #[error("timed out waiting for create admission capacity")]
+    AdmissionTimeout,
+
     #[error("spool not found: {key}")]
     SpoolNotFound { key: String },
 

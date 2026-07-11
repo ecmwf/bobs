@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::{Mutex, Semaphore};
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteReason {
@@ -120,7 +120,52 @@ where
             .acquire_owned()
             .await
             .map_err(|_| BobsError::IoError(std::io::Error::other("admission semaphore closed")))?;
+        self.create_spool_with_permit(
+            permit,
+            key,
+            content_type,
+            content_encoding,
+            write_locked,
+            labels,
+        )
+        .await
+    }
 
+    /// Create a spool after waiting at most `timeout` for admission capacity.
+    /// The timeout covers only semaphore admission, not filesystem persistence.
+    pub async fn create_spool_with_admission_timeout(
+        &self,
+        timeout: Duration,
+        key: String,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        write_locked: bool,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
+        let permit = tokio::time::timeout(timeout, Arc::clone(&self.admission).acquire_owned())
+            .await
+            .map_err(|_| BobsError::AdmissionTimeout)?
+            .map_err(|_| BobsError::IoError(std::io::Error::other("admission semaphore closed")))?;
+        self.create_spool_with_permit(
+            permit,
+            key,
+            content_type,
+            content_encoding,
+            write_locked,
+            labels,
+        )
+        .await
+    }
+
+    async fn create_spool_with_permit(
+        &self,
+        permit: OwnedSemaphorePermit,
+        key: String,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        write_locked: bool,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
         let spool_dir = self.data_dir.join(&key);
         let data_path = spool_dir.join("spool.dat");
 
@@ -166,9 +211,8 @@ where
             )
             .await,
         );
-        self.spools.insert(key.clone(), spool);
+        self.spools.insert(key, spool);
 
-        // Record initial state for the active spool gauge.
         let initial_state = if write_locked {
             crate::metrics::state::WRITE_LOCKED
         } else {
@@ -551,13 +595,13 @@ pub(crate) fn is_recognised_spool_key(name: &str) -> bool {
     uuid::Uuid::parse_str(name).is_ok() || is_request_id_key(name)
 }
 
-/// True for a 26-character lower-case Crockford base32 request ID (the format
-/// BITS mints and clients quote). Crockford base32 excludes i, l, o and u.
+/// True for a 26-character Crockford base32 request ID. Validation is
+/// case-insensitive; HTTP callers are canonicalized to lower case before use.
 pub(crate) fn is_request_id_key(name: &str) -> bool {
     name.len() == 26
         && name.bytes().all(|b| {
             matches!(
-                b,
+                b.to_ascii_lowercase(),
                 b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z'
             )
         })
@@ -604,11 +648,11 @@ mod tests {
         assert!(is_recognised_spool_key(&uuid::Uuid::new_v4().to_string()));
         assert!(is_recognised_spool_key("0123456789abcdefghjkmnpqrs"));
         assert!(is_request_id_key("0123456789abcdefghjkmnpqrs"));
+        assert!(is_request_id_key("0123456789ABCDEFGHJKMNPQRS"));
         // Junk directory names are not recognised (orphan sweep leaves them).
         assert!(!is_recognised_spool_key("not-a-key"));
         assert!(!is_request_id_key("0123456789abcdefghjkmnpqr")); // 25 chars
         assert!(!is_request_id_key("0123456789abcdefghijklmnop")); // i, l, o excluded
-        assert!(!is_request_id_key("0123456789ABCDEFGHJKMNPQRS")); // upper-case excluded
     }
 
     async fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {

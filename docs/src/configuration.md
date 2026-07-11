@@ -31,18 +31,22 @@ cargo build --release --bins --features tokio-fileio-fallback
 ## Fields
 
 | Field | Default | Description |
-|-------|---------|-------------|
+| ------- | --------- | ------------- |
 | `host` | `0.0.0.0` | Address for the HTTP server to bind to. |
 | `port` | `3000` | Port for the HTTP server to listen on. |
 | `data_dir` | `./data` | File system path for storing spool files. |
 | `page_size` | `4096` | Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. |
 | `max_cache_bytes` | `1048576` | Global byte budget for the in-memory page cache across all spools. Set to `0` to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk. |
+| `max_live_spools` | `4096` | Admission limit for spools not yet fully read. This bounds workflow fan-out independently of the byte-bounded global cache; explicit overrides are preserved. |
+| `max_spool_bytes` | `8589934592` | Maximum bytes accepted for one spool across write requests. The default leaves headroom on the chart's default 10 GiB volume. |
+| `create_admission_timeout_ms` | `5000` | Maximum time `/create` waits for a `max_live_spools` admission slot before returning `503 Service Unavailable`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
+| `enable_pprof` | `false` | Expose `/debug/pprof/profile` on the main listener. Keep disabled except during controlled profiling because profiling consumes CPU and the endpoint is unauthenticated. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. |
 | `full_read_complete_ttl_secs` | `30` | Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served. |
 | `reader_done_ttl_secs` | `60` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
-| `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. |
+| `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. Must not exceed `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, or `full_read_complete_ttl_secs`. |
 | `long_poll_timeout_ms` | `25000` | Maximum time in ms to wait for new data during a read before redirecting. |
 | `io_uring_shards` | unset | Linux default-backend ring-pool shard count. Leave unset to resolve to `max(1, num_cpus / 4)`. Keys are mapped to shards with stable hashing. Must be greater than `0` when set. Ignored by fallback builds. |
 | `host_prefix` | `""` | External download host prefix used when generating read URLs. |
@@ -62,7 +66,11 @@ port: 3000
 data_dir: /data/bobs
 page_size: 4096
 max_cache_bytes: 1048576          # global page-cache byte budget; set to 0 to disable caching
+max_live_spools: 4096             # workflow admission cap; independent of cache page capacity
+max_spool_bytes: 8589934592       # 8 GiB per spool
+create_admission_timeout_ms: 5000 # return 503 rather than waiting indefinitely
 writer_inactivity_timeout_secs: 300
+enable_pprof: false               # only enable for controlled, trusted profiling
 read_idle_ttl_secs: 600
 full_read_complete_ttl_secs: 30
 reader_done_ttl_secs: 60      # deprecated compatibility field

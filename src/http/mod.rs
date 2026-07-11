@@ -29,7 +29,8 @@ const JOB_ID_HEADER: &str = "X-Polytope-Job-Id";
 
 fn extract_job_id(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(JOB_ID_HEADER)?.to_str().ok()?;
-    crate::manager::is_request_id_key(value).then(|| value.to_string())
+    let canonical = value.to_ascii_lowercase();
+    crate::manager::is_request_id_key(&canonical).then_some(canonical)
 }
 
 fn request_span(
@@ -38,120 +39,26 @@ fn request_span(
     offset: Option<u64>,
     range: Option<&str>,
 ) -> tracing::Span {
-    match (job_id, key, offset, range) {
-        (None, None, None, None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = tracing::field::Empty,
-            range = tracing::field::Empty,
-        ),
-        (Some(job_id), None, None, None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = tracing::field::Empty,
-            range = tracing::field::Empty,
-        ),
-        (None, Some(key), None, None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = key,
-            offset = tracing::field::Empty,
-            range = tracing::field::Empty,
-        ),
-        (Some(job_id), Some(key), None, None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = key,
-            offset = tracing::field::Empty,
-            range = tracing::field::Empty,
-        ),
-        (None, None, Some(offset), None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = offset,
-            range = tracing::field::Empty,
-        ),
-        (Some(job_id), None, Some(offset), None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = offset,
-            range = tracing::field::Empty,
-        ),
-        (None, Some(key), Some(offset), None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = key,
-            offset = offset,
-            range = tracing::field::Empty,
-        ),
-        (Some(job_id), Some(key), Some(offset), None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = key,
-            offset = offset,
-            range = tracing::field::Empty,
-        ),
-        (None, None, None, Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = tracing::field::Empty,
-            range = range,
-        ),
-        (Some(job_id), None, None, Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = tracing::field::Empty,
-            range = range,
-        ),
-        (None, Some(key), None, Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = key,
-            offset = tracing::field::Empty,
-            range = range,
-        ),
-        (Some(job_id), Some(key), None, Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = key,
-            offset = tracing::field::Empty,
-            range = range,
-        ),
-        (None, None, Some(offset), Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = offset,
-            range = range,
-        ),
-        (Some(job_id), None, Some(offset), Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = offset,
-            range = range,
-        ),
-        (None, Some(key), Some(offset), Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = key,
-            offset = offset,
-            range = range,
-        ),
-        (Some(job_id), Some(key), Some(offset), Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = key,
-            offset = offset,
-            range = range,
-        ),
+    let span = tracing::info_span!(
+        "bobs.request",
+        "request.id" = tracing::field::Empty,
+        "bobs.spool.key" = tracing::field::Empty,
+        offset = tracing::field::Empty,
+        range = tracing::field::Empty,
+    );
+    if let Some(job_id) = job_id {
+        span.record("request.id", job_id);
     }
+    if let Some(key) = key {
+        span.record("bobs.spool.key", key);
+    }
+    if let Some(offset) = offset {
+        span.record("offset", offset);
+    }
+    if let Some(range) = range {
+        span.record("range", range);
+    }
+    span
 }
 
 enum ReadRequestRange {
@@ -182,7 +89,13 @@ struct PprofParams {
 /// On-demand CPU sampling profiler. `GET /debug/pprof/profile?seconds=N` runs an
 /// in-process pprof CPU profile for N seconds (default 30) and returns a
 /// flamegraph SVG. Used to find BOBS's per-pod CPU hot path under load.
-async fn pprof_profile(Query(params): Query<PprofParams>) -> Response {
+async fn pprof_profile<F: FileIO, M: MetadataStore>(
+    State(state): State<Arc<AppState<F, M>>>,
+    Query(params): Query<PprofParams>,
+) -> Response {
+    if !state.config.enable_pprof {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let seconds = params.seconds.unwrap_or(30).clamp(1, 120);
     let guard = match pprof::ProfilerGuardBuilder::default()
         .frequency(199)
@@ -223,13 +136,13 @@ where
 {
     Router::new()
         .route("/api/v1/health", get(health::<F, M>))
-        .route("/api/v1/status", get(status::<F, M>).head(status_head))
+        .route("/api/v1/status", get(health::<F, M>).head(status_head))
         .route("/api/v1/create", put(create_spool::<F, M>))
         .route("/api/v1/write/{key}/{offset}", post(write_spool::<F, M>))
         .route("/api/v1/complete/{key}", post(complete_spool::<F, M>))
         .route("/api/v1/read/{key}", get(read_spool::<F, M>))
         .route("/api/v1/delete/{key}", delete(delete_spool::<F, M>))
-        .route("/debug/pprof/profile", get(pprof_profile))
+        .route("/debug/pprof/profile", get(pprof_profile::<F, M>))
 }
 
 #[derive(Debug, Serialize)]
@@ -247,20 +160,12 @@ async fn health<F: FileIO, M: MetadataStore>(
     })
 }
 
-async fn status<F: FileIO, M: MetadataStore>(
-    State(state): State<Arc<AppState<F, M>>>,
-) -> impl IntoResponse {
-    Json(StatusResponse {
-        status: "ok",
-        hostname: state.hostname.clone(),
-    })
-}
-
 async fn status_head() -> impl IntoResponse {
     StatusCode::OK
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateRequest {
     content_type: Option<String>,
     content_encoding: Option<String>,
@@ -272,8 +177,53 @@ struct CreateRequest {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompleteRequest {
     expected_size: Option<u64>,
+}
+
+fn validate_producer_header(
+    name: &str,
+    value: &Option<String>,
+) -> std::result::Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        return Err(ApiError(BobsError::InvalidRequest(format!(
+            "{name} must not be empty"
+        ))));
+    }
+    HeaderValue::from_str(value).map_err(|error| {
+        ApiError(BobsError::InvalidRequest(format!(
+            "invalid {name}: {error}"
+        )))
+    })?;
+    Ok(())
+}
+
+fn enforce_content_length(
+    headers: &HeaderMap,
+    offset: u64,
+    max_spool_bytes: u64,
+) -> std::result::Result<(), ApiError> {
+    let Some(value) = headers.get(axum::http::header::CONTENT_LENGTH) else {
+        return Ok(());
+    };
+    let length = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| ApiError(BobsError::InvalidRequest("invalid Content-Length".into())))?;
+    if offset
+        .checked_add(length)
+        .is_none_or(|total| total > max_spool_bytes)
+    {
+        return Err(ApiError(BobsError::SpoolTooLarge {
+            max_bytes: max_spool_bytes,
+        }));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -299,8 +249,10 @@ where
             CreateRequest::default()
         } else {
             serde_json::from_slice::<CreateRequest>(&body)
-                .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
+                .map_err(|e| ApiError(BobsError::InvalidRequest(e.to_string())))?
         };
+        validate_producer_header("content_type", &req.content_type)?;
+        validate_producer_header("content_encoding", &req.content_encoding)?;
         let labels = state.config.filter_labels(&req.labels);
         // Key the spool by the originating request ID when the caller supplies
         // one (X-Polytope-Job-Id), so spool directories, read URLs and logs all
@@ -312,7 +264,8 @@ where
         let create_start = Instant::now();
         let create_result = state
             .manager
-            .create_spool(
+            .create_spool_with_admission_timeout(
+                Duration::from_millis(state.config.create_admission_timeout_ms),
                 key.clone(),
                 req.content_type.clone(),
                 req.content_encoding.clone(),
@@ -363,6 +316,7 @@ where
     let job_id = extract_job_id(&headers);
     let span = request_span(job_id.as_deref(), Some(&key), Some(offset), None);
     async move {
+        enforce_content_length(&headers, offset, state.config.max_spool_bytes)?;
         let spool = state
             .manager
             .get_spool(&key)
@@ -372,10 +326,24 @@ where
         let write_batch_size = state.config.page_size;
         let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
         let mut write_offset = offset;
+        let mut received_bytes = 0_u64;
         let write_result: std::result::Result<(), crate::error::BobsError> = async {
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
                 if let Ok(data) = frame.into_data() {
+                    received_bytes = received_bytes
+                        .checked_add(data.len() as u64)
+                        .ok_or(BobsError::SpoolTooLarge {
+                            max_bytes: state.config.max_spool_bytes,
+                        })?;
+                    if offset
+                        .checked_add(received_bytes)
+                        .is_none_or(|total| total > state.config.max_spool_bytes)
+                    {
+                        return Err(BobsError::SpoolTooLarge {
+                            max_bytes: state.config.max_spool_bytes,
+                        });
+                    }
                     let mut cursor = 0;
                     while cursor < data.len() {
                         let remaining_batch_space = write_batch_size - pending.len();
@@ -436,7 +404,7 @@ where
             CompleteRequest::default()
         } else {
             serde_json::from_slice::<CompleteRequest>(&body)
-                .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
+                .map_err(|e| ApiError(BobsError::InvalidRequest(e.to_string())))?
         };
         let spool = state
             .manager
@@ -580,17 +548,40 @@ fn apply_read_response_headers(
     metadata: &ReadMetadata,
     range: &ResolvedReadRange,
 ) -> std::result::Result<(), ApiError> {
-    let content_type_header = HeaderValue::from_str(
-        metadata
-            .content_type
-            .as_deref()
-            .unwrap_or("application/octet-stream"),
-    )
-    .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
+    let content_type = metadata
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let content_type_header = HeaderValue::from_str(content_type)
+        .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
     response
         .headers_mut()
         .insert(axum::http::header::CONTENT_TYPE, content_type_header);
 
+    response.headers_mut().insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    // The payload and media type are producer-controlled and BOBS serves every
+    // spool from one deployment origin. Force download as the browser-level
+    // containment boundary; nosniff/CSP remain defence in depth for user agents
+    // that render despite Content-Disposition.
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
+    );
+    let base_content_type = content_type.split(';').next().unwrap_or_default().trim();
+    if ["text/html", "application/xhtml+xml", "image/svg+xml"]
+        .iter()
+        .any(|active| base_content_type.eq_ignore_ascii_case(active))
+    {
+        // Spools share a deployment origin. Sandboxing producer-controlled active
+        // documents prevents them from inheriting that origin or running script.
+        response.headers_mut().insert(
+            "Content-Security-Policy",
+            HeaderValue::from_static("sandbox; default-src 'none'; frame-ancestors 'none'"),
+        );
+    }
     if let Some(enc) = &metadata.content_encoding {
         let encoding_header = HeaderValue::from_str(enc)
             .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
@@ -1069,6 +1060,9 @@ struct ApiError(BobsError);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
+            BobsError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            BobsError::SpoolTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            BobsError::AdmissionTimeout => StatusCode::SERVICE_UNAVAILABLE,
             BobsError::SpoolNotFound { .. } => StatusCode::NOT_FOUND,
             BobsError::OffsetMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::SizeMismatch { .. } => StatusCode::BAD_REQUEST,
@@ -1123,6 +1117,9 @@ mod tests {
             page_size: 4096,
             max_cache_bytes: 65536,
             max_live_spools: 256,
+            max_spool_bytes: 1024 * 1024,
+            create_admission_timeout_ms: 100,
+            enable_pprof: false,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 600,
             full_read_complete_ttl_secs: 30,
@@ -1150,6 +1147,9 @@ mod tests {
             page_size: 4096,
             max_cache_bytes: 65536,
             max_live_spools: 256,
+            max_spool_bytes: 1024 * 1024,
+            create_admission_timeout_ms: 100,
+            enable_pprof: false,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 2,
             full_read_complete_ttl_secs: 2,
@@ -1166,25 +1166,28 @@ mod tests {
         })
     }
 
-    /// Returns both the `Router` and the shared `AppState` so tests can inspect
-    /// spool fields (e.g. `full_object_read_at`) after HTTP round-trips.
-    async fn app_with_state() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+    async fn app_with_config(
+        configure: impl FnOnce(&mut Config),
+    ) -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
         let data_dir = root.join("data");
+        let mut config = (*test_config(&data_dir)).clone();
+        configure(&mut config);
+        let config = Arc::new(config);
         let manager = Arc::new(
             SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
                 DefaultMetadataStore::new(&data_dir),
                 &data_dir,
-                4096,
-                65536,
-                256,
+                config.page_size,
+                config.max_cache_bytes,
+                config.max_live_spools,
             )
             .expect("manager init"),
         );
         let state = Arc::new(AppState {
             manager,
-            config: test_config(&data_dir),
+            config,
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
@@ -1192,6 +1195,12 @@ mod tests {
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
+    }
+
+    /// Returns both the `Router` and the shared `AppState` so tests can inspect
+    /// spool fields (e.g. `full_object_read_at`) after HTTP round-trips.
+    async fn app_with_state() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+        app_with_config(|_| {}).await
     }
 
     /// Like `app_with_state` but uses `test_config_ttl` (short sweep + TTL values).
@@ -1474,6 +1483,156 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(uuid::Uuid::parse_str(v["key"].as_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_canonicalizes_uppercase_request_id() {
+        let app = app().await;
+        let request_id = "0123456789ABCDEFGHJKMNPQRS";
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, request_id)
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["key"].as_str().unwrap(),
+            request_id.to_ascii_lowercase()
+        );
+    }
+
+    #[tokio::test]
+    async fn pprof_is_not_exposed_by_default() {
+        let app = app().await;
+        let req = Request::builder()
+            .uri("/debug/pprof/profile?seconds=1")
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_producer_headers() {
+        for field in ["content_type", "content_encoding"] {
+            let app = app().await;
+            let body = format!(r#"{{"{field}":"invalid\nvalue"}}"#);
+            let req = Request::builder()
+                .method("PUT")
+                .uri("/api/v1/create")
+                .body(Body::from(body))
+                .expect("request build");
+            let resp = app.oneshot(req).await.expect("oneshot");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "field={field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_and_complete_deny_unknown_fields() {
+        let app = app().await;
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .body(Body::from(r#"{"surprise":true}"#))
+            .expect("request build");
+        let resp = app.clone().oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let key = create_key(&app).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::from(r#"{"unexpected":1}"#))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn write_rejects_spools_over_configured_maximum() {
+        let (app, state) = app_with_config(|config| config.max_spool_bytes = 4).await;
+        let key = create_key(&app).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from("12345"))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 0);
+    }
+
+    #[tokio::test]
+    async fn create_admission_timeout_returns_service_unavailable() {
+        let (app, _) = app_with_config(|config| {
+            config.max_live_spools = 1;
+            config.create_admission_timeout_ms = 10;
+        })
+        .await;
+        create_key(&app).await;
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn active_content_reads_are_forced_downloads_nosniff_and_sandboxed() {
+        let app = app().await;
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .body(Body::from(r#"{"content_type":"text/html; charset=utf-8"}"#))
+            .expect("request build");
+        let resp = app.clone().oneshot(req).await.expect("oneshot");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let key = value["key"].as_str().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from("<script>alert(1)</script>"))
+            .expect("request build");
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let req = Request::builder()
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_DISPOSITION],
+            HeaderValue::from_static("attachment")
+        );
+        assert_eq!(
+            resp.headers()["X-Content-Type-Options"],
+            HeaderValue::from_static("nosniff")
+        );
+        assert_eq!(
+            resp.headers()["Content-Security-Policy"],
+            HeaderValue::from_static("sandbox; default-src 'none'; frame-ancestors 'none'")
+        );
     }
 
     #[test]
