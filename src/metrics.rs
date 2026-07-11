@@ -127,7 +127,6 @@ pub mod outcome {
 pub mod state {
     pub const WRITING: &str = "writing";
     pub const WRITE_LOCKED: &str = "write_locked";
-    pub const READABLE: &str = "readable";
     pub const COMPLETE: &str = "complete";
 }
 
