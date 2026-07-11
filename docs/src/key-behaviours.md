@@ -10,7 +10,7 @@ Understanding these behaviours is crucial for effectively using BOBS.
 
 ### 1. Page-based Streaming
 
-Data is organized into fixed-size pages, configured via `page_size` and defaulting to `4096`. A successful `/write` has already accepted the bytes into `<data_dir>/<key>/spool.dat` before it returns, including any trailing partial page.
+Data is organized into fixed-size pages configured via `page_size`. The Rust binary default is `16777216` bytes (16 MiB); the Helm chart intentionally overrides it with `4096` bytes for lower reader-visible latency. A successful `/write` has already accepted the bytes into `<data_dir>/<key>/spool.dat` before it returns, including any trailing partial page.
 
 Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is completely full. Trailing partial-page bytes remain on disk in `spool.dat` but are not visible to readers until more writes complete the page or the writer calls `/complete` to finalize the spool. This ensures readers always receive consistent, non-torn data.
 
@@ -18,11 +18,11 @@ Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they al
 
 ### 2. Long-poll with Timeout
 
-When a reader requests data that has not been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure, such as Kubernetes Ingress or load balancers, BOBS returns a `307 Temporary Redirect` if no data arrives within `long_poll_timeout_ms`. Clients like `curl -L` will automatically follow the redirect and resume the poll.
+When a follow-mode reader requests a page that has not been written yet, BOBS parks the request using a notification system. If no first page arrives within `long_poll_timeout_ms`, BOBS returns a `307 Temporary Redirect`; clients such as `curl -L` automatically follow it and resume the poll. A timeout after streaming begins ends that response instead of redirecting it.
 
 ### 3. Follow Mode
 
-A read request without a `Range` header enters follow mode from byte `0`, or from byte `X` with `Range: bytes=X-`. The server keeps the stream open and pushes new pages as they become available until the spool is finalized.
+Only a read request without a `Range` header enters follow mode, starting at byte `0`. The server pushes new pages as they become available until the spool is finalized or a mid-stream long-poll timeout ends the response. `Range: bytes=X-` is an open-ended bounded read through the bytes currently servable when the request is resolved; it does not follow later writes.
 
 ### 4. Write-locked Mode
 

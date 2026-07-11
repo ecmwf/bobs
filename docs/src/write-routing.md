@@ -12,13 +12,13 @@ BOBS supports horizontal scaling of writes across a StatefulSet. Each pod owns t
 
 ## Key Format
 
-Every spool key is an opaque UUID, for example:
+A valid `X-Polytope-Job-Id` header is used as the spool key. Valid request IDs are 26-character, lower-case Crockford base32 strings. If the header is absent or invalid, BOBS generates an opaque UUIDv4 key, for example:
 
 ```
 550e8400-e29b-41d4-a716-446655440000
 ```
 
-Keys carry no ownership information. The owning pod is determined entirely by which pod handled the `/create` request — not by parsing the key.
+Keys carry no ownership information. The owning pod is determined entirely by which pod handled the `/create` request—not by parsing the key.
 
 ---
 
@@ -40,7 +40,7 @@ PUT /api/v1/create
 - `read_url` — the public URL through which consumers can stream the spool once writing begins. It is an opaque download link; the BOBS internal `/api/v1/read/{key}` endpoint is not part of this public URL.
 - `write_url` — the **per-pod internal base URL** of the owning pod. Clients must use this URL as the base for all write and complete calls.
 
-The handling pod generates a UUID key, writes the spool entry to its own local database, and returns its own `internal_base_url` as `write_url`. No network calls are made to other pods during create.
+The handling pod selects the validated request ID or generates a fallback UUIDv4 key, creates the spool directory and initial `meta.json` sidecar, and returns its resolved `internal_base_url` as `write_url`. No network calls are made to other pods during create.
 
 ---
 
@@ -90,7 +90,7 @@ If the owning pod dies while a write is in progress:
 1. The worker receives an HTTP error (connection refused or 5xx) on the next `/write` call.
 2. The worker abandons the in-flight spool and retries the entire request from `/create` (on a surviving pod).
 3. The orphaned spool on the dead pod's PVC is left in `Writing` state.
-4. When the pod restarts, `recover()` reads only its own local database. It finds the spool still in `Writing` state with no active writer. The background cleanup task reaps it once the **writer inactivity timeout** (`writer_inactivity_timeout_secs`, default 300 s) expires.
+4. When the pod restarts, `recover()` reads its `meta.json` sidecars and reconstructs in-progress byte state from `spool.dat`. It finds the spool still in `Writing` state with no active writer. The background cleanup task reaps it once the **writer inactivity timeout** (`writer_inactivity_timeout_secs`, default 300 s) expires.
 
 No manual intervention or cross-pod coordination is needed.
 

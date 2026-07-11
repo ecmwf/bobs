@@ -77,14 +77,14 @@ as `_bucket`/`_sum`/`_count` series; duration histograms also receive a
 `_seconds` suffix from the `s` unit annotation. Gauges render as-is.
 
 | OTel instrument | Prometheus series | Type | Labels | What it is |
-|---|---|---|---|---|
-| `bobs.spools.created` | `bobs_spools_created_total` | Counter | caller labels, `otel_scope_name` | Spools successfully created via `POST /spool`. |
-| `bobs.spools.completed` | `bobs_spools_completed_total` | Counter | caller labels, `otel_scope_name` | Spools successfully finalized by the writer via `POST /spool/{key}/complete`. |
-| `bobs.spools.deleted` | `bobs_spools_deleted_total` | Counter | caller labels, `reason`, `otel_scope_name` | Spools deleted — by explicit client request, TTL expiry, writer inactivity timeout, or cleanup. |
-| `bobs.create.duration` | `bobs_create_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `otel_scope_name` | Wall time from spool creation request to the first page being stored. |
-| `bobs.complete.duration` | `bobs_complete_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `otel_scope_name` | Wall time for the complete request to flush and finalize a spool. |
+| --- | --- | --- | --- | --- |
+| `bobs.spools.created` | `bobs_spools_created_total` | Counter | caller labels, `otel_scope_name` | Spools successfully created via `PUT /api/v1/create`. |
+| `bobs.spools.completed` | `bobs_spools_completed_total` | Counter | caller labels, `otel_scope_name` | Spools successfully finalized via `POST /api/v1/complete/{key}`. |
+| `bobs.spools.deleted` | `bobs_spools_deleted_total` | Counter | caller labels, `reason`, `otel_scope_name` | Spools deleted by explicit client request or cleanup. |
+| `bobs.create.duration` | `bobs_create_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `outcome`, `otel_scope_name` | Wall time for the create handler, including admission wait, spool file creation, and initial metadata commit. |
+| `bobs.complete.duration` | `bobs_complete_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `outcome`, `otel_scope_name` | Wall time for the complete request to flush and finalize a spool. |
 | `bobs.write.bytes` | `bobs_write_bytes_total` | Counter | caller labels, `otel_scope_name` | Bytes written into spools. Recorded after each write batch completes. |
-| `bobs.write.duration` | `bobs_write_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `otel_scope_name` | Wall time for a write handler to receive and persist a streaming write body. |
+| `bobs.write.duration` | `bobs_write_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `outcome`, `otel_scope_name` | Wall time for a write handler to receive and append a streaming write body. |
 | `bobs.read.bytes` | `bobs_read_bytes_total` | Counter | caller labels, `mode`, `otel_scope_name` | Bytes served from spools to clients. |
 | `bobs.read.duration` | `bobs_read_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `mode`, `outcome`, `otel_scope_name` | Wall time for a read stream from acquisition to final outcome. |
 | `bobs.read.active` | `bobs_read_active` | Gauge | caller labels, `otel_scope_name` | Current active readers. Incremented on reader acquisition, decremented on release. |

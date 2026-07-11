@@ -12,14 +12,14 @@ BOBS is built around one directory per object key and an asynchronous filesystem
 
 - **Spool**: The core entity representing a data stream. A spool owns its byte file, lifecycle metadata, page visibility state, reader notifications, and cleanup timestamps.
 - **On-disk layout**: Each key is stored under `<data_dir>/<key>/`. Payload bytes live in `<data_dir>/<key>/spool.dat`; lifecycle and byte-derived metadata live in `<data_dir>/<key>/meta.json`.
-- **FileIO**: An abstraction for asynchronous disk I/O. On Linux, the default backend uses a sharded `io_uring` ring pool. It requires a Linux 5.11+ kernel because BOBS submits operations against raw file descriptors, plus a runtime policy that permits `io_uring_setup`. Builds with the `tokio-fileio-fallback` Cargo feature, and non-Linux builds, use the Tokio/blocking positional-file backend instead.
+- **FileIO**: An abstraction for asynchronous disk I/O. On Linux, the default backend uses a sharded `io_uring` ring pool. It requires a Linux 5.11+ kernel because BOBS submits operations against raw file descriptors, plus a runtime policy that permits `io_uring_setup`. Builds with the `tokio-fileio-fallback` Cargo feature, and non-Linux builds, use the Tokio/blocking positional-file backend instead and ignore the `io_uring` tuning fields.
 - **Metadata store**: Sidecar metadata is committed atomically by writing `meta.json.tmp`, syncing that temporary file's data, atomically renaming it over `meta.json`, and syncing the spool directory. Startup recovery ignores leftover temporary files and reads only complete sidecars.
 - **SpoolManager**: A central registry, using `DashMap`, that tracks active spools and reconstructs them from sidecar files during startup.
-- **Page Cache**: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it is written. Entries are keyed by `(spool_key, page_idx)`, and `max_cache_bytes` is the total cache budget across all spools. Setting `max_cache_bytes` to `0` disables caching; pages larger than the byte cap are valid but bypass the cache.
+- **Page Cache**: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it is written. Entries are keyed by `(spool_key, page_idx)`, and `max_cache_bytes` is the total cache budget across all spools. Setting `max_cache_bytes` to `0` disables caching; pages larger than the byte cap are valid but bypass the cache. `max_live_spools` limits spools in the first-read cache phase and applies create backpressure when all admission slots are occupied.
 
 ### Linux `io_uring` routing
 
-Default Linux builds route file operations through a fixed-size pool of `io_uring` shards. `io_uring_shards` can set the shard count explicitly. If `io_uring_shards` is unset, BOBS resolves it to `max(1, num_cpus / 4)`. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust's randomized `Hash` state, so the same object key maps to the same shard for a given shard count across restarts and builds.
+Default Linux builds route file operations through a fixed-size pool of `io_uring` shards. `io_uring_shards` can set the shard count explicitly and must be greater than `0`; when unset, BOBS resolves it to `max(1, num_cpus / 4)`. `io_uring_queue_capacity` defaults to `1024` per shard and must be greater than `0`. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust's randomized `Hash` state, so the same object key maps to the same shard for a given shard count across restarts and builds.
 
 Data-file operations and metadata sidecar commits for the same object are routed by the same object key and therefore use the same shard. This keeps a key's `spool.dat` work and its `meta.json` create/rename/fsync work on one ring while still allowing independent keys to spread across shards.
 
@@ -31,9 +31,9 @@ Future Linux optimizations that are intentionally not implemented yet include `I
 
 ### Data Flow
 
-1. **Create**: BOBS creates `<data_dir>/<key>/`, opens `<data_dir>/<key>/spool.dat`, and commits an initial `<data_dir>/<key>/meta.json` sidecar.
+1. **Create**: BOBS uses a valid `X-Polytope-Job-Id` request ID as the key or generates a fallback UUIDv4, creates `<data_dir>/<key>/`, opens `<data_dir>/<key>/spool.dat`, and commits an initial `<data_dir>/<key>/meta.json` sidecar.
 2. **Write**: Data arrives via POST. Accepted bytes are appended to `spool.dat` through the selected FileIO backend before `/write` returns. In-memory state tracks page assembly, but the data file is the source of truth for accepted bytes.
-3. **Page visibility**: Once enough accepted bytes form a complete page, that page becomes reader-visible, is added to the global FIFO page cache, and any parked reader requests are notified.
+3. **Page visibility**: Once enough accepted bytes form a complete page, that page becomes reader-visible, is offered to the global FIFO page cache, and any parked reader requests are notified.
 4. **Read**: Reader requests a visible range -> check page cache -> if miss, read from `spool.dat` -> stream bytes to the HTTP response. Trailing partial-page bytes may already be present in `spool.dat`, but they are not reader-visible until they become a complete page or `/complete` finalizes the spool.
 5. **Complete**: `/complete` publishes any trailing partial page, syncs `spool.dat` data, then commits final completed metadata to `meta.json` with the sidecar atomic commit protocol.
 6. **Lifecycle**: Spool moves from `Creating` -> `Writing` (or `WriteLocked`) -> `Complete` -> `Deleting`.
@@ -61,6 +61,6 @@ The layout is friendly to shared filesystems and multi-BOBS deployments because 
 
 Cleanup TTL behaviour is preserved with sidecar metadata. Writer inactivity, read-idle, and full-read-complete cleanup still remove both `spool.dat` and `meta.json` for expired keys; TTL timestamps are committed at lifecycle boundaries and reconstructed conservatively on recovery.
 
-### Legacy Metadata Migration
+### Metadata backend
 
-Older BOBS builds stored lifecycle metadata in a native redb database. Current BOBS uses sidecar `meta.json` files. Legacy native redb state is handled as an export/import migration path into sidecars rather than as the live metadata backend.
+Sidecar `meta.json` files are the only current metadata backend. Current BOBS does not read, migrate, export, or import legacy native redb state.
