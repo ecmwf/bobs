@@ -2,6 +2,13 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+/// Maximum explicit number of `io_uring` rings and driver threads.
+///
+/// The automatic default remains `(num_cpus / 4).max(1)`. This limit prevents a
+/// malformed or hostile configuration from attempting pathological allocation and
+/// thread creation.
+pub const MAX_IO_URING_SHARDS: usize = 256;
+
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 pub mod ring_pool;
 pub mod tokio_fs;
