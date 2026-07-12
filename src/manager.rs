@@ -2131,9 +2131,10 @@ mod tests {
         let second = partial.read_page(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
         assert_eq!(
-            read_exact_logical_range::<TokioFileIO>(&partial.file_handle, 2, 6)
+            read_exact_at::<TokioFileIO>(&partial.file_handle, 2, 6, "reading migrated range",)
                 .await
-                .expect("read range across new page boundary"),
+                .expect("read range across new page boundary")
+                .as_ref(),
             b"cdefgh"
         );
 
