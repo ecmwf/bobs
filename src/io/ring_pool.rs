@@ -21,6 +21,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use tokio::sync::{mpsc, oneshot};
@@ -29,30 +31,9 @@ const RING_ENTRIES: u32 = 256;
 const AT_FDCWD: RawFd = -100;
 const METADATA_COMMIT_CHAIN_LEN: usize = 4;
 const METADATA_COMMIT_PHASE_LEN: usize = 2;
+const MAX_SQES_PER_REQUEST: usize = METADATA_COMMIT_PHASE_LEN;
 const METADATA_USER_DATA_SHIFT: u64 = 56;
 const METADATA_USER_DATA_MASK: u64 = (1u64 << METADATA_USER_DATA_SHIFT) - 1;
-
-fn validate_queue_capacity(queue_capacity: usize) -> Result<()> {
-    let configuration_error = |message| {
-        Error::new(
-            ErrorKind::InvalidInput,
-            BobsError::ConfigurationError(message),
-        )
-    };
-
-    if queue_capacity == 0 {
-        return Err(configuration_error(
-            "ring pool queue_capacity must be greater than 0".to_string(),
-        ));
-    }
-    if queue_capacity > tokio::sync::Semaphore::MAX_PERMITS {
-        return Err(configuration_error(format!(
-            "ring pool queue_capacity must not exceed {}",
-            tokio::sync::Semaphore::MAX_PERMITS
-        )));
-    }
-    Ok(())
-}
 
 type OpenSender = oneshot::Sender<Result<Arc<OwnedFd>>>;
 type WriteSender = oneshot::Sender<Result<usize>>;
@@ -95,6 +76,15 @@ pub(crate) enum Request {
         payload: Bytes,
         tx: UnitSender,
     },
+}
+
+impl Request {
+    fn reserved_sqe_work(&self) -> usize {
+        match self {
+            Self::MetadataCommit { .. } => METADATA_COMMIT_PHASE_LEN,
+            _ => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +142,24 @@ struct RingPoolSubmissionInstrumentation {
     sequence: Arc<AtomicU64>,
     submit_failures_remaining: Arc<AtomicUsize>,
     safety_events: Arc<Mutex<Vec<RingPoolSafetyEvent>>>,
+    submission_pause: Arc<(Mutex<bool>, Condvar)>,
+    receive_pause: Arc<(Mutex<bool>, Condvar)>,
+    successful_submissions: Arc<AtomicUsize>,
+    max_driver_sqe_work: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+struct RingPoolDriverPause {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+impl Drop for RingPoolDriverPause {
+    fn drop(&mut self) {
+        let (paused, wake) = &*self.gate;
+        *paused.lock().expect("ring-pool driver pause poisoned") = false;
+        wake.notify_all();
+    }
 }
 
 #[cfg(not(test))]
@@ -228,7 +236,7 @@ pub struct RingPoolShutdown {
 
 impl RingPoolOptions {
     pub fn production(configured_shards: Option<usize>, queue_capacity: usize) -> Result<Self> {
-        validate_queue_capacity(queue_capacity)?;
+        validate_queue_capacity(queue_capacity, RING_ENTRIES as usize)?;
         Ok(Self {
             shard_count: resolve_shard_count(configured_shards)?,
             queue_capacity,
@@ -256,7 +264,7 @@ impl RingPool {
         }
         // RingPoolOptions is public and test/custom callers can bypass
         // RingPoolOptions::production, so validate again at construction.
-        validate_queue_capacity(options.queue_capacity)?;
+        validate_queue_capacity(options.queue_capacity, RING_ENTRIES as usize)?;
 
         let instrumentation = RingPoolInstrumentation::default();
         let shards = Self::start_shards(&options, instrumentation.submission.clone())?;
@@ -446,6 +454,40 @@ impl RingPool {
     }
 
     #[cfg(test)]
+    fn pause_submissions_for_test(&self) -> RingPoolDriverPause {
+        Self::pause_driver_gate(&self.instrumentation.submission.submission_pause)
+    }
+
+    #[cfg(test)]
+    fn pause_receives_for_test(&self) -> RingPoolDriverPause {
+        Self::pause_driver_gate(&self.instrumentation.submission.receive_pause)
+    }
+
+    #[cfg(test)]
+    fn pause_driver_gate(gate: &Arc<(Mutex<bool>, Condvar)>) -> RingPoolDriverPause {
+        let gate = Arc::clone(gate);
+        let (paused, _) = &*gate;
+        *paused.lock().expect("ring-pool driver pause poisoned") = true;
+        RingPoolDriverPause { gate }
+    }
+
+    #[cfg(test)]
+    fn successful_submissions_for_test(&self) -> usize {
+        self.instrumentation
+            .submission
+            .successful_submissions
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn max_driver_sqe_work_for_test(&self) -> usize {
+        self.instrumentation
+            .submission
+            .max_driver_sqe_work
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_submit_failure_for_test(&self) {
         self.instrumentation
             .submission
@@ -506,9 +548,11 @@ fn start_shard(
     index: usize,
     prefix: &str,
     queue_capacity: usize,
-    ring: IoUring,
+    mut ring: IoUring,
     submission_instrumentation: RingPoolSubmissionInstrumentation,
 ) -> Result<RingShard> {
+    let driver_sqe_capacity = ring.submission().capacity();
+    validate_queue_capacity(queue_capacity, driver_sqe_capacity)?;
     let (sender, receiver) = mpsc::channel(queue_capacity);
     let driver_name = format!("{prefix}-{index}");
     let counters = RingShardCounters::default();
@@ -540,17 +584,19 @@ fn start_shard(
 fn run_driver(
     shard_index: usize,
     driver_name: String,
-    ring: IoUring,
+    mut ring: IoUring,
     receiver: mpsc::Receiver<Request>,
     in_flight_operations: Arc<AtomicUsize>,
     driver_stopped: Arc<AtomicBool>,
     submission_instrumentation: RingPoolSubmissionInstrumentation,
 ) {
+    let driver_sqe_capacity = ring.submission().capacity();
     RingDriver::new(
         shard_index,
         driver_name,
         ring,
         receiver,
+        driver_sqe_capacity,
         Arc::clone(&in_flight_operations),
         submission_instrumentation,
     )
@@ -621,6 +667,15 @@ struct InFlight {
     kind: InFlightKind,
 }
 
+impl InFlight {
+    fn reserved_sqe_work(&self) -> usize {
+        match self.kind {
+            InFlightKind::MetadataCommit { .. } => METADATA_COMMIT_PHASE_LEN,
+            _ => 1,
+        }
+    }
+}
+
 struct RingDriver {
     #[allow(dead_code)]
     shard_index: usize,
@@ -630,6 +685,9 @@ struct RingDriver {
     rx: mpsc::Receiver<Request>,
     in_flight: HashMap<u64, InFlight>,
     pending: VecDeque<Request>,
+    pending_sqe_work: usize,
+    in_flight_sqe_work: usize,
+    driver_sqe_capacity: usize,
     next_id: u64,
     in_flight_operations: Arc<AtomicUsize>,
     #[allow(dead_code)]
@@ -642,6 +700,7 @@ impl RingDriver {
         driver_name: String,
         ring: IoUring,
         rx: mpsc::Receiver<Request>,
+        driver_sqe_capacity: usize,
         in_flight_operations: Arc<AtomicUsize>,
         submission_instrumentation: RingPoolSubmissionInstrumentation,
     ) -> Self {
@@ -652,6 +711,9 @@ impl RingDriver {
             rx,
             in_flight: HashMap::new(),
             pending: VecDeque::new(),
+            pending_sqe_work: 0,
+            in_flight_sqe_work: 0,
+            driver_sqe_capacity,
             next_id: 1,
             in_flight_operations,
             submission_instrumentation,
@@ -664,7 +726,11 @@ impl RingDriver {
         while receiver_open || !self.pending.is_empty() || !self.in_flight.is_empty() {
             if receiver_open && self.pending.is_empty() && self.in_flight.is_empty() {
                 match self.rx.blocking_recv() {
-                    Some(req) => self.pending.push_back(req),
+                    Some(req) => {
+                        #[cfg(test)]
+                        self.wait_for_test_gate(&self.submission_instrumentation.receive_pause);
+                        self.queue_pending(req);
+                    }
                     None => {
                         receiver_open = false;
                         continue;
@@ -708,28 +774,91 @@ impl RingDriver {
         }
     }
 
+    #[cfg(test)]
+    fn wait_for_test_gate(&self, gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (paused, wake) = &**gate;
+        let mut paused = paused.lock().expect("ring-pool driver pause poisoned");
+        while *paused {
+            paused = wake.wait(paused).expect("ring-pool driver pause poisoned");
+        }
+    }
+
+    /// Move work out of the bounded channel only while the driver has room for
+    /// the largest request. `pending_sqe_work + in_flight_sqe_work` therefore
+    /// never exceeds the ring's SQE capacity. At most one SQE is deliberately
+    /// left unused when the next channel request is unknown; this keeps metadata
+    /// pairs atomic without reducing batching for ordinary one-SQE requests.
+    ///
+    /// The channel separately owns `queue_capacity` permits. Consequently the
+    /// strict per-shard admitted-work bound is ring capacity plus
+    /// `queue_capacity * MAX_SQES_PER_REQUEST`; capacity arithmetic is checked
+    /// before the channel is created.
     fn drain_available_requests(&mut self) -> bool {
-        loop {
+        while self.available_driver_sqe_work() >= MAX_SQES_PER_REQUEST {
             match self.rx.try_recv() {
-                Ok(req) => self.pending.push_back(req),
+                Ok(req) => self.queue_pending(req),
                 Err(mpsc::error::TryRecvError::Empty) => return true,
                 Err(mpsc::error::TryRecvError::Disconnected) => return false,
             }
         }
+        true
     }
 
+    /// Push one throughput batch, bounded by the ring's SQE capacity. A batch
+    /// may contain up to 255 ordinary requests or 128 two-SQE metadata phases.
     fn submit_pending_batch(&mut self) -> (usize, bool) {
         let mut pushed = 0;
+        let mut batch_sqe_work = 0usize;
         let mut stalled_on_full_submission_queue = false;
         while let Some(req) = self.pending.pop_front() {
+            let request_sqe_work = req.reserved_sqe_work();
+            self.pending_sqe_work -= request_sqe_work;
+            if batch_sqe_work
+                .checked_add(request_sqe_work)
+                .is_none_or(|work| work > self.driver_sqe_capacity)
+            {
+                self.queue_pending_front(req);
+                stalled_on_full_submission_queue = true;
+                break;
+            }
             if let Err(req) = self.submit_request(req) {
-                self.pending.push_front(req);
+                self.queue_pending_front(req);
                 stalled_on_full_submission_queue = true;
                 break;
             }
             pushed += 1;
+            batch_sqe_work += request_sqe_work;
         }
         (pushed, stalled_on_full_submission_queue)
+    }
+
+    fn available_driver_sqe_work(&self) -> usize {
+        self.driver_sqe_capacity
+            .checked_sub(self.pending_sqe_work + self.in_flight_sqe_work)
+            .expect("ring driver SQE work exceeded its configured capacity")
+    }
+
+    fn queue_pending(&mut self, req: Request) {
+        let request_sqe_work = req.reserved_sqe_work();
+        debug_assert!(request_sqe_work <= self.available_driver_sqe_work());
+        self.pending_sqe_work += request_sqe_work;
+        self.pending.push_back(req);
+        self.observe_driver_sqe_work();
+    }
+
+    fn queue_pending_front(&mut self, req: Request) {
+        self.pending_sqe_work += req.reserved_sqe_work();
+        self.pending.push_front(req);
+        self.observe_driver_sqe_work();
+    }
+
+    fn observe_driver_sqe_work(&self) {
+        let work = self.pending_sqe_work + self.in_flight_sqe_work;
+        debug_assert!(work <= self.driver_sqe_capacity);
+        #[cfg(test)]
+        self.submission_instrumentation
+            .max_driver_sqe_work
+            .fetch_max(work, Ordering::SeqCst);
     }
 
     fn submit_request(&mut self, req: Request) -> std::result::Result<(), Request> {
@@ -812,6 +941,12 @@ impl RingDriver {
         let is_metadata_commit = matches!(in_flight.kind, InFlightKind::MetadataCommit { .. });
         self.in_flight.insert(id, in_flight);
         self.in_flight_operations.fetch_add(1, Ordering::SeqCst);
+        self.in_flight_sqe_work += self
+            .in_flight
+            .get(&id)
+            .expect("inserted request missing")
+            .reserved_sqe_work();
+        self.observe_driver_sqe_work();
         let push_result = if is_metadata_commit {
             self.push_metadata_commit_phase(id)
         } else {
@@ -823,6 +958,7 @@ impl RingDriver {
                 .remove(&id)
                 .expect("inserted request missing");
             self.in_flight_operations.fetch_sub(1, Ordering::SeqCst);
+            self.in_flight_sqe_work -= in_flight.reserved_sqe_work();
             return Err(in_flight.into_request());
         }
         Ok(())
@@ -973,6 +1109,7 @@ impl RingDriver {
             None => return Ok(()),
         };
         self.in_flight_operations.fetch_sub(1, Ordering::SeqCst);
+        self.in_flight_sqe_work -= in_flight.reserved_sqe_work();
 
         match &mut in_flight.kind {
             InFlightKind::Open { tx, .. } => {
@@ -996,6 +1133,12 @@ impl RingDriver {
                     if *written < data.len() {
                         self.in_flight.insert(id, in_flight);
                         self.in_flight_operations.fetch_add(1, Ordering::SeqCst);
+                        self.in_flight_sqe_work += self
+                            .in_flight
+                            .get(&id)
+                            .expect("reinserted write request missing")
+                            .reserved_sqe_work();
+                        self.observe_driver_sqe_work();
                         self.resubmit_existing(id)?;
                     } else {
                         send_write(tx, Ok(*written));
@@ -1092,6 +1235,7 @@ impl RingDriver {
                 .remove(&id)
                 .expect("completed metadata commit missing");
             self.in_flight_operations.fetch_sub(1, Ordering::SeqCst);
+            self.in_flight_sqe_work -= in_flight.reserved_sqe_work();
             if let InFlightKind::MetadataCommit { failure, tx, .. } = &mut in_flight.kind {
                 match failure.take() {
                     Some(error) => send_unit(tx, Err(error)),
@@ -1107,6 +1251,7 @@ impl RingDriver {
     fn complete_error(&mut self, id: u64, error: Error) {
         if let Some(mut in_flight) = self.in_flight.remove(&id) {
             self.in_flight_operations.fetch_sub(1, Ordering::SeqCst);
+            self.in_flight_sqe_work -= in_flight.reserved_sqe_work();
             #[cfg(test)]
             {
                 self.record_safety_event(RingPoolSafetyEvent::InFlightReleased);
@@ -1134,6 +1279,16 @@ impl RingDriver {
 
     fn submit_ring(&mut self, wait_for_completion: bool) -> Result<usize> {
         #[cfg(test)]
+        {
+            let (paused, wake) = &*self.submission_instrumentation.submission_pause;
+            let mut paused = paused.lock().expect("ring-pool submission pause poisoned");
+            while *paused {
+                paused = wake
+                    .wait(paused)
+                    .expect("ring-pool submission pause poisoned");
+            }
+        }
+        #[cfg(test)]
         if self
             .submission_instrumentation
             .submit_failures_remaining
@@ -1156,30 +1311,41 @@ impl RingDriver {
             ring.submit()
         };
         #[cfg(test)]
-        if result.is_err() {
-            self.record_safety_event(RingPoolSafetyEvent::SubmitFailed);
+        match &result {
+            Ok(_) => {
+                self.submission_instrumentation
+                    .successful_submissions
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            Err(_) => self.record_safety_event(RingPoolSafetyEvent::SubmitFailed),
         }
         result
     }
 
     fn abort_after_submit_failure(&mut self, error: Error) {
         self.rx.close();
-        while let Ok(request) = self.rx.try_recv() {
-            self.pending.push_back(request);
-        }
 
         // Fail-stop invariant: a submit error permanently terminates this shard;
         // no queued SQE is ever retried on another ring. SQEs may have been consumed
         // by the kernel even when io_uring_enter returned an error. Destroying the
         // ring synchronously cancels and quiesces that kernel context; only after
         // it returns may SQE-backed paths, FDs, and buffers in `in_flight` be
-        // released or their errors reported.
+        // released or any accepted request be notified.
         drop(self.ring.take());
         #[cfg(test)]
         self.record_safety_event(RingPoolSafetyEvent::RingDropped);
 
         self.fail_all(&error);
         while let Some(request) = self.pending.pop_front() {
+            self.pending_sqe_work -= request.reserved_sqe_work();
+            #[cfg(test)]
+            self.record_safety_event(RingPoolSafetyEvent::ErrorReported);
+            fail_request(request, clone_error(&error));
+        }
+        // Do not defeat the normal pending bound while failing. Closing first
+        // freezes channel admission; drain directly until all already-issued
+        // channel permits have either sent or observed closure.
+        while let Some(request) = self.rx.blocking_recv() {
             #[cfg(test)]
             self.record_safety_event(RingPoolSafetyEvent::ErrorReported);
             fail_request(request, clone_error(&error));
@@ -1681,6 +1847,36 @@ pub(crate) fn ring_index_for_key(key: &str, num_shards: usize) -> usize {
     ring_index_for_key_bytes(key.as_bytes(), num_shards)
 }
 
+fn validate_queue_capacity(queue_capacity: usize, driver_sqe_capacity: usize) -> Result<usize> {
+    let configuration_error = |message| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            BobsError::ConfigurationError(message),
+        )
+    };
+
+    if queue_capacity == 0 {
+        return Err(configuration_error(
+            "ring pool queue_capacity must be greater than 0".to_string(),
+        ));
+    }
+    if queue_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(configuration_error(format!(
+            "ring pool queue_capacity must not exceed {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
+
+    queue_capacity
+        .checked_mul(MAX_SQES_PER_REQUEST)
+        .and_then(|queued_work| queued_work.checked_add(driver_sqe_capacity))
+        .ok_or_else(|| {
+            configuration_error(
+                "ring pool queue_capacity overflows the admitted SQE work bound".to_string(),
+            )
+        })
+}
+
 /// Return the ring shard index for opaque routing-key bytes.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ring_index_for_key_bytes(key: &[u8], num_shards: usize) -> usize {
@@ -1693,7 +1889,7 @@ mod tests {
     use super::{
         global_ring_pool, init_global_ring_pool, ring_index_for_key,
         scoped_test_ring_pool_override, shutdown_global_ring_pool_for_exit, Request, RingPool,
-        RingPoolOptions, RingPoolSafetyEvent,
+        RingPoolOptions, RingPoolSafetyEvent, MAX_SQES_PER_REQUEST, RING_ENTRIES,
     };
     use std::collections::{HashMap, HashSet};
     use std::env;
@@ -1701,9 +1897,10 @@ mod tests {
     use std::io;
     use std::os::fd::OwnedFd;
     use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
-    use tokio::sync::{mpsc, oneshot};
-    use tokio::time::{timeout, Duration};
+    use tokio::sync::oneshot;
+    use tokio::time::{sleep, timeout, Duration};
 
     const PROBE_ENV: &str = "BOBS_RING_POOL_HASH_PROBE";
     const PROBE_PREFIX: &str = "BOBS_RING_POOL_HASH_PROBE_RESULT";
@@ -2084,6 +2281,17 @@ mod tests {
     }
 
     #[test]
+    fn ring_pool_rejects_queue_capacity_that_cannot_be_bounded() {
+        let err = RingPool::new_for_test(RingPoolOptions {
+            shard_count: 1,
+            queue_capacity: usize::MAX,
+            driver_name_prefix: "bobs-uring-test".to_owned(),
+        })
+        .expect_err("unrepresentable queue capacity should be rejected, not panic");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn ring_pool_driver_shutdown() {
         let pool = RingPool::new_for_test(explicit_test_options(4))
             .expect("explicit RingPool instance should start");
@@ -2106,45 +2314,120 @@ mod tests {
         assert!(shutdown.driver_threads_all_stopped);
     }
 
-    #[tokio::test]
-    async fn ring_pool_bounded_submission_queue_waits_for_capacity() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn ring_driver_bounds_backpressure_and_submits_under_sustained_arrivals() {
+        const QUEUE_CAPACITY: usize = RING_ENTRIES as usize;
+        const REQUESTS: usize = RING_ENTRIES as usize + QUEUE_CAPACITY + 32;
+        const DRIVER_ONE_SQE_LIMIT: usize = RING_ENTRIES as usize - MAX_SQES_PER_REQUEST + 1;
+
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(temp_dir.path().join("bounded-queue.dat"))
-            .expect("bounded queue test file should open");
+            .open(temp_dir.path().join("bounded-driver.dat"))
+            .expect("bounded driver test file should open");
         let fd = Arc::new(OwnedFd::from(file));
-        let (tx, mut rx) = mpsc::channel::<Request>(1);
+        let pool = Arc::new(
+            RingPool::new_for_test(RingPoolOptions {
+                shard_count: 1,
+                queue_capacity: QUEUE_CAPACITY,
+                driver_name_prefix: "bobs-uring-backpressure-test".to_owned(),
+            })
+            .expect("backpressure test pool should start"),
+        );
+        let receive_pause = pool.pause_receives_for_test();
+        let submission_pause = pool.pause_submissions_for_test();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
 
-        let (first_tx, _first_rx) = oneshot::channel();
-        tx.send(Request::SyncData {
-            fd: Arc::clone(&fd),
-            tx: first_tx,
+        let mut handles = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let pool = Arc::clone(&pool);
+            let fd = Arc::clone(&fd);
+            let accepted = Arc::clone(&accepted);
+            let completed = Arc::clone(&completed);
+            handles.push(tokio::spawn(async move {
+                let (tx, rx) = oneshot::channel();
+                pool.submit_to_ring(0, Request::SyncData { fd, tx }).await?;
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let result = rx.await.map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "driver dropped response")
+                })?;
+                if result.is_ok() {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+                result
+            }));
+        }
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if accepted.load(Ordering::SeqCst) > QUEUE_CAPACITY {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
         })
         .await
-        .expect("first send should fill the bounded queue");
+        .expect("blocked driver should leave the bounded channel full");
+        drop(receive_pause);
 
-        let (second_tx, _second_rx) = oneshot::channel();
-        let second_send = tx.send(Request::SyncData {
-            fd: Arc::clone(&fd),
-            tx: second_tx,
-        });
-        tokio::pin!(second_send);
-        timeout(Duration::from_millis(25), &mut second_send)
-            .await
-            .expect_err("second send should wait while capacity is exhausted");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if pool.submission_events().len() == DRIVER_ONE_SQE_LIMIT
+                    && accepted.load(Ordering::SeqCst) == DRIVER_ONE_SQE_LIMIT + QUEUE_CAPACITY
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("driver should fill only its SQE budget and the bounded channel");
 
-        let (drained, _rx) = tokio::task::spawn_blocking(move || (rx.blocking_recv(), rx))
-            .await
-            .expect("blocking recv task should not panic");
-        assert!(matches!(drained, Some(Request::SyncData { .. })));
-        timeout(Duration::from_secs(1), second_send)
-            .await
-            .expect("second send should complete after capacity is drained")
-            .expect("receiver should remain open");
+        sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            DRIVER_ONE_SQE_LIMIT + QUEUE_CAPACITY,
+            "later senders must remain blocked while driver and channel budgets are exhausted"
+        );
+        assert_eq!(pool.successful_submissions_for_test(), 0);
+        assert_eq!(
+            pool.max_driver_sqe_work_for_test(),
+            DRIVER_ONE_SQE_LIMIT,
+            "driver-held work must stay within the ring SQE budget"
+        );
+
+        drop(submission_pause);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if pool.successful_submissions_for_test() > 0
+                    && completed.load(Ordering::SeqCst) > 0
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("real ring submissions must progress while later arrivals remain queued");
+
+        for handle in handles {
+            timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("sustained-arrival request should not hang")
+                .expect("sender task should not panic")
+                .expect("fsync request should complete");
+        }
+        assert_eq!(completed.load(Ordering::SeqCst), REQUESTS);
+
+        drop(fd);
+        let pool = Arc::try_unwrap(pool).expect("test should own ring pool after tasks finish");
+        let shutdown = pool.shutdown().expect("ring pool should shut down");
+        assert_eq!(shutdown.in_flight_operations_remaining, 0);
+        assert!(shutdown.driver_threads_all_stopped);
     }
 
     #[tokio::test]
@@ -2203,6 +2486,104 @@ mod tests {
         assert_eq!(later_error.kind(), io::ErrorKind::BrokenPipe);
 
         drop(pool);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn submit_failure_reports_driver_and_channel_backlog_after_ring_drop() {
+        const QUEUE_CAPACITY: usize = RING_ENTRIES as usize;
+        const DRIVER_ONE_SQE_LIMIT: usize = RING_ENTRIES as usize - MAX_SQES_PER_REQUEST + 1;
+        const REQUESTS: usize = DRIVER_ONE_SQE_LIMIT + QUEUE_CAPACITY;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(temp_dir.path().join("submit-failure-backlog.dat"))
+            .expect("submit-failure backlog file should open");
+        let fd = Arc::new(OwnedFd::from(file));
+        let pool = Arc::new(
+            RingPool::new_for_test(RingPoolOptions {
+                shard_count: 1,
+                queue_capacity: QUEUE_CAPACITY,
+                driver_name_prefix: "bobs-uring-submit-failure-test".to_owned(),
+            })
+            .expect("submit-failure backlog pool should start"),
+        );
+        let receive_pause = pool.pause_receives_for_test();
+        let submission_pause = pool.pause_submissions_for_test();
+        pool.inject_submit_failure_for_test();
+        let accepted = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let pool = Arc::clone(&pool);
+            let fd = Arc::clone(&fd);
+            let accepted = Arc::clone(&accepted);
+            handles.push(tokio::spawn(async move {
+                let (tx, rx) = oneshot::channel();
+                pool.submit_to_ring(0, Request::SyncData { fd, tx }).await?;
+                accepted.fetch_add(1, Ordering::SeqCst);
+                rx.await.map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "driver dropped response")
+                })?
+            }));
+        }
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if accepted.load(Ordering::SeqCst) > QUEUE_CAPACITY {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("blocked driver should leave the bounded channel full");
+        drop(receive_pause);
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if pool.submission_events().len() == DRIVER_ONE_SQE_LIMIT
+                    && accepted.load(Ordering::SeqCst) == REQUESTS
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both driver budget and channel backlog should fill before failure");
+        drop(submission_pause);
+
+        for handle in handles {
+            let error = timeout(Duration::from_secs(3), handle)
+                .await
+                .expect("submit-failure request should not hang")
+                .expect("sender task should not panic")
+                .expect_err("injected submit must fail every accepted request");
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+        }
+
+        let events = pool.safety_events();
+        assert_eq!(events.first(), Some(&RingPoolSafetyEvent::SubmitFailed));
+        assert_eq!(events.get(1), Some(&RingPoolSafetyEvent::RingDropped));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == RingPoolSafetyEvent::InFlightReleased)
+                .count(),
+            DRIVER_ONE_SQE_LIMIT
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == RingPoolSafetyEvent::ErrorReported)
+                .count(),
+            REQUESTS
+        );
+        assert_eq!(pool.in_flight_operations(), 0);
     }
 
     #[test]
