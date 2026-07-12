@@ -52,7 +52,7 @@ On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. 
 
 Each current sidecar records its spool's `page_size`. For a legacy sidecar without that field, recovery derives a page stride only when the sidecar and durable file length make it unambiguous, then atomically persists the migration before exposing the spool. Unsafe or inconsistent cases are quarantined: BOBS leaves `meta.json` and `spool.dat` intact and fails recovery rather than guessing a stride or deleting the bytes.
 
-The removed legacy `Readable` state is migrated to `Complete`. Recovery validates the durable layout, reconstructs terminal byte/page metadata, clears the obsolete write lock, and atomically commits the migrated sidecar before serving it.
+The removed legacy `Readable` state is migrated to `Complete`. Because it is terminal and its payload is contiguous, recovery resegments its durable bytes using the currently configured `page_size` rather than inferring its old page stride. It reconstructs terminal byte/page metadata, clears the obsolete write lock, and atomically commits the migrated page size and sidecar before serving it.
 
 A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 

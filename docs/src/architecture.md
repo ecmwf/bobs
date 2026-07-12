@@ -19,7 +19,7 @@ BOBS is built around one directory per object key and an asynchronous filesystem
 
 ### Linux `io_uring` routing
 
-Default Linux builds route file operations through a fixed-size pool of `io_uring` shards. `io_uring_shards` can set the shard count explicitly and must be greater than `0`; when unset, BOBS resolves it to `max(1, num_cpus / 4)`. `io_uring_queue_capacity` defaults to `1024` per shard and must be greater than `0`. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust's randomized `Hash` state, so the same object key maps to the same shard for a given shard count across restarts and builds.
+Default Linux builds route file operations through a fixed-size pool of `io_uring` shards. `io_uring_shards` can set the shard count explicitly and must be greater than `0`; when unset, BOBS resolves it to `max(1, num_cpus / 4)`. `io_uring_queue_capacity` defaults to `1024` per shard and must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`). Values above that platform-specific upper bound fail startup with `ConfigurationError` instead of overflowing or panicking. This validation also runs in fallback builds, although fallback I/O otherwise ignores the setting. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust's randomized `Hash` state, so the same object key maps to the same shard for a given shard count across restarts and builds.
 
 Data-file operations and metadata sidecar commits for the same object are routed by the same object key and therefore use the same shard. This keeps a key's `spool.dat` work and its `meta.json` create/rename/fsync work on one ring while still allowing independent keys to spread across shards.
 
@@ -59,7 +59,7 @@ Startup recovery scans `<data_dir>` for key directories with `meta.json`. In-pro
 
 Current sidecars persist the spool's `page_size`, so a later configuration change cannot reinterpret existing page offsets. When a legacy sidecar has no page size, recovery derives it only when the recorded page layout and durable `spool.dat` length determine a safe stride. The upgraded sidecar is atomically committed before the spool is exposed or mutated. If the evidence is ambiguous or inconsistent, recovery leaves the sidecar and data intact and fails; it does not guess a stride or delete the quarantined spool.
 
-Recovery also recognizes the removed legacy `Readable` lifecycle state. It validates the durable file and page layout, reconstructs terminal byte/page metadata, changes the state to `Complete`, clears the obsolete write lock, and atomically persists that migration before serving the spool.
+Recovery also recognizes the removed legacy `Readable` lifecycle state. Because these objects are terminal and their payload is contiguous, recovery resegments the durable bytes using the currently configured `page_size` rather than inferring the old stride. It reconstructs terminal byte/page metadata, changes the state to `Complete`, clears the obsolete write lock, and atomically persists the migrated page size and metadata before serving the spool.
 
 The layout is friendly to shared filesystems and multi-BOBS deployments because each object has its own directory and sidecar, and each spool has a single writer. Independent keys can be created, completed, recovered, and deleted without a global metadata database or cross-key write serialization. Correct routing is still required: create, write, complete, and read traffic for a key must reach a BOBS instance that can see the same `<data_dir>/<key>` files.
 
