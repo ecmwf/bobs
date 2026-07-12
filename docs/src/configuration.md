@@ -20,7 +20,7 @@ Without a config file, BOBS runs with defaults:
 
 Backend selection is build-feature based, not a YAML option: Linux builds without extra features use the `io_uring` FileIO and sidecar metadata backend; builds with `--features tokio-fileio-fallback`, and non-Linux builds, use the Tokio/blocking fallback backend with the same on-disk `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json` layout. These backend settings do not change the HTTP API and do not require an on-disk migration.
 
-Default Linux builds use sharded `io_uring` rings. `io_uring_shards` is optional. If `io_uring_shards` is unset, BOBS resolves it to `max(1, num_cpus / 4)`. File operations are assigned to shards by stable object-key hashing, and each object's data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.
+Default Linux builds use sharded `io_uring` rings. `io_uring_shards` is optional. If `io_uring_shards` is unset, BOBS resolves it to `max(1, num_cpus / 4)`. Explicit values must be between `1` and `256`, inclusive. File operations are assigned to shards by stable object-key hashing, and each object's data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.
 
 The default Linux backend requires Linux 5.11+ because BOBS submits operations against raw file descriptors, and it requires a container/runtime policy that permits `io_uring_setup`. If `io_uring_setup` is blocked, use a runtime seccomp/sysctl policy that permits it or build the fallback binary:
 
@@ -31,7 +31,7 @@ cargo build --release --bins --features tokio-fileio-fallback
 ## Fields
 
 | Field | Default | Description |
-|-------|---------|-------------|
+| ------- | --------- | ------------- |
 | `host` | `0.0.0.0` | Address for the HTTP server to bind to. |
 | `port` | `3000` | Port for the HTTP server to listen on. |
 | `data_dir` | `./data` | File system path for storing spool files. |
@@ -44,7 +44,7 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. |
 | `long_poll_timeout_ms` | `25000` | Maximum time in ms to wait for new data during a read before redirecting. |
-| `io_uring_shards` | unset | Linux default-backend ring-pool shard count. Leave unset to resolve to `max(1, num_cpus / 4)`. Keys are mapped to shards with stable hashing. Must be greater than `0` when set. Ignored by fallback builds. |
+| `io_uring_shards` | unset | Linux default-backend ring-pool shard count. Leave unset to resolve to `max(1, num_cpus / 4)`. Keys are mapped to shards with stable hashing. Explicit values must be between `1` and `256`, inclusive. Ignored by fallback builds. |
 | `host_prefix` | `""` | External download host prefix used when generating read URLs. |
 | `domain` | `""` | External download domain used when generating read URLs. |
 | `route_name` | `""` | External download route prefix, for example `download`. |
@@ -69,7 +69,7 @@ reader_done_ttl_secs: 60      # deprecated compatibility field
 unread_ttl_secs: 3600         # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
-io_uring_shards: 4              # optional; omit to use max(1, num_cpus / 4) on Linux default backend
+io_uring_shards: 4              # optional; valid range 1..=256; omit to use max(1, num_cpus / 4)
 host_prefix: polytope-example
 domain: example.com
 route_name: download

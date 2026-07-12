@@ -2610,11 +2610,13 @@ mod tests {
         state: &AppState<DefaultFileIO, DefaultMetadataStore>,
         key: &str,
     ) {
-        for _ in 0..10_000 {
+        for _ in 0..2_000 {
             if state.manager.get_spool(key).is_none() {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+                .await
+                .expect("removal wait task panicked");
         }
     }
 

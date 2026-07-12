@@ -19,7 +19,7 @@ BOBS is built around one directory per object key and an asynchronous filesystem
 
 ### Linux `io_uring` routing
 
-Default Linux builds route file operations through a fixed-size pool of `io_uring` shards. `io_uring_shards` can set the shard count explicitly. If `io_uring_shards` is unset, BOBS resolves it to `max(1, num_cpus / 4)`. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust's randomized `Hash` state, so the same object key maps to the same shard for a given shard count across restarts and builds.
+Default Linux builds route file operations through a fixed-size pool of `io_uring` shards. `io_uring_shards` can set the shard count explicitly from `1` through `256`, inclusive. If `io_uring_shards` is unset, BOBS resolves it to `max(1, num_cpus / 4)`. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust's randomized `Hash` state, so the same object key maps to the same shard for a given shard count across restarts and builds.
 
 Data-file operations and metadata sidecar commits for the same object are routed by the same object key and therefore use the same shard. This keeps a key's `spool.dat` work and its `meta.json` create/rename/fsync work on one ring while still allowing independent keys to spread across shards.
 
