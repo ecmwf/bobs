@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::io::MAX_IO_URING_SHARDS;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +33,8 @@ pub struct Config {
     pub unread_ttl_secs: u64,
     pub cleanup_sweep_interval_secs: u64,
     pub long_poll_timeout_ms: u64,
+    /// Explicit Linux ring-pool shard count. `None` uses `(num_cpus / 4).max(1)`;
+    /// configured values must be in `1..=MAX_IO_URING_SHARDS`.
     pub io_uring_shards: Option<usize>,
     pub io_uring_queue_capacity: usize,
     pub host_prefix: String,
@@ -140,6 +143,16 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "io_uring_shards must be greater than 0 when set",
+            ));
+        }
+
+        if self
+            .io_uring_shards
+            .is_some_and(|shards| shards > MAX_IO_URING_SHARDS)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("io_uring_shards must not exceed {MAX_IO_URING_SHARDS} when set"),
             ));
         }
 
@@ -467,6 +480,75 @@ route_name: z
 
         let err = config.validate().expect_err("validation should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn config_io_uring_validate_accepts_maximum_shards() {
+        let config = Config {
+            io_uring_shards: Some(MAX_IO_URING_SHARDS),
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        config
+            .validate()
+            .expect("maximum io_uring shard count should be accepted");
+    }
+
+    #[test]
+    fn config_io_uring_validate_rejects_one_above_maximum() {
+        let config = Config {
+            io_uring_shards: Some(MAX_IO_URING_SHARDS + 1),
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(&MAX_IO_URING_SHARDS.to_string()));
+    }
+
+    #[test]
+    fn config_io_uring_validate_rejects_usize_boundary() {
+        let config = Config {
+            io_uring_shards: Some(usize::MAX),
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("validation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn config_io_uring_u64_max_returns_a_configuration_error() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("io-uring-u64-max.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "io_uring_shards: {}\nhost_prefix: x\ndomain: y\nroute_name: z\n",
+                u64::MAX
+            ),
+        )
+        .expect("write yaml");
+
+        let parsed = Config::from_file(&path);
+        if usize::try_from(u64::MAX).is_ok() {
+            let config = parsed.expect("u64::MAX should fit usize on this target");
+            assert_eq!(config.io_uring_shards, Some(usize::MAX));
+            let err = config.validate().expect_err("validation should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        } else {
+            let err = parsed.expect_err("out-of-range usize should fail to parse");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
