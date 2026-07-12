@@ -18,6 +18,9 @@ pub enum BobsError {
     #[error("spool not found: {key}")]
     SpoolNotFound { key: String },
 
+    #[error("spool already exists: {key}")]
+    SpoolAlreadyExists { key: String },
+
     #[error("spool is closed")]
     SpoolClosed,
 

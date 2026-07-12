@@ -40,7 +40,7 @@ Returns the health status and hostname of the instance.
 
 ### PUT /api/v1/create
 
-Creates a new spool. A valid `X-Polytope-Job-Id` header is a 26-character Crockford base32 request ID in either case. Uppercase input is accepted and normalized to the lowercase canonical key; otherwise BOBS generates a UUIDv4 key.
+Creates a new spool and returns its key. A valid `X-Polytope-Job-Id` is a 26-character Crockford base32 request ID in either case; uppercase input is normalized to the lowercase canonical key. Otherwise BOBS generates a UUIDv4 key. Create is not idempotent: if that key already exists or is being created, BOBS returns `409 Conflict` without truncating the existing bytes or changing admission accounting. Exactly one concurrent create can succeed, and a successfully deleted key may be created again.
 
 **Request Body**:
 
@@ -49,7 +49,7 @@ Creates a new spool. A valid `X-Polytope-Job-Id` header is a 26-character Crockf
 - `write_locked` (boolean, optional): Default `false`. If `true`, reads return `423 Locked` until the spool is completed.
 - `labels` (object of string values, optional): Caller labels filtered and propagated to metrics.
 
-BOBS rejects unknown JSON fields and `content_type` or `content_encoding` values that cannot safely be represented as HTTP headers with `400 Bad Request`.
+BOBS rejects unknown JSON fields and `content_type` or `content_encoding` values that cannot safely be represented as HTTP headers with `400 Bad Request`. Repeating or concurrently issuing create with the same valid `X-Polytope-Job-Id` returns `409 Conflict`.
 
 **Example**:
 
@@ -78,7 +78,9 @@ Appends binary data to the spool.
 
 **Response (200 OK)**: Empty body on success.
 
-A write that would exceed `max_spool_bytes` returns `413 Payload Too Large`. If a chunked body crosses the limit after bytes have been written, BOBS durably deletes the partial spool and releases its admission slot before returning `413`; failure to complete that cleanup returns a server error.
+Writes that would take a spool beyond `max_spool_bytes` return `413 Payload Too Large`. Before deleting an oversized spool, BOBS atomically verifies under the lifecycle/write gate that the request offset is still the current write head and the spool remains writable. An offset mismatch therefore returns `400`, a completed spool returns `409`, and a deleting or deleted spool returns `404`, without the oversize path deleting or otherwise changing that object.
+
+For a valid write head, both known-length rejection and a chunked upload crossing the limit durably delete the partial spool and release its admission slot before returning `413`; a cleanup failure returns a server error instead. Known-length oversize requests are rejected without polling the body.
 
 **Error Cases**:
 

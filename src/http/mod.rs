@@ -416,11 +416,7 @@ where
             // not a safe payload rejection.
             state
                 .manager
-                .delete_spool_with_reason(
-                    &key,
-                    crate::manager::DeleteReason::Oversize,
-                    job_id.as_deref(),
-                )
+                .delete_oversize_spool_if_write_head(&key, write_offset, job_id.as_deref())
                 .await
                 .map_err(ApiError)?;
         }
@@ -1123,6 +1119,7 @@ impl IntoResponse for ApiError {
             BobsError::SpoolTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             BobsError::AdmissionTimeout => StatusCode::SERVICE_UNAVAILABLE,
             BobsError::SpoolNotFound { .. } => StatusCode::NOT_FOUND,
+            BobsError::SpoolAlreadyExists { .. } => StatusCode::CONFLICT,
             BobsError::OffsetMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::SizeMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::InvalidRange(_) => StatusCode::BAD_REQUEST,
@@ -1612,6 +1609,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_request_id_create_returns_conflict_without_truncation_or_permit_leak() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_live_spools = 2;
+        })
+        .await;
+        let request_id = "0123456789abcdefghjkmnpqrs";
+
+        let first = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, request_id)
+            .body(Body::empty())
+            .expect("first create request");
+        assert_eq!(
+            app.clone().oneshot(first).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let write = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{request_id}/0"))
+            .body(Body::from("safe"))
+            .expect("write request");
+        assert_eq!(
+            app.clone().oneshot(write).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let duplicate = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, request_id)
+            .body(Body::from(r#"{"write_locked":true}"#))
+            .expect("duplicate create request");
+        assert_eq!(
+            app.oneshot(duplicate).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+
+        assert_eq!(
+            tokio::fs::read(state.config.data_dir.join(request_id).join("spool.dat"))
+                .await
+                .expect("read original spool bytes"),
+            b"safe"
+        );
+        assert_eq!(state.manager.spools.len(), 1);
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_request_id_creates_have_one_winner_and_one_conflict() {
+        let (app, state) = app_with_config(|config| config.max_live_spools = 2).await;
+        let request_id = "0123456789abcdefghjkmnpqrs";
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+
+        for _ in 0..2 {
+            let task_app = app.clone();
+            let task_start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                let request = Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/create")
+                    .header(JOB_ID_HEADER, request_id)
+                    .body(Body::empty())
+                    .expect("create request");
+                task_start.wait().await;
+                task_app
+                    .oneshot(request)
+                    .await
+                    .expect("create response")
+                    .status()
+            }));
+        }
+        start.wait().await;
+        let first = tasks.remove(0).await.expect("first task join");
+        let second = tasks.remove(0).await.expect("second task join");
+        assert!(
+            matches!(
+                (first, second),
+                (StatusCode::CREATED, StatusCode::CONFLICT)
+                    | (StatusCode::CONFLICT, StatusCode::CREATED)
+            ),
+            "unexpected statuses: {first}, {second}"
+        );
+        assert_eq!(state.manager.spools.len(), 1);
+        assert_eq!(state.manager.admission.available_permits(), 1);
+        assert_eq!(
+            tokio::fs::metadata(state.config.data_dir.join(request_id).join("spool.dat"))
+                .await
+                .expect("created data file")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn pprof_is_not_exposed_by_default() {
         let app = app().await;
         let req = Request::builder()
@@ -1906,6 +2000,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_length_oversize_does_not_delete_when_complete_wins_race() {
+        let (app, state) = app_with_config(|config| config.max_spool_bytes = 6).await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        let complete_app = app.clone();
+        let complete_key = key.clone();
+        let complete_task = tokio::spawn(async move {
+            complete_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/complete/{complete_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let write_app = app.clone();
+        let write_key = key.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/write/{write_key}/0"))
+                        .header(axum::http::header::CONTENT_LENGTH, "7")
+                        .body(Body::from_stream(async_stream::stream! {
+                            body_polled_in_stream.store(true, Ordering::SeqCst);
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(lifecycle_guard);
+
+        assert_eq!(complete_task.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(write_task.await.unwrap().status(), StatusCode::CONFLICT);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        let surviving = state
+            .manager
+            .get_spool(&key)
+            .expect("completed spool survives");
+        assert_eq!(
+            surviving.metadata.lock().await.state,
+            crate::spool::SpoolState::Complete
+        );
+        assert!(state.config.data_dir.join(&key).join("spool.dat").exists());
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_does_not_delete_when_complete_wins_race() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_spool_bytes = 6;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let (first_page_tx, first_page_rx) = tokio::sync::oneshot::channel();
+        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+        let write_app = app.clone();
+        let write_key = key.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/write/{write_key}/0"))
+                        .body(Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234"));
+                            let _ = first_page_tx.send(());
+                            let _ = overflow_rx.await;
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"567"));
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        first_page_rx.await.expect("first page written");
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        let complete_app = app.clone();
+        let complete_key = key.clone();
+        let complete_task = tokio::spawn(async move {
+            complete_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/complete/{complete_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        overflow_tx.send(()).expect("send overflow");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(lifecycle_guard);
+
+        assert_eq!(complete_task.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(write_task.await.unwrap().status(), StatusCode::CONFLICT);
+        let surviving = state
+            .manager
+            .get_spool(&key)
+            .expect("completed spool survives");
+        assert_eq!(
+            surviving.metadata.lock().await.state,
+            crate::spool::SpoolState::Complete
+        );
+        assert_eq!(
+            tokio::fs::read(state.config.data_dir.join(&key).join("spool.dat"))
+                .await
+                .unwrap(),
+            b"1234"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_length_oversize_returns_not_found_when_delete_wins_race() {
+        let (app, state) = app_with_config(|config| {
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        let delete_app = app.clone();
+        let delete_key = key.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_app
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/v1/delete/{delete_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let write_app = app.clone();
+        let write_key = key.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/write/{write_key}/0"))
+                        .header(axum::http::header::CONTENT_LENGTH, "7")
+                        .body(Body::from_stream(async_stream::stream! {
+                            body_polled_in_stream.store(true, Ordering::SeqCst);
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(lifecycle_guard);
+
+        assert_eq!(delete_task.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(write_task.await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        assert!(state.manager.get_spool(&key).is_none());
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_returns_not_found_when_delete_wins_race() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let (first_page_tx, first_page_rx) = tokio::sync::oneshot::channel();
+        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+        let write_app = app.clone();
+        let write_key = key.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/write/{write_key}/0"))
+                        .body(Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234"));
+                            let _ = first_page_tx.send(());
+                            let _ = overflow_rx.await;
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"567"));
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        first_page_rx.await.expect("first page written");
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        let delete_app = app.clone();
+        let delete_key = key.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_app
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/v1/delete/{delete_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        overflow_tx.send(()).expect("send overflow");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(lifecycle_guard);
+
+        assert_eq!(delete_task.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(write_task.await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(!state.config.data_dir.join(&key).exists());
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn known_length_oversize_cleanup_failure_returns_500_and_retains_tracked_state() {
         let (app, state) = app_with_config(|config| {
             config.page_size = 4;
@@ -2018,31 +2376,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn huge_page_size_and_body_hint_do_not_eagerly_allocate_or_panic() {
+    async fn known_length_oversize_wrong_offset_returns_400_without_deleting_or_polling() {
         let (app, state) = app_with_config(|config| {
             config.page_size = usize::MAX;
             config.max_spool_bytes = 8;
         })
         .await;
         let key = create_key(&app).await;
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let body_stream = async_stream::stream! {
+            body_polled_in_stream.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"oversize"));
+        };
 
         let hinted_oversize = Request::builder()
             .method("POST")
             .uri(format!("/api/v1/write/{key}/1"))
             .header(axum::http::header::CONTENT_LENGTH, u64::MAX.to_string())
-            .body(Body::empty())
+            .body(Body::from_stream(body_stream))
             .expect("hinted request");
         assert_eq!(
             app.clone().oneshot(hinted_oversize).await.unwrap().status(),
-            StatusCode::PAYLOAD_TOO_LARGE
+            StatusCode::BAD_REQUEST
         );
+        assert!(!body_polled.load(Ordering::SeqCst));
+        assert!(state.manager.get_spool(&key).is_some());
 
-        assert!(state.manager.get_spool(&key).is_none());
-
-        let replacement_key = create_key(&app).await;
         let small_write = Request::builder()
             .method("POST")
-            .uri(format!("/api/v1/write/{replacement_key}/0"))
+            .uri(format!("/api/v1/write/{key}/0"))
             .body(Body::from("tiny"))
             .expect("small write request");
         assert_eq!(
@@ -2051,10 +2414,42 @@ mod tests {
         );
         let spool = state
             .manager
-            .get_spool(&replacement_key)
-            .expect("replacement spool remains");
+            .get_spool(&key)
+            .expect("original spool remains");
         assert_eq!(spool.write_buffer.lock().await.as_ref(), b"tiny");
         assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_wrong_offset_returns_400_without_deleting() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 8;
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/1"))
+            .body(Body::from_stream(async_stream::stream! {
+                yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+            }))
+            .expect("chunked oversize request");
+
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.manager.get_spool(&key).is_some());
+        assert_eq!(
+            tokio::fs::metadata(state.config.data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("original data file")
+                .len(),
+            0
+        );
+        assert_eq!(state.manager.admission.available_permits(), 0);
     }
 
     #[tokio::test]
