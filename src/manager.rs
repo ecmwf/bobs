@@ -415,10 +415,6 @@ where
                 self.metadata_store.write(&meta).await?;
             }
 
-            if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
-                meta.last_write_at = now_secs();
-            }
-
             let handle = match F::open(&meta.data_path).await {
                 Ok(h) => h,
                 Err(e) => {
