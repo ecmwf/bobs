@@ -96,15 +96,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     {
-        let ring_pool = bobs::io::initialize_production_ring_pool(
-            config.io_uring_shards,
-            config.io_uring_queue_capacity,
-        )?;
+        let queue_capacity = config.resolved_io_uring_queue_capacity()?;
+        let ring_pool =
+            bobs::io::initialize_production_ring_pool(config.io_uring_shards, queue_capacity)?;
         tracing::debug!(
             configured_shards = ?ring_pool.configured_shards,
             resolved_shards = ring_pool.resolved_shards,
             cpu_pinning_enabled = ring_pool.cpu_pinning_enabled,
-            queue_capacity = config.io_uring_queue_capacity,
+            queue_capacity,
             "io_uring production ring pool initialized",
         );
     }

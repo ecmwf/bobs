@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::error::{BobsError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,6 +14,8 @@ fn derived_max_live_spools(page_size: usize, max_cache_bytes: usize) -> usize {
 }
 // The chart's default PVC is 10 GiB; reserve 20% for sidecars and headroom.
 const DEFAULT_MAX_SPOOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Tokio's bounded MPSC channel stores capacity in a semaphore.
+pub const MAX_IO_URING_QUEUE_CAPACITY: usize = tokio::sync::Semaphore::MAX_PERMITS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -48,7 +51,7 @@ pub struct Config {
     pub cleanup_sweep_interval_secs: u64,
     pub long_poll_timeout_ms: u64,
     pub io_uring_shards: Option<usize>,
-    pub io_uring_queue_capacity: usize,
+    pub io_uring_queue_capacity: u64,
     pub host_prefix: String,
     pub domain: String,
     pub route_name: String,
@@ -135,91 +138,96 @@ impl Config {
         Ok(config)
     }
 
-    pub fn validate(&self) -> std::io::Result<()> {
+    /// Resolve the configured queue capacity to Tokio's platform-sized channel bound.
+    pub fn resolved_io_uring_queue_capacity(&self) -> Result<usize> {
+        let capacity = usize::try_from(self.io_uring_queue_capacity).map_err(|_| {
+            BobsError::ConfigurationError(format!(
+                "io_uring_queue_capacity must not exceed {MAX_IO_URING_QUEUE_CAPACITY}"
+            ))
+        })?;
+
+        if capacity == 0 {
+            return Err(BobsError::ConfigurationError(
+                "io_uring_queue_capacity must be greater than 0".to_string(),
+            ));
+        }
+
+        if capacity > MAX_IO_URING_QUEUE_CAPACITY {
+            return Err(BobsError::ConfigurationError(format!(
+                "io_uring_queue_capacity must not exceed {MAX_IO_URING_QUEUE_CAPACITY}"
+            )));
+        }
+
+        Ok(capacity)
+    }
+
+    pub fn validate(&self) -> Result<()> {
         if self.page_size == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "page_size must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "page_size must be greater than 0".to_string(),
             ));
         }
 
         if self.max_live_spools == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "max_live_spools must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "max_live_spools must be greater than 0".to_string(),
             ));
         }
 
         if self.max_live_spools > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "max_live_spools must not exceed {}",
-                    tokio::sync::Semaphore::MAX_PERMITS
-                ),
-            ));
+            return Err(BobsError::ConfigurationError(format!(
+                "max_live_spools must not exceed {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
         }
 
         if self.max_spool_bytes == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "max_spool_bytes must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "max_spool_bytes must be greater than 0".to_string(),
             ));
         }
 
         if self.create_admission_timeout_ms == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "create_admission_timeout_ms must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "create_admission_timeout_ms must be greater than 0".to_string(),
             ));
         }
 
         if self.writer_inactivity_timeout_secs == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "writer_inactivity_timeout_secs must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "writer_inactivity_timeout_secs must be greater than 0".to_string(),
             ));
         }
 
         if self.cleanup_sweep_interval_secs == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "cleanup_sweep_interval_secs must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "cleanup_sweep_interval_secs must be greater than 0".to_string(),
             ));
         }
 
         if self.long_poll_timeout_ms == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "long_poll_timeout_ms must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "long_poll_timeout_ms must be greater than 0".to_string(),
             ));
         }
 
         if self.io_uring_shards == Some(0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "io_uring_shards must be greater than 0 when set",
+            return Err(BobsError::ConfigurationError(
+                "io_uring_shards must be greater than 0 when set".to_string(),
             ));
         }
 
-        if self.io_uring_queue_capacity == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "io_uring_queue_capacity must be greater than 0",
-            ));
-        }
+        self.resolved_io_uring_queue_capacity()?;
 
         if self.read_idle_ttl_secs == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "read_idle_ttl_secs must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "read_idle_ttl_secs must be greater than 0".to_string(),
             ));
         }
 
         if self.full_read_complete_ttl_secs == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "full_read_complete_ttl_secs must be greater than 0",
+            return Err(BobsError::ConfigurationError(
+                "full_read_complete_ttl_secs must be greater than 0".to_string(),
             ));
         }
 
@@ -231,30 +239,27 @@ impl Config {
             .min(self.read_idle_ttl_secs)
             .min(self.full_read_complete_ttl_secs);
         if self.cleanup_sweep_interval_secs > shortest_cleanup_deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "cleanup_sweep_interval_secs must not exceed any active cleanup timeout",
+            return Err(BobsError::ConfigurationError(
+                "cleanup_sweep_interval_secs must not exceed any active cleanup timeout"
+                    .to_string(),
             ));
         }
 
         if self.host_prefix.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "host_prefix must be set in config",
+            return Err(BobsError::ConfigurationError(
+                "host_prefix must be set in config".to_string(),
             ));
         }
 
         if self.domain.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "domain must be set in config",
+            return Err(BobsError::ConfigurationError(
+                "domain must be set in config".to_string(),
             ));
         }
 
         if self.route_name.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "route_name must be set in config",
+            return Err(BobsError::ConfigurationError(
+                "route_name must be set in config".to_string(),
             ));
         }
 
@@ -396,7 +401,7 @@ route_name: test-route
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
     }
 
     #[test]
@@ -438,7 +443,7 @@ route_name: test-route
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
     }
 
     #[test]
@@ -452,7 +457,7 @@ route_name: test-route
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
         assert!(err.to_string().contains("max_live_spools"));
     }
 
@@ -475,7 +480,7 @@ route_name: test-route
             },
         ] {
             let err = config.validate().expect_err("validation should fail");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(matches!(err, BobsError::ConfigurationError(_)));
         }
     }
 
@@ -483,7 +488,7 @@ route_name: test-route
     fn test_validate_rejects_missing_routing_fields() {
         let config = Config::default();
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
     }
 
     #[test]
@@ -509,7 +514,7 @@ route_name: test-route
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
     }
 
     #[test]
@@ -523,7 +528,7 @@ route_name: test-route
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
     }
 
     #[test]
@@ -537,7 +542,7 @@ route_name: test-route
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
         assert!(err.to_string().contains("writer_inactivity_timeout_secs"));
     }
 
@@ -553,7 +558,7 @@ route_name: test-route
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
         assert!(err.to_string().contains("cleanup_sweep_interval_secs"));
     }
 
@@ -604,6 +609,11 @@ route_name: z
         let cfg = Config::from_file(&path).expect("parse yaml");
         assert_eq!(cfg.io_uring_shards, None);
         assert_eq!(cfg.io_uring_queue_capacity, 1024);
+        assert_eq!(
+            cfg.resolved_io_uring_queue_capacity()
+                .expect("default queue capacity should be valid"),
+            1024
+        );
     }
 
     #[test]
@@ -617,7 +627,7 @@ route_name: z
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
     }
 
     #[test]
@@ -631,7 +641,68 @@ route_name: z
         };
 
         let err = config.validate().expect_err("validation should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
+    }
+
+    #[test]
+    fn config_io_uring_queue_capacity_accepts_tokio_boundary_and_converts_to_usize() {
+        let config = Config {
+            io_uring_queue_capacity: MAX_IO_URING_QUEUE_CAPACITY as u64,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        config.validate().expect("Tokio channel boundary is valid");
+        assert_eq!(
+            config
+                .resolved_io_uring_queue_capacity()
+                .expect("capacity should convert to usize"),
+            MAX_IO_URING_QUEUE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn config_io_uring_queue_capacity_rejects_values_above_tokio_boundary() {
+        for queue_capacity in [(MAX_IO_URING_QUEUE_CAPACITY as u64) + 1, u64::MAX] {
+            let config = Config {
+                io_uring_queue_capacity: queue_capacity,
+                host_prefix: "test".into(),
+                domain: "example.com".into(),
+                route_name: "bobs".into(),
+                ..Config::default()
+            };
+
+            let err = config
+                .validate()
+                .expect_err("capacity above Tokio's channel limit must fail");
+            assert!(
+                matches!(err, BobsError::ConfigurationError(ref message) if message.contains("io_uring_queue_capacity") && message.contains(&MAX_IO_URING_QUEUE_CAPACITY.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn config_io_uring_from_file_parses_u64_max_for_validation() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("io-uring-u64-max.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "io_uring_queue_capacity: {}\nhost_prefix: x\ndomain: y\nroute_name: z\n",
+                u64::MAX
+            ),
+        )
+        .expect("write yaml");
+
+        let config = Config::from_file(&path).expect("u64::MAX should parse before validation");
+        assert_eq!(config.io_uring_queue_capacity, u64::MAX);
+        assert!(matches!(
+            config.validate(),
+            Err(BobsError::ConfigurationError(message))
+                if message.contains("io_uring_queue_capacity")
+        ));
     }
 
     #[test]
