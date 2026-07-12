@@ -48,13 +48,17 @@ Each spool is stored in its own directory:
 
 Sidecar metadata commits are atomic at the file level: BOBS writes `meta.json.tmp`, syncs that file, renames it over `meta.json`, and syncs the spool directory. Recovery ignores leftover temporary metadata files.
 
+Creation uses a two-state publication protocol. BOBS syncs the empty `spool.dat` and key directory, commits an internal `Creating` sidecar, fsyncs `data_dir`, then commits live `Writing` or `WriteLocked` metadata before returning success or publishing the spool in memory. `Creating` is not an API-visible lifecycle state. A crash before live publication leaves an unambiguous incomplete marker that recovery can remove without guessing about ordinary or legacy spool data.
+
+Deletion removes sidecar metadata and the key directory, then fsyncs `data_dir` before acknowledging success. Cache entries, manager membership, and admission accounting remain held across that parent-directory durability boundary so failure leaves a tracked, retryable `Deleting` spool.
+
 Ordinary `/api/v1/write/{key}/{offset}` calls do not persist a metadata high-water mark. For in-progress spools, `spool.dat` is authoritative after a BOBS process restart; recovery recomputes length and page state from the data file.
 
 ## File I/O
 
 BOBS uses positional file I/O through a `FileIO` abstraction.
 
-On Linux, the default backend is a sharded `io_uring` pool. `io_uring_shards` defaults to unset, which resolves to `max(1, num_cpus / 4)`, and must be greater than `0` when configured. `io_uring_queue_capacity` defaults to `1024` per shard and must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`); an out-of-range value returns `ConfigurationError` during startup validation. Non-Linux builds, and builds with the `tokio-fileio-fallback` feature, use the Tokio/blocking file backend and otherwise ignore those settings. Both backends read and write by explicit offset rather than a shared cursor.
+On Linux, the default backend is a sharded `io_uring` pool. `io_uring_shards` defaults to unset, which resolves to `max(1, num_cpus / 4)`, and accepts configured values in `1..=256`. `io_uring_queue_capacity` defaults to `1024` per shard and must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`); an out-of-range shard or queue value returns `ConfigurationError` during startup validation. Non-Linux builds, and builds with the `tokio-fileio-fallback` feature, use the Tokio/blocking file backend and otherwise ignore those settings. Both backends read and write by explicit offset rather than a shared cursor.
 
 Accepted write bytes are appended to `spool.dat` before `/api/v1/write/{key}/{offset}` returns, but they are not forced to stable storage per page. `/api/v1/complete/{key}` syncs the data file before committing final complete metadata.
 
@@ -106,6 +110,7 @@ Startup recovery scans `data_dir` for spool directories with `meta.json` sidecar
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
 - Interrupted metadata temp files are ignored.
+- Internal `Creating` and `Deleting` sidecars identify interrupted lifecycle operations. Recovery durably removes those incomplete key directories and fsyncs `data_dir`; the state is never exposed through active spool APIs.
 - Unsafe or unrelated directories are not blindly removed. Orphan cleanup is restricted to recognised UUID or 26-character request-ID directories that contain BOBS spool markers.
 - Sidecars now persist each spool's `page_size`. For a legacy sidecar without it, recovery derives a stride only when the sidecar and durable file length determine one safely, then atomically commits the upgraded sidecar before exposing or mutating the spool. If the stride is ambiguous or inconsistent, recovery leaves both `meta.json` and `spool.dat` intact and fails rather than guessing or deleting the data.
 - The removed legacy `Readable` state is migrated to terminal `Complete`. Because its durable payload is terminal and contiguous, recovery resegments it using the currently configured `page_size` rather than inferring the old stride, reconstructs terminal byte/page metadata from `spool.dat`, clears the obsolete write lock, and atomically persists the migrated sidecar before serving it.

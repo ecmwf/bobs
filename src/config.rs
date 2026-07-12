@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::{BobsError, Result};
+use crate::io::MAX_IO_URING_SHARDS;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -50,6 +51,8 @@ pub struct Config {
     pub unread_ttl_secs: u64,
     pub cleanup_sweep_interval_secs: u64,
     pub long_poll_timeout_ms: u64,
+    /// Explicit Linux ring-pool shard count. `None` uses `(num_cpus / 4).max(1)`;
+    /// configured values must be in `1..=MAX_IO_URING_SHARDS`.
     pub io_uring_shards: Option<usize>,
     pub io_uring_queue_capacity: u64,
     pub host_prefix: String,
@@ -215,6 +218,15 @@ impl Config {
             return Err(BobsError::ConfigurationError(
                 "io_uring_shards must be greater than 0 when set".to_string(),
             ));
+        }
+
+        if self
+            .io_uring_shards
+            .is_some_and(|shards| shards > MAX_IO_URING_SHARDS)
+        {
+            return Err(BobsError::ConfigurationError(format!(
+                "io_uring_shards must not exceed {MAX_IO_URING_SHARDS} when set"
+            )));
         }
 
         self.resolved_io_uring_queue_capacity()?;
@@ -628,6 +640,39 @@ route_name: z
 
         let err = config.validate().expect_err("validation should fail");
         assert!(matches!(err, BobsError::ConfigurationError(_)));
+    }
+
+    #[test]
+    fn config_io_uring_validate_accepts_maximum_shards() {
+        let config = Config {
+            io_uring_shards: Some(MAX_IO_URING_SHARDS),
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        config
+            .validate()
+            .expect("maximum io_uring shard count should be accepted");
+    }
+
+    #[test]
+    fn config_io_uring_validate_rejects_oversized_shards() {
+        for shards in [MAX_IO_URING_SHARDS + 1, usize::MAX] {
+            let config = Config {
+                io_uring_shards: Some(shards),
+                host_prefix: "test".into(),
+                domain: "example.com".into(),
+                route_name: "bobs".into(),
+                ..Config::default()
+            };
+
+            let err = config.validate().expect_err("validation should fail");
+            assert!(
+                matches!(err, BobsError::ConfigurationError(ref message) if message.contains("io_uring_shards") && message.contains(&MAX_IO_URING_SHARDS.to_string()))
+            );
+        }
     }
 
     #[test]

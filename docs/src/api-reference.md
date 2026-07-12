@@ -67,6 +67,8 @@ curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "text/plain
 }
 ```
 
+BOBS returns `201 Created` only after `spool.dat`, the key-directory link, and live `Writing` or `WriteLocked` metadata cross their fsync boundaries. The intermediate `Creating` sidecar is internal to crash recovery and is never visible as an active spool. An interrupted create is removed safely during startup recovery.
+
 ---
 
 ### POST /api/v1/write/{key}/{offset}
@@ -160,7 +162,7 @@ curl http://localhost:3000/api/v1/read/YOUR_KEY -H "Range: bytes=1048576-"
 
 ### DELETE /api/v1/delete/{key}
 
-Manually deletes the spool and its associated data files.
+Manually deletes the spool and its associated data files. Success is acknowledged only after sidecar removal, key-directory removal, and an fsync of the parent `data_dir`. If that durability boundary fails, BOBS returns a server error and retains tracked `Deleting` state, cache entries, and admission accounting so the operation can be retried.
 
 **Response (200 OK)**: Success.
 **Error Cases**:

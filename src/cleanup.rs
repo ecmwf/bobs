@@ -231,14 +231,15 @@ mod tests {
     }
 
     async fn wait_for_spool_removal(manager: &SpoolManager<TokioFileIO>, key: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while manager.get_spool(key).is_some() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "spool {key} was not removed before the cleanup deadline"
-            );
-            tokio::task::yield_now().await;
+        for _ in 0..2_000 {
+            if manager.get_spool(key).is_none() {
+                return;
+            }
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+                .await
+                .expect("removal wait task panicked");
         }
+        panic!("spool {key} was not removed before the cleanup deadline");
     }
 
     async fn rewrite_persisted_metadata<F: FileIO>(

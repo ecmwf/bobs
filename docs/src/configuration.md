@@ -16,7 +16,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE='http://bobs-{ordinal}:3000/api/v1' \
 
 Backend selection is build-feature based, not a YAML option: Linux builds without extra features use the `io_uring` FileIO and sidecar metadata backend; builds with `--features tokio-fileio-fallback`, and non-Linux builds, use the Tokio/blocking fallback backend with the same on-disk `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json` layout. These backend settings do not change the HTTP API and do not require an on-disk migration.
 
-Default Linux builds use sharded `io_uring` rings. `io_uring_shards` is optional. If `io_uring_shards` is unset, BOBS resolves it to `max(1, num_cpus / 4)`. File operations are assigned to shards by stable object-key hashing, and each object's data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.
+Default Linux builds use sharded `io_uring` rings. `io_uring_shards` is optional and accepts explicit values from `1` through `256`, inclusive. If unset, BOBS resolves it to `max(1, num_cpus / 4)`. File operations are assigned to shards by stable object-key hashing, and each object's data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.
 
 The default Linux backend requires Linux 5.11+ because BOBS submits operations against raw file descriptors, and it requires a container/runtime policy that permits `io_uring_setup`. If `io_uring_setup` is blocked, use a runtime seccomp/sysctl policy that permits it or build the fallback binary:
 
@@ -46,7 +46,7 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but ignored by cleanup; use `read_idle_ttl_secs`. |
 | `cleanup_sweep_interval_secs` | `30` | Cleanup scan interval. Must be greater than `0` and must not exceed any active cleanup timeout. |
 | `long_poll_timeout_ms` | `25000` | Maximum wait for new data during a follow read before redirecting. Must be greater than `0`. |
-| `io_uring_shards` | unset | Linux ring-pool shard count. Omission resolves to `max(1, num_cpus / 4)`; an explicit value must be greater than `0`. Ignored by fallback builds. |
+| `io_uring_shards` | unset | Linux ring-pool shard count. Omission resolves to `max(1, num_cpus / 4)`; explicit values must be between `1` and `256`, inclusive. Invalid values fail startup, including in fallback builds; fallback I/O otherwise ignores the setting. |
 | `io_uring_queue_capacity` | `1024` | Bounded submission queue capacity for each Linux `io_uring` shard. Submitters wait when the queue is full, applying backpressure instead of growing an unbounded backlog. Must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): `2305843009213693951` on 64-bit targets or `536870911` on 32-bit targets. Invalid values fail startup with `ConfigurationError`, including in fallback builds; otherwise fallback I/O ignores this setting. |
 | `host_prefix` | `""` | External download host prefix used in `read_url`. Must be non-empty. |
 | `domain` | `""` | External download domain used in `read_url`. Must be non-empty. |
@@ -76,7 +76,7 @@ reader_done_ttl_secs: 60       # deprecated compatibility field
 unread_ttl_secs: 3600          # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
-io_uring_shards: 4             # optional; omit for max(1, num_cpus / 4)
+io_uring_shards: 4             # optional; valid range 1..=256; omit for max(1, num_cpus / 4)
 io_uring_queue_capacity: 1024  # 1..=Tokio Semaphore::MAX_PERMITS (usize::MAX >> 3)
 host_prefix: polytope-example
 domain: example.com

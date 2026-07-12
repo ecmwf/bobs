@@ -48,7 +48,7 @@ Operational constraints:
 - `HOSTNAME` must be set and include a pod ordinal such as `bobs-0`.
 - `BOBS_INTERNAL_BASE_URL_TEMPLATE` must be set and non-empty.
 - `page_size`, `max_live_spools`, `max_spool_bytes`, `create_admission_timeout_ms`, `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, `full_read_complete_ttl_secs`, `cleanup_sweep_interval_secs`, `long_poll_timeout_ms`, and `io_uring_queue_capacity` must be greater than `0`; `io_uring_queue_capacity` must not exceed Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`). Invalid queue capacities fail startup with `ConfigurationError`.
-- `io_uring_shards`, when set, must be greater than `0`; omitted shards resolve to `max(1, num_cpus / 4)`.
+- `io_uring_shards`, when set, must be in `1..=256`; omitted shards resolve to `max(1, num_cpus / 4)`.
 - `cleanup_sweep_interval_secs` must not exceed any active cleanup timeout.
 - `max_cache_bytes` may be smaller than `page_size`; `0` disables caching.
 
@@ -64,6 +64,8 @@ Without a valid `X-Polytope-Job-Id` header, the service generates a UUIDv4 key f
 curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "application/octet-stream"}'
 # Response: {"key":"550e8400-e29b-41d4-a716-446655440000","read_url":"https://bobs.example.com/download-0/550e8400-e29b-41d4-a716-446655440000","write_url":"http://localhost:3000/api/v1"}
 ```
+
+A `201 Created` response means the empty data file and key-directory link have crossed their fsync boundaries and live `Writing` or `WriteLocked` metadata is durable. The intermediate `Creating` marker is internal to crash recovery and is never exposed as an active spool. Interrupted creates are removed safely on restart; duplicate or concurrent creates for the same request ID return `409 Conflict` without truncating the existing spool.
 
 ### 2. Write data
 
@@ -119,6 +121,8 @@ Manually remove a spool when finished.
 curl -X DELETE http://localhost:3000/api/v1/delete/unique-spool-key
 ```
 
+A successful delete is acknowledged only after `meta.json` and the key directory are removed and the parent `data_dir` is fsynced. The manager retains cache, admission, and tracked deletion state until that durability boundary succeeds, allowing a failed delete to be retried.
+
 ## Health endpoint
 
 ```bash
@@ -157,7 +161,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field; parsed but ignored by cleanup. Use `read_idle_ttl_secs`. |
 | `cleanup_sweep_interval_secs` | `30` | Cleanup scan frequency. Must be greater than `0` and no longer than any active cleanup timeout. |
 | `long_poll_timeout_ms` | `25000` | Maximum wait for new data during a follow read. Must be greater than `0`. |
-| `io_uring_shards` | unset | Linux ring count. Unset resolves to `max(1, num_cpus / 4)`; an explicit value must be greater than `0`. Ignored by fallback builds. |
+| `io_uring_shards` | unset | Linux ring count. Unset resolves to `max(1, num_cpus / 4)`; explicit values must be in `1..=256`. Invalid values fail startup, including in fallback builds; fallback I/O otherwise ignores the setting. |
 | `io_uring_queue_capacity` | `1024` | Submission queue capacity for each Linux `io_uring` shard. Must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`); invalid values fail startup with `ConfigurationError`, including in fallback builds. Otherwise ignored by fallback I/O. |
 | `host_prefix` | `""` | External download host prefix used to build `read_url`; must be set. |
 | `domain` | `""` | External download domain used to build `read_url`; must be set. |

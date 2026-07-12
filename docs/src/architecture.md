@@ -19,7 +19,7 @@ BOBS is built around one directory per object key and an asynchronous filesystem
 
 ### Linux `io_uring` routing
 
-Default Linux builds route file operations through a fixed-size pool of `io_uring` shards. `io_uring_shards` can set the shard count explicitly and must be greater than `0`; when unset, BOBS resolves it to `max(1, num_cpus / 4)`. `io_uring_queue_capacity` defaults to `1024` per shard and must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`). Values above that platform-specific upper bound fail startup with `ConfigurationError` instead of overflowing or panicking. This validation also runs in fallback builds, although fallback I/O otherwise ignores the setting. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust's randomized `Hash` state, so the same object key maps to the same shard for a given shard count across restarts and builds.
+Default Linux builds route file operations through a fixed-size pool of `io_uring` shards. `io_uring_shards` can set the shard count explicitly from `1` through `256`, inclusive; when unset, BOBS resolves it to `max(1, num_cpus / 4)`. `io_uring_queue_capacity` defaults to `1024` per shard and must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`). Invalid shard or queue bounds fail startup with `ConfigurationError` instead of allocating pathological ring/thread counts, overflowing, or panicking. Validation also runs in fallback builds, although fallback I/O otherwise ignores the settings. Key-to-shard assignment uses a stable SipHash-1-3 hash with fixed keys, not Rust's randomized `Hash` state, so the same object key maps to the same shard for a given shard count across restarts and builds.
 
 Data-file operations and metadata sidecar commits for the same object are routed by the same object key and therefore use the same shard. This keeps a key's `spool.dat` work and its `meta.json` create/rename/fsync work on one ring while still allowing independent keys to spread across shards.
 
@@ -33,19 +33,19 @@ Future Linux optimizations that are intentionally not implemented yet include `I
 
 ### Data Flow
 
-1. **Create**: BOBS uses a valid `X-Polytope-Job-Id` request ID as the key or generates a fallback UUIDv4. Request IDs may use uppercase or lowercase Crockford base32; BOBS normalizes the canonical key to lowercase. It then creates `<data_dir>/<key>/`, opens `<data_dir>/<key>/spool.dat`, and commits an initial `<data_dir>/<key>/meta.json` sidecar.
+1. **Create**: BOBS uses a valid `X-Polytope-Job-Id` request ID as the key or generates a fallback UUIDv4. Request IDs may use uppercase or lowercase Crockford base32; BOBS normalizes the canonical key to lowercase. It atomically reserves `<data_dir>/<key>/`, creates and syncs `spool.dat`, syncs the key directory, commits an internal `Creating` recovery sidecar, syncs `data_dir`, and commits live `Writing` or `WriteLocked` metadata before returning `201 Created`.
 2. **Write**: Data arrives through `/api/v1/write/{key}/{offset}`. Accepted bytes are appended to `spool.dat` before the request returns; the data file is authoritative for in-progress bytes.
 3. **Page visibility**: Complete pages become reader-visible, enter the global FIFO cache when they fit, and notify parked readers.
 4. **Read**: `/api/v1/read/{key}` checks the page cache and then `spool.dat`. A trailing partial page remains hidden until it fills or completion finalizes it.
 5. **Complete**: `/api/v1/complete/{key}` validates any `expected_size`, including on idempotent retries. Initial completion publishes the trailing partial page, syncs data, and atomically commits completed metadata.
-6. **Lifecycle**: A spool moves from `Creating` to `Writing` (or `WriteLocked`), then `Complete`, then `Deleting`. A write-locked spool becomes readable only through completion.
+6. **Lifecycle**: Active spools move from `Writing` (or `WriteLocked`) to `Complete`, then `Deleting`. `Creating` is an internal on-disk crash-recovery tombstone and is never published through the active spool registry or HTTP API. A write-locked spool becomes readable only through completion.
 
 ### Persistence Contract
 
 BOBS persists two things with different authority:
 
 - `spool.dat` stores accepted bytes. For in-progress `Writing` and `WriteLocked` spools, it is authoritative after a BOBS restart.
-- `meta.json` stores lifecycle and completed-object byte metadata. It is committed atomically at creation, completion, and deletion.
+- `meta.json` stores lifecycle and completed-object byte metadata. It is committed atomically at creation and completion, and removed before durable key-directory deletion.
 
 Ordinary writes deliberately do not update a durable high-water mark, and completed pages do not commit per-page metadata. Adding a mandatory per-write or per-page checkpoint would put metadata commits back on the write hot path, which this design avoids.
 
@@ -55,9 +55,13 @@ The in-progress durability invariant is recovery from a BOBS restart, not surviv
 
 Completed metadata is durable through the sidecar protocol: write `meta.json.tmp`, sync it, rename it to `meta.json`, and sync the parent directory. Recovery treats `meta.json` as all-or-nothing and ignores any leftover `meta.json.tmp` from an interrupted commit.
 
+Create acknowledgement has an additional parent-directory durability boundary. BOBS first makes the empty data inode and its name durable, commits a `Creating` sidecar, and syncs `data_dir` so the key-directory link is durable. Only then does it commit live `Writing` or `WriteLocked` metadata and publish the spool in memory. If creation is interrupted, startup sees only the internal `Creating` marker and durably removes that incomplete spool; unrelated, unrecognised, or ambiguous legacy data is left intact.
+
+Delete acknowledgement is likewise delayed until removal is durable. BOBS removes sidecar metadata and the key directory, then fsyncs `data_dir`. Cache entries, manager membership, and admission accounting remain held until that parent-directory fsync succeeds, so a failed acknowledgement can be retried without exposing a falsely completed deletion.
+
 ### Recovery and Shared Filesystems
 
-Startup recovery scans `<data_dir>` for key directories with `meta.json`. Current in-progress spools with a persisted `page_size` are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
+Startup recovery scans `<data_dir>` for key directories with `meta.json`. Internal `Creating` and `Deleting` sidecars are cleaned up as interrupted lifecycle operations, with the parent directory synced after removal. Current in-progress spools with a persisted `page_size` are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
 
 Current sidecars persist the spool's `page_size`, so a later configuration change cannot reinterpret existing page offsets. When a legacy sidecar has no page size, recovery migrates only cases with a safe interpretation and atomically commits the upgraded sidecar before exposing or mutating the spool.
 

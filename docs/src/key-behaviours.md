@@ -46,6 +46,10 @@ Metadata is stored as `<data_dir>/<key>/meta.json`. Each commit writes `<data_di
 
 This protocol keeps metadata off the write hot path while still making lifecycle transitions durable. It also suits shared filesystems because each key has its own directory and sidecar, with one writer per spool rather than one global metadata writer.
 
+Create also crosses the key-directory durability boundary before acknowledgement: BOBS syncs the empty data file and key directory, commits an internal `Creating` sidecar, fsyncs `data_dir`, and only then commits and publishes live metadata. `Creating` is not exposed through active spool APIs. Recovery durably removes an interrupted create identified by that marker while preserving unrecognised directories and ambiguous legacy spools.
+
+Deletion removes sidecar metadata and the key directory, then fsyncs `data_dir` before returning success. Cache entries, admission, and manager membership remain held until that parent-directory sync succeeds, so failed deletion remains tracked and retryable.
+
 ### 8. Recovery and Cleanup
 
 On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. For current in-progress `Writing` and `WriteLocked` spools, `spool.dat` is authoritative for byte state. Any persisted `total_bytes_written`, `total_pages`, or `final_page_size` for those states is advisory only and recovery recomputes it from the file.
