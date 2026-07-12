@@ -153,6 +153,10 @@ mod tests {
             Ok(())
         }
 
+        async fn sync_directory(_path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+
         async fn close(_handle: Self::Handle) -> std::io::Result<()> {
             Ok(())
         }
@@ -199,6 +203,10 @@ mod tests {
         }
 
         async fn sync_data(_handle: &Self::Handle) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn sync_directory(_path: &Path) -> std::io::Result<()> {
             Ok(())
         }
 

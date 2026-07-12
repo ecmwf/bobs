@@ -46,7 +46,7 @@ The table distinguishes Rust defaults from chart overrides where they differ. Ot
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. Must not exceed `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, or `full_read_complete_ttl_secs`. |
 | `long_poll_timeout_ms` | `25000` | Maximum time in ms to wait for new data during a read before redirecting. |
-| `io_uring_shards` | unset | Linux default-backend ring-pool shard count. Leave unset to resolve to `max(1, num_cpus / 4)`. Keys are mapped to shards with stable hashing. Must be greater than `0` when set. Ignored by fallback builds. |
+| `io_uring_shards` | unset | Linux default-backend ring-pool shard count. Leave unset to resolve to `max(1, num_cpus / 4)`. Keys are mapped to shards with stable hashing. Explicit values must be between `1` and `256`, inclusive. Ignored by fallback builds. |
 | `io_uring_queue_capacity` | `1024` | Per-shard bounded request-channel capacity for the Linux default backend. Must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): `2305843009213693951` on 64-bit targets or `536870911` on 32-bit targets. Ignored by fallback I/O after validation. |
 | `host_prefix` | `""` | External download host prefix used when generating read URLs. |
 | `domain` | `""` | External download domain used when generating read URLs. |
@@ -76,7 +76,7 @@ reader_done_ttl_secs: 60      # deprecated compatibility field
 unread_ttl_secs: 3600         # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
-io_uring_shards: 4              # optional; omit to use max(1, num_cpus / 4) on Linux default backend
+io_uring_shards: 4              # optional; valid range 1..=256; omit to use max(1, num_cpus / 4)
 io_uring_queue_capacity: 1024      # 1..=Tokio Semaphore::MAX_PERMITS (usize::MAX >> 3)
 host_prefix: polytope-example
 domain: example.com

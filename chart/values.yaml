@@ -109,8 +109,9 @@ config:
   # Exposes an unauthenticated, CPU-intensive profiler on the main listener.
   enable_pprof: false
   # io_uring tuning. When unset, BOBS auto-resolves shards = (num_cpus/4).max(1)
-  # and a queue capacity of 1024. Queue capacity must be 1..=Tokio's
-  # Semaphore::MAX_PERMITS (usize::MAX >> 3; 2305843009213693951 on 64-bit).
+  # and a queue capacity of 1024. Explicit shard counts must be in 1..=256.
+  # Queue capacity must be 1..=Tokio's Semaphore::MAX_PERMITS
+  # (usize::MAX >> 3; 2305843009213693951 on 64-bit).
   # io_uring_shards: 8
   # io_uring_queue_capacity: 4096
   writer_inactivity_timeout_secs: 300
