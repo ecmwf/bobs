@@ -103,7 +103,8 @@ config:
   # backpressure to writers instead of growing memory without bound.
   max_live_spools: 4096
   # io_uring tuning. When unset, BOBS auto-resolves shards = (num_cpus/4).max(1)
-  # and a queue capacity of 1024. Override for higher per-volume write parallelism.
+  # and a queue capacity of 1024. Explicit shard counts must be in 1..=256;
+  # override within that range for higher per-volume write parallelism.
   # io_uring_shards: 8
   # io_uring_queue_capacity: 4096
   writer_inactivity_timeout_secs: 300

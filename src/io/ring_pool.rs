@@ -7,6 +7,7 @@
 //! This module starts with hash-routing tests so the stable key-to-shard
 //! contract is pinned before the dispatch implementation is introduced.
 
+use super::MAX_IO_URING_SHARDS;
 use bytes::Bytes;
 use io_uring::{opcode, squeue, types, IoUring};
 use siphasher::sip::SipHasher13;
@@ -259,12 +260,6 @@ impl RingPool {
     }
 
     fn from_options(options: RingPoolOptions) -> Result<Self> {
-        if options.shard_count == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "ring pool shard_count must be greater than 0",
-            ));
-        }
         validate_queue_capacity(options.queue_capacity, RING_ENTRIES as usize)?;
 
         let instrumentation = RingPoolInstrumentation::default();
@@ -280,7 +275,20 @@ impl RingPool {
         options: &RingPoolOptions,
         submission_instrumentation: RingPoolSubmissionInstrumentation,
     ) -> Result<Vec<RingShard>> {
-        let mut shards = Vec::with_capacity(options.shard_count);
+        validate_shard_count(options.shard_count)?;
+
+        let mut shards = Vec::new();
+        shards
+            .try_reserve_exact(options.shard_count)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "could not reserve storage for {} ring-pool shards: {error}",
+                        options.shard_count
+                    ),
+                )
+            })?;
         for index in 0..options.shard_count {
             let ring = IoUring::new(RING_ENTRIES)?;
 
@@ -1673,14 +1681,27 @@ pub(crate) fn scoped_test_ring_pool_override(pool: Arc<RingPool>) -> RingPoolTes
     RingPoolTestOverrideGuard { expected: pool }
 }
 
+/// Validate a resolved shard count before allocating rings or spawning drivers.
+fn validate_shard_count(shard_count: usize) -> Result<()> {
+    if !(1..=MAX_IO_URING_SHARDS).contains(&shard_count) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "ring pool shard_count must be in 1..={MAX_IO_URING_SHARDS}, got {shard_count}"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Resolve the configured shard count, using host CPU count for `None`.
 pub fn resolve_shard_count(configured_shards: Option<usize>) -> Result<usize> {
     match configured_shards {
-        Some(0) => Err(Error::new(
-            ErrorKind::InvalidInput,
-            "io_uring_shards must be greater than 0 when set",
-        )),
-        Some(shards) => Ok(shards),
+        Some(shards) => {
+            validate_shard_count(shards)?;
+            Ok(shards)
+        }
         None => Ok((num_cpus::get() / 4).max(1)),
     }
 }
@@ -1905,6 +1926,7 @@ mod tests {
         scoped_test_ring_pool_override, shutdown_global_ring_pool_for_exit, Request, RingPool,
         RingPoolOptions, RingPoolSafetyEvent, MAX_SQES_PER_REQUEST, RING_ENTRIES,
     };
+    use crate::io::MAX_IO_URING_SHARDS;
     use std::collections::{HashMap, HashSet};
     use std::env;
     use std::fs::OpenOptions;
@@ -2064,6 +2086,38 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn ring_pool_resolve_shard_count_enforces_documented_maximum() {
+        assert_eq!(
+            super::resolve_shard_count(Some(MAX_IO_URING_SHARDS))
+                .expect("maximum shard count should resolve"),
+            MAX_IO_URING_SHARDS
+        );
+
+        for shard_count in [MAX_IO_URING_SHARDS + 1, usize::MAX] {
+            let err = super::resolve_shard_count(Some(shard_count))
+                .expect_err("oversized shard count should be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn ring_pool_direct_construction_rejects_oversized_shard_count() {
+        let public_err = RingPool::new(Some(usize::MAX))
+            .expect_err("public construction must reject oversized shard counts");
+        assert_eq!(public_err.kind(), io::ErrorKind::InvalidInput);
+
+        let options_err = RingPool::new_for_test(RingPoolOptions {
+            shard_count: usize::MAX,
+            queue_capacity: 1024,
+            driver_name_prefix: "bobs-uring-oversized-test".to_owned(),
+        })
+        .expect_err("direct options must reject oversized shard counts");
+
+        assert_eq!(options_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(options_err.to_string().contains("shard_count"));
     }
 
     #[test]
