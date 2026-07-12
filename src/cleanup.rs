@@ -235,11 +235,13 @@ mod tests {
     }
 
     async fn wait_for_spool_removal(manager: &SpoolManager<TokioFileIO>, key: &str) {
-        for _ in 0..10_000 {
+        for _ in 0..2_000 {
             if manager.get_spool(key).is_none() {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+                .await
+                .expect("removal wait task panicked");
         }
     }
 

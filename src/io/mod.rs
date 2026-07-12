@@ -83,6 +83,9 @@ pub trait FileIO: Send + Sync + Clone + 'static {
     /// Sync file data to disk.
     fn sync_data(handle: &Self::Handle) -> impl Future<Output = std::io::Result<()>> + Send;
 
+    /// Sync a directory so entry creation, rename, and removal are durable.
+    fn sync_directory(path: &Path) -> impl Future<Output = std::io::Result<()>> + Send;
+
     /// Close the file handle.
     fn close(handle: Self::Handle) -> impl Future<Output = std::io::Result<()>> + Send;
 
@@ -325,6 +328,17 @@ pub(crate) mod fileio_test_cases {
             assert!(file_path.exists(), "file should exist after creation");
             I::remove(&file_path).await.expect("failed to remove file");
             assert!(!file_path.exists(), "file should not exist after removal");
+        }
+
+        pub(crate) async fn sync_directory_succeeds() {
+            let dir = tempdir().expect("failed to create temp dir");
+            let file_path = dir.path().join("directory-entry");
+            let handle = I::create(&file_path).await.expect("failed to create file");
+            I::sync_data(&handle).await.expect("failed to sync file");
+            I::close(handle).await.expect("failed to close");
+            I::sync_directory(dir.path())
+                .await
+                .expect("failed to sync directory");
         }
 
         pub(crate) async fn close_and_drop_are_safe() {
