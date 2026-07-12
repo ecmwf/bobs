@@ -8,12 +8,14 @@ compile_error!("UringFileIO is only available on Linux; use the tokio-fileio-fal
 use super::{ring_pool, FileIO};
 use bytes::Bytes;
 use std::ffi::CString;
+use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use tokio::task;
 
 const O_CREAT: i32 = 0o100;
 const O_TRUNC: i32 = 0o1000;
@@ -155,6 +157,30 @@ impl FileIO for UringFileIO {
             },
         )
         .await?;
+        recv_result(rx).await
+    }
+
+    async fn sync_directory(path: &Path) -> Result<()> {
+        let path = path.to_path_buf();
+        let routing_path = path.clone();
+        let fd: OwnedFd = task::spawn_blocking(move || File::open(path).map(Into::into))
+            .await
+            .map_err(Error::other)??;
+        let fd = Arc::new(fd);
+        let (routed_key, routing_bytes) = data_path_routing_key(&routing_path);
+        #[cfg(not(test))]
+        let _ = &routed_key;
+        let pool = ring_pool::global_or_default_ring_pool()?;
+        let ring_index = ring_pool::ring_index_for_key_bytes(&routing_bytes, pool.shard_count());
+        #[cfg(test)]
+        pool.record_routing(
+            ring_pool::RingPoolOperationKind::DirectorySync,
+            routed_key,
+            ring_index,
+        );
+        let (tx, rx) = oneshot::channel();
+        pool.submit_to_ring(ring_index, ring_pool::Request::SyncDirectory { fd, tx })
+            .await?;
         recv_result(rx).await
     }
 
@@ -403,6 +429,11 @@ mod tests {
     #[tokio::test]
     async fn io_uring_fileio_remove_unlinks_file() {
         Suite::remove_unlinks_file().await;
+    }
+
+    #[tokio::test]
+    async fn io_uring_fileio_sync_directory_succeeds() {
+        Suite::sync_directory_succeeds().await;
     }
 
     #[tokio::test]

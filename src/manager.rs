@@ -135,7 +135,13 @@ where
             .await
             .map_err(BobsError::IoError)?;
 
-        let handle = F::create(&data_path).await.map_err(BobsError::IoError)?;
+        let handle = match F::create(&data_path).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.cleanup_failed_creation(&key, None).await;
+                return Err(BobsError::IoError(error));
+            }
+        };
 
         let now = now_secs();
         let metadata = SpoolMetadata {
@@ -160,7 +166,33 @@ where
             labels,
         };
 
-        self.metadata_store.write(&metadata).await?;
+        let durability_result = async {
+            // Persist the empty data inode and its name before publishing any
+            // metadata that can make this spool recoverable.
+            F::sync_data(&handle).await.map_err(BobsError::IoError)?;
+            F::sync_directory(&spool_dir)
+                .await
+                .map_err(BobsError::IoError)?;
+
+            // First make a recoverable tombstone durable. If creation crashes
+            // before the final sidecar commit, recovery removes Creating spools.
+            let mut creating = metadata.clone();
+            creating.state = SpoolState::Creating;
+            self.metadata_store.write(&creating).await?;
+            F::sync_directory(&self.data_dir)
+                .await
+                .map_err(BobsError::IoError)?;
+
+            // This key directory is now durably linked from data_dir. Publishing
+            // the live state only changes names inside the already-durable key dir.
+            self.metadata_store.write(&metadata).await
+        }
+        .await;
+
+        if let Err(error) = durability_result {
+            self.cleanup_failed_creation(&key, Some(handle)).await;
+            return Err(error);
+        }
 
         let spool = Arc::new(
             Spool::new_with_admission(
@@ -266,12 +298,7 @@ where
         // safely recovers the original spool, and afterwards the orphan sweep removes
         // any directory left behind.
         self.metadata_store.delete(key).await?;
-        let spool_dir = self.data_dir.join(key);
-        match tokio::fs::remove_dir_all(&spool_dir).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(BobsError::IoError(error)),
-        }
+        self.remove_spool_directory_durably(key).await?;
 
         self.page_cache.lock().await.remove_spool(key);
         spool.release_admission();
@@ -284,6 +311,48 @@ where
                 .record_spool_removed(crate::metrics::state::COMPLETE);
         }
         Ok(())
+    }
+
+    async fn cleanup_failed_creation(&self, key: &str, handle: Option<F::Handle>) {
+        if let Some(handle) = handle {
+            if let Err(error) = F::close(handle).await {
+                tracing::warn!(key = %key, error = %error, "failed to close data file while rolling back spool creation");
+            }
+        }
+
+        if let Err(error) = self.metadata_store.delete(key).await {
+            tracing::warn!(key = %key, error = %error, "failed to remove sidecar while rolling back spool creation");
+        }
+
+        let spool_dir = self.data_dir.join(key);
+        match tokio::fs::remove_dir_all(&spool_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(key = %key, error = %error, "failed to remove spool directory while rolling back creation");
+            }
+        }
+
+        // Sync even when the directory is already absent: a previous removal may
+        // have reached the filesystem but failed at this durability boundary.
+        if let Err(error) = F::sync_directory(&self.data_dir).await {
+            tracing::warn!(key = %key, error = %error, "failed to sync data directory while rolling back spool creation");
+        }
+    }
+
+    async fn remove_spool_directory_durably(&self, key: &str) -> Result<()> {
+        let spool_dir = self.data_dir.join(key);
+        match tokio::fs::remove_dir_all(&spool_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(BobsError::IoError(error)),
+        }
+
+        // This is the commit point for deletion. Cache entries, map membership,
+        // and admission remain held until the directory unlink is durable.
+        F::sync_directory(&self.data_dir)
+            .await
+            .map_err(BobsError::IoError)
     }
 
     pub async fn recover(&self) -> Result<()> {
@@ -321,15 +390,11 @@ where
                 SpoolState::Creating => {
                     tracing::debug!(key = %key, "recovery removing incomplete spool (Creating)");
                     stale_keys.push(key.clone());
-                    let spool_dir = self.data_dir.join(&key);
-                    let _ = tokio::fs::remove_dir_all(&spool_dir).await;
                     continue;
                 }
                 SpoolState::Deleting => {
                     tracing::debug!(key = %key, "recovery removing incomplete spool (Deleting)");
                     stale_keys.push(key.clone());
-                    let spool_dir = self.data_dir.join(&key);
-                    let _ = tokio::fs::remove_dir_all(&spool_dir).await;
                     continue;
                 }
                 SpoolState::Writing | SpoolState::WriteLocked | SpoolState::Complete => {}
@@ -511,15 +576,9 @@ where
 
         for key in &stale_keys {
             self.metadata_store.delete(key).await?;
-            let spool_dir = self.data_dir.join(key);
-            match tokio::fs::remove_dir_all(&spool_dir).await {
-                Ok(()) => {
-                    corrupt_deleted += 1;
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(BobsError::IoError(error)),
-            }
+            self.remove_spool_directory_durably(key).await?;
+            corrupt_deleted += 1;
+            tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
         }
 
         let stale_key_set: HashSet<String> = stale_keys.iter().cloned().collect();
@@ -560,9 +619,14 @@ where
             }
 
             tracing::warn!(orphan = %name, "removing orphan spool directory");
-            if tokio::fs::remove_dir_all(entry_path).await.is_ok() {
-                orphan_deleted += 1;
-                tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
+            match self.remove_spool_directory_durably(&name).await {
+                Ok(()) => {
+                    orphan_deleted += 1;
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
+                }
+                Err(error) => {
+                    tracing::warn!(orphan = %name, error = %error, "failed to durably remove orphan spool directory");
+                }
             }
         }
 
@@ -909,8 +973,160 @@ async fn read_exact_logical_range<F: FileIO>(
 mod tests {
     use super::*;
     use crate::io::TokioFileIO;
-    use std::sync::Arc;
+    use bytes::Bytes;
+    use std::sync::{Arc, OnceLock};
     use tempfile::tempdir;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum ProtocolEvent {
+        DataCreate,
+        DataSync,
+        SpoolDirectorySync,
+        ParentDirectorySync,
+        MetadataWrite(SpoolState),
+        MetadataDelete,
+        Close,
+    }
+
+    static PROTOCOL_EVENTS: OnceLock<std::sync::Mutex<Vec<ProtocolEvent>>> = OnceLock::new();
+    static FAIL_NEXT_PARENT_SYNC: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static FAIL_NEXT_LIVE_METADATA_WRITE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn protocol_events() -> &'static std::sync::Mutex<Vec<ProtocolEvent>> {
+        PROTOCOL_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn record_protocol_event(event: ProtocolEvent) {
+        protocol_events()
+            .lock()
+            .expect("protocol event log mutex poisoned")
+            .push(event);
+    }
+
+    fn take_protocol_events() -> Vec<ProtocolEvent> {
+        std::mem::take(
+            &mut *protocol_events()
+                .lock()
+                .expect("protocol event log mutex poisoned"),
+        )
+    }
+
+    #[derive(Clone)]
+    struct ProtocolFileIO;
+
+    impl FileIO for ProtocolFileIO {
+        type Handle = <TokioFileIO as FileIO>::Handle;
+
+        fn create(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            record_protocol_event(ProtocolEvent::DataCreate);
+            TokioFileIO::create(path)
+        }
+
+        fn open(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::open(path)
+        }
+
+        fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: Bytes,
+        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
+            TokioFileIO::write_at(handle, offset, data)
+        }
+
+        fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+            TokioFileIO::read_at(handle, offset, len)
+        }
+
+        fn sync_data(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            record_protocol_event(ProtocolEvent::DataSync);
+            TokioFileIO::sync_data(handle)
+        }
+
+        fn sync_directory(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            let path = path.to_path_buf();
+            async move {
+                let parent = path.ends_with("data");
+                record_protocol_event(if parent {
+                    ProtocolEvent::ParentDirectorySync
+                } else {
+                    ProtocolEvent::SpoolDirectorySync
+                });
+                if parent && FAIL_NEXT_PARENT_SYNC.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(std::io::Error::other(
+                        "injected parent directory fsync failure",
+                    ));
+                }
+                TokioFileIO::sync_directory(&path).await
+            }
+        }
+
+        fn close(
+            handle: Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            record_protocol_event(ProtocolEvent::Close);
+            TokioFileIO::close(handle)
+        }
+
+        fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::remove(path)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ProtocolMetadataStore {
+        inner: SyncSidecarMetadataStore,
+    }
+
+    impl ProtocolMetadataStore {
+        fn new(data_dir: &Path) -> Self {
+            Self {
+                inner: SyncSidecarMetadataStore::new(data_dir),
+            }
+        }
+    }
+
+    impl MetadataStore for ProtocolMetadataStore {
+        async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+            record_protocol_event(ProtocolEvent::MetadataWrite(metadata.state.clone()));
+            if metadata.state != SpoolState::Creating
+                && FAIL_NEXT_LIVE_METADATA_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(BobsError::StorageError(Box::new(std::io::Error::other(
+                    "injected live metadata commit failure",
+                ))));
+            }
+            self.inner.write(metadata).await
+        }
+
+        async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+            self.inner.read(key).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<()> {
+            record_protocol_event(ProtocolEvent::MetadataDelete);
+            self.inner.delete(key).await
+        }
+
+        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+            self.inner.list().await
+        }
+    }
 
     #[test]
     fn recognised_spool_keys_accept_uuid_and_request_id() {
@@ -1253,6 +1469,144 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.key, key);
         assert_eq!(meta.state, SpoolState::Writing);
+    }
+
+    #[tokio::test]
+    async fn test_directory_durability_ordering_failures_and_retry_release() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<ProtocolFileIO, ProtocolMetadataStore>::with_metadata_store(
+            ProtocolMetadataStore::new(&data_dir),
+            &data_dir,
+            4,
+            64,
+            1,
+        )
+        .expect("manager init");
+
+        take_protocol_events();
+        let first_key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(first_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("durable create succeeds");
+        assert_eq!(
+            take_protocol_events(),
+            vec![
+                ProtocolEvent::DataCreate,
+                ProtocolEvent::DataSync,
+                ProtocolEvent::SpoolDirectorySync,
+                ProtocolEvent::MetadataWrite(SpoolState::Creating),
+                ProtocolEvent::ParentDirectorySync,
+                ProtocolEvent::MetadataWrite(SpoolState::Writing),
+            ],
+            "create must durably publish the key directory with a Creating tombstone before the live sidecar"
+        );
+
+        manager
+            .delete_spool(&first_key)
+            .await
+            .expect("durable delete succeeds");
+        assert_eq!(
+            take_protocol_events(),
+            vec![
+                ProtocolEvent::Close,
+                ProtocolEvent::MetadataDelete,
+                ProtocolEvent::ParentDirectorySync,
+            ],
+            "delete must remove and key-dir-sync the sidecar before committing the key-dir unlink in data_dir"
+        );
+
+        let failed_create_key = uuid::Uuid::new_v4().to_string();
+        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = manager
+            .create_spool(failed_create_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect_err("parent fsync failure must not acknowledge create");
+        assert!(matches!(error, BobsError::IoError(_)));
+        let failed_create_events = take_protocol_events();
+        assert!(failed_create_events.contains(&ProtocolEvent::MetadataWrite(SpoolState::Creating)));
+        assert!(
+            !failed_create_events.contains(&ProtocolEvent::MetadataWrite(SpoolState::Writing)),
+            "a failed parent fsync must not publish live metadata"
+        );
+        assert!(failed_create_events.contains(&ProtocolEvent::MetadataDelete));
+        assert!(manager.get_spool(&failed_create_key).is_none());
+        assert!(!data_dir.join(&failed_create_key).exists());
+        assert_eq!(manager.admission.available_permits(), 1);
+
+        let failed_live_key = uuid::Uuid::new_v4().to_string();
+        FAIL_NEXT_LIVE_METADATA_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = manager
+            .create_spool(failed_live_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect_err("final metadata failure must not acknowledge create");
+        assert!(matches!(error, BobsError::StorageError(_)));
+        let failed_live_events = take_protocol_events();
+        assert_eq!(
+            &failed_live_events[..5],
+            &[
+                ProtocolEvent::DataCreate,
+                ProtocolEvent::DataSync,
+                ProtocolEvent::SpoolDirectorySync,
+                ProtocolEvent::MetadataWrite(SpoolState::Creating),
+                ProtocolEvent::ParentDirectorySync,
+            ],
+            "the crash-safe Creating sidecar and parent link precede the live commit attempt"
+        );
+        assert!(failed_live_events.contains(&ProtocolEvent::MetadataDelete));
+        assert!(manager.get_spool(&failed_live_key).is_none());
+        assert!(!data_dir.join(&failed_live_key).exists());
+        assert_eq!(manager.admission.available_permits(), 1);
+
+        let retry_key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(retry_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create retry fixture");
+        take_protocol_events();
+        manager
+            .page_cache
+            .lock()
+            .await
+            .insert(&retry_key, 0, Bytes::from_static(b"data"));
+        assert!(manager.page_cache.lock().await.contains(&retry_key, 0));
+
+        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            manager.delete_spool(&retry_key).await.is_err(),
+            "parent fsync failure must not acknowledge deletion"
+        );
+        assert!(!data_dir.join(&retry_key).exists());
+        let deleting = manager
+            .get_spool(&retry_key)
+            .expect("failed deletion remains tracked");
+        assert_eq!(deleting.metadata.lock().await.state, SpoolState::Deleting);
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert!(manager.page_cache.lock().await.contains(&retry_key, 0));
+        assert_eq!(
+            take_protocol_events(),
+            vec![
+                ProtocolEvent::Close,
+                ProtocolEvent::MetadataDelete,
+                ProtocolEvent::ParentDirectorySync,
+            ]
+        );
+
+        manager
+            .delete_spool(&retry_key)
+            .await
+            .expect("retry syncs parent even though key directory is already absent");
+        assert_eq!(
+            take_protocol_events(),
+            vec![
+                ProtocolEvent::MetadataDelete,
+                ProtocolEvent::ParentDirectorySync,
+            ]
+        );
+        assert!(manager.get_spool(&retry_key).is_none());
+        assert!(!manager.page_cache.lock().await.contains(&retry_key, 0));
+        assert_eq!(manager.admission.available_permits(), 1);
     }
 
     #[tokio::test]

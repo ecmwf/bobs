@@ -257,6 +257,12 @@ mod tests {
             TokioFileIO::sync_data(handle)
         }
 
+        fn sync_directory(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_directory(path)
+        }
+
         fn close(
             handle: Self::Handle,
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
@@ -307,6 +313,12 @@ mod tests {
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
             record_completion_event(CompletionEvent::DataFileSyncData);
             TokioFileIO::sync_data(handle)
+        }
+
+        fn sync_directory(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_directory(path)
         }
 
         fn close(
@@ -512,6 +524,12 @@ mod tests {
 
         async fn sync_data(_handle: &Self::Handle) -> std::io::Result<()> {
             Err(std::io::Error::other("injected sync failure"))
+        }
+
+        fn sync_directory(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_directory(path)
         }
 
         fn close(
