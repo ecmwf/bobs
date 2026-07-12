@@ -103,7 +103,7 @@ where
         let active = {
             let mut meta = self.metadata.lock().await;
             if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
-                meta.last_write_at = now_secs();
+                meta.last_write_at = meta.last_write_at.max(now_secs());
                 true
             } else {
                 false
@@ -130,7 +130,7 @@ where
         }
 
         meta.total_bytes_written = total_bytes_written;
-        meta.last_write_at = now;
+        meta.last_write_at = meta.last_write_at.max(now);
         drop(meta);
 
         if published_pages {
