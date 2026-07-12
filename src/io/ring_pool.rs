@@ -7,6 +7,7 @@
 //! This module starts with hash-routing tests so the stable key-to-shard
 //! contract is pinned before the dispatch implementation is introduced.
 
+use crate::error::BobsError;
 use bytes::Bytes;
 use io_uring::{opcode, squeue, types, IoUring};
 use siphasher::sip::SipHasher13;
@@ -30,6 +31,28 @@ const METADATA_COMMIT_CHAIN_LEN: usize = 4;
 const METADATA_COMMIT_PHASE_LEN: usize = 2;
 const METADATA_USER_DATA_SHIFT: u64 = 56;
 const METADATA_USER_DATA_MASK: u64 = (1u64 << METADATA_USER_DATA_SHIFT) - 1;
+
+fn validate_queue_capacity(queue_capacity: usize) -> Result<()> {
+    let configuration_error = |message| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            BobsError::ConfigurationError(message),
+        )
+    };
+
+    if queue_capacity == 0 {
+        return Err(configuration_error(
+            "ring pool queue_capacity must be greater than 0".to_string(),
+        ));
+    }
+    if queue_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(configuration_error(format!(
+            "ring pool queue_capacity must not exceed {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
+    Ok(())
+}
 
 type OpenSender = oneshot::Sender<Result<Arc<OwnedFd>>>;
 type WriteSender = oneshot::Sender<Result<usize>>;
@@ -205,6 +228,7 @@ pub struct RingPoolShutdown {
 
 impl RingPoolOptions {
     pub fn production(configured_shards: Option<usize>, queue_capacity: usize) -> Result<Self> {
+        validate_queue_capacity(queue_capacity)?;
         Ok(Self {
             shard_count: resolve_shard_count(configured_shards)?,
             queue_capacity,
@@ -230,12 +254,9 @@ impl RingPool {
                 "ring pool shard_count must be greater than 0",
             ));
         }
-        if options.queue_capacity == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "ring pool queue_capacity must be greater than 0",
-            ));
-        }
+        // RingPoolOptions is public and test/custom callers can bypass
+        // RingPoolOptions::production, so validate again at construction.
+        validate_queue_capacity(options.queue_capacity)?;
 
         let instrumentation = RingPoolInstrumentation::default();
         let shards = Self::start_shards(&options, instrumentation.submission.clone())?;
@@ -2015,6 +2036,51 @@ mod tests {
         })
         .expect_err("zero queue capacity should be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn ring_pool_accepts_tokio_queue_capacity_boundary() {
+        let pool = RingPool::new_for_test(RingPoolOptions {
+            shard_count: 1,
+            queue_capacity: tokio::sync::Semaphore::MAX_PERMITS,
+            driver_name_prefix: "bobs-uring-boundary-test".to_owned(),
+        })
+        .expect("Tokio's maximum channel capacity should construct without panicking");
+
+        let shutdown = pool.shutdown().expect("boundary pool should shut down");
+        assert_eq!(shutdown.joined_driver_handles, 1);
+    }
+
+    #[test]
+    fn ring_pool_options_reject_queue_capacity_above_tokio_limit() {
+        let err = RingPoolOptions::production(Some(1), tokio::sync::Semaphore::MAX_PERMITS + 1)
+            .expect_err("production options must reject an oversized queue");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("must not exceed"));
+        assert!(matches!(
+            err.get_ref()
+                .and_then(|source| source.downcast_ref::<crate::error::BobsError>()),
+            Some(crate::error::BobsError::ConfigurationError(_))
+        ));
+    }
+
+    #[test]
+    fn ring_pool_construction_rejects_oversized_custom_options_without_panicking() {
+        let err = RingPool::new_for_test(RingPoolOptions {
+            shard_count: 1,
+            queue_capacity: tokio::sync::Semaphore::MAX_PERMITS + 1,
+            driver_name_prefix: "bobs-uring-test".to_owned(),
+        })
+        .expect_err("custom options must be revalidated before channel construction");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("must not exceed"));
+        assert!(matches!(
+            err.get_ref()
+                .and_then(|source| source.downcast_ref::<crate::error::BobsError>()),
+            Some(crate::error::BobsError::ConfigurationError(_))
+        ));
     }
 
     #[test]

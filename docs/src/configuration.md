@@ -47,7 +47,7 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `cleanup_sweep_interval_secs` | `30` | Cleanup scan interval. Must be greater than `0` and must not exceed any active cleanup timeout. |
 | `long_poll_timeout_ms` | `25000` | Maximum wait for new data during a follow read before redirecting. Must be greater than `0`. |
 | `io_uring_shards` | unset | Linux ring-pool shard count. Omission resolves to `max(1, num_cpus / 4)`; an explicit value must be greater than `0`. Ignored by fallback builds. |
-| `io_uring_queue_capacity` | `1024` | Submission queue capacity for each Linux `io_uring` shard. Must be greater than `0`. Ignored by fallback builds. |
+| `io_uring_queue_capacity` | `1024` | Submission queue capacity for each Linux `io_uring` shard. Must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): `2305843009213693951` on 64-bit targets or `536870911` on 32-bit targets. Invalid values fail startup with `ConfigurationError`, including in fallback builds; otherwise fallback I/O ignores this setting. |
 | `host_prefix` | `""` | External download host prefix used in `read_url`. Must be non-empty. |
 | `domain` | `""` | External download domain used in `read_url`. Must be non-empty. |
 | `route_name` | `""` | External download route prefix. Must be non-empty. |
@@ -77,7 +77,7 @@ unread_ttl_secs: 3600          # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
 io_uring_shards: 4             # optional; omit for max(1, num_cpus / 4)
-io_uring_queue_capacity: 1024
+io_uring_queue_capacity: 1024  # 1..=Tokio Semaphore::MAX_PERMITS (usize::MAX >> 3)
 host_prefix: polytope-example
 domain: example.com
 route_name: download
