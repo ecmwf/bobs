@@ -31,14 +31,14 @@ assert_contains '- ReadWriteOnce' "$tmpdir/default.yaml"
 assert_contains 'volumeMode: "Filesystem"' "$tmpdir/default.yaml"
 
 helm template bobs "$chart" "${common_values[@]}" \
-  --set global.imageRegistry=registry.example.com \
+  --set global.imageRegistry=registry.example.com/team \
   --set image.repository=eccr.ecmwf.int/polytope/bobs \
   --set-string image.tag= \
   --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --set-string rustLog=bobs=debug \
   --set persistence.enabled=false \
   >"$tmpdir/overrides.yaml"
-assert_contains 'image: "registry.example.com/polytope/bobs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$tmpdir/overrides.yaml"
+assert_contains 'image: "registry.example.com/team/polytope/bobs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$tmpdir/overrides.yaml"
 assert_contains 'value: "bobs=debug"' "$tmpdir/overrides.yaml"
 assert_contains 'sizeLimit: "10Gi"' "$tmpdir/overrides.yaml"
 
