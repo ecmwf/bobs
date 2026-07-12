@@ -8,7 +8,6 @@ use crate::io::FileIO;
 use crate::manager::SpoolManager;
 use crate::metadata::MetadataStore;
 use crate::metrics::BobsMetrics;
-use crate::time::now_secs;
 use async_stream::stream;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
@@ -845,21 +844,11 @@ where
                 lease.bytes_served = bytes_served;
                 let chunk_end = offset;
 
-                // 1. Refresh the monotonic cleanup activity anchor.
-                spool.record_read_activity();
-                let now = now_secs();
-
-                // 2. Record coverage and run the full-read transition when this
-                // chunk completes first coverage of the whole object.
+                // Refresh monotonic activity and coverage under the lifecycle lock so
+                // cleanup cannot act on a stale eligibility snapshot.
                 spool
                     .mark_served_and_maybe_fully_read(chunk_start, chunk_end)
                     .await;
-
-                // 3. Keep legacy last_read_at for observability (not used in new cleanup).
-                {
-                    let mut meta = spool.metadata.lock().await;
-                    meta.last_read_at = Some(now);
-                }
 
                 // 4. If this chunk completes a bounded read, record duration
                 //    NOW before yielding. hyper drops the response body
@@ -1081,6 +1070,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
             BobsError::SpoolNotFound { .. } => StatusCode::NOT_FOUND,
+            BobsError::SpoolAlreadyExists { .. } => StatusCode::CONFLICT,
             BobsError::OffsetMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::SizeMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::InvalidRange(_) => StatusCode::BAD_REQUEST,

@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::io::FileIO;
 use crate::manager::{DeleteReason, SpoolManager};
 use crate::metadata::MetadataStore;
-use crate::spool::SpoolState;
+use crate::spool::{CleanupAnchors, SpoolMetadata, SpoolState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,6 +26,57 @@ use tokio::time::{self, Duration};
 ///
 /// Note: `reader_count` is NOT used as an absolute guard. Stalled connections that serve
 /// no bytes will expire via the idle TTL like any other unserved spool.
+#[derive(Clone)]
+struct CleanupCandidate {
+    key: String,
+    state: SpoolState,
+    anchors: CleanupAnchors,
+    reason: &'static str,
+}
+
+fn cleanup_reason(
+    metadata: &SpoolMetadata,
+    anchors: CleanupAnchors,
+    now: Instant,
+    config: &Config,
+) -> Option<&'static str> {
+    if metadata.state == SpoolState::Deleting {
+        return Some(crate::metrics::reason::DELETE_RETRY);
+    }
+
+    let writer_inactive = matches!(
+        metadata.state,
+        SpoolState::Writing | SpoolState::WriteLocked
+    ) && now.saturating_duration_since(anchors.last_write_at)
+        > Duration::from_secs(config.writer_inactivity_timeout_secs);
+    if writer_inactive {
+        return Some(crate::metrics::reason::WRITER_TIMEOUT);
+    }
+
+    if let Some(full_read_at) = anchors.full_object_read_at {
+        let anchor = anchors
+            .last_read_activity_at
+            .map_or(full_read_at, |activity| activity.max(full_read_at));
+        if now.saturating_duration_since(anchor)
+            > Duration::from_secs(config.full_read_complete_ttl_secs)
+        {
+            return Some(crate::metrics::reason::FULL_READ_TTL);
+        }
+    }
+
+    if metadata.state == SpoolState::Complete {
+        let anchor = anchors
+            .last_read_activity_at
+            .or(anchors.readable_at)
+            .unwrap_or(now);
+        if now.saturating_duration_since(anchor) > Duration::from_secs(config.read_idle_ttl_secs) {
+            return Some(crate::metrics::reason::IDLE_TTL);
+        }
+    }
+
+    None
+}
+
 pub async fn run_cleanup_loop<F, M>(manager: Arc<SpoolManager<F, M>>, config: Arc<Config>)
 where
     F: FileIO,
@@ -42,7 +93,8 @@ where
         let started = Instant::now();
         let now = Instant::now();
         let mut to_delete = Vec::new();
-        let keys = manager.spool_keys();
+        let mut keys = manager.spool_keys();
+        keys.sort();
         let mut inspected = 0_u64;
         tracing::debug!(
             "event.name" = "bobs.cleanup.run.started",
@@ -56,70 +108,45 @@ where
             let Some(spool) = manager.get_spool(&key) else {
                 continue;
             };
-
-            let state = spool.metadata.lock().await.state.clone();
+            let _lifecycle_guard = spool.lifecycle_lock.lock().await;
+            let metadata = spool.metadata.lock().await.clone();
             let anchors = spool.cleanup_anchors();
-
-            // --- Rule 1: Writer abandoned the spool. ---
-            let writer_inactive = matches!(state, SpoolState::Writing | SpoolState::WriteLocked)
-                && now.saturating_duration_since(anchors.last_write_at)
-                    > Duration::from_secs(config.writer_inactivity_timeout_secs);
-
-            // --- Rule 2: Full-read short TTL. ---
-            // Subsequent byte-serving activity refreshes this anchor, so deletion only
-            // happens after full coverage and no further read activity.
-            let full_read_expired = anchors.full_object_read_at.is_some_and(|full_read_at| {
-                let anchor = anchors
-                    .last_read_activity_at
-                    .map_or(full_read_at, |activity| activity.max(full_read_at));
-                now.saturating_duration_since(anchor)
-                    > Duration::from_secs(config.full_read_complete_ttl_secs)
-            });
-
-            // --- Rule 3: Idle TTL. ---
-            // Newly completed and recovered readable spools are seeded with a fresh
-            // readable anchor. The fallback remains conservative for manually
-            // constructed or legacy in-memory state.
-            let idle_expired = state == SpoolState::Complete && {
-                let anchor = anchors
-                    .last_read_activity_at
-                    .or(anchors.readable_at)
-                    .unwrap_or(now);
-                now.saturating_duration_since(anchor)
-                    > Duration::from_secs(config.read_idle_ttl_secs)
-            };
-
-            let deletion_retry = state == SpoolState::Deleting;
-            if deletion_retry || writer_inactive || full_read_expired || idle_expired {
-                let reason = if deletion_retry {
-                    crate::metrics::reason::DELETE_RETRY
-                } else if writer_inactive {
-                    crate::metrics::reason::WRITER_TIMEOUT
-                } else if full_read_expired {
-                    crate::metrics::reason::FULL_READ_TTL
-                } else {
-                    crate::metrics::reason::IDLE_TTL
-                };
-                to_delete.push((key, reason));
+            if let Some(reason) = cleanup_reason(&metadata, anchors, now, &config) {
+                to_delete.push(CleanupCandidate {
+                    key,
+                    state: metadata.state,
+                    anchors,
+                    reason,
+                });
             }
         }
 
         let mut deleted = 0_u64;
         let mut failed_delete = 0_u64;
-        for (key, reason) in to_delete {
-            // Capture labels before deletion removes the spool.
-            let labels = if let Some(spool) = manager.get_spool(&key) {
-                spool.metadata.lock().await.labels.clone()
-            } else {
-                std::collections::HashMap::new()
-            };
+        for candidate in to_delete {
+            let expected = candidate.clone();
+            let key = candidate.key.clone();
+            let candidate_config = Arc::clone(&config);
             match manager
-                .delete_spool_with_reason(&key, DeleteReason::Ttl, None)
+                .delete_spool_with_reason_if(&key, DeleteReason::Ttl, move |meta, anchors| {
+                    meta.state == expected.state
+                        && anchors.last_write_at == expected.anchors.last_write_at
+                        && anchors.readable_at == expected.anchors.readable_at
+                        && anchors.last_read_activity_at == expected.anchors.last_read_activity_at
+                        && anchors.full_object_read_at == expected.anchors.full_object_read_at
+                        && cleanup_reason(meta, anchors, now, &candidate_config)
+                            == Some(expected.reason)
+                })
                 .await
             {
-                Ok(()) => {
+                Ok(Some(labels)) => {
                     deleted += 1;
-                    manager.metrics.record_spool_deleted(&labels, reason);
+                    manager
+                        .metrics
+                        .record_spool_deleted(&labels, candidate.reason);
+                }
+                Ok(None) => {
+                    tracing::debug!(%key, "cleanup candidate invalidated by lifecycle activity");
                 }
                 Err(err) => {
                     failed_delete += 1;
@@ -198,6 +225,71 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
 
+    static BLOCK_NEXT_CLOSE: AtomicBool = AtomicBool::new(false);
+    static CLOSE_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+    static CLOSE_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+    #[derive(Clone)]
+    struct BlockingCloseFileIO;
+
+    impl FileIO for BlockingCloseFileIO {
+        type Handle = <TokioFileIO as FileIO>::Handle;
+
+        fn create(
+            path: &std::path::Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::create(path)
+        }
+
+        fn open(
+            path: &std::path::Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::open(path)
+        }
+
+        fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: bytes::Bytes,
+        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
+            TokioFileIO::write_at(handle, offset, data)
+        }
+
+        fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> impl std::future::Future<Output = std::io::Result<bytes::Bytes>> + Send {
+            TokioFileIO::read_at(handle, offset, len)
+        }
+
+        fn sync_data(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_data(handle)
+        }
+
+        fn sync_directory(
+            path: &std::path::Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_directory(path)
+        }
+
+        async fn close(handle: Self::Handle) -> std::io::Result<()> {
+            if BLOCK_NEXT_CLOSE.swap(false, Ordering::SeqCst) {
+                CLOSE_STARTED.notify_waiters();
+                CLOSE_RELEASE.notified().await;
+            }
+            TokioFileIO::close(handle).await
+        }
+
+        fn remove(
+            path: &std::path::Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::remove(path)
+        }
+    }
+
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
             host: "127.0.0.1".into(),
@@ -222,12 +314,13 @@ mod tests {
         })
     }
 
-    async fn test_manager() -> Arc<SpoolManager<TokioFileIO>> {
+    async fn test_manager() -> (Arc<SpoolManager<TokioFileIO>>, tempfile::TempDir) {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
-        Arc::new(
+        let manager = Arc::new(
             SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 256).expect("manager init"),
-        )
+        );
+        (manager, dir)
     }
 
     async fn wait_for_spool_removal(manager: &SpoolManager<TokioFileIO>, key: &str) {
@@ -260,8 +353,8 @@ mod tests {
             .expect("rewrite metadata");
     }
 
-    fn update_anchors(
-        spool: &Spool<TokioFileIO>,
+    fn update_anchors<F: FileIO>(
+        spool: &Spool<F>,
         update: impl FnOnce(&mut crate::spool::CleanupAnchors),
     ) {
         let mut anchors = spool
@@ -284,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn test_writer_inactivity_cleanup() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -435,7 +528,7 @@ mod tests {
     #[tokio::test]
     async fn test_idle_ttl_after_read_activity() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -467,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn test_idle_ttl_uses_monotonic_readable_anchor() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -502,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn test_recent_activity_prevents_idle_cleanup() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -535,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn test_readable_at_none_uses_now_as_safe_anchor() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -567,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn test_stalled_reader_no_activity_idle_expires() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -602,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn test_active_reader_with_recent_bytes_refreshes_idle() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -649,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn test_writing_spool_not_deleted_by_idle() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -686,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_object_read_triggers_short_ttl() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -718,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_object_read_short_ttl_refreshed_by_activity() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -750,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_object_read_short_ttl_not_triggered_before_expiry() {
         tokio::time::pause();
-        let manager = test_manager().await;
+        let (manager, _dir) = test_manager().await;
         let config = test_config();
 
         let key = uuid::Uuid::new_v4().to_string();
@@ -774,5 +867,109 @@ mod tests {
             "full-read TTL must not fire before expiry"
         );
         task.abort();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SnapshotRefresh {
+        Complete,
+        Write,
+        Read,
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_candidates_are_revalidated_after_completion_write_and_read() {
+        for refresh in [
+            SnapshotRefresh::Complete,
+            SnapshotRefresh::Write,
+            SnapshotRefresh::Read,
+        ] {
+            let dir = tempdir().expect("create tempdir");
+            let data_dir = dir.path().join("data");
+            let manager = Arc::new(
+                SpoolManager::<BlockingCloseFileIO>::new(&data_dir, 4096, 65536, 8)
+                    .expect("manager init"),
+            );
+            for key in ["a-first-delete", "b-stale-candidate"] {
+                manager
+                    .create_spool(key.into(), None, None, false, HashMap::new())
+                    .await
+                    .expect("create candidate");
+            }
+            let first = manager
+                .get_spool("a-first-delete")
+                .expect("first candidate exists");
+            update_anchors(&first, |anchors| anchors.last_write_at = old_instant());
+            let second = manager
+                .get_spool("b-stale-candidate")
+                .expect("second candidate exists");
+
+            if matches!(refresh, SnapshotRefresh::Read) {
+                second
+                    .write(0, bytes::Bytes::from_static(b"served"))
+                    .await
+                    .expect("write reader fixture");
+                second
+                    .complete(None)
+                    .await
+                    .expect("complete reader fixture");
+                update_anchors(&second, |anchors| {
+                    anchors.readable_at = Some(old_instant());
+                    anchors.last_read_activity_at = None;
+                    anchors.full_object_read_at = None;
+                });
+            } else {
+                update_anchors(&second, |anchors| {
+                    anchors.last_write_at = old_instant();
+                });
+            }
+
+            let mut config = (*test_config()).clone();
+            config.data_dir = data_dir.clone();
+            config.cleanup_sweep_interval_secs = 3600;
+            let config = Arc::new(config);
+            let close_started = CLOSE_STARTED.notified();
+            BLOCK_NEXT_CLOSE.store(true, Ordering::SeqCst);
+            let task = start_cleanup_task(Arc::clone(&manager), config);
+            tokio::time::timeout(Duration::from_secs(5), close_started)
+                .await
+                .expect("first sorted delete reaches blocked close");
+
+            match refresh {
+                SnapshotRefresh::Complete => {
+                    second
+                        .complete(None)
+                        .await
+                        .expect("complete after snapshot");
+                }
+                SnapshotRefresh::Write => {
+                    second
+                        .write(0, bytes::Bytes::from_static(b"fresh"))
+                        .await
+                        .expect("write after snapshot");
+                }
+                SnapshotRefresh::Read => {
+                    second.mark_served_and_maybe_fully_read(0, 6).await;
+                }
+            }
+            CLOSE_RELEASE.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while manager.get_spool("a-first-delete").is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first candidate is deleted");
+            assert!(
+                manager.get_spool("b-stale-candidate").is_some(),
+                "{refresh:?} after snapshot must invalidate the second deletion candidate"
+            );
+            assert_ne!(
+                second.metadata.lock().await.state,
+                SpoolState::Deleting,
+                "invalidated candidate must retain its live lifecycle state"
+            );
+            task.abort();
+        }
     }
 }
