@@ -69,6 +69,8 @@ curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "text/plain
 
 BOBS returns `201 Created` only after `spool.dat`, the key-directory link, and live `Writing` or `WriteLocked` metadata cross their fsync boundaries. The intermediate `Creating` sidecar is internal to crash recovery and is never visible as an active spool. An interrupted create is removed safely during startup recovery.
 
+If the client disconnects while waiting for admission, no key is reserved. After reservation starts, BOBS completes the create transaction or rolls it back despite client cancellation. A missing response is therefore an unknown outcome: retry with the same `X-Polytope-Job-Id`; `409 Conflict` means the spool now exists.
+
 ---
 
 ### POST /api/v1/write/{key}/{offset}
@@ -96,6 +98,8 @@ For a valid write head, both known-length rejection and a chunked upload crossin
 ### POST /api/v1/complete/{key}
 
 Idempotently finalizes the spool. After this, no more writes are allowed. Repeated completion requests succeed, but a supplied `expected_size` is always checked against the actual completed size.
+
+If a completion attempt fails after finalization starts, BOBS rejects further writes and keeps completion retryable. Retry `/api/v1/complete/{key}` with the same `expected_size`; the internal `Completing` state is not exposed as an API choice.
 
 **Request Body (Optional)**:
 

@@ -33,12 +33,12 @@ Future Linux optimizations that are intentionally not implemented yet include `I
 
 ### Data Flow
 
-1. **Create**: BOBS uses a valid `X-Polytope-Job-Id` request ID as the key or generates a fallback UUIDv4. Request IDs may use uppercase or lowercase Crockford base32; BOBS normalizes the canonical key to lowercase. It atomically reserves `<data_dir>/<key>/`, creates and syncs `spool.dat`, syncs the key directory, commits an internal `Creating` recovery sidecar, syncs `data_dir`, and commits live `Writing` or `WriteLocked` metadata before returning `201 Created`.
+1. **Create**: BOBS uses a valid `X-Polytope-Job-Id` request ID as the key or generates a fallback UUIDv4. Request IDs may use uppercase or lowercase Crockford base32; BOBS normalizes the canonical key to lowercase. It waits for admission before reserving a key, then atomically reserves `<data_dir>/<key>/`, creates and syncs `spool.dat`, syncs the key directory, commits an internal `Creating` recovery sidecar, syncs `data_dir`, and commits live `Writing` or `WriteLocked` metadata before returning `201 Created`. Once reservation starts, the create transaction finishes or rolls back even if the client disconnects.
 2. **Write**: Data arrives through `/api/v1/write/{key}/{offset}`. Accepted bytes are appended to `spool.dat` before the request returns; the data file is authoritative for in-progress bytes.
 3. **Page visibility**: Complete pages become reader-visible, enter the global FIFO cache when they fit, and notify parked readers.
 4. **Read**: `/api/v1/read/{key}` checks the page cache and then `spool.dat`. A trailing partial page remains hidden until it fills or completion finalizes it.
-5. **Complete**: `/api/v1/complete/{key}` validates any `expected_size`, including on idempotent retries. Initial completion publishes the trailing partial page, syncs data, and atomically commits completed metadata.
-6. **Lifecycle**: Active spools move from `Writing` (or `WriteLocked`) to `Complete`, then `Deleting`. `Creating` is an internal on-disk crash-recovery tombstone and is never published through the active spool registry or HTTP API. A write-locked spool becomes readable only through completion.
+5. **Complete**: `/api/v1/complete/{key}` validates any `expected_size`, including on idempotent retries. Initial completion publishes the trailing partial page, syncs data, and atomically commits completed metadata. Once completion starts, internal `Completing` state rejects writes until completion succeeds or is retried.
+6. **Lifecycle**: Active spools move from `Writing` (or `WriteLocked`) through internal retryable `Completing` to `Complete`, then `Deleting`. `Creating` and `Completing` are not client-selectable states, and a write-locked spool becomes readable only through completion.
 
 ### Persistence Contract
 
@@ -55,13 +55,13 @@ The in-progress durability invariant is recovery from a BOBS restart, not surviv
 
 Completed metadata is durable through the sidecar protocol: write `meta.json.tmp`, sync it, rename it to `meta.json`, and sync the parent directory. Recovery treats `meta.json` as all-or-nothing and ignores any leftover `meta.json.tmp` from an interrupted commit.
 
-Create acknowledgement has an additional parent-directory durability boundary. BOBS first makes the empty data inode and its name durable, commits a `Creating` sidecar, and syncs `data_dir` so the key-directory link is durable. Only then does it commit live `Writing` or `WriteLocked` metadata and publish the spool in memory. If creation is interrupted, startup sees only the internal `Creating` marker and durably removes that incomplete spool; unrelated, unrecognised, or ambiguous legacy data is left intact.
+Create acknowledgement has an additional parent-directory durability boundary. BOBS first makes the empty data inode and its name durable, commits a `Creating` sidecar, and syncs `data_dir` so the key-directory link is durable. Only then does it commit live `Writing` or `WriteLocked` metadata and publish the spool in memory. Cancellation while waiting for admission leaves no reservation; cancellation after reservation does not stop the detached transaction, which either publishes durably or rolls back. A retry with the same request ID may therefore return `409 Conflict` after the original response was lost.
 
 Delete acknowledgement is likewise delayed until removal is durable. BOBS removes sidecar metadata and the key directory, then fsyncs `data_dir`. Cache entries, manager membership, and admission accounting remain held until that parent-directory fsync succeeds, so a failed acknowledgement can be retried without exposing a falsely completed deletion.
 
 ### Recovery and Shared Filesystems
 
-Startup recovery scans `<data_dir>` for key directories with `meta.json`. Internal `Creating` and `Deleting` sidecars are cleaned up as interrupted lifecycle operations, with the parent directory synced after removal. Current in-progress spools with a persisted `page_size` are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
+Startup recovery scans `<data_dir>` for key directories with `meta.json`. Internal `Creating` and `Deleting` sidecars are cleaned up as interrupted lifecycle operations, with the parent directory synced after removal. Current in-progress `Writing`, `WriteLocked`, and retryable `Completing` spools with a persisted `page_size` are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
 
 Current sidecars persist the spool's `page_size`, so a later configuration change cannot reinterpret existing page offsets. When a legacy sidecar has no page size, recovery migrates only cases with a safe interpretation and atomically commits the upgraded sidecar before exposing or mutating the spool.
 
@@ -71,7 +71,7 @@ A legacy `Writing` spool whose active page stride cannot be determined safely is
 
 The layout is friendly to shared filesystems and multi-BOBS deployments because each object has its own directory and sidecar, and each spool has a single writer. Independent keys can be created, completed, recovered, and deleted without a global metadata database or cross-key write serialization. Correct routing is still required: create, write, complete, and read traffic for a key must reach a BOBS instance that can see the same `<data_dir>/<key>` files.
 
-Cleanup removes expired `spool.dat` and `meta.json` files after writer inactivity, read-idle, or full-read-complete deadlines. `cleanup_sweep_interval_secs` must not exceed any active cleanup timeout; deprecated `reader_done_ttl_secs` and `unread_ttl_secs` values remain parseable but do not drive cleanup.
+Cleanup removes expired `spool.dat` and `meta.json` files after writer inactivity, read-idle, or full-read-complete deadlines. Immediately before deletion it revalidates lifecycle state and monotonic read/write activity under the spool lifecycle lock, so activity after the sweep snapshot cancels stale eligibility. `cleanup_sweep_interval_secs` must not exceed any active cleanup timeout; deprecated `reader_done_ttl_secs` and `unread_ttl_secs` values remain parseable but do not drive cleanup.
 
 ### Metadata backend
 
