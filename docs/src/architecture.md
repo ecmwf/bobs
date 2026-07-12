@@ -23,6 +23,8 @@ Default Linux builds route file operations through a fixed-size pool of `io_urin
 
 Data-file operations and metadata sidecar commits for the same object are routed by the same object key and therefore use the same shard. This keeps a key's `spool.dat` work and its `meta.json` create/rename/fsync work on one ring while still allowing independent keys to spread across shards.
 
+Each shard has a bounded submission channel. When it fills, submitters wait for capacity rather than growing an unbounded backlog. The driver drains that channel only while it can bound pending plus in-flight SQE work by the ring capacity, while keeping each two-SQE metadata phase atomic. Sustained arrivals are therefore backpressured without disabling batching.
+
 CPU pinning is not enabled by default. If `io_uring_setup` is blocked, use a runtime seccomp/sysctl policy that permits it or build with `--features tokio-fileio-fallback`.
 
 This backend change does not alter the HTTP API or the on-disk `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json` layout, so it does not require an on-disk migration.
@@ -55,11 +57,13 @@ Completed metadata is durable through the sidecar protocol: write `meta.json.tmp
 
 ### Recovery and Shared Filesystems
 
-Startup recovery scans `<data_dir>` for key directories with `meta.json`. In-progress spools are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
+Startup recovery scans `<data_dir>` for key directories with `meta.json`. Current in-progress spools with a persisted `page_size` are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
 
-Current sidecars persist the spool's `page_size`, so a later configuration change cannot reinterpret existing page offsets. When a legacy sidecar has no page size, recovery derives it only when the recorded page layout and durable `spool.dat` length determine a safe stride. The upgraded sidecar is atomically committed before the spool is exposed or mutated. If the evidence is ambiguous or inconsistent, recovery leaves the sidecar and data intact and fails; it does not guess a stride or delete the quarantined spool.
+Current sidecars persist the spool's `page_size`, so a later configuration change cannot reinterpret existing page offsets. When a legacy sidecar has no page size, recovery migrates only cases with a safe interpretation and atomically commits the upgraded sidecar before exposing or mutating the spool.
 
-Recovery also recognizes the removed legacy `Readable` lifecycle state. Because these objects are terminal and their payload is contiguous, recovery resegments the durable bytes using the currently configured `page_size` rather than inferring the old stride. It reconstructs terminal byte/page metadata, changes the state to `Complete`, clears the obsolete write lock, and atomically persists the migrated page size and metadata before serving the spool.
+The removed legacy `Readable` state is terminal: recovery resegments its contiguous durable bytes using the currently configured `page_size`, reconstructs terminal byte/page metadata, changes the state to `Complete`, clears the obsolete write lock, and persists the migration before serving it. A legacy `WriteLocked` spool is also salvaged as `Complete` from its exact durable file length, preserving its write-lock provenance while preventing further writes.
+
+A legacy `Writing` spool whose active page stride cannot be determined safely is quarantined instead of guessed. BOBS leaves its `meta.json` and `spool.dat` unchanged, excludes it from the live manager, and continues startup so other valid spools remain available. Malformed legacy `WriteLocked` sidecars receive the same non-destructive quarantine treatment. Other inconsistent terminal layouts are left intact and can still fail recovery rather than risk serving misinterpreted bytes.
 
 The layout is friendly to shared filesystems and multi-BOBS deployments because each object has its own directory and sidecar, and each spool has a single writer. Independent keys can be created, completed, recovered, and deleted without a global metadata database or cross-key write serialization. Correct routing is still required: create, write, complete, and read traffic for a key must reach a BOBS instance that can see the same `<data_dir>/<key>` files.
 

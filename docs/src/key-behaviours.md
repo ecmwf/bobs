@@ -28,7 +28,7 @@ Only a read request without a `Range` header enters follow mode, starting at byt
 
 A spool created with `write_locked: true` returns `423 Locked` to readers until `/api/v1/complete/{key}` succeeds. Completion is the only transition that makes a write-locked spool readable.
 
-The `WriteLocked` state is lifecycle metadata committed to `<data_dir>/<key>/meta.json`. If BOBS restarts while a spool is `WriteLocked` or `Writing`, recovery inspects `spool.dat` to reconstruct current byte state.
+The `WriteLocked` state is lifecycle metadata committed to `<data_dir>/<key>/meta.json`. Current sidecars record their `page_size`, so recovery can reconstruct in-progress byte state from `spool.dat`. Legacy sidecars without that field follow the migration rules under Recovery and Cleanup below.
 
 ### 5. Parallel Reads
 
@@ -38,7 +38,7 @@ BOBS supports a single consumer opening multiple concurrent connections for the 
 
 Writes must be strictly sequential. The offset in `/api/v1/write/{key}/{offset}` must exactly match the bytes currently stored. Random-access writes and overwrites are unsupported.
 
-A successful write means BOBS accepted bytes through the kernel/file handle; it does not mean `sync_data()` forced them to stable storage. `/api/v1/complete/{key}` is the durability boundary and syncs `spool.dat` before committing final metadata. `max_spool_bytes` defaults to 8 GiB; a request that crosses it returns `413` only after the partial spool is durably removed.
+A successful write means BOBS accepted bytes through the kernel/file handle; it does not mean `sync_data()` forced them to stable storage. `/api/v1/complete/{key}` is the durability boundary and syncs `spool.dat` before committing final metadata. `max_spool_bytes` defaults to 8 GiB. Oversize cleanup first atomically checks the write offset and lifecycle state, so a wrong offset or a spool that completed concurrently is rejected without deletion; only an oversized request at the current writable head durably removes the partial spool before returning `413`.
 
 ### 7. Atomic Sidecar Metadata
 
@@ -48,11 +48,11 @@ This protocol keeps metadata off the write hot path while still making lifecycle
 
 ### 8. Recovery and Cleanup
 
-On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. For in-progress `Writing` and `WriteLocked` spools, `spool.dat` is authoritative for byte state. Any persisted `total_bytes_written`, `total_pages`, or `final_page_size` for those states is advisory only and recovery recomputes it from the file.
+On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. For current in-progress `Writing` and `WriteLocked` spools, `spool.dat` is authoritative for byte state. Any persisted `total_bytes_written`, `total_pages`, or `final_page_size` for those states is advisory only and recovery recomputes it from the file.
 
-Each current sidecar records its spool's `page_size`. For a legacy sidecar without that field, recovery derives a page stride only when the sidecar and durable file length make it unambiguous, then atomically persists the migration before exposing the spool. Unsafe or inconsistent cases are quarantined: BOBS leaves `meta.json` and `spool.dat` intact and fails recovery rather than guessing a stride or deleting the bytes.
+Each current sidecar records its spool's `page_size`. A legacy `Readable` sidecar is terminal and migrates to `Complete` by resegmenting the contiguous durable bytes with the configured page size. A legacy `WriteLocked` spool is likewise salvaged from its exact durable length as `Complete`, retains its write-lock provenance, and cannot accept further writes. Both migrations atomically persist their page size and reconstructed terminal metadata before serving.
 
-The removed legacy `Readable` state is migrated to `Complete`. Because it is terminal and its payload is contiguous, recovery resegments its durable bytes using the currently configured `page_size` rather than inferring its old page stride. It reconstructs terminal byte/page metadata, clears the obsolete write lock, and atomically commits the migrated page size and sidecar before serving it.
+An ambiguous legacy `Writing` partial spool is quarantined without mutation: BOBS leaves `meta.json` and `spool.dat` intact, does not expose the key through spool APIs, and continues startup. A malformed legacy `WriteLocked` sidecar is handled the same way. BOBS does not guess a stride or delete these bytes.
 
 A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 
