@@ -97,7 +97,7 @@ where
         {
             let mut meta = self.metadata.lock().await;
             meta.total_bytes_written = offset + data.len() as u64;
-            meta.last_write_at = now_secs();
+            meta.last_write_at = meta.last_write_at.max(now_secs());
         }
 
         Ok(())

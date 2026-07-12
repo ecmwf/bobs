@@ -19,7 +19,6 @@ use axum::{Json, Router};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -838,21 +837,12 @@ where
                 lease.bytes_served = bytes_served;
                 let chunk_end = offset;
 
-                // 1. Refresh activity timestamp (atomic, lock-free).
+                // Refresh activity and coverage under the lifecycle lock so cleanup
+                // cannot act on a stale eligibility snapshot.
                 let now = now_secs();
-                spool.last_read_activity_at.store(now, Ordering::Relaxed);
-
-                // 2. Record coverage and run the full-read transition when this
-                // chunk completes first coverage of the whole object.
                 spool
                     .mark_served_and_maybe_fully_read(chunk_start, chunk_end, now)
                     .await;
-
-                // 3. Keep legacy last_read_at for observability (not used in new cleanup).
-                {
-                    let mut meta = spool.metadata.lock().await;
-                    meta.last_read_at = Some(now);
-                }
 
                 // 4. If this chunk completes a bounded read, record duration
                 //    NOW before yielding. hyper drops the response body
@@ -1074,6 +1064,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
             BobsError::SpoolNotFound { .. } => StatusCode::NOT_FOUND,
+            BobsError::SpoolAlreadyExists { .. } => StatusCode::CONFLICT,
             BobsError::OffsetMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::SizeMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::InvalidRange(_) => StatusCode::BAD_REQUEST,
@@ -1117,6 +1108,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use serde_json::Value;
+    use std::sync::atomic::Ordering;
     use tower::ServiceExt;
 
     fn test_config(dir: &std::path::Path) -> Arc<Config> {
