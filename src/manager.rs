@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteReason {
@@ -68,7 +68,22 @@ struct CreateTransaction<F: FileIO, M: MetadataStore> {
     page_size: usize,
     page_cache: Arc<Mutex<PageCache>>,
     metrics: Arc<BobsMetrics>,
+}
+
+struct KeyLockLease {
     key_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    key: String,
+    lock: Arc<Mutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for KeyLockLease {
+    fn drop(&mut self) {
+        self.guard.take();
+        self.key_locks.remove_if(&self.key, |_, current| {
+            Arc::ptr_eq(current, &self.lock) && Arc::strong_count(current) == 2
+        });
+    }
 }
 
 impl<F, M> CreateTransaction<F, M>
@@ -84,14 +99,8 @@ where
         write_locked: bool,
         labels: HashMap<String, String>,
         permit: OwnedSemaphorePermit,
+        _key_lease: KeyLockLease,
     ) -> Result<()> {
-        let key_lock = Arc::clone(
-            self.key_locks
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .value(),
-        );
-        let key_guard = key_lock.lock().await;
         let result = self
             .run_reserved(
                 key.clone(),
@@ -102,10 +111,6 @@ where
                 permit,
             )
             .await;
-        drop(key_guard);
-        self.key_locks.remove_if(&key, |_, current| {
-            Arc::ptr_eq(current, &key_lock) && Arc::strong_count(current) == 2
-        });
         result
     }
 
@@ -317,6 +322,17 @@ where
         });
     }
 
+    async fn acquire_key_lock(&self, key: &str) -> KeyLockLease {
+        let lock = self.key_lock(key);
+        let guard = Arc::clone(&lock).lock_owned().await;
+        KeyLockLease {
+            key_locks: Arc::clone(&self.key_locks),
+            key: key.to_string(),
+            lock,
+            guard: Some(guard),
+        }
+    }
+
     pub async fn create_spool(
         &self,
         key: String,
@@ -367,11 +383,18 @@ where
         write_locked: bool,
         labels: HashMap<String, String>,
     ) -> Result<()> {
+        let key_lease = self.acquire_key_lock(&key).await;
         let spool_dir = self.data_dir.join(&key);
-        if self.spools.contains_key(&key)
-            || tokio::fs::try_exists(&spool_dir)
-                .await
-                .map_err(BobsError::IoError)?
+        let existing_is_deleting = if let Some(spool) = self.get_spool(&key) {
+            spool.metadata.lock().await.state == SpoolState::Deleting
+        } else {
+            false
+        };
+        if !existing_is_deleting
+            && (self.spools.contains_key(&key)
+                || tokio::fs::try_exists(&spool_dir)
+                    .await
+                    .map_err(BobsError::IoError)?)
         {
             return Err(BobsError::SpoolAlreadyExists { key });
         }
@@ -404,7 +427,6 @@ where
             page_size: self.page_size,
             page_cache: Arc::clone(&self.page_cache),
             metrics: Arc::clone(&self.metrics),
-            key_locks: Arc::clone(&self.key_locks),
         };
         tokio::spawn(transaction.run(
             key,
@@ -413,6 +435,7 @@ where
             write_locked,
             labels,
             permit,
+            key_lease,
         ))
         .await
         .map_err(|error| {
