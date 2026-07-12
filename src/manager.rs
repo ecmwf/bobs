@@ -336,11 +336,12 @@ where
             let file_size = std::fs::metadata(&meta.data_path)
                 .map(|metadata| metadata.len())
                 .map_err(BobsError::IoError)?;
-            let migration = prepare_recovery_metadata(&mut meta, file_size).map_err(|reason| {
-                BobsError::ConfigurationError(format!(
-                    "cannot safely migrate spool {key}: {reason}; its sidecar and data have been left intact"
-                ))
-            })?;
+            let migration = prepare_recovery_metadata(&mut meta, file_size, self.page_size)
+                .map_err(|reason| {
+                    BobsError::ConfigurationError(format!(
+                        "cannot safely migrate spool {key}: {reason}; its sidecar and data have been left intact"
+                    ))
+                })?;
             let spool_page_size = migration.page_size;
 
             // A legacy sidecar must become self-describing before ordinary
@@ -357,9 +358,12 @@ where
 
             let handle = match F::open(&meta.data_path).await {
                 Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(key = %key, error = %e, "recovery: failed to open data file, discarding");
-                    stale_keys.push(key);
+                Err(error) => {
+                    tracing::warn!(
+                        key = %key,
+                        error = %error,
+                        "recovery: failed to open data file, leaving spool intact and quarantined"
+                    );
                     continue;
                 }
             };
@@ -394,12 +398,12 @@ where
                     meta.final_page_size = None;
                 }
             } else {
-                let expected_full_pages_bytes = match meta.final_page_size {
-                    Some(final_page_size) if meta.total_pages > 0 => {
-                        (meta.total_pages - 1) * spool_page_size as u64 + final_page_size
-                    }
-                    _ => meta.total_pages * spool_page_size as u64,
-                };
+                let expected_full_pages_bytes =
+                    complete_layout_bytes(&meta, meta.page_size).map_err(|reason| {
+                        BobsError::ConfigurationError(format!(
+                            "cannot safely recover spool {key}: {reason}; its sidecar and data have been left intact"
+                        ))
+                    })?;
 
                 if file_size < expected_full_pages_bytes {
                     tracing::warn!(
@@ -556,22 +560,28 @@ struct RecoveryMigration {
     persist: bool,
 }
 
-/// Make old-main sidecars self-describing without consulting the current
-/// configured page size. A stride is accepted only when durable length and the
-/// persisted page count determine it exactly. Cases with no nonzero page offset
-/// choose a positive size that preserves the known zero/one-page invariant.
+/// Make old-main sidecars self-describing. Legacy `Readable` objects were
+/// terminal and read-only, so their contiguous durable bytes can be safely
+/// resegmented with the current configured page size without inferring an old
+/// active stride. Other old-main states still require an unambiguous stride.
 fn prepare_recovery_metadata(
     meta: &mut SpoolMetadata,
     file_size: u64,
+    configured_page_size: usize,
 ) -> std::result::Result<RecoveryMigration, String> {
     let missing_page_size = meta.page_size == 0;
     let legacy_readable = meta.state == SpoolState::Complete && meta.final_page_size == Some(0);
-    if legacy_readable {
-        meta.final_page_size = None;
-    }
 
-    let page_size_u64 = if missing_page_size {
-        derive_legacy_page_size(meta, file_size, legacy_readable)?
+    let page_size_u64 = if legacy_readable {
+        u64::try_from(configured_page_size)
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| {
+                "configured page size cannot describe this legacy Readable spool on disk"
+                    .to_string()
+            })?
+    } else if missing_page_size {
+        derive_legacy_page_size(meta, file_size)?
     } else {
         meta.page_size
     };
@@ -597,9 +607,8 @@ fn prepare_recovery_metadata(
 fn derive_legacy_page_size(
     meta: &SpoolMetadata,
     file_size: u64,
-    legacy_readable: bool,
 ) -> std::result::Result<u64, String> {
-    if legacy_readable || matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
+    if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
         if meta.final_page_size.is_some() {
             return Err("active legacy metadata unexpectedly records a final page size".into());
         }
@@ -698,32 +707,54 @@ fn terminalize_legacy_readable(
     file_size: u64,
     page_size: u64,
 ) -> std::result::Result<(), String> {
-    if meta.final_page_size.is_some() {
-        return Err("legacy Readable metadata unexpectedly records a final page size".into());
+    if meta.final_page_size != Some(0) {
+        return Err("legacy Readable recovery marker is missing".into());
     }
-    if meta.total_bytes_written > file_size {
-        return Err("legacy Readable byte count exceeds durable file length".into());
+    if page_size == 0 {
+        return Err("legacy Readable target page size is zero".into());
     }
 
-    let durable_full_pages = file_size / page_size;
-    if meta.total_pages != durable_full_pages {
-        return Err(
-            "legacy Readable page count is inconsistent with its durable bytes and stride".into(),
-        );
-    }
+    let final_size = file_size % page_size;
+    let full_pages = file_size / page_size;
+    let total_pages = full_pages
+        .checked_add(u64::from(final_size != 0))
+        .ok_or_else(|| "legacy Readable page count overflows u64".to_string())?;
 
     meta.state = SpoolState::Complete;
     meta.write_locked = false;
     meta.total_bytes_written = file_size;
-    if file_size == 0 {
-        meta.total_pages = 0;
-        meta.final_page_size = None;
-    } else {
-        meta.total_pages = file_size.div_ceil(page_size);
-        let final_size = file_size % page_size;
-        meta.final_page_size = (final_size != 0).then_some(final_size);
-    }
+    meta.total_pages = total_pages;
+    meta.final_page_size = (final_size != 0).then_some(final_size);
     Ok(())
+}
+
+fn complete_layout_bytes(meta: &SpoolMetadata, page_size: u64) -> std::result::Result<u64, String> {
+    if page_size == 0 {
+        return Err("complete spool page size is zero".into());
+    }
+    if meta.total_pages == 0 {
+        return if meta.final_page_size.is_none() {
+            Ok(0)
+        } else {
+            Err("zero-page complete metadata records a final page size".into())
+        };
+    }
+
+    match meta.final_page_size {
+        Some(final_size) => {
+            if final_size == 0 || final_size > page_size {
+                return Err("complete spool final page size exceeds its page stride".into());
+            }
+            (meta.total_pages - 1)
+                .checked_mul(page_size)
+                .and_then(|bytes| bytes.checked_add(final_size))
+                .ok_or_else(|| "complete spool byte layout overflows u64".into())
+        }
+        None => meta
+            .total_pages
+            .checked_mul(page_size)
+            .ok_or_else(|| "complete spool byte layout overflows u64".into()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1995,43 +2026,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recovery_terminalizes_old_main_readable_sidecars() {
+    async fn test_recovery_resegments_old_main_readable_sidecars() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
-        let paged_key = uuid::Uuid::new_v4().to_string();
         let partial_key = uuid::Uuid::new_v4().to_string();
-        write_old_main_sidecar_fixture(&data_dir, &paged_key, "Readable", b"abcdefgh", 2, None)
+        let exact_key = uuid::Uuid::new_v4().to_string();
+        let empty_key = uuid::Uuid::new_v4().to_string();
+        let partial_data = b"abcdefghi"; // two old 4-byte pages plus one trailing byte
+        let exact_data = b"abcdefghijkl"; // three old 4-byte pages
+        write_old_main_sidecar_fixture(&data_dir, &partial_key, "Readable", partial_data, 2, None)
             .await;
-        write_old_main_sidecar_fixture(&data_dir, &partial_key, "Readable", b"abc", 0, None).await;
+        write_old_main_sidecar_fixture(&data_dir, &exact_key, "Readable", exact_data, 3, None)
+            .await;
+        write_old_main_sidecar_fixture(&data_dir, &empty_key, "Readable", b"", 0, None).await;
 
+        // The old sidecars were written with 4-byte pages. Recovery must not
+        // infer that active layout: Readable is terminal and can use this new
+        // configured 6-byte segmentation without changing any durable bytes.
         let manager =
-            SpoolManager::<TokioFileIO>::new(&data_dir, 8192, 65536, 256).expect("restart manager");
+            SpoolManager::<TokioFileIO>::new(&data_dir, 6, 65536, 256).expect("restart manager");
         manager.recover().await.expect("migrate Readable spools");
 
-        let paged = manager.get_spool(&paged_key).expect("paged Readable spool");
-        assert_eq!(paged.metadata.lock().await.state, SpoolState::Complete);
-        assert_eq!(paged.page_size, 4);
-        assert_eq!(paged.read_page(1).await.unwrap().unwrap().as_ref(), b"efgh");
         let partial = manager
             .get_spool(&partial_key)
-            .expect("partial Readable spool");
-        assert_eq!(partial.metadata.lock().await.state, SpoolState::Complete);
-        assert_eq!(partial.page_size, 4);
+            .expect("full-plus-partial Readable spool");
+        assert_eq!(partial.page_size, 6);
+        let partial_meta = partial.metadata.lock().await.clone();
+        assert_eq!(partial_meta.state, SpoolState::Complete);
+        assert_eq!(partial_meta.total_bytes_written, 9);
+        assert_eq!(partial_meta.total_pages, 2);
+        assert_eq!(partial_meta.final_page_size, Some(3));
+        let first = partial.read_page(0).await.unwrap().unwrap();
+        let second = partial.read_page(1).await.unwrap().unwrap();
+        assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
         assert_eq!(
-            partial.read_page(0).await.unwrap().unwrap().as_ref(),
-            b"abc"
+            read_exact_logical_range::<TokioFileIO>(&partial.file_handle, 2, 6)
+                .await
+                .expect("read range across new page boundary"),
+            b"cdefgh"
         );
 
-        for key in [&paged_key, &partial_key] {
-            let sidecar: serde_json::Value = serde_json::from_slice(
-                &tokio::fs::read(data_dir.join(key).join("meta.json"))
-                    .await
-                    .expect("migrated sidecar exists"),
-            )
-            .expect("migrated sidecar JSON");
-            assert_eq!(sidecar["state"], "Complete");
-            assert!(sidecar["page_size"].as_u64().is_some());
+        let exact = manager
+            .get_spool(&exact_key)
+            .expect("exact-multiple Readable spool");
+        assert_eq!(exact.page_size, 6);
+        let exact_meta = exact.metadata.lock().await.clone();
+        assert_eq!(exact_meta.total_bytes_written, 12);
+        assert_eq!(exact_meta.total_pages, 2);
+        assert_eq!(exact_meta.final_page_size, None);
+        let first = exact.read_page(0).await.unwrap().unwrap();
+        let second = exact.read_page(1).await.unwrap().unwrap();
+        assert_eq!([first.as_ref(), second.as_ref()].concat(), exact_data);
+
+        let empty = manager.get_spool(&empty_key).expect("empty Readable spool");
+        assert_eq!(empty.page_size, 6);
+        let empty_meta = empty.metadata.lock().await.clone();
+        assert_eq!(empty_meta.total_bytes_written, 0);
+        assert_eq!(empty_meta.total_pages, 0);
+        assert_eq!(empty_meta.final_page_size, None);
+        assert!(empty.read_page(0).await.unwrap().is_none());
+
+        for key in [&partial_key, &exact_key, &empty_key] {
+            let sidecar = persisted_metadata(&manager, key).await;
+            assert_eq!(sidecar.state, SpoolState::Complete);
+            assert_eq!(sidecar.page_size, 6);
             assert!(data_dir.join(key).join("spool.dat").exists());
+            assert!(!data_dir.join(key).join("meta.json.tmp").exists());
         }
     }
 
