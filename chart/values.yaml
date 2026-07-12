@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 replicaCount: 1
+# Dependency condition consumed by parent charts such as polytope-chart.
+enabled: true
 
 # Defaults for standalone BOBS renders. Values under `global` can be supplied by
 # a parent chart and propagate here through Helm's standard global mechanism.

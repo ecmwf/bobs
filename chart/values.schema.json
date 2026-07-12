@@ -1,9 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["replicaCount", "image", "rustLog", "service", "config", "persistence"],
+  "required": ["enabled", "replicaCount", "image", "rustLog", "service", "config", "persistence"],
   "properties": {
     "replicaCount": { "type": "integer", "minimum": 1 },
+    "enabled": { "type": "boolean" },
     "global": {
       "type": "object",
       "properties": {

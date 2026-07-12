@@ -158,6 +158,17 @@ max_cache_bytes: 1048576
 bob_id: bobs-1
 ```
 
+## Helm chart
+
+`chart/` is the source of truth for the BOBS Helm chart. `polytope-chart`
+vendors a packaged copy and verifies it against a pinned commit from this repository.
+Validate chart changes with:
+
+```bash
+./scripts/test-chart.sh
+helm package chart --destination /tmp
+```
+
 ## License
 
 [Apache License 2.0](LICENSE) In applying this licence, ECMWF does not waive the privileges and immunities granted to it by virtue of its status as an intergovernmental organisation nor does it submit to any jurisdiction.
