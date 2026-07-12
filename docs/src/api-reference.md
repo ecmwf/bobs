@@ -38,7 +38,11 @@ Returns the health status and hostname of the instance.
 
 ### PUT /create
 
-Creates a new spool and returns a unique key.
+Creates a new spool and returns its key. A valid `X-Polytope-Job-Id` is used
+as the key; otherwise BOBS generates a UUID. Create is not idempotent: if that
+key already exists or is being created, BOBS returns `409 Conflict` and leaves
+the existing spool, bytes, and admission accounting unchanged. After a
+successful delete, the key may be created again.
 
 **Request Body**:
 
@@ -46,6 +50,8 @@ Creates a new spool and returns a unique key.
 - `content_encoding` (string, optional): Optional encoding header for readers.
 - `write_locked` (boolean, optional): Default `false`. If `true`, reads return `423 Locked` until the spool is completed.
 - Unknown request fields and header values that cannot be represented safely in HTTP are rejected with `400 Bad Request`.
+- Repeating or concurrently issuing create with the same valid
+  `X-Polytope-Job-Id` returns `409 Conflict`; exactly one create can succeed.
 
 **Example**:
 
@@ -72,7 +78,22 @@ Appends binary data to the spool.
 
 **Response (200 OK)**: Empty body on success.
 
-Writes that would take a spool beyond `max_spool_bytes` return `413 Payload Too Large`. If a chunked upload crosses the limit after pages were written, BOBS durably deletes the partial spool and releases its admission slot before returning `413`; a cleanup failure returns a server error instead. Download responses force `Content-Disposition: attachment` because producer-controlled content shares a deployment origin. They also include `X-Content-Type-Options: nosniff`; active document types receive a restrictive sandbox policy as defence in depth.
+Writes that would take a spool beyond `max_spool_bytes` return `413 Payload Too
+Large`. Before deleting an oversized spool, BOBS atomically verifies under the
+lifecycle/write gate that the request offset is still the current write head
+and the spool remains writable. An offset mismatch therefore returns `400`, a
+completed spool returns `409`, and a deleting/deleted spool returns `404`,
+without the oversize path deleting that object.
+
+For a valid write head, both known-length rejection and a chunked upload
+crossing the limit durably delete the partial spool and release its admission
+slot before returning `413`; a cleanup failure returns a server error instead.
+Known-length oversize requests are rejected without polling the body.
+
+Download responses force `Content-Disposition: attachment` because
+producer-controlled content shares a deployment origin. They also include
+`X-Content-Type-Options: nosniff`; active document types receive a restrictive
+sandbox policy as defence in depth.
 
 **Error Cases**:
 

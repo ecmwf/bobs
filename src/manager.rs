@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteReason {
@@ -55,6 +55,8 @@ pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> 
     /// Bounds spools concurrently holding first-read cache memory.
     pub admission: Arc<Semaphore>,
     pub max_live_spools: usize,
+    /// Per-key gates serialize create and delete without blocking unrelated keys.
+    key_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
 impl<F: FileIO> SpoolManager<F, SyncSidecarMetadataStore> {
@@ -115,6 +117,7 @@ where
             metrics: Arc::new(BobsMetrics::new(false)),
             admission: Arc::new(Semaphore::new(max_live_spools)),
             max_live_spools,
+            key_locks: DashMap::new(),
         })
     }
 
@@ -131,12 +134,8 @@ where
         write_locked: bool,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        let permit = Arc::clone(&self.admission)
-            .acquire_owned()
-            .await
-            .map_err(|_| BobsError::IoError(std::io::Error::other("admission semaphore closed")))?;
-        self.create_spool_with_permit(
-            permit,
+        self.create_spool_inner(
+            None,
             key,
             content_type,
             content_encoding,
@@ -147,7 +146,8 @@ where
     }
 
     /// Create a spool after waiting at most `timeout` for admission capacity.
-    /// The timeout covers only semaphore admission, not filesystem persistence.
+    /// The timeout covers only semaphore admission, not per-key serialization or
+    /// filesystem persistence.
     pub async fn create_spool_with_admission_timeout(
         &self,
         timeout: Duration,
@@ -157,12 +157,8 @@ where
         write_locked: bool,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        let permit = tokio::time::timeout(timeout, Arc::clone(&self.admission).acquire_owned())
-            .await
-            .map_err(|_| BobsError::AdmissionTimeout)?
-            .map_err(|_| BobsError::IoError(std::io::Error::other("admission semaphore closed")))?;
-        self.create_spool_with_permit(
-            permit,
+        self.create_spool_inner(
+            Some(timeout),
             key,
             content_type,
             content_encoding,
@@ -172,68 +168,150 @@ where
         .await
     }
 
-    async fn create_spool_with_permit(
+    fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.key_locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .value(),
+        )
+    }
+
+    fn release_key_lock(&self, key: &str, lock: &Arc<Mutex<()>>) {
+        self.key_locks.remove_if(key, |_, current| {
+            Arc::ptr_eq(current, lock) && Arc::strong_count(current) == 2
+        });
+    }
+
+    async fn create_spool_inner(
         &self,
-        permit: OwnedSemaphorePermit,
+        admission_timeout: Option<Duration>,
         key: String,
         content_type: Option<String>,
         content_encoding: Option<String>,
         write_locked: bool,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        let spool_dir = self.data_dir.join(&key);
-        let data_path = spool_dir.join("spool.dat");
+        let key_lock = self.key_lock(&key);
+        let key_guard = key_lock.lock().await;
+        let result = self
+            .create_spool_reserved(
+                admission_timeout,
+                &key,
+                content_type,
+                content_encoding,
+                write_locked,
+                labels,
+            )
+            .await;
+        drop(key_guard);
+        self.release_key_lock(&key, &key_lock);
+        result
+    }
 
-        tokio::fs::create_dir_all(&spool_dir)
+    async fn create_spool_reserved(
+        &self,
+        admission_timeout: Option<Duration>,
+        key: &str,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        write_locked: bool,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
+        if self.spools.contains_key(key) {
+            return Err(BobsError::SpoolAlreadyExists {
+                key: key.to_string(),
+            });
+        }
+
+        tokio::fs::create_dir_all(&self.data_dir)
             .await
             .map_err(BobsError::IoError)?;
 
-        let handle = F::create(&data_path).await.map_err(BobsError::IoError)?;
+        let spool_dir = self.data_dir.join(key);
+        match tokio::fs::create_dir(&spool_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(BobsError::SpoolAlreadyExists {
+                    key: key.to_string(),
+                });
+            }
+            Err(error) => return Err(BobsError::IoError(error)),
+        }
 
-        let now = now_secs();
-        let metadata = SpoolMetadata {
-            key: key.clone(),
-            content_type,
-            content_encoding,
-            state: if write_locked {
-                SpoolState::WriteLocked
+        let result = async {
+            let permit = if let Some(timeout) = admission_timeout {
+                tokio::time::timeout(timeout, Arc::clone(&self.admission).acquire_owned())
+                    .await
+                    .map_err(|_| BobsError::AdmissionTimeout)?
+                    .map_err(|_| {
+                        BobsError::IoError(std::io::Error::other("admission semaphore closed"))
+                    })?
             } else {
-                SpoolState::Writing
-            },
-            write_locked,
-            created_at: now,
-            last_write_at: now,
-            last_read_at: None,
-            readable_at: None,
-            page_size: self.page_size as u64,
-            total_bytes_written: 0,
-            total_pages: 0,
-            final_page_size: None,
-            data_path,
-            labels,
-        };
+                Arc::clone(&self.admission)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        BobsError::IoError(std::io::Error::other("admission semaphore closed"))
+                    })?
+            };
 
-        self.metadata_store.write(&metadata).await?;
+            let data_path = spool_dir.join("spool.dat");
+            let handle = F::create(&data_path).await.map_err(BobsError::IoError)?;
 
-        let spool = Arc::new(Spool::new_with_admission(
-            metadata,
-            handle,
-            self.page_size,
-            Arc::clone(&self.page_cache),
-            self.metadata_store.clone(),
-            Arc::clone(&self.metrics),
-            Some(permit),
-        ));
-        self.spools.insert(key.clone(), spool);
+            let now = now_secs();
+            let metadata = SpoolMetadata {
+                key: key.to_string(),
+                content_type,
+                content_encoding,
+                state: if write_locked {
+                    SpoolState::WriteLocked
+                } else {
+                    SpoolState::Writing
+                },
+                write_locked,
+                created_at: now,
+                last_write_at: now,
+                last_read_at: None,
+                readable_at: None,
+                page_size: self.page_size as u64,
+                total_bytes_written: 0,
+                total_pages: 0,
+                final_page_size: None,
+                data_path,
+                labels,
+            };
 
-        let initial_state = if write_locked {
-            crate::metrics::state::WRITE_LOCKED
-        } else {
-            crate::metrics::state::WRITING
-        };
-        self.metrics.record_state_transition(None, initial_state);
+            self.metadata_store.write(&metadata).await?;
 
-        Ok(())
+            let spool = Arc::new(Spool::new_with_admission(
+                metadata,
+                handle,
+                self.page_size,
+                Arc::clone(&self.page_cache),
+                self.metadata_store.clone(),
+                Arc::clone(&self.metrics),
+                Some(permit),
+            ));
+            self.spools.insert(key.to_string(), spool);
+
+            let initial_state = if write_locked {
+                crate::metrics::state::WRITE_LOCKED
+            } else {
+                crate::metrics::state::WRITING
+            };
+            self.metrics.record_state_transition(None, initial_state);
+
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            // The directory was atomically reserved by this create. Roll it back on
+            // every later failure; the local permit and file handle drop with `result`.
+            let _ = tokio::fs::remove_dir_all(&spool_dir).await;
+        }
+        result
     }
 
     pub fn get_spool(&self, key: &str) -> Option<Arc<Spool<F, M>>> {
@@ -258,7 +336,42 @@ where
         reason: DeleteReason,
         job_id: Option<&str>,
     ) -> Result<()> {
+        let key_lock = self.key_lock(key);
+        let key_guard = key_lock.lock().await;
         let result = self.delete_spool_inner(key).await;
+        drop(key_guard);
+        self.release_key_lock(key, &key_lock);
+        self.record_delete_result(key, reason, job_id, &result);
+        result
+    }
+
+    /// Delete an oversized spool only if `offset` is still its valid write head.
+    /// Validation and the durable Deleting transition share the same lifecycle/write
+    /// gates used by write, complete, and explicit delete.
+    pub async fn delete_oversize_spool_if_write_head(
+        &self,
+        key: &str,
+        offset: u64,
+        job_id: Option<&str>,
+    ) -> Result<()> {
+        let key_lock = self.key_lock(key);
+        let key_guard = key_lock.lock().await;
+        let result = self
+            .delete_oversize_spool_if_write_head_inner(key, offset)
+            .await;
+        drop(key_guard);
+        self.release_key_lock(key, &key_lock);
+        self.record_delete_result(key, DeleteReason::Oversize, job_id, &result);
+        result
+    }
+
+    fn record_delete_result(
+        &self,
+        key: &str,
+        reason: DeleteReason,
+        job_id: Option<&str>,
+        result: &Result<()>,
+    ) {
         let deletion_span = tracing::info_span!(
             "bobs.spool.delete",
             "request.id" = tracing::field::Empty,
@@ -270,7 +383,7 @@ where
         if let Some(job_id) = job_id {
             deletion_span.record("request.id", job_id);
         }
-        match &result {
+        match result {
             Ok(()) => {
                 deletion_span.record("outcome", "success");
                 let _entered = deletion_span.enter();
@@ -283,7 +396,6 @@ where
                 tracing::error!("event.name" = "bobs.spool.deleted", "spool deletion failed");
             }
         }
-        result
     }
 
     async fn delete_spool_inner(&self, key: &str) -> Result<()> {
@@ -295,12 +407,54 @@ where
                 key: key.to_string(),
             })?;
         let _lifecycle_guard = spool.lifecycle_lock.lock().await;
+        let _write_gate = spool.write_buffer.lock().await;
+        self.delete_spool_locked(key, &spool).await
+    }
 
-        // Serialize the Deleting transition with writes/completion. Once this gate
-        // is acquired, all earlier writes have fully published and all later writes
-        // observe Deleting rather than returning a false success.
+    async fn delete_oversize_spool_if_write_head_inner(
+        &self,
+        key: &str,
+        offset: u64,
+    ) -> Result<()> {
+        let spool = self
+            .spools
+            .get(key)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| BobsError::SpoolNotFound {
+                key: key.to_string(),
+            })?;
+        let _lifecycle_guard = spool.lifecycle_lock.lock().await;
         let _write_gate = spool.write_buffer.lock().await;
 
+        {
+            let meta = spool.metadata.lock().await;
+            match meta.state {
+                SpoolState::Writing | SpoolState::WriteLocked => {}
+                SpoolState::Complete => return Err(BobsError::SpoolClosed),
+                SpoolState::Deleting => {
+                    return Err(BobsError::SpoolNotFound {
+                        key: key.to_string(),
+                    });
+                }
+                ref other => {
+                    return Err(BobsError::InvalidState {
+                        current: format!("{other:?}"),
+                        attempted_action: "write oversized request".to_string(),
+                    });
+                }
+            }
+            if offset != meta.total_bytes_written {
+                return Err(BobsError::OffsetMismatch {
+                    expected: meta.total_bytes_written,
+                    got: offset,
+                });
+            }
+        }
+
+        self.delete_spool_locked(key, &spool).await
+    }
+
+    async fn delete_spool_locked(&self, key: &str, spool: &Arc<Spool<F, M>>) -> Result<()> {
         let old_label = {
             let mut meta = spool.metadata.lock().await;
             if meta.state == SpoolState::Deleting {
@@ -335,7 +489,7 @@ where
         spool.release_admission();
         if self
             .spools
-            .remove_if(key, |_, current| Arc::ptr_eq(current, &spool))
+            .remove_if(key, |_, current| Arc::ptr_eq(current, spool))
             .is_some()
         {
             self.metrics
@@ -1282,6 +1436,111 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.key, key);
         assert_eq!(meta.state, SpoolState::Writing);
+    }
+
+    #[tokio::test]
+    async fn test_recovered_key_rejects_create_without_truncating_or_leaking_admission() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+
+        {
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&data_dir, 4, 64, 2).expect("manager init");
+            manager
+                .create_spool(key.clone(), None, None, false, HashMap::new())
+                .await
+                .expect("create spool");
+            manager
+                .get_spool(&key)
+                .expect("spool exists")
+                .write(0, bytes::Bytes::from_static(b"safe"))
+                .await
+                .expect("write original bytes");
+        }
+
+        let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4, 64, 2).expect("manager init");
+        manager.recover().await.expect("recover spool");
+        assert_eq!(manager.admission.available_permits(), 1);
+
+        let result = manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await;
+        assert!(matches!(
+            result,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("read recovered bytes"),
+            b"safe"
+        );
+        assert_eq!(manager.admission.available_permits(), 1);
+        assert_eq!(manager.spools.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_then_create_same_key_is_serialized_and_accounted() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager =
+            Arc::new(SpoolManager::<TokioFileIO>::new(&data_dir, 4, 64, 1).expect("manager init"));
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create original spool");
+        manager
+            .get_spool(&key)
+            .expect("original spool exists")
+            .write(0, bytes::Bytes::from_static(b"safe"))
+            .await
+            .expect("write original bytes");
+
+        let gate = manager.key_lock(&key);
+        let gate_guard = gate.lock().await;
+
+        let delete_manager = Arc::clone(&manager);
+        let delete_key = key.clone();
+        let delete_task =
+            tokio::spawn(async move { delete_manager.delete_spool(&delete_key).await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let create_manager = Arc::clone(&manager);
+        let create_key = key.clone();
+        let create_task = tokio::spawn(async move {
+            create_manager
+                .create_spool(create_key, None, None, false, HashMap::new())
+                .await
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!delete_task.is_finished());
+        assert!(!create_task.is_finished());
+
+        drop(gate_guard);
+        delete_task
+            .await
+            .expect("delete task join")
+            .expect("delete wins reservation order");
+        create_task
+            .await
+            .expect("create task join")
+            .expect("create follows completed delete");
+
+        assert_eq!(
+            tokio::fs::metadata(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("replacement data file")
+                .len(),
+            0
+        );
+        assert_eq!(manager.spools.len(), 1);
+        assert_eq!(manager.admission.available_permits(), 0);
     }
 
     #[tokio::test]
