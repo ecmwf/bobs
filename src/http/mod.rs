@@ -375,6 +375,10 @@ where
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
                 if let Ok(data) = frame.into_data() {
+                    // Refresh before buffering the frame. Sub-page frames may not
+                    // reach Spool::write until the request body ends, but cleanup
+                    // must still order this accepted activity against deletion.
+                    spool.refresh_write_activity(now_secs()).await?;
                     let mut cursor = 0;
                     while cursor < data.len() {
                         let remaining_batch_space = write_batch_size - pending.len();
@@ -2211,6 +2215,107 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 2);
         assert_eq!(meta.total_bytes_written, 8192);
+    }
+
+    #[tokio::test]
+    async fn sub_page_frame_refreshes_activity_before_spool_write() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        spool.metadata.lock().await.last_write_at = 1;
+        let (frame_consumed_tx, frame_consumed_rx) = tokio::sync::oneshot::channel();
+        let (finish_body_tx, finish_body_rx) = tokio::sync::oneshot::channel();
+
+        let body_stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"sub-page"));
+            let _ = frame_consumed_tx.send(());
+            let _ = finish_body_rx.await;
+        };
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from_stream(body_stream))
+            .expect("request build");
+        let write_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.oneshot(write_req).await.expect("write oneshot") }
+        });
+
+        frame_consumed_rx
+            .await
+            .expect("handler must consume the sub-page frame before waiting for body end");
+        let meta = spool.metadata.lock().await;
+        assert!(
+            meta.last_write_at > 1,
+            "the frame itself must refresh writer activity"
+        );
+        assert_eq!(
+            meta.total_bytes_written, 0,
+            "sub-page data must still be pending, proving Spool::write did not refresh it"
+        );
+        drop(meta);
+
+        finish_body_tx
+            .send(())
+            .expect("write request still waiting");
+        assert_eq!(
+            write_task.await.expect("write task join").status(),
+            StatusCode::OK
+        );
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 8);
+    }
+
+    #[tokio::test]
+    async fn frame_refresh_rejection_surfaces_completion_and_delete_states() {
+        for delete_before_frame in [false, true] {
+            let (app, state) = app_with_state().await;
+            let key = create_key(&app).await;
+            let spool = state.manager.get_spool(&key).expect("spool exists");
+            let (body_polled_tx, body_polled_rx) = tokio::sync::oneshot::channel();
+            let (release_frame_tx, release_frame_rx) = tokio::sync::oneshot::channel();
+            let body_stream = async_stream::stream! {
+                let _ = body_polled_tx.send(());
+                let _ = release_frame_rx.await;
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"));
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/write/{key}/0"))
+                .body(Body::from_stream(body_stream))
+                .expect("request build");
+            let task = tokio::spawn({
+                let app = app.clone();
+                async move { app.oneshot(request).await.expect("write oneshot") }
+            });
+            body_polled_rx
+                .await
+                .expect("handler captured the spool before lifecycle transition");
+
+            let expected = if delete_before_frame {
+                state
+                    .manager
+                    .delete_spool(&key)
+                    .await
+                    .expect("delete before frame");
+                StatusCode::NOT_FOUND
+            } else {
+                spool.complete(None).await.expect("complete before frame");
+                StatusCode::CONFLICT
+            };
+            release_frame_tx
+                .send(())
+                .expect("handler still polling body");
+            assert_eq!(
+                task.await.expect("write task join").status(),
+                expected,
+                "HTTP must return the lifecycle refresh rejection"
+            );
+            assert_eq!(
+                spool.metadata.lock().await.total_bytes_written,
+                0,
+                "rejected frame must never reach the pending buffer or data file"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

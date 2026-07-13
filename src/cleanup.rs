@@ -905,15 +905,15 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum SnapshotRefresh {
         Complete,
-        Write,
+        SubPageFrame,
         Read,
     }
 
     #[tokio::test]
-    async fn stale_cleanup_candidates_are_revalidated_after_completion_write_and_read() {
+    async fn stale_cleanup_candidates_are_revalidated_after_completion_frame_and_read() {
         for refresh in [
             SnapshotRefresh::Complete,
-            SnapshotRefresh::Write,
+            SnapshotRefresh::SubPageFrame,
             SnapshotRefresh::Read,
         ] {
             let dir = tempdir().expect("create tempdir");
@@ -971,11 +971,17 @@ mod tests {
                         .await
                         .expect("complete after snapshot");
                 }
-                SnapshotRefresh::Write => {
+                SnapshotRefresh::SubPageFrame => {
+                    let before = second.metadata.lock().await.total_bytes_written;
                     second
-                        .write(0, bytes::Bytes::from_static(b"fresh"))
+                        .refresh_write_activity(now_secs())
                         .await
-                        .expect("write after snapshot");
+                        .expect("sub-page HTTP frame refresh after snapshot");
+                    assert_eq!(
+                        second.metadata.lock().await.total_bytes_written,
+                        before,
+                        "the interleaving must exercise frame refresh, not Spool::write"
+                    );
                 }
                 SnapshotRefresh::Read => {
                     second
