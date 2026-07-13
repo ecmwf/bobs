@@ -105,3 +105,97 @@ imagePullSecrets:
   {{- toYaml $secrets | nindent 2 }}
 {{- end -}}
 {{- end -}}
+
+{{/* Render community ingress-nginx resources, including per-pod forwarded prefixes. */}}
+{{- define "bobs.communityIngresses" -}}
+{{- $fullName := include "bobs.fullname" . -}}
+{{- $routeName := required "config.route_name must be set" .Values.config.route_name -}}
+{{- $port := .Values.service.port -}}
+{{- $host := printf "%s.%s" .Values.config.host_prefix .Values.config.domain -}}
+{{- $userAnnotations := .Values.ingress.annotations | default dict -}}
+{{- /* Strip NGINX Inc / Bologna-only keys from community ingress resources. */ -}}
+{{- $filtered := dict -}}
+{{- range $key, $value := $userAnnotations -}}
+  {{- if not (or (hasPrefix "nginx.org/" $key) (hasPrefix "dns.operators.ecmwf.int/" $key)) -}}
+    {{- $_ := set $filtered $key $value -}}
+  {{- end -}}
+{{- end -}}
+{{- $secureDefaults := dict
+  "nginx.ingress.kubernetes.io/ssl-redirect" "true"
+  "nginx.ingress.kubernetes.io/force-ssl-redirect" "true"
+  "nginx.ingress.kubernetes.io/use-regex" "true"
+  "nginx.ingress.kubernetes.io/rewrite-target" "/api/v1/read/$2" -}}
+{{- $annotations := mergeOverwrite (deepCopy $secureDefaults) $filtered -}}
+{{ print "\n" -}}
+# Community ingress-nginx's native x-forwarded-prefix annotation is static per
+# Ingress, so forwarded-prefix mode renders one Ingress per replica. The regex
+# accepts short public URLs and redirected public /api/v1/read URLs.
+{{- if .Values.ingress.forwardedPrefix.enabled }}
+{{- range $index, $_ := until (int .Values.replicaCount) }}
+{{- $podAnnotations := deepCopy $annotations -}}
+{{- $_ := set $podAnnotations "nginx.ingress.kubernetes.io/x-forwarded-prefix" (printf "/%s-%d" $routeName $index) }}
+{{ if gt $index 0 }}
+---
+{{ end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ (printf "%s-%d" $fullName $index) | trunc 63 | trimSuffix "-" | quote }}
+  labels:
+    app.kubernetes.io/name: '{{ include "bobs.name" $ }}'
+    app.kubernetes.io/instance: '{{ $.Release.Name }}'
+  annotations:
+    {{- toYaml $podAnnotations | nindent 4 }}
+spec:
+  {{- if $.Values.ingress.className }}
+  ingressClassName: {{ $.Values.ingress.className | quote }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: '/{{ $routeName }}-{{ $index }}/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$'
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: '{{ $fullName }}-{{ $index }}'
+                port:
+                  number: {{ $port }}
+  {{- if $.Values.ingress.tls }}
+  tls:
+    {{- toYaml $.Values.ingress.tls | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- else }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: '{{ $fullName }}'
+  labels:
+    app.kubernetes.io/name: '{{ include "bobs.name" . }}'
+    app.kubernetes.io/instance: '{{ .Release.Name }}'
+  annotations:
+    {{- toYaml $annotations | nindent 4 }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- range $index, $_ := until (int $.Values.replicaCount) }}
+          - path: '/{{ $routeName }}-{{ $index }}/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$'
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: '{{ $fullName }}-{{ $index }}'
+                port:
+                  number: {{ $port }}
+          {{- end }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- toYaml .Values.ingress.tls | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end -}}

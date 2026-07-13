@@ -8,7 +8,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tracing::{Event, Level, Subscriber};
+use tracing::{span::Record, Event, Level, Subscriber};
 use tracing_subscriber::field::{RecordFields, Visit};
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormattedFields, MakeWriter};
@@ -218,6 +218,20 @@ impl<'writer> FormatFields<'writer> for JsonFields {
             &Value::Object(visitor.fields),
         )
         .map_err(|_| fmt::Error)
+    }
+
+    fn add_fields(
+        &self,
+        current: &'writer mut FormattedFields<Self>,
+        fields: &Record<'_>,
+    ) -> fmt::Result {
+        let mut merged =
+            serde_json::from_str::<Map<String, Value>>(current.as_str()).map_err(|_| fmt::Error)?;
+        let mut visitor = JsonVisitor::default();
+        fields.record(&mut visitor);
+        merged.extend(visitor.fields);
+        current.fields = serde_json::to_string(&Value::Object(merged)).map_err(|_| fmt::Error)?;
+        Ok(())
     }
 }
 
@@ -469,9 +483,13 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!(
                 "request",
-                "request.id" = "0123456789abcdefghjkmnpqrs",
-                "bobs.spool.key" = "key-1"
+                "request.id" = tracing::field::Empty,
+                "bobs.spool.key" = tracing::field::Empty
             );
+            // HTTP request spans attach validated identifiers after construction.
+            // Keep this regression case distinct from initial span field recording.
+            span.record("request.id", "0123456789abcdefghjkmnpqrs");
+            span.record("bobs.spool.key", "key-1");
             let _enter = span.enter();
             tracing::info!(
                 "event.name" = "bobs.spool.created",

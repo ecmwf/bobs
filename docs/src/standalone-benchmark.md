@@ -16,7 +16,7 @@ The `bobs-benchmark` binary drives complete BOBS object lifecycles directly over
 
 Use it to validate BOBS itself before adding Polytope, ingress, or other clients to the path. Start local, then repeat the same workload from a container or Kubernetes pod.
 
-Persistence expectations for this benchmark match the BOBS contract: each object is stored as `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json`. Before `/complete`, recovery is required across a BOBS restart by reconstructing in-progress byte state from `spool.dat`, not across a node or storage crash. `/write` must append accepted bytes to `spool.dat` through the kernel/file handle before returning, but does not force them to stable storage with `sync_data()`. Full pages become reader-visible as they are completed; trailing partial-page bytes may already be in `spool.dat` but remain invisible until more writes complete the page or `/complete` finalizes the spool. `/complete` is the durability boundary: BOBS syncs `spool.dat` data before committing final metadata to `meta.json` with the sidecar atomic commit protocol.
+Persistence expectations for this benchmark match the BOBS contract: each object is stored as `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json`. Before `/api/v1/complete/{key}`, recovery across a BOBS restart reconstructs in-progress byte state from `spool.dat`; node or storage crash durability is not promised. `/api/v1/write/{key}/{offset}` appends accepted bytes through the kernel/file handle before returning but does not force them to stable storage with `sync_data()`. Full pages become reader-visible as they fill; a trailing partial page remains hidden until it fills or completion finalizes it. Completion is an owned durability transaction that survives caller cancellation: BOBS syncs `spool.dat`, atomically commits an exact-layout `Completing` recovery marker, then atomically commits `Complete`.
 
 > Plain HTTP only: this first benchmark implementation accepts `http://` BOBS endpoints. `https://` support requires an approved dependency or feature change.
 
@@ -47,7 +47,7 @@ The Dockerfile builds the default Linux backend. Build a fallback image by passi
 
 Run a local BOBS server first. This keeps network and Kubernetes scheduling effects out of the initial measurement.
 
-Create a temporary config. The Linux `io_uring_shards` field is omitted here so BOBS resolves it to `max(1, num_cpus / 4)`. CPU pinning is not enabled by default.
+Create a temporary config with an explicit 4 KiB page / 1 MiB cache baseline (the Helm chart profile, not the Rust binary defaults). The Linux `io_uring_shards` field is omitted so BOBS resolves it to `max(1, num_cpus / 4)`. CPU pinning is not enabled by default.
 
 ```bash
 cat >/tmp/bobs-bench.yaml <<'YAML'
@@ -114,14 +114,14 @@ cargo run --release --bin bobs-benchmark -- \
 
 ## Page size comparison
 
-Keep the runtime default at `4096` unless benchmark evidence says otherwise. Wider pages can reduce per-page overhead and may improve throughput, especially after removal of write-hot-path metadata commits. They also delay reader visibility until a full page is available and consume more of the global cache budget per cached page, so cache reach may fall unless `max_cache_bytes` is increased. `page_size` may be larger than `max_cache_bytes`; oversized pages simply bypass the cache.
+The Rust binary defaults are `page_size: 16777216` (16 MiB), `max_cache_bytes: 268435456` (256 MiB), and a derived `max_live_spools` of 16. The Helm chart overrides these with `page_size: 4096`, `max_cache_bytes: 1048576`, and explicit `max_live_spools: 256` to favour lower reader-visible latency. Wider pages can reduce per-page overhead but delay visibility and consume more cache budget per page. Oversized pages simply bypass the cache.
 
-Compare at least the default, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The example below uses a global cache budget sized to hold roughly 256 pages for each run, if the workload and eviction order allow.
+Compare the chart's 4 KiB profile, 1 MiB, 4 MiB, and the binary's 16 MiB page size with representative objects. The examples use a cache sized for roughly 256 pages, except that the binary-default 16 MiB/256 MiB pairing holds 16 pages.
 
 Start one BOBS server per page size, run the matching benchmark, then stop the server before moving to the next size:
 
 ```bash
-# 4 KiB default-page run
+# 4 KiB Helm-chart-profile run
 cat >/tmp/bobs-bench-4096.yaml <<'YAML'
 host: 127.0.0.1
 port: 3000

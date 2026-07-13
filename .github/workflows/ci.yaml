@@ -7,7 +7,7 @@ name: CI
 on:
   push:
     branches:
-      - '**'
+      - "**"
 
 permissions:
   contents: read
@@ -39,5 +39,23 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
+      - name: Run default-feature tests
         run: cargo test
+
+      - name: Run Skaffold telemetry-feature tests
+        run: cargo test --features telemetry
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint chart --values chart/tests/forwarded-prefix-values.yaml
+
+      - name: Test forwarded-prefix ingress rendering
+        run: chart/tests/forwarded-prefix-render.sh
