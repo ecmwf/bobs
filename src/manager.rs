@@ -855,7 +855,8 @@ where
             }
 
             let activity_at = recovery_activity_at(&meta);
-            match prepare_recovery_candidate(meta, self.page_size) {
+            let canonical_data_path = self.data_dir.join(&name).join("spool.dat");
+            match prepare_recovery_candidate(meta, &canonical_data_path, self.page_size) {
                 RecoveryMetadataDisposition::Candidate(_) => {
                     candidates.push(RecoveryCandidateSummary {
                         key: name,
@@ -915,7 +916,12 @@ where
                 }
             };
 
-            let prepared = match prepare_recovery_candidate(meta, self.page_size) {
+            let canonical_data_path = self.data_dir.join(&key).join("spool.dat");
+            let prepared = match prepare_recovery_candidate(
+                meta,
+                &canonical_data_path,
+                self.page_size,
+            ) {
                 RecoveryMetadataDisposition::Candidate(prepared) => *prepared,
                 RecoveryMetadataDisposition::Cleanup { reason } => {
                     tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unrecoverable; discarding it and trying the next candidate");
@@ -935,6 +941,7 @@ where
                 meta,
                 file_size,
                 migration,
+                data_path_migrated,
                 metadata_needs_persist,
                 trailing_partial_len,
                 finalized_completing,
@@ -951,7 +958,7 @@ where
                 }
             };
 
-            let handle = match F::open(&meta.data_path).await {
+            let handle = match F::open(&canonical_data_path).await {
                 Ok(handle) => handle,
                 Err(error) => {
                     tracing::warn!(key = %key, error = %error, "recovery: failed to open data file; leaving spool intact and trying the next candidate");
@@ -986,6 +993,9 @@ where
             };
 
             if metadata_needs_persist {
+                if data_path_migrated {
+                    tracing::info!(key = %key, data_path = %meta.data_path.display(), "recovery: atomically migrating stale payload path metadata to the canonical local spool");
+                }
                 if migration.write_locked_salvage {
                     tracing::warn!(key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating legacy WriteLocked spool to Complete salvage; further writes are rejected, reads and idempotent completion remain available");
                 } else if migration.persist {
@@ -1212,6 +1222,7 @@ struct PreparedRecoveryCandidate {
     meta: SpoolMetadata,
     file_size: u64,
     migration: RecoveryMigration,
+    data_path_migrated: bool,
     metadata_needs_persist: bool,
     trailing_partial_len: u64,
     finalized_completing: bool,
@@ -1225,6 +1236,7 @@ enum RecoveryMetadataDisposition {
 
 fn prepare_recovery_candidate(
     mut meta: SpoolMetadata,
+    canonical_data_path: &Path,
     configured_page_size: usize,
 ) -> RecoveryMetadataDisposition {
     match meta.state {
@@ -1244,19 +1256,35 @@ fn prepare_recovery_candidate(
         | SpoolState::Complete => {}
     }
 
-    let file_size = match std::fs::metadata(&meta.data_path) {
-        Ok(metadata) => metadata.len(),
+    // `data_path` came from persisted JSON and is never an authority for a
+    // filesystem operation. Recovery binds the scanned key to its fixed local
+    // payload name before inspecting or opening anything.
+    let data_path_migrated = meta.data_path != canonical_data_path;
+    meta.data_path = canonical_data_path.to_path_buf();
+
+    let file_metadata = match std::fs::symlink_metadata(canonical_data_path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return RecoveryMetadataDisposition::Cleanup {
-                reason: "data file missing".to_owned(),
+            return RecoveryMetadataDisposition::Preserve {
+                reason: "canonical data file missing".to_owned(),
             };
         }
         Err(error) => {
             return RecoveryMetadataDisposition::Preserve {
-                reason: format!("failed to inspect data file metadata: {error}"),
+                reason: format!("failed to inspect canonical data file metadata: {error}"),
             };
         }
     };
+    if !file_metadata.file_type().is_file() {
+        return RecoveryMetadataDisposition::Preserve {
+            reason: if file_metadata.file_type().is_symlink() {
+                "canonical data file is a symlink".to_owned()
+            } else {
+                "canonical data file is not a regular file".to_owned()
+            },
+        };
+    }
+    let file_size = file_metadata.len();
 
     let finalized_completing = meta.state == SpoolState::Completing;
     if finalized_completing {
@@ -1277,7 +1305,8 @@ fn prepare_recovery_candidate(
             };
         }
     };
-    let mut metadata_needs_persist = finalized_completing || migration.persist;
+    let mut metadata_needs_persist =
+        finalized_completing || migration.persist || data_path_migrated;
     let mut trailing_partial_len = 0;
 
     if meta.state == SpoolState::Complete && meta.readable_at.is_none() {
@@ -1313,6 +1342,7 @@ fn prepare_recovery_candidate(
         meta,
         file_size,
         migration,
+        data_path_migrated,
         metadata_needs_persist,
         trailing_partial_len,
         finalized_completing,
@@ -2285,7 +2315,7 @@ mod tests {
         tokio::fs::create_dir_all(&spool_dir)
             .await
             .expect("create spool dir");
-        tokio::fs::write(&metadata.data_path, data)
+        tokio::fs::write(spool_dir.join("spool.dat"), data)
             .await
             .expect("write spool data");
         manager
@@ -4132,28 +4162,319 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recovery_discards_missing_data_file_sidecar() {
+    async fn recovery_never_uses_cross_spool_data_path_for_later_mutations() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
             .expect("manager init");
-        let key = uuid::Uuid::new_v4().to_string();
-        let metadata = sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, 4096);
-        tokio::fs::create_dir_all(data_dir.join(&key))
+        let key_a = uuid::Uuid::new_v4().to_string();
+        let key_b = uuid::Uuid::new_v4().to_string();
+        let canonical_a = data_dir.join(&key_a).join("spool.dat");
+        let canonical_b = data_dir.join(&key_b).join("spool.dat");
+
+        let metadata_b = sidecar_fixture_metadata(&data_dir, &key_b, SpoolState::Complete, 9);
+        write_sidecar_fixture(&manager, metadata_b, b"B payload").await;
+        let mut metadata_a = sidecar_fixture_metadata(&data_dir, &key_a, SpoolState::Writing, 1);
+        metadata_a.data_path = canonical_b.clone();
+        write_sidecar_fixture(&manager, metadata_a, b"A").await;
+        let b_sidecar_before = tokio::fs::read(data_dir.join(&key_b).join("meta.json"))
             .await
-            .expect("create spool dir");
+            .expect("snapshot B sidecar");
+
+        manager.recover().await.expect("recover both spools");
+        let spool_a = manager.get_spool(&key_a).expect("recover A");
+        assert_eq!(spool_a.data_path, canonical_a);
+        spool_a
+            .write(1, Bytes::from_static(b"-tail"))
+            .await
+            .expect("append to A");
+        spool_a.complete(Some(6)).await.expect("complete A");
+
+        assert_eq!(
+            tokio::fs::read(&canonical_a).await.expect("read A"),
+            b"A-tail"
+        );
+        assert_eq!(
+            tokio::fs::read(&canonical_b).await.expect("read B"),
+            b"B payload"
+        );
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key_b).join("meta.json"))
+                .await
+                .expect("read B sidecar"),
+            b_sidecar_before,
+            "A recovery and lifecycle commits must not rewrite B metadata"
+        );
+        assert_eq!(
+            persisted_metadata(&manager, &key_a).await.data_path,
+            canonical_a
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_treats_absolute_and_traversal_data_paths_as_untrusted_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let external_path = dir.path().join("external.dat");
+        tokio::fs::write(&external_path, b"external sentinel")
+            .await
+            .expect("write external target");
+        let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
+            .expect("manager init");
+        let absolute_key = uuid::Uuid::new_v4().to_string();
+        let traversal_key = uuid::Uuid::new_v4().to_string();
+
+        let mut absolute = sidecar_fixture_metadata(
+            &data_dir,
+            &absolute_key,
+            SpoolState::Complete,
+            b"absolute local".len() as u64,
+        );
+        absolute.data_path = external_path.clone();
+        write_sidecar_fixture(&manager, absolute, b"absolute local").await;
+
+        let mut traversal = sidecar_fixture_metadata(
+            &data_dir,
+            &traversal_key,
+            SpoolState::Complete,
+            b"traversal local".len() as u64,
+        );
+        traversal.data_path = PathBuf::from("../../external.dat");
+        write_sidecar_fixture(&manager, traversal, b"traversal local").await;
+
+        manager.recover().await.expect("recover local payloads");
+        for key in [&absolute_key, &traversal_key] {
+            let canonical = data_dir.join(key).join("spool.dat");
+            let spool = manager.get_spool(key).expect("recover canonical spool");
+            assert_eq!(spool.data_path, canonical);
+            assert_eq!(
+                persisted_metadata(&manager, key).await.data_path,
+                canonical,
+                "stale path metadata must be atomically rewritten"
+            );
+        }
+        assert_eq!(
+            tokio::fs::read(&external_path)
+                .await
+                .expect("read external target"),
+            b"external sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rewrites_relocated_data_dir_to_local_canonical_path() {
+        let dir = tempdir().expect("create tempdir");
+        let old_data_dir = dir.path().join("old-data");
+        let new_data_dir = dir.path().join("new-data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let fixture = SpoolManager::<TokioFileIO>::new(&old_data_dir, 4096, 16 * 4096, 256)
+            .expect("fixture manager init");
+        write_sidecar_fixture(
+            &fixture,
+            sidecar_fixture_metadata(
+                &old_data_dir,
+                &key,
+                SpoolState::Complete,
+                b"relocated".len() as u64,
+            ),
+            b"relocated",
+        )
+        .await;
+        drop(fixture);
+
+        tokio::fs::rename(&old_data_dir, &new_data_dir)
+            .await
+            .expect("relocate data directory");
+        let manager = SpoolManager::<TokioFileIO>::new(&new_data_dir, 4096, 16 * 4096, 256)
+            .expect("relocated manager init");
+        manager.recover().await.expect("recover relocated spool");
+
+        let canonical = new_data_dir.join(&key).join("spool.dat");
+        let spool = manager.get_spool(&key).expect("recover local spool");
+        assert_eq!(spool.data_path, canonical);
+        assert_eq!(
+            persisted_metadata(&manager, &key).await.data_path,
+            canonical
+        );
+        assert_eq!(
+            tokio::fs::read(&canonical)
+                .await
+                .expect("read relocated data"),
+            b"relocated"
+        );
+        assert!(!old_data_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_symlink_spool_without_opening_or_mutating_it() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let external_path = dir.path().join("external.dat");
+        tokio::fs::write(&external_path, b"external sentinel")
+            .await
+            .expect("write external target");
+        let key = uuid::Uuid::new_v4().to_string();
+        let spool_dir = data_dir.join(&key);
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .expect("create spool directory");
+        std::os::unix::fs::symlink(&external_path, spool_dir.join("spool.dat"))
+            .expect("create spool symlink");
+        let manager = SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
+            .expect("manager init");
+        manager
+            .metadata_store
+            .write(&sidecar_fixture_metadata(
+                &data_dir,
+                &key,
+                SpoolState::Complete,
+                b"external sentinel".len() as u64,
+            ))
+            .await
+            .expect("write sidecar");
+        let sidecar_before = tokio::fs::read(spool_dir.join("meta.json"))
+            .await
+            .expect("snapshot sidecar");
+        RECOVERY_OPEN_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        manager.recover().await.expect("quarantine symlink spool");
+
+        assert!(manager.get_spool(&key).is_none());
+        assert_eq!(
+            RECOVERY_OPEN_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a symlink payload must be rejected before FileIO::open"
+        );
+        assert!(tokio::fs::symlink_metadata(spool_dir.join("spool.dat"))
+            .await
+            .expect("lstat spool symlink")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            tokio::fs::read(spool_dir.join("meta.json"))
+                .await
+                .expect("read quarantined sidecar"),
+            sidecar_before
+        );
+        assert_eq!(
+            tokio::fs::read(&external_path)
+                .await
+                .expect("read external target"),
+            b"external sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_quarantines_missing_canonical_data_without_touching_external_target() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let external_path = dir.path().join("external.dat");
+        tokio::fs::write(&external_path, b"valid external payload")
+            .await
+            .expect("write external target");
+        let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
+            .expect("manager init");
+        let key = uuid::Uuid::new_v4().to_string();
+        let spool_dir = data_dir.join(&key);
+        let mut metadata = sidecar_fixture_metadata(
+            &data_dir,
+            &key,
+            SpoolState::Complete,
+            b"valid external payload".len() as u64,
+        );
+        metadata.data_path = external_path.clone();
         manager
             .metadata_store
             .write(&metadata)
             .await
             .expect("write sidecar");
+        let sidecar_before = tokio::fs::read(spool_dir.join("meta.json"))
+            .await
+            .expect("snapshot sidecar");
 
-        let manager2 = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
-            .expect("manager2 init");
-        manager2.recover().await.expect("recover succeeds");
+        manager
+            .recover()
+            .await
+            .expect("quarantine missing canonical payload");
 
-        assert!(manager2.get_spool(&key).is_none());
-        assert!(!data_dir.join(&key).exists());
+        assert!(manager.get_spool(&key).is_none());
+        assert!(
+            spool_dir.exists(),
+            "local quarantine must be non-destructive"
+        );
+        assert_eq!(
+            tokio::fs::read(spool_dir.join("meta.json"))
+                .await
+                .expect("read quarantined sidecar"),
+            sidecar_before
+        );
+        assert_eq!(
+            tokio::fs::read(&external_path)
+                .await
+                .expect("read external target"),
+            b"valid external payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_sidecar_cleanup_is_scoped_to_its_scanned_key_directory() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
+            .expect("manager init");
+        let corrupt_key = uuid::Uuid::new_v4().to_string();
+        let valid_key = uuid::Uuid::new_v4().to_string();
+        let valid_path = data_dir.join(&valid_key).join("spool.dat");
+        write_sidecar_fixture(
+            &manager,
+            sidecar_fixture_metadata(&data_dir, &valid_key, SpoolState::Complete, 4),
+            b"safe",
+        )
+        .await;
+        let valid_sidecar_before = tokio::fs::read(data_dir.join(&valid_key).join("meta.json"))
+            .await
+            .expect("snapshot valid sidecar");
+
+        let corrupt_dir = data_dir.join(&corrupt_key);
+        tokio::fs::create_dir_all(&corrupt_dir)
+            .await
+            .expect("create corrupt directory");
+        tokio::fs::write(corrupt_dir.join("spool.dat"), b"local corrupt data")
+            .await
+            .expect("write corrupt local payload");
+        let mut corrupt_json = serde_json::to_value(sidecar_fixture_metadata(
+            &data_dir,
+            &corrupt_key,
+            SpoolState::Complete,
+            4,
+        ))
+        .expect("serialize corrupt fixture base");
+        corrupt_json["data_path"] = serde_json::Value::String(valid_path.display().to_string());
+        corrupt_json["total_pages"] = serde_json::Value::String("not-a-number".to_owned());
+        tokio::fs::write(
+            corrupt_dir.join("meta.json"),
+            serde_json::to_vec(&corrupt_json).expect("serialize corrupt sidecar"),
+        )
+        .await
+        .expect("write corrupt sidecar");
+
+        manager.recover().await.expect("recover valid spool");
+
+        assert!(!corrupt_dir.exists());
+        assert!(manager.get_spool(&valid_key).is_some());
+        assert_eq!(
+            tokio::fs::read(&valid_path)
+                .await
+                .expect("read valid payload"),
+            b"safe"
+        );
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&valid_key).join("meta.json"))
+                .await
+                .expect("read valid sidecar"),
+            valid_sidecar_before
+        );
     }
 
     #[tokio::test]
