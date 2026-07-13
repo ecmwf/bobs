@@ -51,7 +51,7 @@ Operational constraints:
 - `max_live_spools`, `max_spool_bytes`, `create_admission_timeout_ms`, `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, `full_read_complete_ttl_secs`, `cleanup_sweep_interval_secs`, `long_poll_timeout_ms`, and `io_uring_queue_capacity` must be greater than `0`; `io_uring_queue_capacity` must not exceed Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`). Invalid queue capacities fail startup with `ConfigurationError`.
 - `io_uring_shards`, when set, must be in `1..=256`; omitted shards resolve to `max(1, num_cpus / 4)`.
 - `cleanup_sweep_interval_secs` must not exceed any active cleanup timeout.
-- `max_cache_bytes` may be smaller than `page_size`; `0` disables caching.
+- `max_cache_bytes` may be smaller than `page_size`; `0` disables caching while one bounded disk-backed read response remains admitted.
 
 Example:
 
@@ -158,7 +158,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of individual data pages. Valid range `1..=67108864` (64 MiB), no larger than `max_spool_bytes`. In-progress readers see a page only once it is full; `/api/v1/complete/{key}` publishes the final partial page. |
-| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO budget for bounded cache-owned page allocations across all spools, excluding allocator overhead. Cache admission may copy solely to avoid retaining an oversized frame backing; disabled caching and pages rejected for exceeding the cap do not make that isolation copy. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO budget for bounded cache-owned page allocations across all spools, excluding allocator overhead, and the source for `max(1, floor(max_cache_bytes / page_size))` weighted read-response permits held through response-body lifetime. Cache admission may copy solely to avoid retaining an oversized frame backing; disabled caching and pages rejected for exceeding the cap do not make that isolation copy. `0` still admits one bounded disk-backed response. |
 | `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for the first-read cache phase. Omitted values derive from effective page/cache settings; explicit values are preserved. Proven full-object coverage immediately frees the spool's cache and admission slot while leaving it readable from disk. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool; must be at least `page_size`. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
 | `create_admission_timeout_ms` | `5000` | Maximum `/api/v1/create` admission wait before `503 Service Unavailable`. |

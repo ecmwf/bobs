@@ -7,7 +7,7 @@ name: CI
 on:
   push:
     branches:
-      - '**'
+      - "**"
 
 permissions:
   contents: read
@@ -41,3 +41,18 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint chart --values chart/tests/forwarded-prefix-values.yaml
+
+      - name: Test forwarded-prefix ingress rendering
+        run: chart/tests/forwarded-prefix-render.sh

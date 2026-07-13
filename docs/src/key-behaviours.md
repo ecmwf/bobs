@@ -16,9 +16,15 @@ Reader visibility is still page-based: a page is visible, cached, and used to no
 
 Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they also delay reader visibility until that larger page is full. They consume more of the global cache budget per cached page, so cache reach can fall unless `max_cache_bytes` is increased alongside `page_size`. Setting `max_cache_bytes` to `0` disables caching entirely; if a full page is larger than the cache cap, that page simply bypasses the cache and reads fall back to disk. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.
 
+Read response memory is admitted separately from live-spool admission. The manager permits `max(1, floor(max_cache_bytes / page_size))` ordinary configured-page responses at once and retains each permit until the client body is consumed or dropped. Slow clients therefore queue instead of retaining one additional page buffer each. Wider persisted pages recovered after a config change consume multiple units. With caching disabled, one response remains admitted so disk-backed reads still stream with bounded page memory.
+
 ### 2. Long-poll with Timeout
 
 When a follow-mode reader requests a page that has not been written yet, BOBS parks the request using a notification system. If no first page arrives within `long_poll_timeout_ms`, BOBS returns a `307 Temporary Redirect`; clients such as `curl -L` automatically follow it and resume the poll. If the timeout occurs after bytes have started streaming, BOBS aborts the transfer with a response-body error instead of redirecting or returning a clean end of stream.
+
+The initial timeout includes time waiting for read-response admission. A timeout redirect, client cancellation, or spool deletion drops the reader lease and any permit immediately. Long-poll and response admission do not hold metadata, lifecycle, cache, or live-spool admission locks while waiting.
+
+When `ingress.forwardedPrefix.enabled` is enabled, the chart sends the exact public pod prefix (for example, `/download-0`) in `X-Forwarded-Prefix`. The redirect then remains on the public route, such as `/download-0/api/v1/read/<key>`, rather than exposing the rewritten internal route. The NGINX Inc controller derives the prefix in its location snippet. Community ingress-nginx uses its native `nginx.ingress.kubernetes.io/x-forwarded-prefix` annotation and therefore renders one Ingress per replica; its path regex accepts both the short download URL and the redirected public API URL. User-supplied annotations remain on the rendered Ingress resources.
 
 ### 3. Follow Mode
 
@@ -64,6 +70,8 @@ An ambiguous legacy `Writing` partial spool is quarantined without mutation: BOB
 
 Recovery admission uses the same non-zero `max_live_spools` bound as normal creation and applies it uniformly to in-progress and complete spools. Candidates with newer persisted activity are considered first, with the key as a deterministic tie-breaker. Metadata-only lifecycle, migration, and layout checks run before admission, so invalid candidates cannot occupy capacity; failed admitted candidates release their permit and recovery continues. Once the bound is successfully filled, metadata-valid excess entries stay durable but unavailable without opening their data file, loading a partial tail, or rewriting their sidecar. Increasing capacity on a later restart admits more of this quarantined set.
 
+Recovery performs one top-level directory scan and processes sidecars with bounded reads. `meta.json` is limited to 1 MiB; the open file's size is checked before allocating its read buffer. Oversized sidecars and sidecars with unknown JSON fields are preserved unchanged and quarantined as unsupported, while malformed sidecars are handled as per-key corruption. Candidate ordering keeps compact key/activity summaries, and full metadata is retained only for the candidate currently being validated or admitted.
+
 A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 
 - **Writer Inactivity**: The producer stopped writing without completing the spool (`writer_inactivity_timeout_secs`, default 300).
@@ -79,3 +87,9 @@ Coverage tracking uses missing byte ranges rather than per-byte state, so large 
 ### 9. HTTP/2 Support
 
 The server supports both HTTP/1.1 and HTTP/2 (h2c cleartext). Using HTTP/2 is recommended for high-concurrency streaming to benefit from request multiplexing.
+
+### 10. Graceful Shutdown
+
+On SIGTERM or Ctrl+C, BOBS first stops accepting connections and asks Hyper to shut down every accepted connection gracefully. Idle HTTP/1.1 keep-alive sockets close promptly, HTTP/2 connections stop accepting new streams, and active request bodies, response streams, and handlers that own spool mutations can finish.
+
+The HTTP drain has a fixed 25-second deadline. Connections still active at the deadline are aborted before storage and telemetry teardown, so a stalled peer cannot block process exit forever. The chart leaves Kubernetes' termination grace period unset; the standard 30-second default leaves time after the HTTP deadline for forced aborts and final teardown. Keep any deployment-level termination grace period greater than 25 seconds.

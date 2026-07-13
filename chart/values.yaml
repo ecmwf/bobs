@@ -96,16 +96,16 @@ config:
   # Helm deployment profile. These intentionally override the Rust binary defaults
   # (data_dir ./data, page_size 16 MiB, global cache 256 MiB) with the PVC path
   # and a lower-latency 4 KiB page / 1 MiB global cache. max_cache_bytes may be
-  # smaller than page_size; 0 disables caching and oversized pages bypass the cache.
+  # smaller than page_size. It also derives the weighted response-lifetime read
+  # budget as max(1, floor(max_cache_bytes / page_size)); 0 disables caching but
+  # retains one bounded disk-backed response.
   data_dir: "/var/lib/bobs"
-  # The chart favours lower streaming latency than the Rust binary defaults:
-  # it overrides 16 MiB/256 MiB with 4 KiB/1 MiB. Valid page sizes are
-  # 1..=67108864 bytes (64 MiB) and must not exceed max_spool_bytes. Pages
-  # larger than the cache bypass it, so the cache may remain smaller than a page.
+  # Valid page sizes are 1..=67108864 bytes (64 MiB) and must not exceed
+  # max_spool_bytes. Pages larger than the cache bypass it.
   page_size: 4096
   max_cache_bytes: 1048576
-  # Explicit chart admission limit matching max_cache_bytes / page_size.
-  # Operators can still override this independently for their workload.
+  # Separate first-read/live-spool admission limit. The explicit chart default
+  # matches max_cache_bytes / page_size; operators may override it independently.
   max_live_spools: 256
   # Per-spool write limit; must be >= page_size. 8 GiB leaves headroom on the default 10 GiB PVC.
   max_spool_bytes: 8589934592
@@ -156,10 +156,10 @@ ingress:
   className: nginx
   annotations: {}
   tls: []
-  # X-Forwarded-Prefix location snippet for the nginx-inc ingress. Off by default
-  # (parity with the deployed/vendored chart). When enabled, the ingress preserves
-  # the external route prefix (/{route_name}-N) for BOBS long-poll redirects and
-  # re-asserts the standard forwarded headers explicitly.
+  # Preserve the exact external /{route_name}-N pod prefix in BOBS long-poll
+  # redirects. Off by default for deployment parity. NGINX Inc uses a location
+  # snippet; community ingress-nginx renders one Ingress per replica with its
+  # native x-forwarded-prefix annotation. Existing user annotations are retained.
   forwardedPrefix:
     enabled: false
 

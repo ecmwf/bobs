@@ -9,7 +9,7 @@ use bytes::Bytes;
 
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
-use crate::spool::{Spool, SpoolState};
+use crate::spool::{ReadResponsePermit, Spool, SpoolState};
 
 impl<F, M> Spool<F, M>
 where
@@ -28,8 +28,14 @@ where
     /// no such page exists. Only returns full pages (or the final partial page
     /// after complete) — never the in-progress write buffer.
     ///
-    /// Resolution order: page cache → disk → long-poll (wait for writer).
-    pub async fn read_page(&self, page_idx: u64) -> Result<Option<Bytes>> {
+    /// The caller must retain `response_permit` for at least as long as any
+    /// response that owns the returned page. Resolution order is page cache →
+    /// disk → long-poll (wait for writer).
+    pub async fn read_page(
+        &self,
+        page_idx: u64,
+        _response_permit: &ReadResponsePermit,
+    ) -> Result<Option<Bytes>> {
         loop {
             if self.metadata.lock().await.state == SpoolState::Deleting {
                 return Err(BobsError::SpoolNotFound {
@@ -96,6 +102,14 @@ where
                 }
             }
         }
+    }
+
+    /// Test-only low-level convenience. Production response paths must retain the
+    /// permit across the complete body lifetime rather than only this call.
+    #[cfg(test)]
+    pub(crate) async fn read_page_for_test(&self, page_idx: u64) -> Result<Option<Bytes>> {
+        let permit = self.acquire_read_response_permit().await?;
+        self.read_page(page_idx, &permit).await
     }
 }
 
@@ -335,7 +349,10 @@ mod tests {
             meta.total_pages = 1;
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         let got = got.expect("cached page should exist");
         assert_eq!(got, data);
         assert_eq!(
@@ -371,7 +388,10 @@ mod tests {
             assert!(cache.contains(&spool.key, 1));
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(page0), "evicted page must be read from disk");
     }
 
@@ -392,7 +412,10 @@ mod tests {
             meta.total_pages = 1;
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(data)));
     }
 
@@ -432,7 +455,7 @@ mod tests {
             Arc::new(crate::metrics::BobsMetrics::new(false)),
         ));
         let reader_spool = Arc::clone(&spool);
-        let read_task = tokio::spawn(async move { reader_spool.read_page(0).await });
+        let read_task = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
 
         entered.notified().await;
         let metadata_guard =
@@ -458,7 +481,10 @@ mod tests {
         let data = Bytes::from((0..page_size).map(|n| (n % 251) as u8).collect::<Vec<_>>());
         let spool = make_short_read_spool(dir.path(), data.clone(), 997, page_size).await;
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(data));
     }
 
@@ -474,7 +500,10 @@ mod tests {
         )
         .await;
 
-        let err = spool.read_page(0).await.expect_err("read should fail");
+        let err = spool
+            .read_page_for_test(0)
+            .await
+            .expect_err("read should fail");
         let BobsError::IoError(err) = err else {
             panic!("expected IoError, got {err:?}");
         };
@@ -501,7 +530,10 @@ mod tests {
             meta.state = SpoolState::Writing;
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(data)));
     }
 
@@ -525,8 +557,11 @@ mod tests {
             meta.state = SpoolState::Writing;
         }
 
-        let result =
-            tokio::time::timeout(tokio::time::Duration::from_millis(50), spool.read_page(0)).await;
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(50),
+            spool.read_page_for_test(0),
+        )
+        .await;
         assert!(
             result.is_err(),
             "recovered trailing partial must long-poll before complete"
@@ -553,7 +588,10 @@ mod tests {
             meta.state = SpoolState::Complete;
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(partial)));
     }
 
@@ -563,7 +601,7 @@ mod tests {
         let spool = Arc::new(make_spool(dir.path(), 4096).await);
         let reader_spool = Arc::clone(&spool);
 
-        let reader = tokio::spawn(async move { reader_spool.read_page(0).await });
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
@@ -592,7 +630,7 @@ mod tests {
         let spool = Arc::new(make_spool(dir.path(), 4096).await);
         let reader_spool = Arc::clone(&spool);
 
-        let reader = tokio::spawn(async move { reader_spool.read_page(0).await });
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         spool.cancel.cancel();
@@ -625,7 +663,7 @@ mod tests {
             meta.total_bytes_written = 1000;
         }
 
-        let reader = tokio::spawn(async move { reader_spool.read_page(0).await });
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         assert!(!reader.is_finished());

@@ -79,11 +79,13 @@ The page cache is global across all spools. Entries are keyed by `(spool_key, pa
 
 `max_live_spools` limits the number of spools in the first-read cache phase. When omitted, it derives as `max(1, max_cache_bytes / page_size)`, which is 16 with the 16 MiB/256 MiB binary defaults. Explicit values are preserved; the chart sets 256 for its 4 KiB/1 MiB profile. `/api/v1/create` waits up to `create_admission_timeout_ms` (default 5000) for a slot, then returns `503 Service Unavailable`; a key already tracked in any state returns `409 Conflict` immediately instead of entering that wait. The first transition to proven full-object coverage frees that spool's cache entries and releases its admission slot immediately; the spool remains readable from disk until cleanup.
 
+Read responses use a separate manager-wide weighted semaphore derived from the same page/cache sizing: `max(1, floor(max_cache_bytes / page_size))` configured-page units. A response acquires its units before cache lookup or disk buffering and holds them until its streaming body is dropped, including while a yielded chunk is stalled at a slow client. Recovered spools with wider persisted pages acquire `ceil(persisted_page_size / configured_page_size)` units, capped at the full budget. Timeout, cancellation, and deletion release admission through the reader lease. When caching is disabled or smaller than one page, the one-unit minimum serializes page-backed responses rather than allowing unbounded cache-miss buffers.
+
 A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/api/v1/complete/{key}` publishes it as the final page. A spool accepts at most `max_spool_bytes` (default 8 GiB); an upload that crosses the limit is durably deleted before the server returns `413 Payload Too Large`.
 
 ## Read behaviour
 
-Reads first check the global page cache. Cache misses read the required page bytes from `spool.dat` using positional I/O.
+Reads acquire response admission, then check the global page cache. Cache misses read the required page bytes from `spool.dat` using positional I/O. Cache entries and response buffers remain separate allocations and separate accounting; the response permit does not alter cache ownership or zero-copy cache-hit slicing.
 
 Only a request without `Range` enters follow mode, starting at byte 0. If the next page has not been written yet, BOBS parks the request until more data arrives, the spool completes, the spool is deleted, or the long-poll timeout fires.
 
@@ -114,6 +116,8 @@ After successful completion, `meta.json` is the durable completed-object record.
 ## Recovery
 
 Startup recovery scans `data_dir` for spool directories with `meta.json` sidecars.
+
+Recovery uses one top-level directory scan, reads sidecars individually, and keeps only compact key/activity indexing plus the bounded preferred candidate heap. Each sidecar is statted before allocation and is limited to 1 MiB. Oversized payloads and payloads with unknown fields are preserved unchanged as unsupported quarantine; malformed known-schema JSON is isolated to per-key corrupt cleanup. Selected candidates are reread before admission, and excess candidates never have `spool.dat` opened or tail bytes loaded.
 
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
 - A valid durable `Completing` marker is deterministically finalized to `Complete` using its exact candidate layout. If marker metadata and `spool.dat` disagree, recovery leaves both unchanged, quarantines the spool, and never reopens it for writes.

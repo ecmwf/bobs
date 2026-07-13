@@ -34,7 +34,7 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `port` | `3000` | Port for the HTTP server to listen on. |
 | `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages. Valid range: `1..=67108864` (64 MiB), and it must not exceed `max_spool_bytes`. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. |
-| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global budget for the logical bytes of bounded cache-owned page allocations across all spools, excluding allocator overhead. Cache insertion may copy a page solely to avoid retaining an oversized transport-frame backing; the frame-to-disk path remains zero-copy. Set to `0` to disable caching without an isolation copy. A page rejected because it exceeds the cap likewise bypasses the cache without an isolation copy and remains readable from disk. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global budget for the logical bytes of bounded cache-owned page allocations across all spools, excluding allocator overhead. It also derives the read-response permit budget as `max(1, floor(max_cache_bytes / page_size))`; weighted permits are held until response bodies are dropped. Cache insertion may copy a page solely to avoid retaining an oversized transport-frame backing; the frame-to-disk path remains zero-copy. Set to `0` to disable caching while retaining a one-page response bound. A page rejected because it exceeds the cap likewise bypasses the cache without an isolation copy and remains readable from disk. |
 | `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools in the first-read cache phase and for startup recovery. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. The first proven full-object read frees that spool's cache and admission slot immediately while leaving it readable from disk. Startup admits at most this many durable spools and leaves excess entries unopened and unchanged for a later restart with more capacity. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests. Must be greater than `0` and at least `page_size`. |
 | `create_admission_timeout_ms` | `5000` | Maximum time `/api/v1/create` waits for a `max_live_spools` slot before returning `503 Service Unavailable`. Must be greater than `0`. |
@@ -57,6 +57,14 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `metrics.allowed_labels` | `[]` | Caller-provided label keys forwarded as metric attributes. Empty list means all caller labels pass through. Set to a non-empty list to restrict label cardinality. |
 | `metrics.max_label_value_length` | `128` | Maximum byte length for label values. Values exceeding this limit are truncated before recording. |
 
+Recovery metadata has a fixed safety policy rather than a configuration field: `meta.json` is limited to 1 MiB and its size is checked before read allocation. Oversized or unknown-field payloads are preserved unchanged but unavailable, allowing operator inspection or a newer compatible binary to recover them.
+
+## Helm ingress and shutdown settings
+
+`ingress.forwardedPrefix.enabled` defaults to `false`. Enable it when an ingress rewrites a public per-pod route such as `/download-0/...` to `/api/v1/read/...`. The chart then supplies `X-Forwarded-Prefix: /download-0`, allowing a long-poll `307` to return `/download-0/api/v1/read/<key>`. NGINX Inc uses `nginx.org/location-snippets`; community ingress-nginx renders one Ingress per pod with the native `nginx.ingress.kubernetes.io/x-forwarded-prefix` annotation. This per-replica Ingress topology is an architectural change: when forwarded prefixes are enabled, each replica needs its own exact prefix annotation because community ingress-nginx cannot derive a dynamic prefix per regex match. Other entries in `ingress.annotations` are preserved on every rendered Ingress.
+
+BOBS stops accepts and gracefully drains all HTTP connections for at most 25 seconds, then aborts leftovers. The chart leaves `terminationGracePeriodSeconds` unset, so standard Kubernetes uses its 30-second default. If a parent chart or platform sets it explicitly, keep it above 25 seconds so forced aborts and final storage/telemetry teardown can run before SIGKILL.
+
 ## Example
 
 ```yaml
@@ -64,7 +72,7 @@ host: 0.0.0.0
 port: 3000
 data_dir: /data/bobs
 page_size: 16777216
-max_cache_bytes: 268435456      # global page-cache byte budget; set to 0 to disable caching
+max_cache_bytes: 268435456      # cache and slow-reader response budget; 0 disables cache
 # max_live_spools omitted: derives 16 here and bounds startup recovery
 max_spool_bytes: 8589934592   # 8 GiB per spool
 create_admission_timeout_ms: 5000
@@ -125,6 +133,6 @@ Page size changes streaming behaviour:
 - larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless `max_cache_bytes` is increased;
 - benchmark representative object sizes and write chunk sizes before changing either deployment profile.
 
-`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching. A page larger than the cap bypasses the cache while disk-backed reads continue to work. This cache-skipping behaviour is independent of the required `page_size <= max_spool_bytes` relationship. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; explicit values remain unchanged. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
+`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely, but the manager still admits one read response at a time so disk-backed page buffers remain bounded. Otherwise it admits `floor(max_cache_bytes / page_size)` ordinary configured-page responses, with a minimum of one. Admission is acquired before page lookup or disk I/O and stays with the response body, so slow or unconsumed clients queue rather than each retaining another page allocation. Recovered spools whose persisted page size is wider than the current configured page consume proportionally more permit units. A page larger than the cache cap still bypasses the cache while disk-backed reads continue to work. This cache-skipping behaviour is independent of the required `page_size <= max_spool_bytes` relationship. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; set it explicitly when workflow concurrency should differ from cache page capacity. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
 
 See the standalone benchmark guide for page-size comparison commands.

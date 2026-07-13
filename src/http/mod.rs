@@ -488,6 +488,7 @@ where
     started_at: Instant,
     duration_recorded: bool,
     bytes_served: u64,
+    response_permit: Option<crate::spool::ReadResponsePermit>,
 }
 
 fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
@@ -783,6 +784,7 @@ where
             started_at: read_start,
             duration_recorded: false,
             bytes_served: 0,
+            response_permit: None,
         };
         let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
         let page_size = spool.page_size as u64;
@@ -813,14 +815,20 @@ where
         let response_range = ResolvedReadRange { start, end, follow };
         tracing::info!("event.name" = "bobs.spool.read.started", "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "success", "spool read started");
 
-    // Pre-fetch the first page before committing to a streaming response.
-    // If the timeout fires before any data arrives, return a 307 redirect
-    // so standard clients (curl -L, browsers) retry automatically.
+    // Acquire response-buffer admission and pre-fetch the first page before
+    // committing to a streaming response. The timeout covers both queueing and
+    // long-polling; every error/redirect path drops any acquired permit.
     let first_page_idx = start / page_size;
-    let first_page = match tokio::time::timeout(long_poll_timeout, spool.read_page(first_page_idx))
-        .await
-    {
-        Ok(Ok(v)) => v,
+    let first_read = async {
+        let permit = spool.acquire_read_response_permit().await?;
+        let page = spool.read_page(first_page_idx, &permit).await?;
+        Ok::<_, BobsError>((page, permit))
+    };
+    let first_page = match tokio::time::timeout(long_poll_timeout, first_read).await {
+        Ok(Ok((page, permit))) => {
+            lease.response_permit = Some(permit);
+            page
+        }
         Ok(Err(e)) => {
             lease.duration_recorded = true;
             state.metrics.record_read_duration(&read_labels, read_mode, crate::metrics::outcome::ERROR, read_start.elapsed().as_secs_f64());
@@ -866,9 +874,13 @@ where
             let maybe_page = if let Some(page) = prefetched.take() {
                 Some(page)
             } else if follow {
+                let response_permit = lease
+                    .response_permit
+                    .as_ref()
+                    .expect("prefetched response must retain read admission");
                 match tokio::time::timeout(
                     long_poll_timeout,
-                    spool.read_page(page_idx),
+                    spool.read_page(page_idx, response_permit),
                 ).await {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
@@ -890,7 +902,11 @@ where
                     }
                 }
             } else {
-                match spool.read_page(page_idx).await {
+                let response_permit = lease
+                    .response_permit
+                    .as_ref()
+                    .expect("prefetched response must retain read admission");
+                match spool.read_page(page_idx, response_permit).await {
                     Ok(v) => v,
                     Err(e) => {
                         outcome = crate::metrics::outcome::ERROR;
@@ -1296,16 +1312,16 @@ mod tests {
         let mut config = (*test_config(&data_dir)).clone();
         configure(&mut config);
         let config = Arc::new(config);
-        let manager = Arc::new(
-            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-                DefaultMetadataStore::new(&data_dir),
-                &data_dir,
-                config.page_size,
-                config.max_cache_bytes,
-                config.max_live_spools,
-            )
-            .expect("manager init"),
-        );
+        let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+            DefaultMetadataStore::new(&data_dir),
+            &data_dir,
+            config.page_size,
+            config.max_cache_bytes,
+            config.max_live_spools,
+        )
+        .expect("manager init");
+        manager.set_metrics(Arc::clone(&metrics));
+        let manager = Arc::new(manager);
         let state = Arc::new(AppState {
             manager,
             config,
@@ -1316,6 +1332,23 @@ mod tests {
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
+    }
+
+    async fn app_with_read_budget(
+        page_size: usize,
+        max_cache_bytes: usize,
+        long_poll_timeout_ms: u64,
+        metrics: Arc<BobsMetrics>,
+    ) -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+        app_with_config_and_metrics(
+            |config| {
+                config.page_size = page_size;
+                config.max_cache_bytes = max_cache_bytes;
+                config.long_poll_timeout_ms = long_poll_timeout_ms;
+            },
+            metrics,
+        )
+        .await
     }
 
     async fn app_with_config(
@@ -1394,6 +1427,69 @@ mod tests {
         panic!("spool {key} was not removed after cleanup was scheduled");
     }
 
+    async fn complete_disk_fixture(
+        state: &Arc<AppState<DefaultFileIO, DefaultMetadataStore>>,
+        data: Bytes,
+    ) -> (
+        String,
+        Arc<crate::spool::Spool<DefaultFileIO, DefaultMetadataStore>>,
+    ) {
+        let key = uuid::Uuid::new_v4().to_string();
+        state
+            .manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create disk fixture spool");
+        let spool = state.manager.get_spool(&key).expect("fixture spool exists");
+        spool
+            .write(0, data.clone())
+            .await
+            .expect("write disk fixture");
+        spool
+            .complete(Some(data.len() as u64))
+            .await
+            .expect("complete disk fixture");
+        state.manager.page_cache.lock().await.free_spool(&key);
+        (key, spool)
+    }
+
+    fn read_request(key: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("build read request")
+    }
+
+    async fn wait_for_reader_count<F, M>(spool: &crate::spool::Spool<F, M>, expected: usize)
+    where
+        F: FileIO,
+        M: MetadataStore + Clone + Send + Sync + 'static,
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if spool.reader_count.load(Ordering::SeqCst) == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader count reached expected value");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_rss_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+        let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        Some(kib * 1024)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn current_rss_bytes() -> Option<u64> {
+        None
+    }
+
     #[test]
     fn read_page_chunk_uses_zero_copy_slice() {
         let page = Bytes::from((0u8..64).collect::<Vec<_>>());
@@ -1453,7 +1549,7 @@ mod tests {
         let key = write_and_complete(&app, data).await;
         let spool = state.manager.get_spool(&key).expect("spool must exist");
         let page = spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("page read should succeed")
             .expect("page should exist");
@@ -2992,7 +3088,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_page_long_poll_timeout_still_redirects() {
-        let (app, _state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
+        let (app, state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
         let key = create_key(&app).await;
         let req = Request::builder()
             .method("GET")
@@ -3009,6 +3105,39 @@ mod tests {
                 .get(axum::http::header::LOCATION)
                 .and_then(|value| value.to_str().ok()),
             Some(format!("/api/v1/read/{key}").as_str())
+        );
+        let spool = state.manager.get_spool(&key).expect("spool remains");
+        assert_eq!(spool.reader_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(
+            state.manager.read_response_available_permits(),
+            state.manager.read_response_permit_limit()
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_ingress_long_poll_redirect_stays_on_public_pod_path() {
+        let (app, _state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
+        let key = create_key(&app).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("X-Forwarded-Prefix", "/download-0")
+            .body(Body::empty())
+            .expect("build ingress follow request");
+
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("ingress follow read oneshot");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("/download-0/api/v1/read/{key}").as_str())
         );
     }
 
@@ -3973,5 +4102,238 @@ mod tests {
             "spool must be deleted once activity stops and idle TTL expires"
         );
         task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_unconsumed_parallel_readers_are_page_budget_bounded() {
+        const PAGE_SIZE: usize = 4 * 1024 * 1024;
+        const PERMIT_LIMIT: usize = 4;
+        const CLIENTS: usize = 64;
+
+        let (app, state) = app_with_read_budget(
+            PAGE_SIZE,
+            PAGE_SIZE * PERMIT_LIMIT,
+            60_000,
+            Arc::new(BobsMetrics::new(false)),
+        )
+        .await;
+        let (key, spool) = complete_disk_fixture(&state, Bytes::from(vec![0xA5; PAGE_SIZE])).await;
+        assert_eq!(state.manager.read_response_permit_limit(), PERMIT_LIMIT);
+        let rss_before = current_rss_bytes();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(CLIENTS);
+        let mut tasks = Vec::with_capacity(CLIENTS);
+        for id in 0..CLIENTS {
+            let app = app.clone();
+            let request = read_request(&key);
+            let sender = sender.clone();
+            tasks.push(tokio::spawn(async move {
+                let response = app.oneshot(request).await.expect("parallel read response");
+                let _ = sender.send((id, response)).await;
+            }));
+        }
+        drop(sender);
+
+        let mut held_responses = Vec::with_capacity(PERMIT_LIMIT);
+        for _ in 0..PERMIT_LIMIT {
+            let (_, response) = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
+                .await
+                .expect("admitted reader returned")
+                .expect("reader channel remains open");
+            assert_eq!(response.status(), StatusCode::OK);
+            held_responses.push(response);
+        }
+        wait_for_reader_count(&spool, CLIENTS).await;
+
+        assert_eq!(state.manager.active_read_responses(), PERMIT_LIMIT);
+        assert_eq!(state.manager.active_read_response_permits(), PERMIT_LIMIT);
+        assert_eq!(state.manager.read_response_available_permits(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+                .await
+                .is_err(),
+            "an unconsumed response must retain its page-buffer permit"
+        );
+
+        let rss_after = current_rss_bytes();
+        if let (Some(before), Some(after)) = (rss_before, rss_after) {
+            eprintln!(
+                "slow-reader instrumentation: clients={CLIENTS} page_bytes={PAGE_SIZE} permit_limit={PERMIT_LIMIT} active={} permit_units={} rss_before={} rss_after={} rss_delta={}",
+                state.manager.active_read_responses(),
+                state.manager.active_read_response_permits(),
+                before,
+                after,
+                after.saturating_sub(before),
+            );
+        }
+
+        drop(held_responses.pop());
+        let (_, replacement) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("one queued reader admitted after release")
+            .expect("reader channel remains open");
+        assert_eq!(replacement.status(), StatusCode::OK);
+        held_responses.push(replacement);
+        assert_eq!(state.manager.active_read_responses(), PERMIT_LIMIT);
+
+        for task in &tasks {
+            task.abort();
+        }
+        drop(held_responses);
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.active_read_response_permits(), 0);
+        assert_eq!(
+            state.manager.read_response_available_permits(),
+            PERMIT_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_reader_waiting_for_response_permit_cleans_up_activity() {
+        let (app, state) =
+            app_with_read_budget(4096, 0, 60_000, Arc::new(BobsMetrics::new(false))).await;
+        let (key, spool) = complete_disk_fixture(&state, Bytes::from_static(b"page")).await;
+
+        let held = app
+            .clone()
+            .oneshot(read_request(&key))
+            .await
+            .expect("first response");
+        assert_eq!(state.manager.active_read_responses(), 1);
+
+        let waiting_app = app.clone();
+        let waiting_request = read_request(&key);
+        let waiting = tokio::spawn(async move { waiting_app.oneshot(waiting_request).await });
+        wait_for_reader_count(&spool, 2).await;
+        waiting.abort();
+        assert!(waiting
+            .await
+            .expect_err("waiting request must be cancelled")
+            .is_cancelled());
+        wait_for_reader_count(&spool, 1).await;
+        assert_eq!(state.manager.active_read_responses(), 1);
+
+        drop(held);
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.read_response_available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn permit_queue_timeout_redirect_does_not_leak_or_steal_capacity() {
+        let (app, state) =
+            app_with_read_budget(4096, 0, 25, Arc::new(BobsMetrics::new(false))).await;
+        let (key, spool) = complete_disk_fixture(&state, Bytes::from_static(b"page")).await;
+
+        let held = app
+            .clone()
+            .oneshot(read_request(&key))
+            .await
+            .expect("first response");
+        let redirect = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.clone().oneshot(read_request(&key)),
+        )
+        .await
+        .expect("queued read observes initial timeout")
+        .expect("redirect response");
+
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(state.manager.active_read_responses(), 1);
+        assert_eq!(state.manager.active_read_response_permits(), 1);
+        assert_eq!(state.manager.read_response_available_permits(), 0);
+        wait_for_reader_count(&spool, 1).await;
+
+        drop(redirect);
+        drop(held);
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.read_response_available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_cancels_permit_waiter_without_waiting_for_slow_response() {
+        let (app, state) =
+            app_with_read_budget(4096, 0, 60_000, Arc::new(BobsMetrics::new(false))).await;
+        let (key, spool) = complete_disk_fixture(&state, Bytes::from_static(b"page")).await;
+
+        let held = app
+            .clone()
+            .oneshot(read_request(&key))
+            .await
+            .expect("first response");
+        let waiting_app = app.clone();
+        let waiting_request = read_request(&key);
+        let waiting = tokio::spawn(async move { waiting_app.oneshot(waiting_request).await });
+        wait_for_reader_count(&spool, 2).await;
+
+        tokio::time::timeout(Duration::from_secs(5), state.manager.delete_spool(&key))
+            .await
+            .expect("delete must not wait for response admission")
+            .expect("delete succeeds");
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("permit waiter wakes on delete")
+            .expect("waiting task joins")
+            .expect("router returns not-found response");
+        assert_eq!(cancelled.status(), StatusCode::NOT_FOUND);
+        wait_for_reader_count(&spool, 1).await;
+        assert_eq!(state.manager.active_read_responses(), 1);
+
+        drop(cancelled);
+        drop(held);
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.read_response_available_permits(), 1);
+        assert!(state.manager.get_spool(&key).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admitted_parallel_readers_drain_normally_at_full_throughput() {
+        const PAGE_SIZE: usize = 64 * 1024;
+        const READERS: usize = 16;
+        let (app, state) = app_with_read_budget(
+            PAGE_SIZE,
+            PAGE_SIZE * 2,
+            5_000,
+            Arc::new(BobsMetrics::new(false)),
+        )
+        .await;
+        let expected = Bytes::from(
+            (0..PAGE_SIZE * 4)
+                .map(|offset| (offset % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (key, spool) = complete_disk_fixture(&state, expected.clone()).await;
+
+        let mut tasks = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let app = app.clone();
+            let request = read_request(&key);
+            let expected = expected.clone();
+            tasks.push(tokio::spawn(async move {
+                let response = app.oneshot(request).await.expect("read response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("collect admitted response")
+                    .to_bytes();
+                assert_eq!(body, expected);
+            }));
+        }
+
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(15), task)
+                .await
+                .expect("reader drains without admission deadlock")
+                .expect("reader task joins");
+        }
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.active_read_response_permits(), 0);
+        assert_eq!(state.manager.read_response_available_permits(), 2);
     }
 }

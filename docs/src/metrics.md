@@ -89,6 +89,8 @@ as `_bucket`/`_sum`/`_count` series; duration histograms also receive a
 | `bobs.read.bytes` | `bobs_read_bytes_total` | Counter | caller labels, `mode`, `otel_scope_name` | Bytes served from spools to clients. |
 | `bobs.read.duration` | `bobs_read_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `mode`, `outcome`, `otel_scope_name` | Wall time for a read stream from acquisition to final outcome. |
 | `bobs.read.active` | `bobs_read_active` | Gauge | caller labels, `otel_scope_name` | Current active readers. Incremented on reader acquisition, decremented on release. |
+| `bobs.read.response_buffers.active` | `bobs_read_response_buffers_active` | Gauge | `otel_scope_name` | Read responses currently holding page-buffer admission, including slow or unconsumed bodies. |
+| `bobs.read.response_permits.active` | `bobs_read_response_permits_active` | Gauge | `otel_scope_name` | Weighted configured-page permit units held by read responses. Compare with `max(1, floor(max_cache_bytes / page_size))`. |
 | `bobs.spools.active` | `bobs_spools_active` | Gauge | `state`, `otel_scope_name` | Current active spools broken down by state. Updated on every state transition and spool removal. |
 | `bobs.disk.usage.bytes` | `bobs_disk_usage_bytes` | Gauge | `otel_scope_name` | Disk usage of the spool data directory. Sampled asynchronously at the end of each cleanup sweep. |
 | `bobs.recovery.spools` | `bobs_recovery_spools` | Gauge | `status`, `otel_scope_name` | Startup admission snapshot: configured capacity, successfully recovered spools, and durable spools left quarantined. |

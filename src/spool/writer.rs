@@ -475,7 +475,10 @@ mod tests {
 
         let mut expected = first;
         expected.extend_from_slice(&second);
-        let got = spool.read_page(0).await.expect("page read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("page read should succeed");
         assert_eq!(got, Some(bytes::Bytes::from(expected)));
     }
 
@@ -663,7 +666,7 @@ mod tests {
         );
         assert_eq!(
             spool
-                .read_page(0)
+                .read_page_for_test(0)
                 .await
                 .expect("read cached page")
                 .expect("cached page exists")
@@ -681,7 +684,7 @@ mod tests {
         assert_eq!(recovered.metadata.lock().await.state, SpoolState::Complete);
         assert_eq!(
             recovered
-                .read_page(0)
+                .read_page_for_test(0)
                 .await
                 .expect("read recovered page")
                 .expect("recovered page exists")
