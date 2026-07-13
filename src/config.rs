@@ -52,6 +52,7 @@ pub struct Config {
     pub page_size: usize,
     pub max_cache_bytes: usize,
     /// Maximum number of spools admitted before their first complete read.
+    /// Writers wait for a slot; startup leaves excess durable spools quarantined.
     /// When omitted from YAML, this is derived from `max_cache_bytes / page_size`
     /// (with a minimum of one). Explicit operator overrides are preserved.
     pub max_live_spools: usize,

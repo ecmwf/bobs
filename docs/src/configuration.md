@@ -35,7 +35,7 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages. Valid range: `1..=67108864` (64 MiB), and it must not exceed `max_spool_bytes`. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. |
 | `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global budget for the logical bytes of bounded cache-owned page allocations across all spools, excluding allocator overhead. Cache insertion may copy a page solely to avoid retaining an oversized transport-frame backing; the frame-to-disk path remains zero-copy. Set to `0` to disable caching without an isolation copy. A page rejected because it exceeds the cap likewise bypasses the cache without an isolation copy and remains readable from disk. |
-| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools not yet fully read. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. |
+| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools not yet fully read and for startup recovery. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. Startup admits at most this many durable spools and leaves excess entries unopened and unchanged for a later restart with more capacity. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests. Must be greater than `0` and at least `page_size`. |
 | `create_admission_timeout_ms` | `5000` | Maximum time `/api/v1/create` waits for a `max_live_spools` slot before returning `503 Service Unavailable`. Must be greater than `0`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup timeout for an unfinished spool whose writer has stopped sending data. Must be greater than `0`. |
@@ -65,7 +65,7 @@ port: 3000
 data_dir: /data/bobs
 page_size: 16777216
 max_cache_bytes: 268435456      # global page-cache byte budget; set to 0 to disable caching
-# max_live_spools omitted: derives 16 from this page/cache combination
+# max_live_spools omitted: derives 16 here and bounds startup recovery
 max_spool_bytes: 8589934592   # 8 GiB per spool
 create_admission_timeout_ms: 5000
 writer_inactivity_timeout_secs: 300

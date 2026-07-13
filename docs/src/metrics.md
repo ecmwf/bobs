@@ -69,6 +69,7 @@ scrape_configs:
 - `mode`: read mode — `follow` (stream until completion), `range` (bounded HTTP range read).
 - `outcome`: read outcome — `success`, `error`, `timeout`, `client_gone`.
 - `state`: active spool state — `writing`, `write_locked`, `complete`.
+- `status`: startup recovery snapshot — `configured`, `recovered`, or `quarantined`.
 
 ## Metrics reference
 
@@ -90,6 +91,7 @@ as `_bucket`/`_sum`/`_count` series; duration histograms also receive a
 | `bobs.read.active` | `bobs_read_active` | Gauge | caller labels, `otel_scope_name` | Current active readers. Incremented on reader acquisition, decremented on release. |
 | `bobs.spools.active` | `bobs_spools_active` | Gauge | `state`, `otel_scope_name` | Current active spools broken down by state. Updated on every state transition and spool removal. |
 | `bobs.disk.usage.bytes` | `bobs_disk_usage_bytes` | Gauge | `otel_scope_name` | Disk usage of the spool data directory. Sampled asynchronously at the end of each cleanup sweep. |
+| `bobs.recovery.spools` | `bobs_recovery_spools` | Gauge | `status`, `otel_scope_name` | Startup admission snapshot: configured capacity, successfully recovered spools, and durable spools left quarantined. |
 | `bobs.pages.cache.hits` | `bobs_pages_cache_hits_total` | Counter | `otel_scope_name` | Page reads served from the in-memory page cache. |
 | `bobs.pages.cache.misses` | `bobs_pages_cache_misses_total` | Counter | `otel_scope_name` | Page reads that missed the cache and were loaded from disk. |
 
