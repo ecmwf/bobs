@@ -499,6 +499,42 @@ struct ResolvedReadRange {
     follow: bool,
 }
 
+#[derive(Debug)]
+struct ContiguousResponseProgress {
+    start: u64,
+    next: u64,
+    contiguous: bool,
+}
+
+impl ContiguousResponseProgress {
+    fn new(start: u64) -> Self {
+        Self {
+            start,
+            next: start,
+            contiguous: true,
+        }
+    }
+
+    fn record(&mut self, start: u64, end: u64) {
+        if !self.contiguous || start != self.next || start >= end {
+            self.contiguous = false;
+            return;
+        }
+        self.next = end;
+    }
+
+    fn successful_completion(
+        &self,
+        expected_end: u64,
+        outcome: &'static str,
+    ) -> Option<(u64, u64)> {
+        (self.contiguous
+            && self.next == expected_end
+            && outcome == crate::metrics::outcome::SUCCESS)
+            .then_some((self.start, self.next))
+    }
+}
+
 fn resolve_read_range(
     request_range: ReadRequestRange,
     metadata: &ReadMetadata,
@@ -778,6 +814,7 @@ where
         let mut bytes_served = 0_u64;
         let mut outcome = crate::metrics::outcome::SUCCESS;
         let mut prefetched = first_page;
+        let mut response_progress = ContiguousResponseProgress::new(start);
 
         loop {
             if let Some(end) = end {
@@ -840,6 +877,7 @@ where
                 bytes_served += chunk_len;
                 lease.bytes_served = bytes_served;
                 let chunk_end = offset;
+                response_progress.record(chunk_start, chunk_end);
 
                 // Refresh activity and coverage under the lifecycle lock so cleanup
                 // cannot act on a stale eligibility snapshot.
@@ -848,11 +886,25 @@ where
                     .mark_served_and_maybe_fully_read(chunk_start, chunk_end, now)
                     .await;
 
-                // 4. If this chunk completes a bounded read, record duration
-                //    NOW before yielding. hyper drops the response body
-                //    without a final poll once Content-Length is satisfied,
-                //    so the post-loop cleanup would never execute.
-                if end.is_some_and(|e| offset >= e) && !lease.duration_recorded {
+                // If this chunk completes a bounded response, record its exact
+                // contiguous extent before yielding. Hyper may not poll again once
+                // Content-Length is satisfied. In fragmented fallback, only a
+                // completed full-object response can recover coverage.
+                let completed_response = end.and_then(|expected_end| {
+                    response_progress.successful_completion(expected_end, outcome)
+                });
+                if let Some((response_start, response_end)) = completed_response {
+                    spool
+                        .mark_contiguous_response_complete_and_maybe_fully_read(
+                            response_start,
+                            response_end,
+                            now,
+                        )
+                        .await;
+                }
+
+                // Record duration before yielding for the same final-poll reason.
+                if completed_response.is_some() && !lease.duration_recorded {
                     let completion_span = request_span(
                         stream_job_id.as_deref(),
                         Some(&stream_key),
@@ -884,6 +936,28 @@ where
                 break;
             }
         }
+        // A chunked follow response can only provide fallback recovery after a
+        // clean end at the completed object's exact size. Error, timeout, client
+        // cancellation, partial and gapped streams never reach this transition.
+        if end.is_none() {
+            let completed_size = {
+                let meta = spool.metadata.lock().await;
+                (meta.state == crate::spool::SpoolState::Complete)
+                    .then_some(meta.total_bytes_written)
+            };
+            if let Some((response_start, response_end)) = completed_size.and_then(|size| {
+                response_progress.successful_completion(size, outcome)
+            }) {
+                spool
+                    .mark_contiguous_response_complete_and_maybe_fully_read(
+                        response_start,
+                        response_end,
+                        now_secs(),
+                    )
+                    .await;
+            }
+        }
+
         // Post-loop fallback for chunked responses (follow mode on
         // in-progress spools) where Content-Length is not set and hyper
         // polls the stream to completion normally.
@@ -1242,6 +1316,42 @@ mod tests {
             chunk.as_ptr(),
             unsafe { page.as_ptr().add(slice_start) },
             "chunk should point into the cached page allocation"
+        );
+    }
+
+    #[test]
+    fn contiguous_response_progress_rejects_gaps_partial_errors_and_timeouts() {
+        let mut partial = ContiguousResponseProgress::new(0);
+        partial.record(0, 50);
+        assert_eq!(
+            partial.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            None
+        );
+
+        let mut gapped = ContiguousResponseProgress::new(0);
+        gapped.record(0, 50);
+        gapped.record(51, 100);
+        assert_eq!(
+            gapped.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            None
+        );
+
+        let mut full = ContiguousResponseProgress::new(0);
+        full.record(0, 50);
+        full.record(50, 100);
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::ERROR),
+            None,
+            "errored response must not recover coverage"
+        );
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::TIMEOUT),
+            None,
+            "timed-out response must not recover coverage"
+        );
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            Some((0, 100))
         );
     }
 
@@ -2365,6 +2475,72 @@ mod tests {
             cache.contains(&key, 0) || cache.contains(&key, 1),
             "partial reads must not free this spool's page cache entries"
         );
+    }
+
+    #[tokio::test]
+    async fn fragmented_fallback_requires_one_completed_full_range() {
+        let (app, state) = app_with_state().await;
+        let key = write_and_complete(&app, vec![7u8; 8192]).await;
+        let spool = state.manager.get_spool(&key).expect("spool must exist");
+
+        {
+            let mut missing = spool.missing_ranges.lock().await;
+            for fragment in 0u64..1025 {
+                let start = fragment * 2;
+                missing.mark_served(start, start + 1);
+            }
+            assert!(
+                missing.is_capped(),
+                ">1024 disjoint fragments must cap tracking"
+            );
+            assert!(
+                !missing.is_complete(),
+                "overflow must not claim full coverage"
+            );
+        }
+        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // A completed partial response is insufficient exact evidence.
+        assert_eq!(
+            range_read_drain(&app, &key, "bytes=0-4095").await,
+            StatusCode::PARTIAL_CONTENT
+        );
+        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // Dropping a full-range body after its first page must not commit the
+        // response-level fallback, even though per-page activity was recorded.
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header(axum::http::header::RANGE, "bytes=0-8191")
+            .body(Body::empty())
+            .expect("build range request");
+        let response = app.clone().oneshot(request).await.expect("range oneshot");
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("first frame")
+            .expect("first frame succeeds")
+            .into_data()
+            .expect("data frame");
+        assert_eq!(first.len(), 4096);
+        drop(body);
+        tokio::task::yield_now().await;
+        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // A subsequent successfully drained contiguous full range re-establishes
+        // exact coverage and releases this spool's admission permit.
+        assert_eq!(
+            range_read_drain(&app, &key, "bytes=0-8191").await,
+            StatusCode::PARTIAL_CONTENT
+        );
+        assert!(spool.full_object_read_at.load(Ordering::SeqCst) > 0);
+        assert_eq!(state.manager.admission.available_permits(), 256);
+        assert!(!spool.missing_ranges.lock().await.is_capped());
     }
 
     /// Two non-overlapping ranges that together cover the full 8 KiB object

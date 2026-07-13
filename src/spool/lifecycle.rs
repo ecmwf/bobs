@@ -204,6 +204,36 @@ where
         }
     }
 
+    /// Record one successfully completed contiguous response under the lifecycle
+    /// lock. This only changes state when fragmented coverage fallback can be
+    /// recovered by exact full-object evidence.
+    pub async fn mark_contiguous_response_complete_and_maybe_fully_read(
+        &self,
+        start: u64,
+        end: u64,
+        now: u64,
+    ) {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        if self.metadata.lock().await.state == SpoolState::Deleting {
+            return;
+        }
+
+        let became_fully_read = {
+            let mut missing_ranges = self.missing_ranges.lock().await;
+            missing_ranges.mark_contiguous_response_complete(start, end);
+            missing_ranges.is_complete()
+                && self.full_object_read_at.load(Ordering::SeqCst) == 0
+                && self
+                    .full_object_read_at
+                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+        };
+
+        if became_fully_read {
+            self.on_fully_read().await;
+        }
+    }
+
     /// First full-read transition hook. At this point every byte has been served
     /// at least once, so the first-read page cache for this spool is redundant.
     pub async fn on_fully_read(&self) {

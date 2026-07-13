@@ -13,10 +13,12 @@ use std::mem;
 /// least once and `is_complete()` returns `true`.
 ///
 /// A fragmentation cap prevents unbounded memory growth from random-access
-/// clients. Once the number of distinct gaps exceeds `fragmentation_cap`,
-/// `capped` is set and all further tracking is disabled. `is_complete()`
-/// stays `false` in the capped state — a safe false-negative that lets the
-/// idle TTL handle cleanup instead.
+/// clients. Adjacent and overlapping pre-completion reads are coalesced before
+/// the cap is checked, so a sequential follow stream remains one interval.
+/// Genuinely fragmented coverage that exceeds the cap enters a conservative
+/// fallback: aggregate tracking stops and `is_complete()` remains false. A
+/// later successfully completed contiguous full-object response can recover
+/// exact coverage without retaining the discarded fragments.
 ///
 /// Ranges served before `initialize()` is called are buffered in `pending`
 /// and replayed once `total_size` is known.
@@ -26,27 +28,26 @@ pub struct MissingRanges {
     gaps: BTreeMap<u64, u64>,
     /// `None` until `initialize()` is called.
     pub total_size: Option<u64>,
-    /// Maximum number of distinct gaps allowed before capping.
+    /// Maximum number of distinct intervals allowed before capping.
     fragmentation_cap: usize,
-    /// `true` when the fragmentation cap was exceeded; `is_complete()` is always `false`.
+    /// `true` after fragmented coverage overflow; aggregate tracking is disabled.
     capped: bool,
-    /// Ranges served before `total_size` was known, buffered for replay at `initialize()`.
-    pending: Vec<(u64, u64)>,
+    /// Coalesced served intervals observed before `total_size` was known.
+    pending: BTreeMap<u64, u64>,
 }
 
 impl MissingRanges {
     /// Create a new tracker with the given fragmentation cap.
     ///
-    /// `fragmentation_cap` sets the maximum number of distinct gaps that may
-    /// be tracked simultaneously. A value of 1024 is a safe default for any
-    /// realistic HTTP Range access pattern.
+    /// The cap bounds genuinely fragmented missing/served interval state.
+    /// Sequential and overlapping streams are coalesced before it is applied.
     pub fn new(fragmentation_cap: usize) -> Self {
         Self {
             gaps: BTreeMap::new(),
             total_size: None,
             fragmentation_cap,
             capped: false,
-            pending: Vec::new(),
+            pending: BTreeMap::new(),
         }
     }
 
@@ -61,42 +62,66 @@ impl MissingRanges {
         }
         self.total_size = Some(total_size);
         if total_size == 0 {
-            // Zero-byte object is immediately complete; leave gaps empty.
+            // Zero-byte objects are complete regardless of prior irrelevant ranges.
+            self.capped = false;
+            self.pending.clear();
+            return;
+        }
+        if self.capped {
             self.pending.clear();
             return;
         }
         self.gaps.insert(0, total_size);
         let pending = mem::take(&mut self.pending);
-        for (s, e) in pending {
-            self.apply(s, e);
+        for (start, end) in pending {
+            self.apply(start, end);
+            if self.capped {
+                break;
+            }
         }
     }
 
     /// Record that bytes `[start, end)` have been served.
     ///
     /// - If `start >= end` this is a no-op.
-    /// - If `total_size` is not yet known the range is buffered in `pending`
-    ///   and applied when `initialize()` is called.
-    /// - Once `capped` is `true` all calls are no-ops.
+    /// - If `total_size` is not yet known, adjacent and overlapping ranges are
+    ///   coalesced in `pending` and replayed when `initialize()` is called.
+    /// - Once `capped` is `true`, aggregate calls are ignored. Recovery requires
+    ///   `mark_contiguous_response_complete()` for one successful full response.
     pub fn mark_served(&mut self, start: u64, end: u64) {
         if self.capped || start >= end {
             return;
         }
         if self.total_size.is_none() {
-            self.pending.push((start, end));
-            if self.pending.len() > self.fragmentation_cap {
-                self.capped = true;
-                self.pending.clear();
-            }
+            self.insert_pending(start, end);
             return;
         }
         self.apply(start, end);
     }
 
+    /// Record the exact extent of one successfully completed contiguous response.
+    ///
+    /// In the normal tracking mode, per-chunk `mark_served()` calls already carry
+    /// coverage. In fragmented fallback this is the bounded recovery path: only a
+    /// single response covering `[0, total_size)` can restore completeness.
+    pub fn mark_contiguous_response_complete(&mut self, start: u64, end: u64) {
+        if !self.capped {
+            return;
+        }
+        if self
+            .total_size
+            .is_some_and(|total_size| start == 0 && end >= total_size)
+        {
+            self.capped = false;
+            self.gaps.clear();
+            self.pending.clear();
+        }
+    }
+
     /// Returns `true` when every byte `[0, total_size)` has been served.
     ///
-    /// Always `false` if `total_size` is unknown or if the fragmentation cap
-    /// was exceeded (safe false-negative).
+    /// Always `false` if `total_size` is unknown or fragmented tracking is in
+    /// conservative fallback.
     pub fn is_complete(&self) -> bool {
         !self.capped && self.total_size.is_some() && self.gaps.is_empty()
     }
@@ -117,6 +142,30 @@ impl MissingRanges {
     // Private helpers
     // -----------------------------------------------------------------------
 
+    /// Insert one pre-completion served interval, merging overlap and adjacency
+    /// before enforcing the fragmentation cap.
+    fn insert_pending(&mut self, start: u64, end: u64) {
+        let overlapping: Vec<(u64, u64)> = self
+            .pending
+            .range(..=end)
+            .filter(|(_, &pending_end)| pending_end >= start)
+            .map(|(&pending_start, &pending_end)| (pending_start, pending_end))
+            .collect();
+
+        let mut merged_start = start;
+        let mut merged_end = end;
+        for (pending_start, pending_end) in overlapping {
+            self.pending.remove(&pending_start);
+            merged_start = merged_start.min(pending_start);
+            merged_end = merged_end.max(pending_end);
+        }
+        self.pending.insert(merged_start, merged_end);
+
+        if self.pending.len() > self.fragmentation_cap {
+            self.cap();
+        }
+    }
+
     /// Apply a served range `[start, end)` against the current gap map.
     ///
     /// Complexity: O((k + 1) log n) where k = overlapping gaps, n = total gaps.
@@ -127,27 +176,31 @@ impl MissingRanges {
         let overlapping: Vec<(u64, u64)> = self
             .gaps
             .range(..end)
-            .filter(|(_, &ge)| ge > start)
-            .map(|(&gs, &ge)| (gs, ge))
+            .filter(|(_, &gap_end)| gap_end > start)
+            .map(|(&gap_start, &gap_end)| (gap_start, gap_end))
             .collect();
 
-        for (gs, ge) in overlapping {
-            self.gaps.remove(&gs);
+        for (gap_start, gap_end) in overlapping {
+            self.gaps.remove(&gap_start);
             // Preserve left portion of gap not covered by served range.
-            if gs < start {
-                self.gaps.insert(gs, start);
+            if gap_start < start {
+                self.gaps.insert(gap_start, start);
             }
             // Preserve right portion of gap not covered by served range.
-            if ge > end {
-                self.gaps.insert(end, ge);
+            if gap_end > end {
+                self.gaps.insert(end, gap_end);
             }
         }
 
-        // Enforce fragmentation cap.
         if self.gaps.len() > self.fragmentation_cap {
-            self.capped = true;
-            self.gaps.clear();
+            self.cap();
         }
+    }
+
+    fn cap(&mut self) {
+        self.capped = true;
+        self.gaps.clear();
+        self.pending.clear();
     }
 }
 
@@ -289,27 +342,32 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_fragmentation_cap_triggers_fallback() {
+    fn test_fragmentation_cap_is_conservative_and_full_response_recovers() {
         // Use a small cap so we can trigger it within total_size=100.
         let mut mr = MissingRanges::new(10);
         mr.initialize(100);
 
         // Serve non-adjacent 1-byte ranges: [0,1), [2,3), [4,5), ...
         // Each one splits the rightmost gap, growing gap count by 1.
-        // After 11 such ranges the gap count exceeds cap=10 → capped.
         for i in 0u64..11 {
             mr.mark_served(i * 2, i * 2 + 1);
         }
 
-        assert!(
-            mr.is_capped(),
-            "fragmentation cap should have been triggered"
-        );
-        assert!(!mr.is_complete(), "capped tracker must not report complete");
+        assert!(mr.is_capped(), "fragmentation cap should be triggered");
+        assert!(!mr.is_complete(), "fallback must not report complete");
 
-        // Serving the rest of the object still cannot flip is_complete.
+        // Per-chunk or partial-response progress cannot recover discarded state.
         mr.mark_served(0, 100);
-        assert!(!mr.is_complete(), "is_complete must stay false when capped");
+        mr.mark_contiguous_response_complete(0, 99);
+        assert!(!mr.is_complete(), "partial recovery must stay incomplete");
+
+        // One successfully completed contiguous full response is exact evidence.
+        mr.mark_contiguous_response_complete(0, 100);
+        assert!(
+            mr.is_complete(),
+            "full response must recover exact coverage"
+        );
+        assert!(!mr.is_capped());
     }
 
     // -----------------------------------------------------------------------
@@ -333,6 +391,33 @@ mod tests {
         assert!(
             mr.is_complete(),
             "pending range covering the full object should make it complete after init"
+        );
+    }
+
+    #[test]
+    fn test_sequential_pending_ranges_coalesce_before_cap() {
+        const PAGE_SIZE: u64 = 4096;
+        const PAGES: u64 = 1025;
+        let mut mr = MissingRanges::new(1024);
+
+        for page in 0..PAGES {
+            let start = page * PAGE_SIZE;
+            mr.mark_served(start, start + PAGE_SIZE);
+        }
+
+        assert!(
+            !mr.is_capped(),
+            "sequential follow progress must not overflow"
+        );
+        assert_eq!(
+            mr.pending.len(),
+            1,
+            "adjacent pages must remain one interval"
+        );
+        mr.initialize(PAGES * PAGE_SIZE);
+        assert!(
+            mr.is_complete(),
+            "all followed pages cover the completed object"
         );
     }
 
