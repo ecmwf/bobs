@@ -191,6 +191,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "io-uring",
+ "libc",
  "num_cpus",
  "opentelemetry",
  "opentelemetry-prometheus",
