@@ -9,7 +9,7 @@ compile_error!(
 
 use super::FileIO;
 use bytes::Bytes;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::task;
@@ -28,16 +28,9 @@ impl FileIO for TokioFileIO {
     ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
         let path = path.to_path_buf();
         async move {
-            let file = task::spawn_blocking(move || {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .read(true)
-                    .open(path)
-            })
-            .await
-            .map_err(join_error_to_io)??;
+            let file = task::spawn_blocking(move || open_regular_file(&path, true))
+                .await
+                .map_err(join_error_to_io)??;
             Ok(Arc::new(file))
         }
     }
@@ -47,14 +40,9 @@ impl FileIO for TokioFileIO {
     ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
         let path = path.to_path_buf();
         async move {
-            let file = task::spawn_blocking(move || {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .read(true)
-                    .open(path)
-            })
-            .await
-            .map_err(join_error_to_io)??;
+            let file = task::spawn_blocking(move || open_regular_file(&path, false))
+                .await
+                .map_err(join_error_to_io)??;
             Ok(Arc::new(file))
         }
     }
@@ -148,6 +136,25 @@ impl FileIO for TokioFileIO {
     }
 }
 
+fn open_regular_file(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW);
+    if create {
+        options.create(true).truncate(true);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("data path is not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 fn join_error_to_io(error: task::JoinError) -> std::io::Error {
     std::io::Error::other(error)
 }
@@ -182,6 +189,11 @@ mod tests {
     #[tokio::test]
     async fn tokio_fileio_read_beyond_eof_returns_available_then_empty_bytes() {
         Suite::read_beyond_eof_returns_available_then_empty_bytes().await;
+    }
+
+    #[tokio::test]
+    async fn tokio_fileio_open_rejects_symlink() {
+        Suite::open_rejects_symlink().await;
     }
 
     #[tokio::test]

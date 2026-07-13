@@ -219,7 +219,7 @@ impl SyncSidecarMetadataStore {
                 let path = entry.path();
                 MetadataDirectoryEntryKind::Directory {
                     has_sidecar: path.join(META_FILE).exists(),
-                    has_data: path.join("spool.dat").exists(),
+                    has_data: fs::symlink_metadata(path.join("spool.dat")).is_ok(),
                 }
             } else {
                 MetadataDirectoryEntryKind::Other
