@@ -7,7 +7,7 @@
 //! This module starts with hash-routing tests so the stable key-to-shard
 //! contract is pinned before the dispatch implementation is introduced.
 
-use super::MAX_IO_URING_SHARDS;
+use super::{MAX_IO_URING_IO_LEN, MAX_IO_URING_SHARDS};
 use crate::error::BobsError;
 use bytes::Bytes;
 use io_uring::{opcode, squeue, types, IoUring};
@@ -36,6 +36,15 @@ const MAX_SQES_PER_REQUEST: usize = METADATA_COMMIT_PHASE_LEN;
 const METADATA_USER_DATA_SHIFT: u64 = 56;
 const METADATA_USER_DATA_MASK: u64 = (1u64 << METADATA_USER_DATA_SHIFT) - 1;
 
+pub(crate) fn checked_sqe_len(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("io_uring operations are limited to {MAX_IO_URING_IO_LEN} bytes, got {len}"),
+        )
+    })
+}
+
 type OpenSender = oneshot::Sender<Result<Arc<OwnedFd>>>;
 type WriteSender = oneshot::Sender<Result<usize>>;
 type ReadSender = oneshot::Sender<Result<Bytes>>;
@@ -52,12 +61,13 @@ pub(crate) enum Request {
         fd: Arc<OwnedFd>,
         offset: u64,
         data: Bytes,
+        sqe_len: u32,
         tx: WriteSender,
     },
     Read {
         fd: Arc<OwnedFd>,
         offset: u64,
-        len: usize,
+        sqe_len: u32,
         tx: ReadSender,
     },
     SyncData {
@@ -79,6 +89,7 @@ pub(crate) enum Request {
         tmp_name: CString,
         final_name: CString,
         payload: Bytes,
+        payload_len: u32,
         tx: UnitSender,
     },
 }
@@ -355,6 +366,7 @@ impl RingPool {
         final_name: CString,
         payload: Bytes,
     ) -> Result<()> {
+        let payload_len = checked_sqe_len(payload.len())?;
         let ring_index = ring_index_for_key(&key, self.shard_count());
         #[cfg(test)]
         self.record_routing(
@@ -373,6 +385,7 @@ impl RingPool {
                 tmp_name,
                 final_name,
                 payload,
+                payload_len,
                 tx,
             },
         )
@@ -650,13 +663,14 @@ enum InFlightKind {
         fd: Arc<OwnedFd>,
         offset: u64,
         data: Bytes,
+        sqe_len: u32,
         written: usize,
         tx: Option<WriteSender>,
     },
     Read {
         fd: Arc<OwnedFd>,
         offset: u64,
-        len: usize,
+        sqe_len: u32,
         buf: Vec<u8>,
         tx: Option<ReadSender>,
     },
@@ -679,6 +693,7 @@ enum InFlightKind {
         tmp_name: CString,
         final_name: CString,
         payload: Bytes,
+        payload_len: u32,
         phase: MetadataCommitPhase,
         completed: [bool; METADATA_COMMIT_PHASE_LEN],
         failure: Option<Error>,
@@ -904,12 +919,14 @@ impl RingDriver {
                 fd,
                 offset,
                 data,
+                sqe_len,
                 tx,
             } => InFlight {
                 kind: InFlightKind::Write {
                     fd,
                     offset,
                     data,
+                    sqe_len,
                     written: 0,
                     tx: Some(tx),
                 },
@@ -917,17 +934,17 @@ impl RingDriver {
             Request::Read {
                 fd,
                 offset,
-                len,
+                sqe_len,
                 tx,
             } => InFlight {
                 kind: InFlightKind::Read {
                     fd,
                     offset,
-                    len,
-                    // The kernel initializes at most `len` bytes before the CQE is
+                    sqe_len,
+                    // The kernel initializes at most `sqe_len` bytes before the CQE is
                     // published. Length stays zero until that CQE is observed, so Rust
                     // never exposes uninitialized memory and large reads avoid a memset.
-                    buf: allocate_read_buffer(len),
+                    buf: allocate_read_buffer(sqe_len),
                     tx: Some(tx),
                 },
             },
@@ -947,6 +964,7 @@ impl RingDriver {
                 tmp_name,
                 final_name,
                 payload,
+                payload_len,
                 tx,
             } => InFlight {
                 kind: InFlightKind::MetadataCommit {
@@ -956,6 +974,7 @@ impl RingDriver {
                     tmp_name,
                     final_name,
                     payload,
+                    payload_len,
                     phase: MetadataCommitPhase::WriteAndSync,
                     completed: [false; METADATA_COMMIT_PHASE_LEN],
                     failure: None,
@@ -1143,10 +1162,23 @@ impl RingDriver {
                 send_open(tx, Ok(Arc::new(fd)));
             }
             InFlightKind::Write {
-                data, written, tx, ..
+                data,
+                sqe_len,
+                written,
+                tx,
+                ..
             } => {
                 let n = res as usize;
-                if n == 0 && *written < data.len() {
+                let remaining = (*sqe_len as usize).saturating_sub(*written);
+                if n > remaining {
+                    send_write(
+                        tx,
+                        Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "io_uring write completion exceeded submitted buffer length",
+                        )),
+                    );
+                } else if n == 0 && *written < data.len() {
                     send_write(
                         tx,
                         Err(Error::new(
@@ -1171,9 +1203,11 @@ impl RingDriver {
                     }
                 }
             }
-            InFlightKind::Read { len, buf, tx, .. } => {
+            InFlightKind::Read {
+                sqe_len, buf, tx, ..
+            } => {
                 let n = res as usize;
-                if n > *len || n > buf.capacity() {
+                if n > *sqe_len as usize || n > buf.capacity() {
                     send_read(
                         tx,
                         Err(Error::new(
@@ -1182,7 +1216,7 @@ impl RingDriver {
                         )),
                     );
                 } else {
-                    // SAFETY: the read SQE points at this allocation for `len`
+                    // SAFETY: the read SQE points at this allocation for `sqe_len`
                     // bytes, and a successful CQE of `n` means exactly those first `n`
                     // bytes were initialized by the kernel. The allocation remains in
                     // `in_flight` until this CQE is consumed.
@@ -1400,8 +1434,8 @@ impl RingDriver {
     }
 }
 
-fn allocate_read_buffer(len: usize) -> Vec<u8> {
-    Vec::with_capacity(len)
+fn allocate_read_buffer(sqe_len: u32) -> Vec<u8> {
+    Vec::with_capacity(sqe_len as usize)
 }
 
 fn build_entry(id: u64, in_flight: &mut InFlight) -> squeue::Entry {
@@ -1416,24 +1450,32 @@ fn build_entry(id: u64, in_flight: &mut InFlight) -> squeue::Entry {
             fd,
             offset,
             data,
+            sqe_len,
             written,
             ..
-        } => opcode::Write::new(
-            types::Fd(fd.as_raw_fd()),
-            data[*written..].as_ptr(),
-            (data.len() - *written) as u32,
-        )
-        .offset(*offset + *written as u64)
-        .build(),
+        } => {
+            let written_len =
+                u32::try_from(*written).expect("validated io_uring write length exceeded u32::MAX");
+            let remaining = sqe_len
+                .checked_sub(written_len)
+                .expect("io_uring write completion exceeded requested length");
+            opcode::Write::new(
+                types::Fd(fd.as_raw_fd()),
+                data[*written..].as_ptr(),
+                remaining,
+            )
+            .offset(*offset + *written as u64)
+            .build()
+        }
         InFlightKind::Read {
             fd,
             offset,
-            len,
+            sqe_len,
             buf,
             ..
         } => {
-            debug_assert!(buf.capacity() >= *len);
-            opcode::Read::new(types::Fd(fd.as_raw_fd()), buf.as_mut_ptr(), *len as u32)
+            debug_assert!(buf.capacity() >= *sqe_len as usize);
+            opcode::Read::new(types::Fd(fd.as_raw_fd()), buf.as_mut_ptr(), *sqe_len)
                 .offset(*offset)
                 .build()
         }
@@ -1477,6 +1519,7 @@ fn build_metadata_commit_entries(
         tmp_name,
         final_name,
         payload,
+        payload_len,
         phase,
         ..
     } = &in_flight.kind
@@ -1490,7 +1533,7 @@ fn build_metadata_commit_entries(
             opcode::Write::new(
                 types::Fd(tmp_fd.as_raw_fd()),
                 payload.as_ptr(),
-                payload.len() as u32,
+                *payload_len,
             )
             .offset(0)
             .build()
@@ -1537,24 +1580,26 @@ impl InFlight {
                 fd,
                 offset,
                 data,
+                sqe_len,
                 mut tx,
                 ..
             } => Request::Write {
                 fd,
                 offset,
                 data,
+                sqe_len,
                 tx: tx.take().expect("write sender missing"),
             },
             InFlightKind::Read {
                 fd,
                 offset,
-                len,
+                sqe_len,
                 mut tx,
                 ..
             } => Request::Read {
                 fd,
                 offset,
-                len,
+                sqe_len,
                 tx: tx.take().expect("read sender missing"),
             },
             InFlightKind::SyncData { fd, mut tx } => Request::SyncData {
@@ -1576,6 +1621,7 @@ impl InFlight {
                 tmp_name,
                 final_name,
                 payload,
+                payload_len,
                 mut tx,
                 ..
             } => Request::MetadataCommit {
@@ -1585,6 +1631,7 @@ impl InFlight {
                 tmp_name,
                 final_name,
                 payload,
+                payload_len,
                 tx: tx.take().expect("metadata commit sender missing"),
             },
         }
@@ -1937,11 +1984,11 @@ pub(crate) fn ring_index_for_key_bytes(key: &[u8], num_shards: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        global_ring_pool, init_global_ring_pool, ring_index_for_key,
+        checked_sqe_len, global_ring_pool, init_global_ring_pool, ring_index_for_key,
         scoped_test_ring_pool_override, shutdown_global_ring_pool_for_exit, Request, RingPool,
         RingPoolOptions, RingPoolSafetyEvent, MAX_SQES_PER_REQUEST, RING_ENTRIES,
     };
-    use crate::io::MAX_IO_URING_SHARDS;
+    use crate::io::{MAX_IO_URING_IO_LEN, MAX_IO_URING_SHARDS};
     use std::collections::{HashMap, HashSet};
     use std::env;
     use std::fs::OpenOptions;
@@ -1955,6 +2002,21 @@ mod tests {
 
     const PROBE_ENV: &str = "BOBS_RING_POOL_HASH_PROBE";
     const PROBE_PREFIX: &str = "BOBS_RING_POOL_HASH_PROBE_RESULT";
+
+    #[test]
+    fn io_uring_sqe_length_is_checked_at_u32_boundary() {
+        assert_eq!(
+            checked_sqe_len(MAX_IO_URING_IO_LEN).expect("u32::MAX must be accepted"),
+            u32::MAX
+        );
+
+        if let Some(above_max) = MAX_IO_URING_IO_LEN.checked_add(1) {
+            let error =
+                checked_sqe_len(above_max).expect_err("a length above u32::MAX must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(&above_max.to_string()));
+        }
+    }
 
     fn pinned_vectors() -> &'static [(&'static str, usize, usize)] {
         &[
@@ -2537,6 +2599,7 @@ mod tests {
                 fd: Arc::clone(&fd),
                 offset: 0,
                 data: bytes::Bytes::from(vec![0xA5; 1024 * 1024]),
+                sqe_len: checked_sqe_len(1024 * 1024).expect("test write length should fit"),
                 tx,
             },
         )
@@ -2671,11 +2734,11 @@ mod tests {
 
     #[test]
     fn large_read_buffers_skip_initialization_until_kernel_completion() {
-        let requested = 16 * 1024 * 1024;
+        let requested: u32 = 16 * 1024 * 1024;
         let buffer = super::allocate_read_buffer(requested);
         assert_eq!(buffer.len(), 0, "read allocation must not initialize bytes");
         assert!(
-            buffer.capacity() >= requested,
+            buffer.capacity() >= requested as usize,
             "read allocation must reserve the full kernel-visible range"
         );
     }

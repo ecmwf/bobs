@@ -3,14 +3,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::{BobsError, Result};
-use crate::io::MAX_IO_URING_SHARDS;
+use crate::io::{MAX_IO_URING_IO_LEN, MAX_IO_URING_SHARDS};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 const DEFAULT_PAGE_SIZE: usize = 16 * 1024 * 1024;
+const MAX_PAGE_SIZE_POLICY_BYTES: usize = 64 * 1024 * 1024;
 /// Operational ceiling for one page and its per-request staging buffer.
-pub const MAX_PAGE_SIZE_BYTES: usize = 64 * 1024 * 1024;
+///
+/// The 64 MiB policy remains below the exported one-SQE io_uring length bound.
+pub const MAX_PAGE_SIZE_BYTES: usize =
+    if MAX_PAGE_SIZE_POLICY_BYTES <= MAX_IO_URING_IO_LEN {
+        MAX_PAGE_SIZE_POLICY_BYTES
+    } else {
+        MAX_IO_URING_IO_LEN
+    };
 const DEFAULT_MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 fn derived_max_live_spools(page_size: usize, max_cache_bytes: usize) -> usize {
     max_cache_bytes.checked_div(page_size).unwrap_or(0).max(1)
@@ -447,6 +455,8 @@ route_name: test-route
         };
 
         config.validate().expect("maximum page size should pass");
+        assert_eq!(MAX_PAGE_SIZE_BYTES, 64 * 1024 * 1024);
+        assert!(MAX_PAGE_SIZE_BYTES <= MAX_IO_URING_IO_LEN);
     }
 
     #[test]
