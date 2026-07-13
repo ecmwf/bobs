@@ -139,7 +139,7 @@ BOBS reads an optional YAML file passed as a CLI argument. Most fields have Rust
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Page size in bytes; valid range `1..=67108864` (64 MiB), and no larger than `max_spool_bytes`. |
-| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global in-memory cache budget across all spools. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global budget for bounded cache-owned page allocations across all spools. |
 | `max_live_spools` | binary: derived from cache/page capacity (16); chart: `256` | Admission limit; explicit YAML overrides are preserved. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Per-spool write limit; must be at least `page_size`. |
 | `writer_inactivity_timeout_secs` | `300` | Seconds of writer silence before cleanup. |

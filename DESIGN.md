@@ -67,11 +67,11 @@ Write path:
 1. HTTP body bytes are accepted at the required sequential offset.
 2. Bytes are written to `spool.dat` through `FileIO`.
 3. Full pages become reader-visible.
-4. Visible pages are inserted into a global FIFO page cache and waiting readers are notified.
+4. Visible pages admitted to the global FIFO cache are copied once into page-sized cache-owned allocations, then waiting readers are notified. The preceding disk append still uses the transport-backed `Bytes` directly.
 
 HTTP write staging starts empty, ignores untrusted body-size hints for reservation, and only copies cross-frame partial pages. Its per-request staging allocation is therefore lazy and bounded by the 64 MiB page-size maximum.
 
-The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Setting `max_cache_bytes` to `0` disables caching. Pages larger than the cap bypass the cache. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
+The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Each entry owns an allocation bounded by its logical page length, so a small page slice cannot pin a much larger HTTP frame outside the accounting. This cache-only isolation copy is made only after admission; setting `max_cache_bytes` to `0` disables caching without a copy, and pages larger than the cap also bypass the cache. Cache hits clone the isolated `Bytes` without copying page contents. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 
 A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/complete` publishes it as the final page.
 
