@@ -55,11 +55,13 @@ Completed metadata is durable through the sidecar protocol: write `meta.json.tmp
 
 ### Recovery and Shared Filesystems
 
-Startup recovery scans `<data_dir>` for key directories with `meta.json`. In-progress spools are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
+Startup recovery scans `<data_dir>` for key directories with `meta.json`. Recovery admits at most `max_live_spools` entries, including completed spools. Candidates are ordered by most recent persisted activity (`last_read_at`, `readable_at`, `last_write_at`, or `created_at`), newest first, then lexically by key. This makes reduced-capacity restarts predictable.
+
+Only admitted candidates have `spool.dat` inspected or opened. Their in-progress trailing partial page is reconstructed from disk; completed spools validate that the data file still satisfies the committed logical length before serving. Excess candidates are quarantined in place: BOBS does not open or read their data, migrate their metadata, classify them as corrupt, or delete them. A later restart with more capacity can recover them. Startup emits per-key warnings and a summary with configured, recovered, and quarantined counts.
 
 The layout is friendly to shared filesystems and multi-BOBS deployments because each object has its own directory and sidecar, and each spool has a single writer. Independent keys can be created, completed, recovered, and deleted without a global metadata database or cross-key write serialization. Correct routing is still required: create, write, complete, and read traffic for a key must reach a BOBS instance that can see the same `<data_dir>/<key>` files.
 
-Cleanup TTL behaviour is preserved with sidecar metadata. Writer inactivity, read-idle, and full-read-complete cleanup still remove both `spool.dat` and `meta.json` for expired keys; TTL timestamps are committed at lifecycle boundaries and reconstructed conservatively on recovery.
+Cleanup TTL behaviour is preserved with sidecar metadata. Writer inactivity, read-idle, and full-read-complete cleanup still remove both `spool.dat` and `meta.json` for admitted expired keys; TTL timestamps are committed at lifecycle boundaries and reconstructed conservatively on recovery. Quarantined excess entries are not present in the live manager and therefore are not cleanup candidates during that process lifetime.
 
 ### Legacy Metadata Migration
 
