@@ -15,8 +15,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub page_size: usize,
     pub max_cache_bytes: usize,
-    /// Maximum number of spools that may concurrently hold first-read cache memory.
-    /// Writers block on create until a slot frees.
+    /// Maximum number of spools admitted to the live registry and cache lifecycle.
+    /// Writers wait for a slot; startup leaves excess durable spools quarantined.
     pub max_live_spools: usize,
     pub writer_inactivity_timeout_secs: u64,
     /// Idle TTL (seconds) anchored on the time the spool became readable,
