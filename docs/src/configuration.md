@@ -57,6 +57,12 @@ The table distinguishes Rust defaults from chart overrides where they differ. Ot
 | `metrics.allowed_labels` | `[]` | Caller-provided label keys forwarded as metric attributes. Empty list means all caller labels pass through. Set to a non-empty list to restrict label cardinality. |
 | `metrics.max_label_value_length` | `128` | Maximum byte length for label values. Values exceeding this limit are truncated before recording. |
 
+## Helm ingress and shutdown settings
+
+`ingress.forwardedPrefix.enabled` defaults to `false`. Enable it when an ingress rewrites a public per-pod route such as `/download-0/...` to `/api/v1/read/...`. The chart then supplies `X-Forwarded-Prefix: /download-0`, allowing a long-poll `307` to return `/download-0/api/v1/read/<key>`. NGINX Inc uses `nginx.org/location-snippets`; community ingress-nginx renders one Ingress per pod with the native `nginx.ingress.kubernetes.io/x-forwarded-prefix` annotation. Other entries in `ingress.annotations` are preserved.
+
+BOBS stops accepts and gracefully drains all HTTP connections for at most 25 seconds, then aborts leftovers. The chart leaves `terminationGracePeriodSeconds` unset, so standard Kubernetes uses its 30-second default. If a parent chart or platform sets it explicitly, keep it above 25 seconds so forced aborts and final storage/telemetry teardown can run before SIGKILL.
+
 ## Example
 
 ```yaml

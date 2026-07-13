@@ -147,10 +147,10 @@ ingress:
   className: nginx
   annotations: {}
   tls: []
-  # X-Forwarded-Prefix location snippet for the nginx-inc ingress. Off by default
-  # (parity with the deployed/vendored chart). When enabled, the ingress preserves
-  # the external route prefix (/{route_name}-N) for BOBS long-poll redirects and
-  # re-asserts the standard forwarded headers explicitly.
+  # Preserve the exact external /{route_name}-N pod prefix in BOBS long-poll
+  # redirects. Off by default for deployment parity. NGINX Inc uses a location
+  # snippet; community ingress-nginx renders one Ingress per replica with its
+  # native x-forwarded-prefix annotation. Existing user annotations are retained.
   forwardedPrefix:
     enabled: false
 

@@ -3013,6 +3013,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwarded_ingress_long_poll_redirect_stays_on_public_pod_path() {
+        let (app, _state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
+        let key = create_key(&app).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("X-Forwarded-Prefix", "/download-0")
+            .body(Body::empty())
+            .expect("build ingress follow request");
+
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("ingress follow read oneshot");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("/download-0/api/v1/read/{key}").as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn mid_stream_follow_timeout_aborts_chunked_body() {
         let (app, state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
         let key = write_in_progress_page(&app, 0x5a).await;

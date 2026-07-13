@@ -12,13 +12,24 @@ default = []
 # Opt in to the existing Tokio/blocking filesystem path for baseline benchmarking.
 tokio-fileio-fallback = []
 # OpenTelemetry metrics export via Prometheus scrape endpoint.
-telemetry = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-prometheus", "prometheus"]
+telemetry = [
+  "opentelemetry",
+  "opentelemetry_sdk",
+  "opentelemetry-prometheus",
+  "prometheus",
+]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "http2"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1", "http2"] }
+hyper-util = { version = "0.1", features = [
+  "server-auto",
+  "server-graceful",
+  "tokio",
+  "http1",
+  "http2",
+] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 bytes = "1"
@@ -36,7 +47,9 @@ async-stream = "0.3"
 num_cpus = "1"
 siphasher = "1"
 opentelemetry = { version = "0.32", optional = true }
-opentelemetry_sdk = { version = "0.32", features = ["metrics"], optional = true }
+opentelemetry_sdk = { version = "0.32", features = [
+  "metrics",
+], optional = true }
 opentelemetry-prometheus = { version = "0.32", optional = true }
 prometheus = { version = "0.14", optional = true, default-features = false }
 serde_norway = "0.9.42"
@@ -52,6 +65,7 @@ io-uring = "0.7"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tempfile = "3"
 tower = "0.5"
+libc = "0.2"
 
 # Keep symbol/line info in release so the in-process CPU profiler
 # (/debug/pprof/profile) produces a readable flamegraph.

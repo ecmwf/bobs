@@ -20,6 +20,8 @@ Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they al
 
 When a reader requests data that has not been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure, such as Kubernetes Ingress or load balancers, BOBS returns a `307 Temporary Redirect` if no data arrives within `long_poll_timeout_ms`. Clients like `curl -L` will automatically follow the redirect and resume the poll.
 
+When `ingress.forwardedPrefix.enabled` is enabled, the chart sends the exact public pod prefix (for example, `/download-0`) in `X-Forwarded-Prefix`. The redirect then remains on the public route, such as `/download-0/api/v1/read/<key>`, rather than exposing the rewritten internal route. The NGINX Inc controller derives the prefix in its location snippet. Community ingress-nginx uses its native `nginx.ingress.kubernetes.io/x-forwarded-prefix` annotation and therefore renders one Ingress per replica; its path regex accepts both the short download URL and the redirected public API URL. User-supplied annotations remain on the rendered Ingress resources.
+
 ### 3. Follow Mode
 
 A read request without a `Range` header enters follow mode from byte `0`, or from byte `X` with `Range: bytes=X-`. The server keeps the stream open and pushes new pages as they become available until the spool is finalized.
@@ -65,3 +67,9 @@ Coverage tracking uses missing byte ranges rather than per-byte state, so large 
 ### 9. HTTP/2 Support
 
 The server supports both HTTP/1.1 and HTTP/2 (h2c cleartext). Using HTTP/2 is recommended for high-concurrency streaming to benefit from request multiplexing.
+
+### 10. Graceful Shutdown
+
+On SIGTERM or Ctrl+C, BOBS first stops accepting connections and asks Hyper to shut down every accepted connection gracefully. Idle HTTP/1.1 keep-alive sockets close promptly, HTTP/2 connections stop accepting new streams, and active request bodies, response streams, and handlers that own spool mutations can finish.
+
+The HTTP drain has a fixed 25-second deadline. Connections still active at the deadline are aborted before storage and telemetry teardown, so a stalled peer cannot block process exit forever. The chart leaves Kubernetes' termination grace period unset; the standard 30-second default leaves time after the HTTP deadline for forced aborts and final teardown. Keep any deployment-level termination grace period greater than 25 seconds.
