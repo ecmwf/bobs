@@ -16,6 +16,7 @@ BOBS is built around one directory per object key and an asynchronous filesystem
 - **Metadata store**: Sidecar metadata is committed atomically by writing `meta.json.tmp`, syncing that temporary file's data, atomically renaming it over `meta.json`, and syncing the spool directory. Startup recovery ignores leftover temporary files and reads only complete sidecars.
 - **SpoolManager**: A central registry, using `DashMap`, that tracks active spools and reconstructs them from sidecar files during startup.
 - **Page Cache**: A global byte-capped FIFO cache that minimizes disk reads for hot data being consumed immediately after it is written. Entries are keyed by `(spool_key, page_idx)`, and `max_cache_bytes` is the total cache budget across all spools. Admitted pages are copied once into dedicated page-sized allocations so slices cannot retain larger HTTP frames outside that budget; the disk write still uses the original transport-backed bytes. Cache hits share the isolated allocation without another copy. Setting `max_cache_bytes` to `0` disables caching without copying; pages larger than the byte cap are valid but likewise bypass the cache.
+- **Read-response admission**: A manager-wide weighted semaphore bounds page allocations retained by slow or unconsumed response bodies. Its configured-page budget is `max(1, floor(max_cache_bytes / page_size))`. A read acquires admission before cache lookup or disk buffering and keeps it until the HTTP body is dropped. Recovered spools with wider persisted pages consume proportionally more units, capped at the full budget. Long-poll timeout, cancellation, and deletion release queued or held admission without taking cache, lifecycle, or live-spool admission locks. Cache-disabled deployments therefore still allow one bounded page response rather than unbounded disk-read buffers.
 
 ### Linux `io_uring` routing
 
@@ -56,6 +57,8 @@ Completed metadata is durable through the sidecar protocol: write `meta.json.tmp
 ### Recovery and Shared Filesystems
 
 Startup recovery scans `<data_dir>` for key directories with `meta.json`. Recovery admits at most `max_live_spools` entries, including completed spools. Candidates are ordered by most recent persisted activity (`last_read_at`, `readable_at`, `last_write_at`, or `created_at`), newest first, then lexically by key. This makes reduced-capacity restarts predictable.
+
+The top-level directory is scanned once. Recovery reads one sidecar at a time, retains only a compact key/activity index plus a `max_live_spools`-sized preferred heap, and rereads only selected sidecars before admission. Sidecar length is checked from the open file before allocating, with a fixed 1 MiB maximum. Payloads above that limit or containing unknown fields are treated as potentially newer/unsupported metadata: they are left byte-for-byte intact and unavailable, rather than deleted. Malformed known-schema JSON remains isolated corrupt metadata and only its key directory is removed.
 
 Recovery first performs metadata-only validation in that order. Incomplete `Creating` and `Deleting` transactions and corrupt entries are cleaned without consuming admission; unsafe or ambiguous legacy metadata remains intact but unavailable. Recovery keeps examining candidates until it successfully admits `max_live_spools` valid spools or exhausts the ordered set.
 

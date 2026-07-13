@@ -518,7 +518,7 @@ mod tests {
             .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
             Ok(Vec::new())
         }
     }
@@ -596,8 +596,8 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
-            self.inner.list().await
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
+            self.inner.scan().await
         }
     }
 
@@ -640,7 +640,7 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
             Ok(Vec::new())
         }
     }
@@ -700,8 +700,8 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
-            self.inner.list().await
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
+            self.inner.scan().await
         }
     }
 
@@ -1138,12 +1138,16 @@ mod tests {
             data
         );
         let page = spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read final page")
             .expect("final page exists");
         assert_eq!(page.as_ref(), data);
-        assert!(spool.read_page(1).await.expect("read exact EOF").is_none());
+        assert!(spool
+            .read_page_for_test(1)
+            .await
+            .expect("read exact EOF")
+            .is_none());
     }
 
     #[tokio::test]
@@ -1355,13 +1359,13 @@ mod tests {
             .get_spool("test-key")
             .expect("completed spool recovers");
         let recovered_page = recovered_spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read recovered final page")
             .expect("recovered final page exists");
         assert_eq!(recovered_page.as_ref(), b"cache-contention-tail");
         assert!(recovered_spool
-            .read_page(1)
+            .read_page_for_test(1)
             .await
             .expect("read recovered EOF")
             .is_none());
@@ -1423,7 +1427,10 @@ mod tests {
         assert_eq!(meta.final_page_size, Some(1000));
         drop(meta);
 
-        let got = spool.read_page(0).await.expect("read partial final page");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read partial final page");
         assert_eq!(got.as_deref(), Some(partial_data.as_slice()));
     }
 
@@ -1699,16 +1706,16 @@ mod tests {
         drop(meta);
 
         let first = spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read first page")
             .expect("first page present");
         let final_partial = spool
-            .read_page(1)
+            .read_page_for_test(1)
             .await
             .expect("read final page")
             .expect("final page present");
-        let end = spool.read_page(2).await.expect("read end marker");
+        let end = spool.read_page_for_test(2).await.expect("read end marker");
         assert!(end.is_none());
 
         let mut read_back = Vec::new();
@@ -1789,7 +1796,7 @@ mod tests {
             .expect("complete with true size succeeds");
 
         let got = spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read final partial page")
             .expect("page present");
@@ -1892,13 +1899,13 @@ mod tests {
             .get_spool("test-key")
             .expect("published complete spool recovers");
         let recovered_page = recovered_spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read recovered page")
             .expect("recovered page exists");
         assert_eq!(recovered_page.as_ref(), data.as_ref());
         assert!(recovered_spool
-            .read_page(1)
+            .read_page_for_test(1)
             .await
             .expect("read recovered EOF")
             .is_none());

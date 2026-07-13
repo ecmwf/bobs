@@ -45,6 +45,7 @@ Operational requirements:
 - `HOSTNAME` must be set and include a pod ordinal like `bobs-0`
 - `page_size` must be between `1` and `67108864` bytes (64 MiB), and no larger than `max_spool_bytes`
 - `BOBS_INTERNAL_BASE_URL_TEMPLATE` must be set and non-empty
+- `max_cache_bytes` may be `0` to disable caching; one bounded disk-backed read response remains admitted
 
 Example:
 
@@ -139,7 +140,7 @@ BOBS reads an optional YAML file passed as a CLI argument. Most fields have Rust
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Page size in bytes; valid range `1..=67108864` (64 MiB), and no larger than `max_spool_bytes`. |
-| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global budget for bounded cache-owned page allocations across all spools. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global cache budget and source for the read-response bound: `max(1, floor(max_cache_bytes / page_size))` page leases held through response-body lifetime. `0` disables caching but still admits one bounded disk-backed response. |
 | `max_live_spools` | binary: derived from cache/page capacity (16); chart: `256` | Admission limit; explicit YAML overrides are preserved. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Per-spool write limit; must be at least `page_size`. |
 | `writer_inactivity_timeout_secs` | `300` | Seconds of writer silence before cleanup. |
