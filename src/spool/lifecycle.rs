@@ -200,7 +200,6 @@ where
         &self,
         start: u64,
         end: u64,
-        now: u64,
     ) {
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
         if self.metadata.lock().await.state == SpoolState::Deleting {
@@ -210,12 +209,7 @@ where
         let became_fully_read = {
             let mut missing_ranges = self.missing_ranges.lock().await;
             missing_ranges.mark_contiguous_response_complete(start, end);
-            missing_ranges.is_complete()
-                && self.full_object_read_at.load(Ordering::SeqCst) == 0
-                && self
-                    .full_object_read_at
-                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            missing_ranges.is_complete() && self.record_fully_read()
         };
 
         if became_fully_read {
