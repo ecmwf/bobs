@@ -89,10 +89,10 @@ pub trait FileIO: Send + Sync + Clone + 'static {
     /// Associated type for file handles. Must be Send + Sync.
     type Handle: Send + Sync + 'static;
 
-    /// Create a new file at the given path.
+    /// Create a new regular file at the given path without following a final symlink.
     fn create(path: &Path) -> impl Future<Output = std::io::Result<Self::Handle>> + Send;
 
-    /// Open an existing file at the given path.
+    /// Open an existing regular file at the given path without following a final symlink.
     fn open(path: &Path) -> impl Future<Output = std::io::Result<Self::Handle>> + Send;
 
     /// Write owned data at a specific byte offset in the file.
@@ -344,6 +344,30 @@ pub(crate) mod fileio_test_cases {
                 .expect("failed to read beyond eof");
             assert!(buf.is_empty(), "reading beyond EOF should return no bytes");
             I::close(handle).await.expect("failed to close");
+        }
+
+        pub(crate) async fn open_rejects_symlink() {
+            let dir = tempdir().expect("failed to create temp dir");
+            let target_path = dir.path().join("target.bin");
+            let symlink_path = dir.path().join("spool.dat");
+            std::fs::write(&target_path, b"external sentinel").expect("write symlink target");
+            std::os::unix::fs::symlink(&target_path, &symlink_path).expect("create data symlink");
+
+            let error = I::open(&symlink_path)
+                .await
+                .err()
+                .expect("opening a symlink must fail");
+            assert!(
+                matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ELOOP
+                ) || error.kind() == std::io::ErrorKind::InvalidData,
+                "unexpected symlink rejection: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&target_path).expect("read symlink target"),
+                b"external sentinel"
+            );
         }
 
         pub(crate) async fn remove_unlinks_file() {
