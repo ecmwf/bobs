@@ -210,6 +210,15 @@ route_name: download
 
 `chart/` is the source of truth for the BOBS Helm chart. `polytope-chart`
 vendors a packaged copy and verifies it against a pinned commit from this repository.
+
+BOBS needs `config.data_dir` to be a directory, so the chart supports only
+`persistence.volumeMode: Filesystem`; raw `Block` PVCs are rejected and are never
+rendered as `volumeDevices`. The StatefulSet governing Service is controlled by
+`headlessService`: with `enabled: true`, an empty `name` preserves the managed
+`<fullname>-svc` default and a non-empty name overrides it. With `enabled: false`,
+`name` is required and must identify an existing headless Service in the release
+namespace. The governing name is used by the StatefulSet and its default stable pod
+DNS. Ingress still uses the chart's per-replica Services.
 Validate chart changes with:
 
 ```bash

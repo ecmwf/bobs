@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["enabled", "replicaCount", "image", "rustLog", "service", "config", "persistence"],
+  "required": ["enabled", "replicaCount", "image", "rustLog", "service", "config", "persistence", "headlessService"],
   "properties": {
     "replicaCount": { "type": "integer", "minimum": 1 },
     "enabled": { "type": "boolean" },
@@ -140,7 +140,7 @@
             "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"]
           }
         },
-        "volumeMode": { "type": "string", "enum": ["Filesystem", "Block"] },
+        "volumeMode": { "type": "string", "const": "Filesystem" },
         "annotations": { "type": "object", "additionalProperties": { "type": "string" } },
         "retentionPolicy": {
           "type": "object",
@@ -180,8 +180,28 @@
       "required": ["enabled", "name"],
       "properties": {
         "enabled": { "type": "boolean" },
-        "name": { "type": "string", "minLength": 1 }
-      }
+        "name": {
+          "type": "string",
+          "oneOf": [
+            { "const": "" },
+            {
+              "maxLength": 63,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["enabled"],
+            "properties": { "enabled": { "const": false } }
+          },
+          "then": {
+            "properties": { "name": { "not": { "const": "" } } }
+          }
+        }
+      ]
     },
     "nameOverride": { "type": "string" },
     "fullnameOverride": { "type": "string" }

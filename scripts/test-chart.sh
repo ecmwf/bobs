@@ -20,6 +20,34 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local unexpected=$1 file=$2
+  if grep -Fq -- "$unexpected" "$file"; then
+    printf 'Expected rendered chart not to contain: %s\n' "$unexpected" >&2
+    exit 1
+  fi
+}
+
+assert_count() {
+  local expected=$1 needle=$2 file=$3
+  local actual
+  actual=$(grep -Fc -- "$needle" "$file" || true)
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Expected %s occurrences of %s, found %s\n' "$expected" "$needle" "$actual" >&2
+    exit 1
+  fi
+}
+
+assert_template_rejects() {
+  local name=$1 expected=$2
+  shift 2
+  if helm template bobs "$chart" --skip-schema-validation "${common_values[@]}" "$@" >"$tmpdir/$name.yaml" 2>"$tmpdir/$name.log"; then
+    printf 'Expected template validation to reject %s with schema validation bypassed\n' "$name" >&2
+    exit 1
+  fi
+  assert_contains "$expected" "$tmpdir/$name.log"
+}
+
 assert_schema_rejects() {
   local name=$1
   shift
@@ -51,7 +79,8 @@ assert_contains 'enable_pprof: false' "$tmpdir/default.yaml"
 assert_contains 'whenDeleted: Retain' "$tmpdir/default.yaml"
 assert_contains 'whenScaled: Delete' "$tmpdir/default.yaml"
 assert_contains '- ReadWriteOnce' "$tmpdir/default.yaml"
-assert_contains 'volumeMode: "Filesystem"' "$tmpdir/default.yaml"
+assert_contains 'volumeMode: Filesystem' "$tmpdir/default.yaml"
+assert_not_contains 'volumeDevices:' "$tmpdir/default.yaml"
 
 helm template bobs "$chart" "${common_values[@]}" \
   --set global.imageRegistry=registry.example.com/team \
@@ -67,16 +96,74 @@ assert_contains 'sizeLimit: "10Gi"' "$tmpdir/overrides.yaml"
 
 helm template bobs "$chart" "${common_values[@]}" \
   --set persistence.accessModes[0]=ReadWriteMany \
-  --set persistence.volumeMode=Block \
+  --set persistence.volumeMode=Filesystem \
   --set-string 'persistence.annotations.storage\.example\.com/owner=bobs' \
   --set persistence.retentionPolicy.whenDeleted=Delete \
   --set persistence.retentionPolicy.whenScaled=Retain \
   >"$tmpdir/persistence.yaml"
 assert_contains 'storage.example.com/owner: bobs' "$tmpdir/persistence.yaml"
 assert_contains '- ReadWriteMany' "$tmpdir/persistence.yaml"
-assert_contains 'volumeMode: "Block"' "$tmpdir/persistence.yaml"
+assert_contains 'volumeMode: Filesystem' "$tmpdir/persistence.yaml"
+assert_not_contains 'volumeDevices:' "$tmpdir/persistence.yaml"
 assert_contains 'whenDeleted: Delete' "$tmpdir/persistence.yaml"
 assert_contains 'whenScaled: Retain' "$tmpdir/persistence.yaml"
+
+assert_schema_rejects block-volume --set persistence.volumeMode=Block
+assert_template_rejects block-volume-template \
+  'persistence.volumeMode must be Filesystem because BOBS requires a filesystem directory; raw Block volumes are unsupported' \
+  --set persistence.volumeMode=Block
+
+# Default and explicit-enabled renders preserve the existing <fullname>-svc name.
+assert_count 1 'clusterIP: None' "$tmpdir/default.yaml"
+assert_contains "  serviceName: 'bobs-svc'" "$tmpdir/default.yaml"
+assert_contains "value: 'http://bobs-{ordinal}.bobs-svc:3000/api/v1'" "$tmpdir/default.yaml"
+helm template bobs "$chart" "${common_values[@]}" \
+  --set headlessService.enabled=true \
+  --set-string headlessService.name= \
+  >"$tmpdir/headless-enabled.yaml"
+assert_contains '  name: "bobs-svc"' "$tmpdir/headless-enabled.yaml"
+assert_contains "  serviceName: 'bobs-svc'" "$tmpdir/headless-enabled.yaml"
+
+# A custom governing Service name drives the managed Service, StatefulSet, and
+# stable pod DNS. Per-pod Services remain the ingress backends.
+helm template bobs "$chart" "${common_values[@]}" \
+  --set replicaCount=2 \
+  --set headlessService.name=custom-governing \
+  --set ingress.enabled=true \
+  --set global.ingress.controller=nginx-inc \
+  >"$tmpdir/headless-custom.yaml"
+assert_contains '  name: "custom-governing"' "$tmpdir/headless-custom.yaml"
+assert_contains "  serviceName: 'custom-governing'" "$tmpdir/headless-custom.yaml"
+assert_contains "value: 'http://bobs-{ordinal}.custom-governing:3000/api/v1'" "$tmpdir/headless-custom.yaml"
+assert_contains "name: 'bobs-0'" "$tmpdir/headless-custom.yaml"
+assert_contains "name: 'bobs-1'" "$tmpdir/headless-custom.yaml"
+assert_not_contains "name: 'custom-governing-0'" "$tmpdir/headless-custom.yaml"
+
+# Disabling management omits only the headless Service and uses an existing
+# external headless Service for StatefulSet identity and pod DNS.
+helm template bobs "$chart" "${common_values[@]}" \
+  --set replicaCount=2 \
+  --set headlessService.enabled=false \
+  --set headlessService.name=external-governing \
+  --set ingress.enabled=true \
+  --set global.ingress.controller=nginx-community \
+  >"$tmpdir/headless-external.yaml"
+assert_count 0 'clusterIP: None' "$tmpdir/headless-external.yaml"
+assert_not_contains '  name: "external-governing"' "$tmpdir/headless-external.yaml"
+assert_contains "  serviceName: 'external-governing'" "$tmpdir/headless-external.yaml"
+assert_contains "value: 'http://bobs-{ordinal}.external-governing:3000/api/v1'" "$tmpdir/headless-external.yaml"
+assert_contains "name: 'bobs-0'" "$tmpdir/headless-external.yaml"
+assert_contains "name: 'bobs-1'" "$tmpdir/headless-external.yaml"
+
+assert_schema_rejects external-service-missing \
+  --set headlessService.enabled=false --set-string headlessService.name=
+assert_template_rejects external-service-missing-template \
+  'headlessService.name must be a non-empty external governing Service name when headlessService.enabled=false' \
+  --set headlessService.enabled=false --set-string headlessService.name=
+assert_schema_rejects governing-service-invalid --set-string headlessService.name=Bad_Name
+assert_template_rejects governing-service-invalid-template \
+  "headlessService.name must be a valid DNS-1123 Service name" \
+  --set-string headlessService.name=Bad_Name
 
 # Validate the exact final runtime bounds represented by the chart contract.
 helm template bobs "$chart" "${common_values[@]}" \

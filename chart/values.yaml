@@ -80,11 +80,11 @@ probes:
   enabled: false
 
 # Internal base URL template bobs uses to build per-ordinal pod URLs. Leave empty
-# to use the default derived from the release fullname and service port:
-#   http://<fullname>-{ordinal}:<service.port>/api/v1
-# Set to override (tpl-rendered; `{ordinal}` is substituted by bobs at runtime),
-# e.g. to route via the headless service:
-#   internalBaseUrlTemplate: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ .Values.headlessService.name }}:{{ .Values.service.port }}/api/v1'
+# to use StatefulSet pod DNS through the governing Service:
+#   http://<fullname>-{ordinal}.<headless-service-name>:<service.port>/api/v1
+# Set to override (tpl-rendered; `{ordinal}` is substituted by bobs at runtime).
+# The `bobs.headlessServiceName` helper resolves either the managed Service name
+# or the required external governing Service name.
 internalBaseUrlTemplate: ""
 
 # tracing-subscriber filter used by the BOBS process.
@@ -154,6 +154,9 @@ config:
       interval: 30s
       labels: {}
 
+# BOBS requires data_dir to be a mounted filesystem directory. Raw Block PVCs
+# are unsupported; persistence.volumeMode is fixed to Filesystem.
+
 persistence:
   enabled: true
   size: 10Gi
@@ -181,6 +184,10 @@ ingress:
   forwardedPrefix:
     enabled: false
 
+# StatefulSet governing Service and stable pod DNS. When enabled, the chart creates
+# a headless Service. An empty name preserves the <fullname>-svc default; set a
+# valid Service name to override it. When disabled, name is required and must name
+# an existing external headless Service in this release namespace.
 headlessService:
   enabled: true
-  name: bobs-svc
+  name: ""

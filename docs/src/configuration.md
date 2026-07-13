@@ -59,6 +59,12 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 
 Recovery metadata has a fixed safety policy rather than a configuration field: `meta.json` is limited to 1 MiB and its size is checked before read allocation. Oversized or unknown-field payloads are preserved unchanged but unavailable, allowing operator inspection or a newer compatible binary to recover them.
 
+## Helm storage and StatefulSet DNS
+
+The chart mounts `config.data_dir` as a filesystem directory. `persistence.volumeMode` is therefore fixed to `Filesystem`; raw `Block` PVCs are rejected and the chart does not render `volumeDevices`.
+
+`headlessService` controls the StatefulSet governing Service. With `enabled: true`, an empty `name` keeps the managed `<fullname>-svc` default and a valid non-empty name overrides it. With `enabled: false`, the chart omits that Service and `name` must identify an existing headless Service in the release namespace. The resolved name drives `StatefulSet.spec.serviceName` and the chart's default pod URL, `http://<fullname>-{ordinal}.<governing-service>:<port>/api/v1`. Per-replica Services remain managed separately for ingress routing.
+
 ## Helm ingress and shutdown settings
 
 `ingress.forwardedPrefix.enabled` defaults to `false`. Enable it when an ingress rewrites a public per-pod route such as `/download-0/...` to `/api/v1/read/...`. The chart then supplies `X-Forwarded-Prefix: /download-0`, allowing a long-poll `307` to return `/download-0/api/v1/read/<key>`. NGINX Inc uses `nginx.org/location-snippets`; community ingress-nginx renders one Ingress per pod with the native `nginx.ingress.kubernetes.io/x-forwarded-prefix` annotation. This per-replica Ingress topology is an architectural change: when forwarded prefixes are enabled, each replica needs its own exact prefix annotation because community ingress-nginx cannot derive a dynamic prefix per regex match. Other entries in `ingress.annotations` are preserved on every rendered Ingress.

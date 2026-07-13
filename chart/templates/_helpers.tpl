@@ -30,6 +30,60 @@ the subchart's own `global.ingress.controller` default.
 {{- end -}}
 {{- end -}}
 
+{{/*
+Resolve the StatefulSet governing Service. An empty name keeps the historical
+<fullname>-svc default when this chart manages the Service. Disabled management
+requires an explicit existing headless Service in the release namespace.
+*/}}
+{{- define "bobs.headlessServiceName" -}}
+{{- $rawName := .Values.headlessService.name | default "" -}}
+{{- $name := $rawName | trim -}}
+{{- if ne $rawName $name -}}
+{{- fail "headlessService.name must be a valid DNS-1123 Service name (lowercase alphanumeric or '-', at most 63 characters)" -}}
+{{- end -}}
+{{- if $name -}}
+{{- if or (gt (len $name) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name)) -}}
+{{- fail "headlessService.name must be a valid DNS-1123 Service name (lowercase alphanumeric or '-', at most 63 characters)" -}}
+{{- end -}}
+{{- $name -}}
+{{- else if .Values.headlessService.enabled -}}
+{{- printf "%s-svc" (include "bobs.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- fail "headlessService.name must be a non-empty external governing Service name when headlessService.enabled=false" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* BOBS mounts data_dir as a directory and cannot consume a raw block device. */}}
+{{- define "bobs.validatePersistence" -}}
+{{- if ne (.Values.persistence.volumeMode | default "") "Filesystem" -}}
+{{- fail "persistence.volumeMode must be Filesystem because BOBS requires a filesystem directory; raw Block volumes are unsupported" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Validate chart-wide invariants while resolving the StatefulSet serviceName. */}}
+{{- define "bobs.governingServiceName" -}}
+{{- include "bobs.validatePersistence" . -}}
+{{- include "bobs.headlessServiceName" . -}}
+{{- end -}}
+
+{{/* Keep the fsGroup fallback outside YAML so an empty context still mounts writable PVCs. */}}
+{{- define "bobs.podSecurityContext" -}}
+{{- if .Values.podSecurityContext -}}
+{{- toYaml .Values.podSecurityContext -}}
+{{- else -}}
+{{- toYaml (dict "fsGroup" 10001) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Render the optional PVC storageClassName without duplicating YAML keys. */}}
+{{- define "bobs.storageClassName" -}}
+{{- if and .Values.persistence.storageClass (ne .Values.persistence.storageClass "-") -}}
+storageClassName: {{ .Values.persistence.storageClass | quote }}
+{{- else if eq .Values.persistence.storageClass "-" -}}
+storageClassName: ""
+{{- end -}}
+{{- end -}}
+
 {{- define "bobs.labels" -}}
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/name: {{ include "bobs.name" . }}

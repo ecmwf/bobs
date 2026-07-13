@@ -68,7 +68,7 @@ If an `/api/v1/write/{key}/{offset}` or `/api/v1/complete/{key}` request reaches
 Each BOBS pod requires `HOSTNAME` ending in a numeric ordinal and a non-empty `BOBS_INTERNAL_BASE_URL_TEMPLATE`:
 
 ```
-BOBS_INTERNAL_BASE_URL_TEMPLATE=http://release-bobs-{ordinal}:3000/api/v1
+BOBS_INTERNAL_BASE_URL_TEMPLATE=http://release-bobs-{ordinal}.release-bobs-svc:3000/api/v1
 ```
 
 The literal placeholder `{ordinal}` (single braces) is **not** expanded by Helm — it is replaced at runtime by the BOBS process itself.
@@ -76,10 +76,12 @@ The literal placeholder `{ordinal}` (single braces) is **not** expanded by Helm 
 On startup BOBS reads this variable, substitutes its own ordinal to derive `internal_base_url`, and fails fast with a clear error if the variable is absent or empty. It logs the resolved value:
 
 ```
-INFO internal_base_url = http://release-bobs-2:3000/api/v1
+INFO internal_base_url = http://release-bobs-2.release-bobs-svc:3000/api/v1
 ```
 
 The chart injects the variable automatically into the StatefulSet. No per-replica manual configuration is required.
+
+By default, the chart addresses each pod through its StatefulSet DNS name and managed `<fullname>-svc` headless Service. `headlessService.name` overrides that governing Service name. If `headlessService.enabled` is `false`, the name is required and must refer to an existing external headless Service. This does not change the per-replica Services used as ingress backends.
 
 ---
 
