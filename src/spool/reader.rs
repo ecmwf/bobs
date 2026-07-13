@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
-use crate::spool::{Spool, SpoolState};
+use crate::spool::{ReadResponsePermit, Spool, SpoolState};
 
 impl<F, M> Spool<F, M>
 where
@@ -27,9 +28,20 @@ where
     /// no such page exists. Only returns full pages (or the final partial page
     /// after complete) — never the in-progress write buffer.
     ///
-    /// Resolution order: page cache → disk → long-poll (wait for writer).
-    pub async fn read_page(&self, page_idx: u64) -> Result<Option<Bytes>> {
+    /// The caller must retain `response_permit` for at least as long as any
+    /// response that owns the returned page. Resolution order is page cache →
+    /// disk → long-poll (wait for writer).
+    pub async fn read_page(
+        &self,
+        page_idx: u64,
+        _response_permit: &ReadResponsePermit,
+    ) -> Result<Option<Bytes>> {
         loop {
+            if self.metadata.lock().await.state == SpoolState::Deleting {
+                return Err(BobsError::SpoolNotFound {
+                    key: self.key.clone(),
+                });
+            }
             // 1. Check in-memory page cache (recently written pages).
             {
                 let cache = self.page_cache.lock().await;
@@ -39,43 +51,42 @@ where
                 }
             }
 
-            // 2. Page was flushed to disk but evicted from cache.
-            {
+            // 2. Snapshot page availability under metadata, then release the lock
+            // before doing potentially slow disk I/O.
+            let disk_read = {
                 let meta = self.metadata.lock().await;
                 if page_idx < meta.total_pages {
                     let is_final_partial =
-                        matches!(meta.state, SpoolState::Complete | SpoolState::Deleting)
-                            && page_idx + 1 == meta.total_pages;
+                        meta.state == SpoolState::Complete && page_idx + 1 == meta.total_pages;
                     let page_len = if is_final_partial {
                         meta.final_page_size.unwrap_or(self.page_size as u64) as usize
                     } else {
                         self.page_size
                     };
-                    let file_offset = page_idx * self.page_size as u64;
-                    let handle_guard = self.file_handle.lock().await;
-                    let Some(handle) = handle_guard.as_ref() else {
-                        return Err(BobsError::WriterInactive);
-                    };
-
-                    let disk_buf = read_exact_at::<F>(
-                        handle,
-                        file_offset,
-                        page_len,
-                        "reading spool page from disk",
-                    )
-                    .await
-                    .map_err(BobsError::IoError)?;
-                    self.metrics.record_cache_miss();
-                    return Ok(Some(disk_buf));
+                    Some((page_idx * self.page_size as u64, page_len))
+                } else {
+                    None
                 }
+            };
+
+            if let Some((file_offset, page_len)) = disk_read {
+                let handle = Arc::clone(&self.file_handle);
+                let disk_buf = read_exact_at::<F>(
+                    &handle,
+                    file_offset,
+                    page_len,
+                    "reading spool page from disk",
+                )
+                .await
+                .map_err(BobsError::IoError)?;
+                self.metrics.record_cache_miss();
+                return Ok(Some(disk_buf));
             }
 
             // 3. No more pages to read and writer is done.
             {
                 let meta = self.metadata.lock().await;
-                if matches!(meta.state, SpoolState::Complete | SpoolState::Deleting)
-                    && page_idx >= meta.total_pages
-                {
+                if meta.state == SpoolState::Complete && page_idx >= meta.total_pages {
                     return Ok(None);
                 }
             }
@@ -91,6 +102,14 @@ where
                 }
             }
         }
+    }
+
+    /// Test-only low-level convenience. Production response paths must retain the
+    /// permit across the complete body lifetime rather than only this call.
+    #[cfg(test)]
+    pub(crate) async fn read_page_for_test(&self, page_idx: u64) -> Result<Option<Bytes>> {
+        let permit = self.acquire_read_response_permit().await?;
+        self.read_page(page_idx, &permit).await
     }
 }
 
@@ -148,6 +167,63 @@ mod tests {
             Ok(())
         }
 
+        async fn sync_directory(_path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn close(_handle: Self::Handle) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn remove(_path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingReadFileIO;
+
+    struct BlockingReadHandle {
+        data: Bytes,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl FileIO for BlockingReadFileIO {
+        type Handle = BlockingReadHandle;
+
+        async fn create(_path: &Path) -> std::io::Result<Self::Handle> {
+            unreachable!("blocking-read tests construct handles directly")
+        }
+
+        async fn open(_path: &Path) -> std::io::Result<Self::Handle> {
+            unreachable!("blocking-read tests construct handles directly")
+        }
+
+        async fn write_at(
+            _handle: &Self::Handle,
+            _offset: u64,
+            _data: Bytes,
+        ) -> std::io::Result<usize> {
+            unreachable!("blocking-read tests do not write")
+        }
+
+        async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> std::io::Result<Bytes> {
+            handle.entered.notify_one();
+            handle.release.notified().await;
+            let start = offset as usize;
+            let end = handle.data.len().min(start + len);
+            Ok(handle.data.slice(start..end))
+        }
+
+        async fn sync_data(_handle: &Self::Handle) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn sync_directory(_path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+
         async fn close(_handle: Self::Handle) -> std::io::Result<()> {
             Ok(())
         }
@@ -179,6 +255,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: page_size as u64,
             total_pages: 1,
             final_page_size: None,
@@ -194,10 +271,9 @@ mod tests {
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
         )
-        .await
     }
 
-    async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
+    async fn make_spool(dir: &std::path::Path, page_size: usize) -> Arc<Spool<TokioFileIO>> {
         make_spool_with_cache_bytes(dir, page_size, page_size * 256).await
     }
 
@@ -205,7 +281,7 @@ mod tests {
         dir: &std::path::Path,
         page_size: usize,
         cache_bytes: usize,
-    ) -> Spool<TokioFileIO> {
+    ) -> Arc<Spool<TokioFileIO>> {
         let spool_dir = dir.join("test-key");
         tokio::fs::create_dir_all(&spool_dir)
             .await
@@ -225,6 +301,7 @@ mod tests {
             last_write_at: 0,
             last_read_at: None,
             readable_at: None,
+            page_size: page_size as u64,
             total_bytes_written: 0,
             total_pages: 0,
             final_page_size: None,
@@ -237,7 +314,7 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Spool::new(
+        Arc::new(Spool::new(
             meta,
             handle,
             page_size,
@@ -246,8 +323,7 @@ mod tests {
             ))),
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
-        )
-        .await
+        ))
     }
 
     #[tokio::test]
@@ -256,23 +332,33 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = Bytes::from(vec![0xABu8; 4096]);
-        let cached_ptr = data.as_ptr();
-        {
+        let source_ptr = data.as_ptr();
+        let cached_ptr = {
             let mut cache = spool.page_cache.lock().await;
             cache.insert(&spool.key, 0, data.clone());
-        }
+            let cached = cache.get(&spool.key, 0).expect("page should be cached");
+            assert_ne!(
+                cached.as_ptr(),
+                source_ptr,
+                "cache admission must isolate the page from its source allocation"
+            );
+            cached.as_ptr()
+        };
         {
             let mut meta = spool.metadata.lock().await;
             meta.total_pages = 1;
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         let got = got.expect("cached page should exist");
         assert_eq!(got, data);
         assert_eq!(
             got.as_ptr(),
             cached_ptr,
-            "cached full pages must be returned as shared Bytes, not copied"
+            "cache hits must share the isolated page allocation, not copy it"
         );
     }
 
@@ -302,7 +388,10 @@ mod tests {
             assert!(cache.contains(&spool.key, 1));
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(page0), "evicted page must be read from disk");
     }
 
@@ -312,25 +401,77 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = vec![0x7Au8; 4096];
-        {
-            let handle_guard = spool.file_handle.lock().await;
-            let handle = handle_guard
-                .as_ref()
-                .expect("file handle should be active for disk read test");
-            TokioFileIO::write_at(handle, 0, Bytes::copy_from_slice(&data))
-                .await
-                .expect("failed to write test data to disk");
-            TokioFileIO::sync_data(handle)
-                .await
-                .expect("failed to sync test data");
-        }
+        TokioFileIO::write_at(&spool.file_handle, 0, Bytes::copy_from_slice(&data))
+            .await
+            .expect("failed to write test data to disk");
+        TokioFileIO::sync_data(&spool.file_handle)
+            .await
+            .expect("failed to sync test data");
         {
             let mut meta = spool.metadata.lock().await;
             meta.total_pages = 1;
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(data)));
+    }
+
+    #[tokio::test]
+    async fn test_disk_read_releases_metadata_lock_while_io_is_pending() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let data = Bytes::from(vec![0x7A; 4096]);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let metadata = SpoolMetadata {
+            key: "blocking-read-key".to_string(),
+            content_type: None,
+            content_encoding: None,
+            state: SpoolState::Writing,
+            write_locked: false,
+            created_at: 0,
+            last_write_at: 0,
+            last_read_at: None,
+            readable_at: None,
+            page_size: 4096,
+            total_bytes_written: data.len() as u64,
+            total_pages: 1,
+            final_page_size: None,
+            data_path: dir.path().join("spool.dat"),
+            labels: HashMap::new(),
+        };
+        let spool = Arc::new(Spool::<BlockingReadFileIO>::new(
+            metadata,
+            BlockingReadHandle {
+                data: data.clone(),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            4096,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(0))),
+            SyncSidecarMetadataStore::new(dir.path()),
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ));
+        let reader_spool = Arc::clone(&spool);
+        let read_task = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
+
+        entered.notified().await;
+        let metadata_guard =
+            tokio::time::timeout(std::time::Duration::from_millis(50), spool.metadata.lock())
+                .await
+                .expect("disk I/O must not hold the metadata lock");
+        drop(metadata_guard);
+
+        release.notify_one();
+        assert_eq!(
+            read_task
+                .await
+                .expect("read task join")
+                .expect("read succeeds"),
+            Some(data)
+        );
     }
 
     #[tokio::test]
@@ -340,7 +481,10 @@ mod tests {
         let data = Bytes::from((0..page_size).map(|n| (n % 251) as u8).collect::<Vec<_>>());
         let spool = make_short_read_spool(dir.path(), data.clone(), 997, page_size).await;
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(data));
     }
 
@@ -356,7 +500,10 @@ mod tests {
         )
         .await;
 
-        let err = spool.read_page(0).await.expect_err("read should fail");
+        let err = spool
+            .read_page_for_test(0)
+            .await
+            .expect_err("read should fail");
         let BobsError::IoError(err) = err else {
             panic!("expected IoError, got {err:?}");
         };
@@ -369,18 +516,12 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = vec![0x42u8; 4096];
-        {
-            let handle_guard = spool.file_handle.lock().await;
-            let handle = handle_guard
-                .as_ref()
-                .expect("file handle should be active for disk read test");
-            TokioFileIO::write_at(handle, 0, Bytes::copy_from_slice(&data))
-                .await
-                .expect("failed to write recovered full page to disk");
-            TokioFileIO::sync_data(handle)
-                .await
-                .expect("failed to sync test data");
-        }
+        TokioFileIO::write_at(&spool.file_handle, 0, Bytes::copy_from_slice(&data))
+            .await
+            .expect("failed to write recovered full page to disk");
+        TokioFileIO::sync_data(&spool.file_handle)
+            .await
+            .expect("failed to sync test data");
         {
             let mut meta = spool.metadata.lock().await;
             meta.total_bytes_written = data.len() as u64;
@@ -389,7 +530,10 @@ mod tests {
             meta.state = SpoolState::Writing;
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(data)));
     }
 
@@ -399,18 +543,12 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let partial = vec![0x55u8; 1000];
-        {
-            let handle_guard = spool.file_handle.lock().await;
-            let handle = handle_guard
-                .as_ref()
-                .expect("file handle should be active for disk read test");
-            TokioFileIO::write_at(handle, 0, Bytes::copy_from_slice(&partial))
-                .await
-                .expect("failed to write recovered partial to disk");
-            TokioFileIO::sync_data(handle)
-                .await
-                .expect("failed to sync test data");
-        }
+        TokioFileIO::write_at(&spool.file_handle, 0, Bytes::copy_from_slice(&partial))
+            .await
+            .expect("failed to write recovered partial to disk");
+        TokioFileIO::sync_data(&spool.file_handle)
+            .await
+            .expect("failed to sync test data");
         {
             let mut meta = spool.metadata.lock().await;
             meta.total_bytes_written = partial.len() as u64;
@@ -419,8 +557,11 @@ mod tests {
             meta.state = SpoolState::Writing;
         }
 
-        let result =
-            tokio::time::timeout(tokio::time::Duration::from_millis(50), spool.read_page(0)).await;
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(50),
+            spool.read_page_for_test(0),
+        )
+        .await;
         assert!(
             result.is_err(),
             "recovered trailing partial must long-poll before complete"
@@ -433,18 +574,12 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let partial = vec![0x66u8; 1000];
-        {
-            let handle_guard = spool.file_handle.lock().await;
-            let handle = handle_guard
-                .as_ref()
-                .expect("file handle should be active for disk read test");
-            TokioFileIO::write_at(handle, 0, Bytes::copy_from_slice(&partial))
-                .await
-                .expect("failed to write recovered partial to disk");
-            TokioFileIO::sync_data(handle)
-                .await
-                .expect("failed to sync test data");
-        }
+        TokioFileIO::write_at(&spool.file_handle, 0, Bytes::copy_from_slice(&partial))
+            .await
+            .expect("failed to write recovered partial to disk");
+        TokioFileIO::sync_data(&spool.file_handle)
+            .await
+            .expect("failed to sync test data");
         {
             let mut meta = spool.metadata.lock().await;
             meta.total_bytes_written = partial.len() as u64;
@@ -453,7 +588,10 @@ mod tests {
             meta.state = SpoolState::Complete;
         }
 
-        let got = spool.read_page(0).await.expect("read should succeed");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read should succeed");
         assert_eq!(got, Some(Bytes::from(partial)));
     }
 
@@ -463,7 +601,7 @@ mod tests {
         let spool = Arc::new(make_spool(dir.path(), 4096).await);
         let reader_spool = Arc::clone(&spool);
 
-        let reader = tokio::spawn(async move { reader_spool.read_page(0).await });
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
@@ -492,7 +630,7 @@ mod tests {
         let spool = Arc::new(make_spool(dir.path(), 4096).await);
         let reader_spool = Arc::clone(&spool);
 
-        let reader = tokio::spawn(async move { reader_spool.read_page(0).await });
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         spool.cancel.cancel();
@@ -525,7 +663,7 @@ mod tests {
             meta.total_bytes_written = 1000;
         }
 
-        let reader = tokio::spawn(async move { reader_spool.read_page(0).await });
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         assert!(!reader.is_finished());

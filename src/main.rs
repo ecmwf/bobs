@@ -9,13 +9,10 @@ use bobs::io::DefaultFileIO;
 use bobs::manager::SpoolManager;
 use bobs::metadata::DefaultMetadataStore;
 use bobs::metrics::BobsMetrics;
+use bobs::server::{serve_http, SHUTDOWN_DRAIN_TIMEOUT};
 use bobs::shutdown;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::task::JoinSet;
-use tower::ServiceExt;
 
 #[cfg(feature = "telemetry")]
 use bobs::metrics::{init_meter_provider, serve_metrics};
@@ -96,15 +93,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     {
-        let ring_pool = bobs::io::initialize_production_ring_pool(
-            config.io_uring_shards,
-            config.io_uring_queue_capacity,
-        )?;
+        let queue_capacity = config.resolved_io_uring_queue_capacity()?;
+        let ring_pool =
+            bobs::io::initialize_production_ring_pool(config.io_uring_shards, queue_capacity)?;
         tracing::debug!(
             configured_shards = ?ring_pool.configured_shards,
             resolved_shards = ring_pool.resolved_shards,
             cpu_pinning_enabled = ring_pool.cpu_pinning_enabled,
-            queue_capacity = config.io_uring_queue_capacity,
+            queue_capacity,
             "io_uring production ring pool initialized",
         );
     }
@@ -158,56 +154,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("event.name" = "startup.server.listening", outcome = "success", addr = %addr, host = %config.host, port = config.port, "server listening");
 
-    // 16 MiB h2 windows — one body fits in a single window with no flow-control pauses.
-    const H2_WINDOW: u32 = 16 * 1024 * 1024;
-    // Largest HTTP/2 frame we let peers send us (spec ceiling 2^24-1). The default is
-    // 16 KiB, which shreds a 16 MiB write body into ~1024 DATA frames; at the ceiling a
-    // 16 MiB body is ~1-2 frames. After CRC removal the per-frame h2 codec/flow-control
-    // work was ~37% of BOBS CPU on the worker->BOBS write path — this collapses it.
-    const H2_MAX_FRAME: u32 = 16 * 1024 * 1024 - 1;
-
-    let mut shutdown = std::pin::pin!(shutdown::shutdown_signal());
-    let mut tasks: JoinSet<()> = JoinSet::new();
-
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (stream, _) = result?;
-                let io = TokioIo::new(stream);
-                let app = app.clone();
-                tasks.spawn(async move {
-                    let mut builder = Builder::new(TokioExecutor::new());
-                    builder
-                        .http2()
-                        .initial_stream_window_size(H2_WINDOW)
-                        .initial_connection_window_size(H2_WINDOW)
-                        .max_frame_size(H2_MAX_FRAME);
-                    let svc = hyper::service::service_fn(move |req| {
-                        let app = app.clone();
-                        async move { app.oneshot(req).await }
-                    });
-                    if let Err(err) = builder.serve_connection_with_upgrades(io, svc).await {
-                        tracing::warn!(error = %err, "connection error");
-                    }
-                });
-            }
-            _ = &mut shutdown => {
-                tracing::info!("event.name" = "startup.shutdown.received", outcome = "success", "shutdown signal received");
-                break;
-            }
-            // Reap finished connection tasks to avoid unbounded JoinSet growth.
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
-        }
+    let drain = serve_http(
+        listener,
+        app,
+        async {
+            shutdown::shutdown_signal().await;
+            tracing::info!(
+                "event.name" = "startup.shutdown.received",
+                outcome = "success",
+                drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                "shutdown signal received; stopping accepts and draining connections"
+            );
+        },
+        SHUTDOWN_DRAIN_TIMEOUT,
+    )
+    .await?;
+    if drain.timed_out {
+        tracing::warn!(
+            "event.name" = "startup.shutdown.drain_timeout",
+            outcome = "timeout",
+            drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+            aborted_connections = drain.aborted_connections,
+            "HTTP drain deadline reached; aborted remaining connections"
+        );
     }
-
-    // Drain in-flight connections before exiting.
-    while tasks.join_next().await.is_some() {}
 
     // Drop HTTP entrypoints and background manager users before tearing down
     // the global io_uring pool; otherwise lingering Arc<SpoolManager> handles
     // can keep pool clones alive and prevent driver shutdown from joining.
-    drop(listener);
-    drop(app);
     cleanup_task.abort();
     match cleanup_task.await {
         Ok(()) => tracing::debug!("cleanup task exited before shutdown"),

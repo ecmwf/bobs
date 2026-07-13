@@ -126,6 +126,17 @@ impl FileIO for TokioFileIO {
         }
     }
 
+    fn sync_directory(
+        path: &Path,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        let path = path.to_path_buf();
+        async move {
+            task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+                .await
+                .map_err(join_error_to_io)?
+        }
+    }
+
     async fn close(handle: Self::Handle) -> std::io::Result<()> {
         drop(handle);
         Ok(())
@@ -176,6 +187,11 @@ mod tests {
     #[tokio::test]
     async fn tokio_fileio_remove_unlinks_file() {
         Suite::remove_unlinks_file().await;
+    }
+
+    #[tokio::test]
+    async fn tokio_fileio_sync_directory_succeeds() {
+        Suite::sync_directory_succeeds().await;
     }
 
     #[tokio::test]

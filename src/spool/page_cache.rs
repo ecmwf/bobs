@@ -21,6 +21,11 @@ impl CacheKey {
 }
 
 /// Shared bounded FIFO page cache for all spools.
+///
+/// Every admitted page is copied into a dedicated allocation whose size is its
+/// logical byte length. This prevents a small `Bytes` slice from retaining an
+/// arbitrarily large transport frame outside `max_bytes` accounting. Cache hits
+/// remain zero-copy because cloning the stored `Bytes` shares that isolated page.
 /// NOT thread-safe — caller must wrap in Mutex.
 /// Uses FIFO eviction (correct for sequential spool access patterns).
 pub struct PageCache {
@@ -41,11 +46,12 @@ impl PageCache {
     }
 
     /// Insert a page for a spool. If needed, evicts the oldest entries (FIFO)
-    /// until the total cached bytes are within `max_bytes`.
+    /// before allocating the cache-owned copy, keeping retained page allocations
+    /// within `max_bytes`.
     ///
     /// A max size of zero disables caching. Pages larger than `max_bytes` are
     /// never cached; if such a page updates an existing key, the old cached
-    /// value is removed.
+    /// value is removed. These bypass paths return before copying `data`.
     pub fn insert(&mut self, spool_key: &str, page_idx: u64, data: Bytes) {
         let key = CacheKey::new(spool_key, page_idx);
 
@@ -58,14 +64,19 @@ impl PageCache {
             return;
         }
 
-        self.current_bytes += data.len();
-        self.entries.insert(key.clone(), data);
-        self.eviction_order.push_back(key);
+        self.evict_to_fit(data.len());
 
-        self.evict_to_limit();
+        // Cache ownership deliberately starts here, after admission and eviction.
+        // The disk write path can keep using the original transport-backed Bytes;
+        // only the cache pays this one copy.
+        let owned = Bytes::copy_from_slice(&data);
+        self.current_bytes += owned.len();
+        self.entries.insert(key.clone(), owned);
+        self.eviction_order.push_back(key);
     }
 
-    /// Get a page by spool key and page index. Returns None if not cached.
+    /// Get a page by spool key and page index. The returned `Bytes` clone shares
+    /// the cache-owned, page-sized allocation and does not copy page contents.
     pub fn get(&self, spool_key: &str, page_idx: u64) -> Option<Bytes> {
         self.entries
             .get(&CacheKey::new(spool_key, page_idx))
@@ -90,10 +101,6 @@ impl PageCache {
             .retain(|key| key.spool_key.as_str() != spool_key);
     }
 
-    pub fn remove_spool(&mut self, spool_key: &str) {
-        self.free_spool(spool_key);
-    }
-
     pub fn current_bytes(&self) -> usize {
         self.current_bytes
     }
@@ -115,9 +122,16 @@ impl PageCache {
         self.entries.is_empty()
     }
 
-    fn evict_to_limit(&mut self) {
-        while self.current_bytes > self.max_bytes {
+    fn evict_to_fit(&mut self, incoming_bytes: usize) {
+        debug_assert!(incoming_bytes <= self.max_bytes);
+        let target_bytes = self.max_bytes - incoming_bytes;
+        while self.current_bytes > target_bytes {
             let Some(oldest) = self.eviction_order.pop_front() else {
+                debug_assert!(
+                    self.entries.is_empty(),
+                    "cache eviction order is incomplete"
+                );
+                self.entries.clear();
                 self.current_bytes = 0;
                 break;
             };
@@ -141,6 +155,34 @@ impl PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const TRACKED_FRAME_BYTES: usize = 256 * 1024;
+    const TRACKED_PAGE_BYTES: usize = 4 * 1024;
+
+    struct DropTrackedFrame {
+        data: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for DropTrackedFrame {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl Drop for DropTrackedFrame {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn tracked_frame(drops: Arc<AtomicUsize>, page_offset: usize, marker: u8) -> Bytes {
+        let mut data = vec![0; TRACKED_FRAME_BYTES];
+        data[page_offset..page_offset + TRACKED_PAGE_BYTES].fill(marker);
+        Bytes::from_owner(DropTrackedFrame { data, drops })
+    }
 
     fn insert_and_assert_bound(cache: &mut PageCache, spool_key: &str, page_idx: u64, data: Bytes) {
         cache.insert(spool_key, page_idx, data);
@@ -331,6 +373,114 @@ mod tests {
                 ("hot".to_string(), 1),
                 ("cold".to_string(), 1),
             ]
+        );
+    }
+
+    #[test]
+    fn test_interleaved_slices_release_large_owners_and_match_cache_accounting() {
+        const RETAINED_PAGES: usize = 8;
+        const INSERTED_PAGES: usize = 64;
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut cache = PageCache::new(RETAINED_PAGES * TRACKED_PAGE_BYTES);
+
+        for i in 0..INSERTED_PAGES {
+            let page_offset = (i % (TRACKED_FRAME_BYTES / TRACKED_PAGE_BYTES)) * TRACKED_PAGE_BYTES;
+            let frame = tracked_frame(drops.clone(), page_offset, i as u8);
+            let page = frame.slice(page_offset..page_offset + TRACKED_PAGE_BYTES);
+            let source_ptr = page.as_ptr();
+            let spool_key = format!("spool-{}", i % 7);
+            let page_idx = (i / 7) as u64;
+
+            cache.insert(&spool_key, page_idx, page);
+
+            let cached = cache
+                .get(&spool_key, page_idx)
+                .expect("new page should remain cached");
+            assert_ne!(
+                cached.as_ptr(),
+                source_ptr,
+                "cache must isolate a page from its large backing owner"
+            );
+            assert_eq!(cached.len(), TRACKED_PAGE_BYTES);
+            assert!(
+                cached.iter().all(|&byte| byte == i as u8),
+                "isolated cache page must preserve source contents"
+            );
+            drop(cached);
+            drop(frame);
+
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                i + 1,
+                "the cache retained large source frame {i}"
+            );
+            assert!(cache.current_bytes() <= cache.max_bytes());
+        }
+
+        assert_eq!(cache.len(), RETAINED_PAGES);
+        assert_eq!(cache.current_bytes(), RETAINED_PAGES * TRACKED_PAGE_BYTES);
+        assert_eq!(
+            cache.entries.values().map(Bytes::len).sum::<usize>(),
+            cache.current_bytes(),
+            "retained page allocations must match the accounted logical bytes"
+        );
+
+        drop(cache);
+        assert_eq!(drops.load(Ordering::SeqCst), INSERTED_PAGES);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_interleaved_insertions_evict_within_owned_byte_cap() {
+        const TASKS: usize = 8;
+        const PAGES_PER_TASK: usize = 12;
+        const RETAINED_PAGES: usize = 10;
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(tokio::sync::Mutex::new(PageCache::new(
+            RETAINED_PAGES * TRACKED_PAGE_BYTES,
+        )));
+        let mut tasks = Vec::new();
+
+        for task_idx in 0..TASKS {
+            let cache = cache.clone();
+            let drops = drops.clone();
+            tasks.push(tokio::spawn(async move {
+                for page_idx in 0..PAGES_PER_TASK {
+                    let slot = (task_idx + page_idx) % (TRACKED_FRAME_BYTES / TRACKED_PAGE_BYTES);
+                    let page_offset = slot * TRACKED_PAGE_BYTES;
+                    let frame = tracked_frame(
+                        drops.clone(),
+                        page_offset,
+                        (task_idx * PAGES_PER_TASK + page_idx) as u8,
+                    );
+                    let page = frame.slice(page_offset..page_offset + TRACKED_PAGE_BYTES);
+
+                    cache
+                        .lock()
+                        .await
+                        .insert(&format!("spool-{task_idx}"), page_idx as u64, page);
+                    drop(frame);
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for task in tasks {
+            task.await.expect("cache insertion task panicked");
+        }
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            TASKS * PAGES_PER_TASK,
+            "concurrent cache entries retained their large source frames"
+        );
+        let cache = cache.lock().await;
+        assert_eq!(cache.len(), RETAINED_PAGES);
+        assert_eq!(cache.current_bytes(), RETAINED_PAGES * TRACKED_PAGE_BYTES);
+        assert_eq!(
+            cache.entries.values().map(Bytes::len).sum::<usize>(),
+            cache.current_bytes()
         );
     }
 }

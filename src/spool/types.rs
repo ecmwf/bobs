@@ -2,8 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::{BobsError, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -12,51 +11,20 @@ pub enum SpoolState {
     Creating,
     Writing,
     WriteLocked, // write-lock mode: writes OK, reads blocked until Complete
-    Readable,    // after write-lock released
-    Complete,    // writer finished, all data readable
+    /// Completion has started but its metadata commit is not known to be durable.
+    /// Writes are fail-stop; completion remains retryable.
+    Completing,
+    Complete, // writer finished, all data readable
     Deleting,
 }
 
 impl SpoolState {
-    pub fn can_transition_to(&self, target: &SpoolState) -> bool {
-        use SpoolState::*;
-        matches!(
-            (self, target),
-            (Creating, Writing)
-            | (Creating, WriteLocked)
-            | (Writing, WriteLocked)
-            | (Writing, Complete)
-            | (Writing, Deleting)
-            | (WriteLocked, Readable)
-            | (WriteLocked, Complete)   // complete releases write-lock
-            | (WriteLocked, Deleting)
-            | (Readable, WriteLocked)
-            | (Readable, Complete)
-            | (Complete, Deleting)
-            | (Readable, Deleting)
-        )
-    }
-
-    pub fn transition_to(&self, target: SpoolState) -> Result<SpoolState> {
-        if self.can_transition_to(&target) {
-            Ok(target)
-        } else {
-            Err(BobsError::InvalidState {
-                current: format!("{:?}", self),
-                attempted_action: format!("transition to {:?}", target),
-            })
-        }
-    }
-
     pub fn is_readable(&self) -> bool {
-        matches!(
-            self,
-            SpoolState::Complete | SpoolState::Readable | SpoolState::Writing
-        )
+        matches!(self, SpoolState::Complete | SpoolState::Writing)
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SpoolMetadata {
     pub key: String,
     pub content_type: Option<String>,
@@ -68,6 +36,10 @@ pub struct SpoolMetadata {
     pub last_read_at: Option<u64>,
     #[serde(default)]
     pub readable_at: Option<u64>, // unix secs; set when spool first becomes readable
+    /// Page size fixed when this spool was created. Zero identifies a legacy
+    /// sidecar whose stride must be derived and durably migrated during recovery.
+    #[serde(default)]
+    pub page_size: u64,
     pub total_bytes_written: u64,
     pub total_pages: u64,
     pub final_page_size: Option<u64>, // size of last (partial) page after complete
@@ -78,52 +50,90 @@ pub struct SpoolMetadata {
     pub labels: HashMap<String, String>,
 }
 
+#[derive(Deserialize)]
+enum PersistedSpoolState {
+    Creating,
+    Writing,
+    WriteLocked,
+    Completing,
+    Readable,
+    Complete,
+    Deleting,
+}
+
+#[derive(Deserialize)]
+struct PersistedSpoolMetadata {
+    key: String,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+    state: PersistedSpoolState,
+    write_locked: bool,
+    created_at: u64,
+    last_write_at: u64,
+    last_read_at: Option<u64>,
+    #[serde(default)]
+    readable_at: Option<u64>,
+    #[serde(default)]
+    page_size: u64,
+    total_bytes_written: u64,
+    total_pages: u64,
+    final_page_size: Option<u64>,
+    data_path: PathBuf,
+    #[serde(default)]
+    labels: HashMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for SpoolMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedSpoolMetadata::deserialize(deserializer)?;
+        let legacy_readable = matches!(persisted.state, PersistedSpoolState::Readable);
+        let state = match persisted.state {
+            PersistedSpoolState::Creating => SpoolState::Creating,
+            PersistedSpoolState::Writing => SpoolState::Writing,
+            PersistedSpoolState::WriteLocked => SpoolState::WriteLocked,
+            PersistedSpoolState::Completing => SpoolState::Completing,
+            PersistedSpoolState::Readable | PersistedSpoolState::Complete => SpoolState::Complete,
+            PersistedSpoolState::Deleting => SpoolState::Deleting,
+        };
+
+        Ok(Self {
+            key: persisted.key,
+            content_type: persisted.content_type,
+            content_encoding: persisted.content_encoding,
+            state,
+            write_locked: persisted.write_locked,
+            created_at: persisted.created_at,
+            last_write_at: persisted.last_write_at,
+            last_read_at: persisted.last_read_at,
+            readable_at: persisted.readable_at,
+            page_size: persisted.page_size,
+            total_bytes_written: persisted.total_bytes_written,
+            total_pages: persisted.total_pages,
+            // `Some(0)` is impossible for valid terminal metadata and acts only
+            // as a transient recovery marker for the removed Readable state.
+            final_page_size: if legacy_readable {
+                Some(0)
+            } else {
+                persisted.final_page_size
+            },
+            data_path: persisted.data_path,
+            labels: persisted.labels,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_valid_transitions() {
-        assert!(SpoolState::Creating.can_transition_to(&SpoolState::Writing));
-        assert!(SpoolState::Writing.can_transition_to(&SpoolState::Complete));
-        assert!(SpoolState::WriteLocked.can_transition_to(&SpoolState::Complete));
-        assert!(SpoolState::Complete.can_transition_to(&SpoolState::Deleting));
-    }
-
-    #[test]
-    fn test_invalid_transitions() {
-        assert!(!SpoolState::Complete.can_transition_to(&SpoolState::Writing));
-        assert!(!SpoolState::Deleting.can_transition_to(&SpoolState::Writing));
-        assert!(!SpoolState::Writing.can_transition_to(&SpoolState::Creating));
-    }
-
-    #[test]
-    fn test_transition_to_returns_error_on_invalid() {
-        let result = SpoolState::Complete.transition_to(SpoolState::Writing);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_transition_to_success() {
-        let result = SpoolState::Creating.transition_to(SpoolState::Writing);
-        assert_eq!(result.unwrap(), SpoolState::Writing);
-
-        let result = SpoolState::Writing.transition_to(SpoolState::Complete);
-        assert_eq!(result.unwrap(), SpoolState::Complete);
-
-        let result = SpoolState::WriteLocked.transition_to(SpoolState::Complete);
-        assert_eq!(result.unwrap(), SpoolState::Complete);
-
-        let result = SpoolState::Complete.transition_to(SpoolState::Deleting);
-        assert_eq!(result.unwrap(), SpoolState::Deleting);
-    }
-
     #[test]
     fn test_is_readable_per_state() {
         assert!(!SpoolState::Creating.is_readable());
         assert!(SpoolState::Writing.is_readable());
         assert!(!SpoolState::WriteLocked.is_readable());
-        assert!(SpoolState::Readable.is_readable());
+        assert!(!SpoolState::Completing.is_readable());
         assert!(SpoolState::Complete.is_readable());
         assert!(!SpoolState::Deleting.is_readable());
     }
