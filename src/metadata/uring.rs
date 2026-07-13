@@ -4,8 +4,9 @@
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use super::{
-    remove_file_if_present, run_blocking, storage_error, MetadataStore, SyncSidecarMetadataStore,
-    UringSidecarMetadataStore, META_FILE, TMP_FILE,
+    ensure_sidecar_size, remove_file_if_present, run_blocking, storage_error,
+    MetadataDirectoryEntry, MetadataStore, SyncSidecarMetadataStore, UringSidecarMetadataStore,
+    META_FILE, TMP_FILE,
 };
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use crate::error::{BobsError, Result};
@@ -131,6 +132,7 @@ impl UringSidecarMetadataStore {
     async fn write_uring(&self, metadata: &SpoolMetadata) -> Result<()> {
         let payload = serde_json::to_vec(metadata)
             .map_err(|error| BobsError::SerializationError(error.to_string()))?;
+        ensure_sidecar_size(payload.len() as u64)?;
         let pool = crate::io::ring_pool::global_or_default_ring_pool().map_err(storage_error)?;
 
         let spool_dir = self.spool_dir(&metadata.key);
@@ -217,9 +219,9 @@ impl MetadataStore for UringSidecarMetadataStore {
         store.delete(key).await
     }
 
-    async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+    async fn scan(&self) -> Result<Vec<MetadataDirectoryEntry>> {
         let store = self.sync_store();
-        store.list().await
+        store.scan().await
     }
 }
 
@@ -688,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-    async fn uring_store_write_read_delete_and_list() {
+    async fn uring_store_write_read_delete_and_scan() {
         let dir = tempdir().expect("create tempdir");
         let store = UringSidecarMetadataStore::new(dir.path());
         let meta = metadata_for_key_generation("sidecar-test-key".to_string(), 1);
@@ -707,17 +709,9 @@ mod tests {
             &meta,
         );
 
-        let listed: Vec<_> = store
-            .list()
-            .await
-            .expect("list metadata")
-            .into_iter()
-            .map(|(key, metadata)| (key, metadata.expect("listed metadata parses")))
-            .collect();
-        assert_eq!(listed.len(), 1);
-        let (key, listed_metadata) = listed.into_iter().next().expect("listed metadata");
-        assert_eq!(key, meta.key);
-        assert_metadata_eq(listed_metadata, &meta);
+        let entries = store.scan().await.expect("scan metadata");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, meta.key);
 
         store.delete(&meta.key).await.expect("delete metadata");
         assert!(store

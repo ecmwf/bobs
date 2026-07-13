@@ -42,6 +42,12 @@ pub enum BobsError {
     #[error("serialization error: {0}")]
     SerializationError(String),
 
+    #[error("metadata sidecar is too large: {actual} bytes exceeds {maximum}-byte limit")]
+    MetadataTooLarge { actual: u64, maximum: u64 },
+
+    #[error("metadata sidecar contains unsupported field: {field}")]
+    MetadataUnknownField { field: String },
+
     #[error("invalid state transition: cannot {attempted_action} when in {current} state")]
     InvalidState {
         current: String,

@@ -4,12 +4,13 @@
 
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
-use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
+use crate::metadata::{MetadataDirectoryEntryKind, MetadataStore, SyncSidecarMetadataStore};
 use crate::metrics::BobsMetrics;
 use crate::spool::{CleanupAnchors, PageCache, Spool, SpoolMetadata, SpoolState};
 use crate::time::now_secs;
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -519,210 +520,214 @@ where
 
     async fn recover_with_counts(&self) -> Result<(usize, usize)> {
         let started = Instant::now();
-        let mut recovered: Vec<(String, SpoolMetadata)> = Vec::new();
-        let mut stale_keys: Vec<String> = Vec::new();
+        let mut stale_keys = Vec::new();
         let mut corrupt_deleted = 0_u64;
         let mut orphan_deleted = 0_u64;
+        let mut rejected_count = 0_usize;
+        let mut candidates = RecoveryCandidateBuilder::new(self.max_live_spools);
 
-        for (key, result) in self.metadata_store.list().await? {
-            match result {
-                Ok(meta) if meta.key == key => recovered.push((key, meta)),
-                Ok(meta) => {
-                    tracing::warn!(directory_key = %key, metadata_key = %meta.key, "recovery: sidecar key does not match directory, discarding");
-                    stale_keys.push(key);
+        // This is the only top-level data-directory scan. Sidecars are then read
+        // individually through the bounded metadata API and immediately dropped.
+        for entry in self.metadata_store.scan().await? {
+            let name = entry.name;
+            let (has_sidecar, has_data) = match entry.kind {
+                MetadataDirectoryEntryKind::Symlink => {
+                    tracing::warn!(orphan = %name, "recovery: skipping symlink during data-directory scan");
+                    continue;
+                }
+                MetadataDirectoryEntryKind::Other => {
+                    tracing::warn!(orphan = %name, "recovery: skipping non-directory entry during data-directory scan");
+                    continue;
+                }
+                MetadataDirectoryEntryKind::Directory {
+                    has_sidecar,
+                    has_data,
+                } => (has_sidecar, has_data),
+            };
+
+            if !has_sidecar {
+                if !is_recognised_spool_key(&name) {
+                    tracing::warn!(orphan = %name, "recovery: skipping unrecognised directory during orphan sweep");
+                    continue;
+                }
+
+                let entry_path = self.data_dir.join(&name);
+                if !has_data {
+                    // remove_dir is the atomic emptiness check: concurrent data
+                    // creation makes it fail rather than recursively deleting it.
+                    match tokio::fs::remove_dir(&entry_path).await {
+                        Ok(()) => {
+                            orphan_deleted += 1;
+                            tracing::debug!(orphan = %name, "recovery: removed empty pre-marker spool directory; parent sync pending");
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::DirectoryNotEmpty
+                                    | std::io::ErrorKind::NotFound
+                            ) =>
+                        {
+                            if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                                tracing::warn!(orphan = %name, "recovery: preserving non-empty spool-key directory without spool markers");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(orphan = %name, error = %error, "recovery: failed to inspect/remove empty pre-marker spool directory");
+                        }
+                    }
+                    continue;
+                }
+
+                tracing::warn!(orphan = %name, "removing orphan spool directory");
+                match self.remove_spool_directory_durably(&name).await {
+                    Ok(()) => {
+                        orphan_deleted += 1;
+                        tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
+                    }
+                    Err(error) => {
+                        tracing::warn!(orphan = %name, error = %error, "failed to durably remove orphan spool directory");
+                    }
+                }
+                continue;
+            }
+
+            let meta = match self.metadata_store.read(&name).await {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
+                    tracing::warn!(key = %name, "recovery: indexed sidecar disappeared; leaving directory intact");
+                    rejected_count += 1;
+                    continue;
+                }
+                Err(error @ BobsError::MetadataTooLarge { .. })
+                | Err(error @ BobsError::MetadataUnknownField { .. }) => {
+                    tracing::warn!(
+                        "event.name" = "bobs.recovery.sidecar_quarantined",
+                        key = %name,
+                        error = %error,
+                        "recovery: unsupported sidecar left intact and unavailable"
+                    );
+                    rejected_count += 1;
+                    continue;
+                }
+                Err(error @ BobsError::SerializationError(_)) => {
+                    tracing::warn!(key = %name, error = %error, "recovery: corrupt sidecar metadata, discarding affected spool directory");
+                    stale_keys.push(name);
+                    continue;
                 }
                 Err(error) => {
-                    tracing::warn!(key = %key, error = %error, "recovery: corrupt sidecar metadata, discarding affected spool directory");
-                    stale_keys.push(key);
+                    tracing::warn!(key = %name, error = %error, "recovery: sidecar read failed; leaving affected spool intact and unavailable");
+                    rejected_count += 1;
+                    continue;
+                }
+            };
+
+            if meta.key != name {
+                tracing::warn!(directory_key = %name, metadata_key = %meta.key, "recovery: sidecar key does not match directory, discarding");
+                stale_keys.push(name);
+                continue;
+            }
+
+            let activity_at = recovery_activity_at(&meta);
+            match prepare_recovery_candidate(meta, self.page_size) {
+                RecoveryMetadataDisposition::Candidate(_) => {
+                    candidates.push(RecoveryCandidateSummary {
+                        key: name,
+                        activity_at,
+                    });
+                }
+                RecoveryMetadataDisposition::Cleanup { reason } => {
+                    tracing::warn!(key = %name, reason = %reason, "recovery: discarding unrecoverable spool directory");
+                    stale_keys.push(name);
+                }
+                RecoveryMetadataDisposition::Preserve { reason } => {
+                    tracing::warn!(key = %name, reason = %reason, "recovery: candidate left intact and unavailable");
+                    rejected_count += 1;
                 }
             }
         }
 
-        let recovered_keys: HashSet<String> =
-            recovered.iter().map(|(key, _)| key.clone()).collect();
+        stale_keys.sort();
+        stale_keys.dedup();
+        let stale_count = stale_keys.len();
+        for key in stale_keys {
+            self.metadata_store.delete(&key).await?;
+            self.remove_spool_directory_durably(&key).await?;
+            corrupt_deleted += 1;
+            tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+        }
 
-        // Most-recently-active spools win; lexical key order breaks ties so the same
-        // on-disk set and configuration always produce the same recovery order.
-        recovered.sort_by(|(left_key, left), (right_key, right)| {
-            recovery_activity_at(right)
-                .cmp(&recovery_activity_at(left))
-                .then_with(|| left_key.cmp(right_key))
-        });
-
+        let mut candidates = candidates.finish();
         let mut recovered_count = 0_usize;
-        let mut quarantined_count = 0_usize;
-        let mut rejected_count = 0_usize;
+        let mut capacity_blocked_candidate = None;
 
-        // Validate candidates in deterministic order. Metadata-only checks happen
-        // before admission, so invalid newer entries cannot displace older valid
-        // spools. Once capacity is full, valid excess entries remain unopened.
-        for (key, mut meta) in recovered {
-            match meta.state {
-                SpoolState::Creating => {
-                    tracing::debug!(key = %key, "recovery removing incomplete spool (Creating)");
-                    stale_keys.push(key);
+        // The preferred heap is bounded by max_live_spools. Full metadata is
+        // reread only for selected candidates. If data validation fails, the
+        // compact excess index is heapified lazily and supplies the next key.
+        while recovered_count < self.max_live_spools {
+            let Some(summary) = candidates.next() else {
+                break;
+            };
+            let activity_at = summary.activity_at;
+            let key = summary.key;
+            let meta = match self.metadata_store.read(&key).await {
+                Ok(Some(meta)) if meta.key == key => meta,
+                Ok(Some(meta)) => {
+                    tracing::warn!(directory_key = %key, metadata_key = %meta.key, "recovery: selected sidecar key changed; leaving it intact and unavailable");
+                    rejected_count += 1;
                     continue;
                 }
-                SpoolState::Deleting => {
-                    tracing::debug!(key = %key, "recovery removing incomplete spool (Deleting)");
-                    stale_keys.push(key);
-                    continue;
-                }
-                SpoolState::Writing
-                | SpoolState::WriteLocked
-                | SpoolState::Completing
-                | SpoolState::Complete => {}
-            }
-
-            let file_size = match std::fs::metadata(&meta.data_path) {
-                Ok(metadata) => metadata.len(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::warn!(key = %key, "recovery: data file missing, discarding");
-                    stale_keys.push(key);
+                Ok(None) => {
+                    tracing::warn!(key = %key, "recovery: selected sidecar disappeared; leaving directory intact");
+                    rejected_count += 1;
                     continue;
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        key = %key,
-                        error = %error,
-                        "recovery: failed to inspect data file metadata; leaving spool intact and unavailable"
-                    );
+                    tracing::warn!(key = %key, error = %error, "recovery: selected sidecar changed or became unreadable; leaving it intact and trying the next candidate");
                     rejected_count += 1;
                     continue;
                 }
             };
 
-            let finalized_completing = meta.state == SpoolState::Completing;
-            if finalized_completing {
-                if let Err(reason) = validate_completing_marker(&meta, file_size) {
-                    tracing::warn!(
-                        key = %key,
-                        file_size = file_size,
-                        reason = %reason,
-                        "recovery: inconsistent Completing marker; leaving sidecar and data intact and unavailable"
-                    );
-                    rejected_count += 1;
+            let prepared = match prepare_recovery_candidate(meta, self.page_size) {
+                RecoveryMetadataDisposition::Candidate(prepared) => *prepared,
+                RecoveryMetadataDisposition::Cleanup { reason } => {
+                    tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unrecoverable; discarding it and trying the next candidate");
+                    self.metadata_store.delete(&key).await?;
+                    self.remove_spool_directory_durably(&key).await?;
+                    corrupt_deleted += 1;
                     continue;
                 }
-
-                // The marker follows spool.dat fdatasync and carries the exact final
-                // layout. Finalization is persisted only if this candidate passes
-                // data validation and is admitted.
-                meta.state = SpoolState::Complete;
-                meta.readable_at.get_or_insert_with(now_secs);
-            }
-
-            let migration = match prepare_recovery_metadata(&mut meta, file_size, self.page_size) {
-                Ok(migration) => migration,
-                Err(reason) => {
-                    tracing::warn!(
-                        key = %key,
-                        state = ?meta.state,
-                        file_size = file_size,
-                        reason = %reason,
-                        "recovery: candidate metadata cannot be recovered safely; leaving sidecar and data intact and unavailable"
-                    );
+                RecoveryMetadataDisposition::Preserve { reason } => {
+                    tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unsafe; leaving it intact and trying the next candidate");
                     rejected_count += 1;
                     continue;
                 }
             };
+
+            let PreparedRecoveryCandidate {
+                meta,
+                file_size,
+                migration,
+                metadata_needs_persist,
+                trailing_partial_len,
+                finalized_completing,
+            } = prepared;
             let spool_page_size = migration.page_size;
-            let mut metadata_needs_persist = finalized_completing || migration.persist;
-            let mut trailing_partial_len = 0;
-
-            // Backfill readable_at for spools persisted before this field existed.
-            // The write is deferred until admission and data validation succeed.
-            if meta.state == SpoolState::Complete && meta.readable_at.is_none() {
-                meta.readable_at = Some(now_secs());
-                metadata_needs_persist = true;
-            }
-
-            if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
-                let progress = in_progress_progress_from_file(file_size, spool_page_size);
-                trailing_partial_len = progress.trailing_partial_len;
-
-                if meta.total_bytes_written != progress.total_bytes_written
-                    || meta.total_pages != progress.total_pages
-                    || meta.final_page_size.is_some()
-                {
-                    tracing::warn!(
-                        key = %key,
-                        file_size = file_size,
-                        total_pages = progress.total_pages,
-                        trailing_partial_len = trailing_partial_len,
-                        "recovery: deriving in-progress spool metadata from disk"
-                    );
-                    meta.total_bytes_written = progress.total_bytes_written;
-                    meta.total_pages = progress.total_pages;
-                    meta.final_page_size = None;
-                }
-            } else {
-                let expected_full_pages_bytes = match complete_layout_bytes(&meta, meta.page_size) {
-                    Ok(expected) => expected,
-                    Err(reason) => {
-                        tracing::warn!(
-                            key = %key,
-                            reason = %reason,
-                            "recovery: completed spool metadata is invalid; leaving sidecar and data intact and unavailable"
-                        );
-                        rejected_count += 1;
-                        continue;
-                    }
-                };
-
-                if file_size < expected_full_pages_bytes {
-                    tracing::warn!(
-                        key = %key,
-                        expected_pages = meta.total_pages,
-                        expected_bytes = expected_full_pages_bytes,
-                        file_size = file_size,
-                        "recovery: completed spool data file shorter than persisted logical size, discarding"
-                    );
-                    stale_keys.push(key);
-                    continue;
-                }
-            }
-
-            if recovered_count >= self.max_live_spools {
-                quarantined_count += 1;
-                tracing::warn!(
-                    "event.name" = "bobs.recovery.spool_quarantined",
-                    key = %key,
-                    configured = self.max_live_spools,
-                    activity_at = recovery_activity_at(&meta),
-                    reason = "admission_capacity",
-                    "recovery: valid excess candidate left durable and unopened for a later restart"
-                );
-                continue;
-            }
 
             let permit = match Arc::clone(&self.admission).try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    quarantined_count += 1;
-                    tracing::warn!(
-                        "event.name" = "bobs.recovery.spool_quarantined",
-                        key = %key,
-                        configured = self.max_live_spools,
-                        activity_at = recovery_activity_at(&meta),
-                        reason = "admission_capacity",
-                        "recovery: valid excess candidate left durable and unopened for a later restart"
-                    );
-                    continue;
+                    tracing::warn!(key = %key, "recovery: admission permit unavailable before configured bound");
+                    capacity_blocked_candidate =
+                        Some(RecoveryCandidateSummary { key, activity_at });
+                    break;
                 }
             };
 
-            // Opening and loading a partial tail are data validation, so they happen
-            // only while this candidate owns a slot. Any failure drops the permit
-            // immediately and recovery continues with the next ordered candidate.
             let handle = match F::open(&meta.data_path).await {
                 Ok(handle) => handle,
                 Err(error) => {
-                    tracing::warn!(
-                        key = %key,
-                        error = %error,
-                        "recovery: failed to open data file; leaving spool intact and trying the next candidate"
-                    );
+                    tracing::warn!(key = %key, error = %error, "recovery: failed to open data file; leaving spool intact and trying the next candidate");
                     rejected_count += 1;
                     drop(permit);
                     continue;
@@ -740,11 +745,7 @@ where
                 {
                     Ok(partial) => Some(partial),
                     Err(error) => {
-                        tracing::warn!(
-                            key = %key,
-                            error = %error,
-                            "recovery: failed to validate trailing partial page; leaving spool intact and trying the next candidate"
-                        );
+                        tracing::warn!(key = %key, error = %error, "recovery: failed to validate trailing partial page; leaving spool intact and trying the next candidate");
                         if let Err(close_error) = F::close(handle).await {
                             tracing::warn!(key = %key, error = %close_error, "recovery: failed to close rejected data file handle");
                         }
@@ -757,30 +758,14 @@ where
                 None
             };
 
-            // A legacy or Completing sidecar becomes self-describing/terminal only
-            // after the admitted candidate's data has passed validation.
             if metadata_needs_persist {
                 if migration.write_locked_salvage {
-                    tracing::warn!(
-                        key = %key,
-                        page_size = spool_page_size,
-                        file_size = file_size,
-                        "recovery: atomically migrating legacy WriteLocked spool to Complete salvage; further writes are rejected, reads and idempotent completion remain available"
-                    );
+                    tracing::warn!(key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating legacy WriteLocked spool to Complete salvage; further writes are rejected, reads and idempotent completion remain available");
                 } else if migration.persist {
-                    tracing::info!(
-                        key = %key,
-                        page_size = spool_page_size,
-                        "recovery: atomically migrating legacy sidecar metadata"
-                    );
+                    tracing::info!(key = %key, page_size = spool_page_size, "recovery: atomically migrating legacy sidecar metadata");
                 }
                 if finalized_completing {
-                    tracing::info!(
-                        key = %key,
-                        total_bytes = meta.total_bytes_written,
-                        total_pages = meta.total_pages,
-                        "recovery: finalizing durable Completing marker"
-                    );
+                    tracing::info!(key = %key, total_bytes = meta.total_bytes_written, total_pages = meta.total_pages, "recovery: finalizing durable Completing marker");
                 }
                 if let Err(error) = self.metadata_store.write(&meta).await {
                     if let Err(close_error) = F::close(handle).await {
@@ -790,7 +775,6 @@ where
                 }
             }
 
-            // Capture fields needed for post-init before meta is moved.
             let meta_state_for_init = meta.state.clone();
             let meta_write_locked_for_init = meta.write_locked;
             let meta_total_bytes_for_init = meta.total_bytes_written;
@@ -834,88 +818,28 @@ where
 
             self.spools.insert(key, spool);
             recovered_count += 1;
-
             let recovered_label =
                 metric_state_label(&meta_state_for_init, meta_write_locked_for_init);
             self.metrics.record_state_transition(None, recovered_label);
         }
 
-        stale_keys.sort();
-        stale_keys.dedup();
-
-        for key in &stale_keys {
-            self.metadata_store.delete(key).await?;
-            self.remove_spool_directory_durably(key).await?;
-            corrupt_deleted += 1;
-            tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+        let mut quarantined_count = 0_usize;
+        let mut record_quarantine = |summary: RecoveryCandidateSummary| {
+            quarantined_count += 1;
+            tracing::warn!(
+                "event.name" = "bobs.recovery.spool_quarantined",
+                key = %summary.key,
+                configured = self.max_live_spools,
+                activity_at = summary.activity_at,
+                reason = "admission_capacity",
+                "recovery: valid excess candidate left durable and unopened for a later restart"
+            );
+        };
+        if let Some(summary) = capacity_blocked_candidate {
+            record_quarantine(summary);
         }
-
-        let stale_key_set: HashSet<String> = stale_keys.iter().cloned().collect();
-        let mut entries = tokio::fs::read_dir(&self.data_dir)
-            .await
-            .map_err(BobsError::IoError)?;
-        while let Some(entry) = entries.next_entry().await.map_err(BobsError::IoError)? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let file_type = entry.file_type().await.map_err(BobsError::IoError)?;
-            if file_type.is_symlink() {
-                tracing::warn!(orphan = %name, "recovery: skipping symlink during orphan sweep");
-                continue;
-            }
-            if !file_type.is_dir() {
-                tracing::warn!(orphan = %name, "recovery: skipping non-directory entry during orphan sweep");
-                continue;
-            }
-            if !is_recognised_spool_key(&name) {
-                tracing::warn!(orphan = %name, "recovery: skipping unrecognised directory during orphan sweep");
-                continue;
-            }
-            if recovered_keys.contains(&name)
-                || self.spools.contains_key(&name)
-                || stale_key_set.contains(&name)
-            {
-                continue;
-            }
-
-            let entry_path = entry.path();
-            // A crash immediately after create_dir can leave a recognised key
-            // directory before any spool marker exists. remove_dir is the atomic
-            // emptiness check: if data appears after inspection it fails rather
-            // than recursively deleting that data.
-            let shaped_like_spool =
-                entry_path.join("spool.dat").exists() || entry_path.join("meta.json").exists();
-            if !shaped_like_spool {
-                match tokio::fs::remove_dir(&entry_path).await {
-                    Ok(()) => {
-                        orphan_deleted += 1;
-                        tracing::debug!(orphan = %name, "recovery: removed empty pre-marker spool directory; parent sync pending");
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
-                        ) =>
-                    {
-                        if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
-                            tracing::warn!(orphan = %name, "recovery: preserving non-empty spool-key directory without spool markers");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(orphan = %name, error = %error, "recovery: failed to inspect/remove empty pre-marker spool directory");
-                    }
-                }
-                continue;
-            }
-
-            tracing::warn!(orphan = %name, "removing orphan spool directory");
-            match self.remove_spool_directory_durably(&name).await {
-                Ok(()) => {
-                    orphan_deleted += 1;
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
-                }
-                Err(error) => {
-                    tracing::warn!(orphan = %name, error = %error, "failed to durably remove orphan spool directory");
-                }
-            }
+        while let Some(summary) = candidates.next() {
+            record_quarantine(summary);
         }
 
         // Commit empty pre-marker removals, and retry any parent-directory
@@ -948,7 +872,7 @@ where
             quarantined = quarantined_count,
             rejected = rejected_count,
             active = self.spools.len(),
-            stale = stale_keys.len(),
+            stale = stale_count,
             orphan_deleted = orphan_deleted,
             corrupt_deleted = corrupt_deleted,
             duration_ms = started.elapsed().as_millis() as u64,
@@ -967,6 +891,205 @@ fn recovery_activity_at(metadata: &SpoolMetadata) -> u64 {
         .chain([metadata.last_write_at, metadata.created_at])
         .max()
         .unwrap_or(0)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecoveryCandidateSummary {
+    key: String,
+    activity_at: u64,
+}
+
+impl Ord for RecoveryCandidateSummary {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.activity_at
+            .cmp(&other.activity_at)
+            // A lexically smaller key is the better candidate on a tie.
+            .then_with(|| other.key.cmp(&self.key))
+    }
+}
+
+impl PartialOrd for RecoveryCandidateSummary {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct RecoveryCandidateBuilder {
+    capacity: usize,
+    preferred: BinaryHeap<Reverse<RecoveryCandidateSummary>>,
+    excess: Vec<RecoveryCandidateSummary>,
+}
+
+impl RecoveryCandidateBuilder {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            preferred: BinaryHeap::with_capacity(capacity),
+            excess: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, candidate: RecoveryCandidateSummary) {
+        if self.preferred.len() < self.capacity {
+            self.preferred.push(Reverse(candidate));
+            return;
+        }
+        let replace_worst = self
+            .preferred
+            .peek()
+            .is_some_and(|worst| candidate > worst.0);
+        if replace_worst {
+            let Reverse(worst) = self
+                .preferred
+                .pop()
+                .expect("non-empty preferred recovery heap");
+            self.excess.push(worst);
+            self.preferred.push(Reverse(candidate));
+        } else {
+            self.excess.push(candidate);
+        }
+    }
+
+    fn finish(self) -> RecoveryCandidateQueue {
+        RecoveryCandidateQueue {
+            preferred: self
+                .preferred
+                .into_iter()
+                .map(|Reverse(candidate)| candidate)
+                .collect(),
+            excess: self.excess,
+            refill: None,
+        }
+    }
+}
+
+struct RecoveryCandidateQueue {
+    preferred: BinaryHeap<RecoveryCandidateSummary>,
+    excess: Vec<RecoveryCandidateSummary>,
+    refill: Option<BinaryHeap<RecoveryCandidateSummary>>,
+}
+
+impl RecoveryCandidateQueue {
+    fn next(&mut self) -> Option<RecoveryCandidateSummary> {
+        if let Some(candidate) = self.preferred.pop() {
+            return Some(candidate);
+        }
+        let refill = self
+            .refill
+            .get_or_insert_with(|| BinaryHeap::from(std::mem::take(&mut self.excess)));
+        refill.pop()
+    }
+}
+
+struct PreparedRecoveryCandidate {
+    meta: SpoolMetadata,
+    file_size: u64,
+    migration: RecoveryMigration,
+    metadata_needs_persist: bool,
+    trailing_partial_len: u64,
+    finalized_completing: bool,
+}
+
+enum RecoveryMetadataDisposition {
+    Candidate(Box<PreparedRecoveryCandidate>),
+    Cleanup { reason: String },
+    Preserve { reason: String },
+}
+
+fn prepare_recovery_candidate(
+    mut meta: SpoolMetadata,
+    configured_page_size: usize,
+) -> RecoveryMetadataDisposition {
+    match meta.state {
+        SpoolState::Creating => {
+            return RecoveryMetadataDisposition::Cleanup {
+                reason: "incomplete Creating transition".to_owned(),
+            };
+        }
+        SpoolState::Deleting => {
+            return RecoveryMetadataDisposition::Cleanup {
+                reason: "incomplete Deleting transition".to_owned(),
+            };
+        }
+        SpoolState::Writing
+        | SpoolState::WriteLocked
+        | SpoolState::Completing
+        | SpoolState::Complete => {}
+    }
+
+    let file_size = match std::fs::metadata(&meta.data_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RecoveryMetadataDisposition::Cleanup {
+                reason: "data file missing".to_owned(),
+            };
+        }
+        Err(error) => {
+            return RecoveryMetadataDisposition::Preserve {
+                reason: format!("failed to inspect data file metadata: {error}"),
+            };
+        }
+    };
+
+    let finalized_completing = meta.state == SpoolState::Completing;
+    if finalized_completing {
+        if let Err(reason) = validate_completing_marker(&meta, file_size) {
+            return RecoveryMetadataDisposition::Preserve {
+                reason: format!("inconsistent Completing marker: {reason}"),
+            };
+        }
+        meta.state = SpoolState::Complete;
+        meta.readable_at.get_or_insert_with(now_secs);
+    }
+
+    let migration = match prepare_recovery_metadata(&mut meta, file_size, configured_page_size) {
+        Ok(migration) => migration,
+        Err(reason) => {
+            return RecoveryMetadataDisposition::Preserve {
+                reason: format!("metadata cannot be recovered safely: {reason}"),
+            };
+        }
+    };
+    let mut metadata_needs_persist = finalized_completing || migration.persist;
+    let mut trailing_partial_len = 0;
+
+    if meta.state == SpoolState::Complete && meta.readable_at.is_none() {
+        meta.readable_at = Some(now_secs());
+        metadata_needs_persist = true;
+    }
+
+    if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
+        let progress = in_progress_progress_from_file(file_size, migration.page_size);
+        trailing_partial_len = progress.trailing_partial_len;
+        meta.total_bytes_written = progress.total_bytes_written;
+        meta.total_pages = progress.total_pages;
+        meta.final_page_size = None;
+    } else {
+        let expected_bytes = match complete_layout_bytes(&meta, meta.page_size) {
+            Ok(expected) => expected,
+            Err(reason) => {
+                return RecoveryMetadataDisposition::Preserve {
+                    reason: format!("completed metadata is invalid: {reason}"),
+                };
+            }
+        };
+        if file_size < expected_bytes {
+            return RecoveryMetadataDisposition::Cleanup {
+                reason: format!(
+                    "completed data file has {file_size} bytes but requires {expected_bytes}"
+                ),
+            };
+        }
+    }
+
+    RecoveryMetadataDisposition::Candidate(Box::new(PreparedRecoveryCandidate {
+        meta,
+        file_size,
+        migration,
+        metadata_needs_persist,
+        trailing_partial_len,
+        finalized_completing,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1693,8 +1816,8 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
-            self.inner.list().await
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
+            self.inner.scan().await
         }
     }
 
@@ -1709,6 +1832,27 @@ mod tests {
         assert!(!is_request_id_key("0123456789abcdefghjkmnpqr")); // 25 chars
         assert!(!is_request_id_key("0123456789abcdefghijklmnop")); // i, l, o excluded
         assert!(!is_request_id_key("0123456789ABCDEFGHJKMNPQRS")); // upper-case excluded
+    }
+
+    #[test]
+    fn million_key_recovery_index_keeps_only_capacity_sized_preferred_heap() {
+        const KEY_COUNT: usize = 1_000_000;
+        const CAPACITY: usize = 64;
+        let mut builder = RecoveryCandidateBuilder::new(CAPACITY);
+        for index in 0..KEY_COUNT {
+            builder.push(RecoveryCandidateSummary {
+                key: format!("{index:07}"),
+                activity_at: index as u64,
+            });
+        }
+
+        assert_eq!(builder.preferred.len(), CAPACITY);
+        assert_eq!(builder.excess.len(), KEY_COUNT - CAPACITY);
+        let mut queue = builder.finish();
+        assert_eq!(
+            queue.next().expect("best candidate").activity_at,
+            (KEY_COUNT - 1) as u64
+        );
     }
 
     async fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {
@@ -2622,6 +2766,177 @@ mod tests {
             keys.len() * partial_len
         );
         assert_eq!(expanded.admission.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_streams_512_large_sidecars_and_rereads_only_selected_metadata() {
+        const SIDECAR_COUNT: usize = 512;
+        const CAPACITY: usize = 4;
+        const PADDING_BYTES: usize = 64 * 1024;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let padding = "x".repeat(PADDING_BYTES);
+        for index in 0..SIDECAR_COUNT {
+            let key = format!("20000000-0000-4000-8000-{index:012}");
+            let mut metadata = sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, 1);
+            metadata.last_write_at = index as u64;
+            metadata
+                .labels
+                .insert("padding".to_owned(), padding.clone());
+            let spool_dir = data_dir.join(&key);
+            tokio::fs::create_dir_all(&spool_dir)
+                .await
+                .expect("create spool directory");
+            tokio::fs::write(spool_dir.join("spool.dat"), b"x")
+                .await
+                .expect("write data");
+            tokio::fs::write(
+                spool_dir.join("meta.json"),
+                serde_json::to_vec(&metadata).expect("serialize large sidecar"),
+            )
+            .await
+            .expect("write sidecar");
+        }
+
+        let stats = Arc::new(crate::metadata::MetadataReadStats::default());
+        let store = SyncSidecarMetadataStore::with_read_stats(&data_dir, Arc::clone(&stats));
+        let manager = SpoolManager::<TokioFileIO, _>::with_metadata_store(
+            store, &data_dir, 4096, 65536, CAPACITY,
+        )
+        .expect("manager");
+        let counts = manager
+            .recover_with_counts()
+            .await
+            .expect("bounded recovery");
+
+        assert_eq!(counts, (CAPACITY, SIDECAR_COUNT - CAPACITY));
+        assert_eq!(stats.scan_calls(), 1, "recovery must scan data_dir once");
+        assert_eq!(
+            stats.read_calls(),
+            SIDECAR_COUNT + CAPACITY,
+            "each sidecar is summarized once and only selected sidecars are reread"
+        );
+        assert!(
+            stats.total_allocated_bytes() >= SIDECAR_COUNT * PADDING_BYTES,
+            "instrumentation must observe the aggregate workload"
+        );
+        assert_eq!(stats.live_allocated_bytes(), 0);
+        assert!(
+            stats.peak_allocated_bytes() < 70 * 1024,
+            "sidecar buffers must be released between keys, peak was {} bytes",
+            stats.peak_allocated_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_quarantines_oversized_and_unknown_sidecars_non_destructively() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let valid_new = "30000000-0000-4000-8000-000000000001";
+        let valid_old = "30000000-0000-4000-8000-000000000002";
+        let unknown_key = "30000000-0000-4000-8000-000000000003";
+        let oversized_key = "30000000-0000-4000-8000-000000000004";
+        let corrupt_key = "30000000-0000-4000-8000-000000000005";
+        let creating_key = "30000000-0000-4000-8000-000000000006";
+        let deleting_key = "30000000-0000-4000-8000-000000000007";
+        let fixture =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 8).expect("fixture manager");
+
+        for (key, activity) in [(valid_new, 200), (valid_old, 100)] {
+            let mut meta = sidecar_fixture_metadata(&data_dir, key, SpoolState::Complete, 1);
+            meta.last_write_at = activity;
+            write_sidecar_fixture(&fixture, meta, b"x").await;
+        }
+
+        let unknown_dir = data_dir.join(unknown_key);
+        let unknown_meta =
+            sidecar_fixture_metadata(&data_dir, unknown_key, SpoolState::Complete, 1);
+        write_sidecar_fixture(&fixture, unknown_meta.clone(), b"x").await;
+        let mut unknown_value =
+            serde_json::to_value(&unknown_meta).expect("serialize unknown-field fixture");
+        unknown_value
+            .as_object_mut()
+            .expect("metadata object")
+            .insert("future_generation".to_owned(), serde_json::json!(2));
+        let unknown_bytes = serde_json::to_vec(&unknown_value).expect("serialize unknown sidecar");
+        tokio::fs::write(unknown_dir.join("meta.json"), &unknown_bytes)
+            .await
+            .expect("write unknown sidecar");
+
+        let oversized_dir = data_dir.join(oversized_key);
+        tokio::fs::create_dir_all(&oversized_dir)
+            .await
+            .expect("create oversized directory");
+        tokio::fs::write(oversized_dir.join("spool.dat"), b"x")
+            .await
+            .expect("write oversized data");
+        let oversized_bytes = vec![b'x'; crate::metadata::MAX_SIDECAR_BYTES as usize + 1];
+        tokio::fs::write(oversized_dir.join("meta.json"), &oversized_bytes)
+            .await
+            .expect("write oversized sidecar");
+
+        let corrupt_dir = data_dir.join(corrupt_key);
+        tokio::fs::create_dir_all(&corrupt_dir)
+            .await
+            .expect("create corrupt directory");
+        tokio::fs::write(corrupt_dir.join("spool.dat"), b"x")
+            .await
+            .expect("write corrupt data");
+        tokio::fs::write(corrupt_dir.join("meta.json"), b"{broken")
+            .await
+            .expect("write corrupt sidecar");
+
+        for (key, state) in [
+            (creating_key, SpoolState::Creating),
+            (deleting_key, SpoolState::Deleting),
+        ] {
+            let meta = sidecar_fixture_metadata(&data_dir, key, state, 0);
+            write_sidecar_fixture(&fixture, meta, b"").await;
+        }
+        drop(fixture);
+
+        let limited =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 1).expect("limited manager");
+        assert_eq!(
+            limited
+                .recover_with_counts()
+                .await
+                .expect("limited recovery"),
+            (1, 1)
+        );
+        assert!(limited.get_spool(valid_new).is_some());
+        assert!(limited.get_spool(valid_old).is_none());
+        assert_eq!(
+            tokio::fs::read(unknown_dir.join("meta.json"))
+                .await
+                .expect("unknown sidecar remains"),
+            unknown_bytes
+        );
+        assert_eq!(
+            tokio::fs::read(oversized_dir.join("meta.json"))
+                .await
+                .expect("oversized sidecar remains"),
+            oversized_bytes
+        );
+        assert!(!corrupt_dir.exists());
+        assert!(!data_dir.join(creating_key).exists());
+        assert!(!data_dir.join(deleting_key).exists());
+        drop(limited);
+
+        let expanded =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 2).expect("expanded manager");
+        assert_eq!(
+            expanded
+                .recover_with_counts()
+                .await
+                .expect("expanded recovery"),
+            (2, 0)
+        );
+        assert!(expanded.get_spool(valid_new).is_some());
+        assert!(expanded.get_spool(valid_old).is_some());
+        assert!(unknown_dir.exists());
+        assert!(oversized_dir.exists());
     }
 
     #[tokio::test]

@@ -55,6 +55,8 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `metrics.allowed_labels` | `[]` | Caller-provided label keys forwarded as metric attributes. Empty list means all caller labels pass through. Set to a non-empty list to restrict label cardinality. |
 | `metrics.max_label_value_length` | `128` | Maximum byte length for label values. Values exceeding this limit are truncated before recording. |
 
+Recovery metadata has a fixed safety policy rather than a configuration field: `meta.json` is limited to 1 MiB and its size is checked before read allocation. Oversized or unknown-field payloads are preserved unchanged but unavailable, allowing operator inspection or a newer compatible binary to recover them.
+
 ## Example
 
 ```yaml

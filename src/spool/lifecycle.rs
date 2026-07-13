@@ -518,7 +518,7 @@ mod tests {
             .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
             Ok(Vec::new())
         }
     }
@@ -596,8 +596,8 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
-            self.inner.list().await
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
+            self.inner.scan().await
         }
     }
 
@@ -640,7 +640,7 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
             Ok(Vec::new())
         }
     }
@@ -700,8 +700,8 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn list(&self) -> Result<Vec<(String, Result<SpoolMetadata>)>> {
-            self.inner.list().await
+        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
+            self.inner.scan().await
         }
     }
 

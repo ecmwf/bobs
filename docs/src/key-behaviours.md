@@ -56,6 +56,8 @@ On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. 
 
 Recovery admission uses the same non-zero `max_live_spools` bound as normal creation and applies it uniformly to in-progress and complete spools. Candidates with newer persisted activity are considered first, with the key as a deterministic tie-breaker. Metadata-only lifecycle, migration, and layout checks run before admission, so invalid candidates cannot occupy capacity; failed admitted candidates release their permit and recovery continues. Once the bound is successfully filled, metadata-valid excess entries stay durable but unavailable without opening their data file, loading a partial tail, or rewriting their sidecar. Increasing capacity on a later restart admits more of this quarantined set.
 
+Recovery performs one top-level directory scan and processes sidecars with bounded reads. `meta.json` is limited to 1 MiB; the open file's size is checked before allocating its read buffer. Oversized sidecars and sidecars with unknown JSON fields are preserved unchanged and quarantined as unsupported, while malformed sidecars are handled as per-key corruption. Candidate ordering keeps compact key/activity summaries, and full metadata is retained only for the candidate currently being validated or admitted.
+
 A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 
 - **Writer Inactivity**: The producer stopped writing without completing the spool.
