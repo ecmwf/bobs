@@ -10,7 +10,7 @@ Understanding these behaviours is crucial for effectively using BOBS.
 
 ### 1. Page-based Streaming
 
-Data is organized into fixed-size pages configured via `page_size`. The Rust binary default is `16777216` bytes (16 MiB); the Helm chart intentionally overrides it with `4096` bytes for lower reader-visible latency. A successful `/api/v1/write/{key}/{offset}` has accepted the bytes into `<data_dir>/<key>/spool.dat` before it returns, including any trailing partial page.
+Data is organized into fixed-size pages configured via `page_size`. The Rust binary default is `16777216` bytes (16 MiB); the Helm chart intentionally overrides it with `4096` bytes for lower reader-visible latency. Valid pages are in `1..=67108864` bytes (64 MiB), remain below the one-SQE `io_uring` I/O limit, and must not exceed `max_spool_bytes`. A successful `/api/v1/write/{key}/{offset}` has accepted the bytes into `<data_dir>/<key>/spool.dat` before it returns, including any trailing partial page.
 
 Reader visibility is still page-based: a page is visible, cached, and used to notify parked readers only once it is full. Trailing partial-page bytes remain on disk but are not visible until more writes complete the page or `/api/v1/complete/{key}` finalizes the spool.
 
@@ -39,6 +39,8 @@ BOBS supports a single consumer opening multiple concurrent connections for the 
 Writes must be strictly sequential. The offset in `/api/v1/write/{key}/{offset}` must exactly match the bytes currently stored. Random-access writes and overwrites are unsupported.
 
 A successful write means BOBS accepted bytes through the kernel/file handle; it does not mean `sync_data()` forced them to stable storage. `/api/v1/complete/{key}` is the durability boundary: an owned transaction that survives caller cancellation syncs `spool.dat`, commits an exact-layout `Completing` marker, then commits `Complete`. `max_spool_bytes` defaults to 8 GiB. Oversize cleanup first atomically checks the write offset and lifecycle state, so a wrong offset or a spool that completed concurrently is rejected without deletion; only an oversized request at the current writable head durably removes the partial spool before returning `413`.
+
+Write and completion mutations are single-flight per spool. Each caller waits on a one-permit operation gate before any owned task is spawned, so cancelling a waiter leaves no detached work or task amplification. Once admitted, the owned transaction keeps the gate and lifecycle lock until I/O and publication reach a stable result, even if its caller disconnects. Cleanup, deletion, and frame/read activity take only the lifecycle lock; no path takes the locks in reverse order.
 
 ### 7. Atomic Sidecar Metadata
 

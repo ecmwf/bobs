@@ -9,6 +9,12 @@
 /// thread creation.
 pub const MAX_IO_URING_SHARDS: usize = 256;
 
+/// Maximum byte length representable by one `io_uring` read or write SQE.
+///
+/// Callers that configure backend I/O sizes may use this limit, but higher-level
+/// protocols remain responsible for choosing their own request or page policies.
+pub const MAX_IO_URING_IO_LEN: usize = u32::MAX as usize;
+
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 pub mod ring_pool;
 pub mod tokio_fs;

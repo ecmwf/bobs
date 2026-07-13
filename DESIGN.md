@@ -58,13 +58,13 @@ Ordinary `/api/v1/write/{key}/{offset}` calls do not persist a metadata high-wat
 
 BOBS uses positional file I/O through a `FileIO` abstraction.
 
-On Linux, the default backend is a sharded `io_uring` pool. `io_uring_shards` defaults to unset, which resolves to `max(1, num_cpus / 4)`, and accepts configured values in `1..=256`. `io_uring_queue_capacity` defaults to `1024` per shard and must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`); an out-of-range shard or queue value returns `ConfigurationError` during startup validation. Non-Linux builds, and builds with the `tokio-fileio-fallback` feature, use the Tokio/blocking file backend and otherwise ignore those settings. Both backends read and write by explicit offset rather than a shared cursor.
+On Linux, the default backend is a sharded `io_uring` pool. `io_uring_shards` defaults to unset, which resolves to `max(1, num_cpus / 4)`, and accepts configured values in `1..=256`. `io_uring_queue_capacity` defaults to `1024` per shard and must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`); an out-of-range shard or queue value returns `ConfigurationError` during startup validation. Each read or write submitted as one SQE is limited to `u32::MAX` bytes (`4294967295`); larger lengths are rejected before routing or submission. Non-Linux builds, and builds with the `tokio-fileio-fallback` feature, use the Tokio/blocking file backend and otherwise ignore ring settings. Both backends read and write by explicit offset rather than a shared cursor.
 
 Accepted write bytes are appended to `spool.dat` before `/api/v1/write/{key}/{offset}` returns, but they are not forced to stable storage per page. `/api/v1/complete/{key}` syncs the data file before committing final complete metadata.
 
 ## Paging and cache
 
-The byte stream is divided into fixed-size pages (`page_size`, binary default 16777216 bytes / 16 MiB). The Helm chart overrides this with 4096-byte (4 KiB) pages. `page_size` must be greater than `0`.
+The byte stream is divided into fixed-size pages (`page_size`). The Rust binary defaults to 16777216 bytes (16 MiB); the Helm chart overrides this to 4096 bytes (4 KiB). Configuration bounds pages at 67108864 bytes (64 MiB), below the one-SQE `io_uring` I/O limit, and requires `page_size <= max_spool_bytes`.
 
 Write path:
 
@@ -72,6 +72,8 @@ Write path:
 2. Bytes are written to `spool.dat` through `FileIO`.
 3. Full pages become reader-visible.
 4. Visible pages are offered to the global FIFO page cache and waiting readers are notified.
+
+HTTP write staging starts empty, ignores untrusted body-size hints for reservation, and only copies cross-frame partial pages. Its per-request staging allocation is therefore lazy and bounded by the 64 MiB page-size maximum.
 
 The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget (binary default 268435456 bytes / 256 MiB; current Helm chart value 1048576 bytes / 1 MiB). `max_cache_bytes` may be smaller than `page_size`: setting it to `0` disables caching, and pages larger than the cap bypass the cache while remaining readable from disk. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 
@@ -99,7 +101,11 @@ The write-lock state is lifecycle metadata in `meta.json` and is recovered on re
 
 ## Completion and durability boundary
 
-`/api/v1/complete/{key}` validates the optional expected size, including on idempotent retries, then starts an owned transaction that continues if the request future is cancelled. Initial completion syncs `spool.dat`, commits a durable `Completing` marker containing the exact candidate page layout, commits `Complete`, updates in-memory metadata, and only then clears the volatile trailing buffer and optionally populates the page cache. The cache is never authoritative; readers reconstruct every page, including the exact tail, from `spool.dat`.
+Each write and completion call first waits on a one-permit, per-spool operation gate before spawning owned work. Waiting callers are cancellable and create no detached task. An admitted owned transaction retains the operation permit and then the lifecycle lock through backend I/O and all metadata, buffer, cache, and notification publication, so a cancelled request cannot overlap a retry with unfinished owned I/O.
+
+The mutation lock order is operation gate, lifecycle lock, then write buffer. Cleanup revalidation, deletion, and read/write activity ordering take the lifecycle lock without taking the operation gate, so there is no reverse acquisition path. Readers release metadata, cache, and file-handle guards before recording lifecycle activity.
+
+`/api/v1/complete/{key}` validates the optional expected size inside the admitted owned transaction, including on idempotent retries. Initial completion syncs `spool.dat`, commits a durable `Completing` marker containing the exact candidate page layout, commits `Complete`, updates in-memory metadata, and only then clears the volatile trailing buffer and optionally populates the page cache. The cache is never authoritative; readers reconstruct every page, including the exact tail, from `spool.dat`.
 
 Completion is fail-stop once it begins: further writes are rejected while finalization is uncertain. A failed attempt can be retried with the same expected size. `Completing` is internal and is never exposed as a client-selectable lifecycle state.
 

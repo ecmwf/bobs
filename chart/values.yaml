@@ -99,14 +99,15 @@ config:
   # smaller than page_size; 0 disables caching and oversized pages bypass the cache.
   data_dir: "/var/lib/bobs"
   # The chart favours lower streaming latency than the Rust binary defaults:
-  # it overrides 16 MiB/256 MiB with 4 KiB/1 MiB. Pages larger than the cache
-  # bypass it, so max_cache_bytes does not need to be >= page_size.
+  # it overrides 16 MiB/256 MiB with 4 KiB/1 MiB. Valid page sizes are
+  # 1..=67108864 bytes (64 MiB) and must not exceed max_spool_bytes. Pages
+  # larger than the cache bypass it, so the cache may remain smaller than a page.
   page_size: 4096
   max_cache_bytes: 1048576
   # Explicit chart admission limit matching max_cache_bytes / page_size.
   # Operators can still override this independently for their workload.
   max_live_spools: 256
-  # Per-spool write limit. 8 GiB leaves headroom on the default 10 GiB PVC.
+  # Per-spool write limit; must be >= page_size. 8 GiB leaves headroom on the default 10 GiB PVC.
   max_spool_bytes: 8589934592
   # Bound create admission waits; exhausted capacity returns HTTP 503.
   create_admission_timeout_ms: 5000

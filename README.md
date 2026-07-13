@@ -47,10 +47,17 @@ Operational constraints:
 
 - `HOSTNAME` must be set and include a pod ordinal such as `bobs-0`.
 - `BOBS_INTERNAL_BASE_URL_TEMPLATE` must be set and non-empty.
-- `page_size`, `max_live_spools`, `max_spool_bytes`, `create_admission_timeout_ms`, `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, `full_read_complete_ttl_secs`, `cleanup_sweep_interval_secs`, `long_poll_timeout_ms`, and `io_uring_queue_capacity` must be greater than `0`; `io_uring_queue_capacity` must not exceed Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`). Invalid queue capacities fail startup with `ConfigurationError`.
+- `page_size` must be in `1..=67108864` bytes (64 MiB) and no larger than `max_spool_bytes`.
+- `max_live_spools`, `max_spool_bytes`, `create_admission_timeout_ms`, `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, `full_read_complete_ttl_secs`, `cleanup_sweep_interval_secs`, `long_poll_timeout_ms`, and `io_uring_queue_capacity` must be greater than `0`; `io_uring_queue_capacity` must not exceed Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`). Invalid queue capacities fail startup with `ConfigurationError`.
 - `io_uring_shards`, when set, must be in `1..=256`; omitted shards resolve to `max(1, num_cpus / 4)`.
 - `cleanup_sweep_interval_secs` must not exceed any active cleanup timeout.
 - `max_cache_bytes` may be smaller than `page_size`; `0` disables caching.
+
+Example:
+
+```bash
+./target/release/bobs config.yaml
+```
 
 ## Usage Example
 
@@ -82,6 +89,8 @@ Finalize the spool to signal readers that no more data is coming. Optional `expe
 ```bash
 curl -X POST http://localhost:3000/api/v1/complete/unique-spool-key -d '{"expected_size": 1048576}'
 ```
+
+Writes and completion are single-flight per spool. A caller cancelled while waiting leaves no detached task; once admitted, owned mutation work continues to a stable result while holding the per-spool operation gate, so a retry cannot overlap unfinished I/O or completion publication.
 
 ### 4. Read data
 
@@ -148,10 +157,10 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `host` | `0.0.0.0` | Address to listen on. |
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
-| `page_size` | `16777216` (16 MiB) | Size of individual data pages. In-progress readers see a page only once it is full; `/api/v1/complete/{key}` publishes the final partial page. Must be greater than `0`. |
-| `max_cache_bytes` | `268435456` (256 MiB) | Global FIFO page-cache budget across all spools. `0` disables caching. A page larger than the budget bypasses the cache and remains readable from disk. |
-| `max_live_spools` | derived as `max(1, max_cache_bytes / page_size)` (`16` with binary defaults) | Admission limit for spools not yet fully read. Omitted values derive from effective page/cache settings; explicit values are preserved. |
-| `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
+| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of individual data pages. Valid range `1..=67108864` (64 MiB), no larger than `max_spool_bytes`. In-progress readers see a page only once it is full; `/api/v1/complete/{key}` publishes the final partial page. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO page-cache budget across all spools. `0` disables caching. A page larger than the budget bypasses the cache and remains readable from disk. |
+| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools not yet fully read. Omitted values derive from effective page/cache settings; explicit values are preserved. |
+| `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool; must be at least `page_size`. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
 | `create_admission_timeout_ms` | `5000` | Maximum `/api/v1/create` admission wait before `503 Service Unavailable`. |
 | `writer_inactivity_timeout_secs` | `300` | Writer-silence interval after which an unfinished spool is eligible for cleanup. Must be greater than `0`. |
 | `enable_pprof` | `false` | Enables unauthenticated `/debug/pprof/profile` on the main listener; use only in a controlled environment. |
@@ -172,7 +181,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `metrics.allowed_labels` | `[]` | Caller label keys allowed as metric attributes. Empty allows all keys. |
 | `metrics.max_label_value_length` | `128` | Maximum label-value byte length; longer values are truncated. |
 
-The Helm chart overrides the binary profile with `page_size: 4096` (4 KiB), `max_cache_bytes: 1048576` (1 MiB), and an explicit `max_live_spools: 256`. There is no requirement that `max_cache_bytes` be at least `page_size`.
+The Helm chart overrides the binary profile with `page_size: 4096` (4 KiB), `max_cache_bytes: 1048576` (1 MiB), and an explicit `max_live_spools: 256`. There is no requirement that `max_cache_bytes` be at least `page_size`. Linux `io_uring` reads and writes submitted as one SQE are limited to `u32::MAX` bytes (`4294967295`); larger lengths are rejected before ring routing or submission.
 
 Example `config.yaml`:
 

@@ -16,7 +16,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE='http://bobs-{ordinal}:3000/api/v1' \
 
 Backend selection is build-feature based, not a YAML option: Linux builds without extra features use the `io_uring` FileIO and sidecar metadata backend; builds with `--features tokio-fileio-fallback`, and non-Linux builds, use the Tokio/blocking fallback backend with the same on-disk `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json` layout. These backend settings do not change the HTTP API and do not require an on-disk migration.
 
-Default Linux builds use sharded `io_uring` rings. `io_uring_shards` is optional and accepts explicit values from `1` through `256`, inclusive. If unset, BOBS resolves it to `max(1, num_cpus / 4)`. File operations are assigned to shards by stable object-key hashing, and each object's data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.
+Default Linux builds use sharded `io_uring` rings. `io_uring_shards` is optional and accepts explicit values from `1` through `256`, inclusive. If unset, BOBS resolves it to `max(1, num_cpus / 4)`. File operations are assigned to shards by stable object-key hashing, and each object's data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default. A read or write submitted as one SQE is limited to `u32::MAX` bytes (`4294967295`); oversized operations fail before routing or submission.
 
 The default Linux backend requires Linux 5.11+ because BOBS submits operations against raw file descriptors, and it requires a container/runtime policy that permits `io_uring_setup`. If `io_uring_setup` is blocked, use a runtime seccomp/sysctl policy that permits it or build the fallback binary:
 
@@ -33,10 +33,10 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `host` | `0.0.0.0` | Address for the HTTP server to bind to. |
 | `port` | `3000` | Port for the HTTP server to listen on. |
 | `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. |
-| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. Must be greater than `0`. |
-| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO page-cache budget. `0` disables caching; a page larger than the cap bypasses the cache. |
+| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages. Valid range: `1..=67108864` (64 MiB), and it must not exceed `max_spool_bytes`. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO page-cache budget. `0` disables caching; a page larger than the cap bypasses the cache and remains readable from disk. |
 | `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools not yet fully read. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. |
-| `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests. Must be greater than `0`. |
+| `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests. Must be greater than `0` and at least `page_size`. |
 | `create_admission_timeout_ms` | `5000` | Maximum time `/api/v1/create` waits for a `max_live_spools` slot before returning `503 Service Unavailable`. Must be greater than `0`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup timeout for an unfinished spool whose writer has stopped sending data. Must be greater than `0`. |
 | `enable_pprof` | `false` | Exposes unauthenticated `/debug/pprof/profile` on the main listener. Enable only for controlled profiling. |
@@ -117,7 +117,7 @@ Future optimizations not implemented in the current backend are `IORING_REGISTER
 
 ## Page size tuning
 
-The binary default `page_size` is `16777216` (16 MiB), paired with a `268435456`-byte (256 MiB) cache and a derived `max_live_spools` of 16. The Helm chart intentionally overrides these with `page_size: 4096`, `max_cache_bytes: 1048576`, and explicit `max_live_spools: 256`.
+The binary default `page_size` is `16777216` (16 MiB), paired with a `268435456`-byte (256 MiB) cache and a derived `max_live_spools` of 16. The Helm chart intentionally overrides these with `page_size: 4096`, `max_cache_bytes: 1048576`, and explicit `max_live_spools: 256`. The operational page maximum is `67108864` (64 MiB), which remains below the one-SQE `io_uring` limit and bounds page reads and lazy per-request partial-page staging. `page_size` must also be no larger than `max_spool_bytes`.
 
 Page size changes streaming behaviour:
 
@@ -125,6 +125,6 @@ Page size changes streaming behaviour:
 - larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless `max_cache_bytes` is increased;
 - benchmark representative object sizes and write chunk sizes before changing either deployment profile.
 
-`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching. A page larger than the cap bypasses the cache while disk-backed reads continue to work. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; explicit values remain unchanged. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
+`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching. A page larger than the cap bypasses the cache while disk-backed reads continue to work. This cache-skipping behaviour is independent of the required `page_size <= max_spool_bytes` relationship. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; explicit values remain unchanged. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
 
 See the standalone benchmark guide for page-size comparison commands.

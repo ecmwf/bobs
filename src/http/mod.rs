@@ -322,8 +322,9 @@ where
         let labels = spool.metadata.lock().await.labels.clone();
         let write_start = Instant::now();
         let write_batch_size = state.config.page_size;
-        // Start empty: the common full-frame path can pass zero-copy Bytes slices
-        // directly to Spool::write without eagerly allocating a 16 MiB staging buffer.
+        // Start empty so body size hints cannot trigger eager reservation. Full-frame
+        // pages remain zero-copy; partial staging grows only with received bytes and
+        // is bounded by the validated 64 MiB page-size ceiling.
         let mut pending = bytes::BytesMut::new();
         let mut write_offset = offset;
         let mut received_bytes = 0_u64;
@@ -2393,7 +2394,7 @@ mod tests {
     #[tokio::test]
     async fn known_length_oversize_wrong_offset_returns_400_without_deleting_or_polling() {
         let (app, state) = app_with_config(|config| {
-            config.page_size = usize::MAX;
+            config.page_size = 8;
             config.max_spool_bytes = 8;
         })
         .await;
