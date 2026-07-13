@@ -8,7 +8,7 @@ use crate::metrics::BobsMetrics;
 use bytes::BytesMut;
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -35,6 +35,32 @@ pub(crate) struct CleanupAnchors {
     pub full_object_read_at: Option<Instant>,
 }
 
+/// Weighted manager-wide admission held for the lifetime of one read response.
+///
+/// The semaphore units represent configured pages. Recovered spools with wider
+/// persisted pages acquire multiple units, so old layouts cannot bypass the current
+/// response-memory budget. Dropping the lease releases both admission and metrics.
+pub struct ReadResponsePermit {
+    _permit: OwnedSemaphorePermit,
+    active_responses: Arc<AtomicUsize>,
+    active_permits: Arc<AtomicUsize>,
+    permit_units: usize,
+    metrics: Arc<BobsMetrics>,
+}
+
+impl Drop for ReadResponsePermit {
+    fn drop(&mut self) {
+        let previous_responses = self.active_responses.fetch_sub(1, Ordering::AcqRel);
+        let previous_permits = self
+            .active_permits
+            .fetch_sub(self.permit_units, Ordering::AcqRel);
+        debug_assert!(previous_responses > 0);
+        debug_assert!(previous_permits >= self.permit_units);
+        self.metrics
+            .record_read_response_permit_released(self.permit_units);
+    }
+}
+
 pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub key: String,
     pub metadata: Arc<Mutex<SpoolMetadata>>,
@@ -57,6 +83,12 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     /// Serializes mutation with terminal lifecycle operations and cleanup activity.
     /// Operation transactions always acquire `operation_gate` before this lock.
     pub(crate) lifecycle_lock: Mutex<()>,
+    /// Manager-wide response-buffer admission. A response acquires its weighted
+    /// share before any page read and retains it until its body/reader lease drops.
+    read_response_admission: Arc<Semaphore>,
+    read_response_active: Arc<AtomicUsize>,
+    read_response_permits_active: Arc<AtomicUsize>,
+    read_response_permits_per_reader: u32,
     pub page_size: usize,
     pub data_path: PathBuf,
     /// Number of active reader connections.
@@ -88,6 +120,7 @@ where
         metadata_store: M,
         metrics: Arc<BobsMetrics>,
     ) -> Self {
+        let read_response_admission = Arc::new(Semaphore::new(1));
         Self::new_with_admission(
             metadata,
             file_handle,
@@ -96,9 +129,14 @@ where
             metadata_store,
             metrics,
             None,
+            read_response_admission,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            1,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_admission(
         metadata: SpoolMetadata,
         file_handle: F::Handle,
@@ -107,6 +145,10 @@ where
         metadata_store: M,
         metrics: Arc<BobsMetrics>,
         admission_permit: Option<OwnedSemaphorePermit>,
+        read_response_admission: Arc<Semaphore>,
+        read_response_active: Arc<AtomicUsize>,
+        read_response_permits_active: Arc<AtomicUsize>,
+        read_response_permits_per_reader: u32,
     ) -> Self {
         let data_path = metadata.data_path.clone();
         let key = metadata.key.clone();
@@ -124,6 +166,10 @@ where
             cancel: CancellationToken::new(),
             operation_gate: Arc::new(Semaphore::new(1)),
             lifecycle_lock: Mutex::new(()),
+            read_response_admission,
+            read_response_active,
+            read_response_permits_active,
+            read_response_permits_per_reader,
             page_size,
             data_path,
             reader_count: Arc::new(AtomicUsize::new(0)),
@@ -185,6 +231,53 @@ where
         if let Ok(mut permit) = self.admission_permit.lock() {
             permit.take();
         }
+    }
+
+    /// Acquire the manager-wide response-buffer budget without holding lifecycle,
+    /// metadata, cache, or spool-admission locks. Deletion cancels queued readers
+    /// immediately rather than leaving them behind a slow client.
+    pub async fn acquire_read_response_permit(&self) -> crate::error::Result<ReadResponsePermit> {
+        if self.cancel.is_cancelled() {
+            return Err(crate::error::BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            });
+        }
+
+        let units = self.read_response_permits_per_reader;
+        let acquire = Arc::clone(&self.read_response_admission).acquire_many_owned(units);
+        let permit = tokio::select! {
+            result = acquire => result.map_err(|_| {
+                crate::error::BobsError::IoError(std::io::Error::other(
+                    "read response semaphore closed",
+                ))
+            })?,
+            _ = self.cancel.cancelled() => {
+                return Err(crate::error::BobsError::SpoolNotFound {
+                    key: self.key.clone(),
+                });
+            }
+        };
+
+        // Deletion can race the semaphore wake. Do not publish a lease after the
+        // spool has become terminal; dropping the raw permit restores capacity.
+        if self.cancel.is_cancelled() {
+            return Err(crate::error::BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            });
+        }
+
+        self.read_response_active.fetch_add(1, Ordering::AcqRel);
+        self.read_response_permits_active
+            .fetch_add(units as usize, Ordering::AcqRel);
+        self.metrics
+            .record_read_response_permit_acquired(units as usize);
+        Ok(ReadResponsePermit {
+            _permit: permit,
+            active_responses: Arc::clone(&self.read_response_active),
+            active_permits: Arc::clone(&self.read_response_permits_active),
+            permit_units: units as usize,
+            metrics: Arc::clone(&self.metrics),
+        })
     }
 
     pub async fn persist_metadata(&self, metadata: &SpoolMetadata) -> crate::error::Result<()> {

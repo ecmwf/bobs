@@ -71,11 +71,13 @@ Write path:
 
 The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Each entry owns an allocation bounded by its logical page length, so a small page slice cannot pin a much larger HTTP frame outside the accounting. This cache-only isolation copy is made only after admission; setting `max_cache_bytes` to `0` disables caching without a copy, and pages larger than the cap also bypass the cache. Cache hits clone the isolated `Bytes` without copying page contents. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 
+Read responses use a separate manager-wide weighted semaphore derived from the same page/cache sizing: `max(1, floor(max_cache_bytes / page_size))` configured-page units. A response acquires its units before cache lookup or disk buffering and holds them until its streaming body is dropped, including while a yielded chunk is stalled at a slow client. Recovered spools with wider persisted pages acquire `ceil(persisted_page_size / configured_page_size)` units, capped at the full budget. Timeout, cancellation, and deletion release admission through the reader lease. When caching is disabled or smaller than one page, the one-unit minimum serializes page-backed responses rather than allowing unbounded cache-miss buffers.
+
 A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/complete` publishes it as the final page.
 
 ## Read behaviour
 
-Reads first check the global page cache. Cache misses read the required page bytes from `spool.dat` using positional I/O.
+Reads acquire response admission, then check the global page cache. Cache misses read the required page bytes from `spool.dat` using positional I/O. Cache entries and response buffers remain separate allocations and separate accounting; the response permit does not alter cache ownership or zero-copy cache-hit slicing.
 
 A request without `Range`, or with `Range: bytes=X-`, enters follow mode. If the requested byte has not been written yet, BOBS parks the request until more data arrives, the spool completes, the spool is deleted, or the long-poll timeout fires.
 

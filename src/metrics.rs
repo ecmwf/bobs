@@ -159,6 +159,8 @@ struct InnerMetrics {
     read_bytes: Counter<u64>,
     read_duration: Histogram<f64>,
     read_active: UpDownCounter<i64>,
+    read_response_buffers_active: UpDownCounter<i64>,
+    read_response_permits_active: UpDownCounter<i64>,
 
     // System-level
     spools_active: UpDownCounter<i64>,
@@ -269,6 +271,16 @@ impl BobsMetrics {
             read_active: meter
                 .i64_up_down_counter("bobs.read.active")
                 .with_description("Currently active readers")
+                .build(),
+            read_response_buffers_active: meter
+                .i64_up_down_counter("bobs.read.response_buffers.active")
+                .with_description("Read responses currently holding page-buffer admission")
+                .build(),
+            read_response_permits_active: meter
+                .i64_up_down_counter("bobs.read.response_permits.active")
+                .with_description(
+                    "Weighted page-buffer permit units currently held by read responses",
+                )
                 .build(),
 
             // ── System-level ──────────────────────────────────────────────────
@@ -445,6 +457,30 @@ impl BobsMetrics {
         }
     }
 
+    pub fn record_read_response_permit_acquired(&self, permit_units: usize) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            inner.read_response_buffers_active.add(1, &[]);
+            inner
+                .read_response_permits_active
+                .add(permit_units as i64, &[]);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = permit_units;
+    }
+
+    pub fn record_read_response_permit_released(&self, permit_units: usize) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            inner.read_response_buffers_active.add(-1, &[]);
+            inner
+                .read_response_permits_active
+                .add(-(permit_units as i64), &[]);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = permit_units;
+    }
+
     // --- System-Level ---
 
     #[allow(unused_variables)]
@@ -545,6 +581,8 @@ mod tests {
         metrics.record_state_transition(Some(state::WRITING), state::COMPLETE);
         metrics.record_cache_hit();
         metrics.record_cache_miss();
+        metrics.record_read_response_permit_acquired(2);
+        metrics.record_read_response_permit_released(2);
         metrics.record_recovery_snapshot(3, 2, 1);
     }
 

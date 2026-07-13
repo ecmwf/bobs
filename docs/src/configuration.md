@@ -36,7 +36,7 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `port` | `3000` | Port for the HTTP server to listen on. |
 | `data_dir` | `./data` | File system path for storing spool files. |
 | `page_size` | `4096` | Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. |
-| `max_cache_bytes` | `1048576` | Global byte budget for cache-owned page allocations across all spools, excluding allocator overhead. Cached slices are isolated from larger transport frames. Set to `0` to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk. |
+| `max_cache_bytes` | `1048576` | Global byte budget for cache-owned page allocations across all spools, excluding allocator overhead. Cached slices are isolated from larger transport frames. It also derives the read-response permit budget as `max(1, floor(max_cache_bytes / page_size))`; permits are held until response bodies are dropped. Set to `0` to disable caching while retaining a one-page response bound. If an individual page is larger than this cap, it bypasses the cache and remains readable from disk. |
 | `max_live_spools` | `4096` | Non-zero admission bound for live spools. New writers wait when the bound is full. Startup recovers at most this many spools and leaves excess durable entries quarantined for a later restart with capacity. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. |
@@ -62,7 +62,7 @@ host: 0.0.0.0
 port: 3000
 data_dir: /data/bobs
 page_size: 4096
-max_cache_bytes: 1048576          # global page-cache byte budget; set to 0 to disable caching
+max_cache_bytes: 1048576          # page cache and derived slow-reader response budget; 0 disables cache
 max_live_spools: 4096              # live create/recovery admission bound; must be non-zero
 writer_inactivity_timeout_secs: 300
 read_idle_ttl_secs: 600
@@ -119,6 +119,6 @@ Larger pages such as `1048576` (1 MiB), `4194304` (4 MiB), and `16777216` (16 Mi
 - larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless `max_cache_bytes` is increased;
 - benchmark representative object sizes and write chunk sizes before changing production defaults.
 
-`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely. If a full page is larger than the cache cap, that page simply bypasses the cache while disk-backed reads continue to work.
+`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely, but the manager still admits one read response at a time so disk-backed page buffers remain bounded. Otherwise it admits `floor(max_cache_bytes / page_size)` ordinary configured-page responses, with a minimum of one. Admission is acquired before page lookup or disk I/O and stays with the response body, so slow or unconsumed clients queue rather than each retaining another page allocation. Recovered spools whose persisted page size is wider than the current configured page consume proportionally more permit units. A page larger than the cache cap still bypasses the cache while disk-backed reads continue to work.
 
 See the standalone benchmark guide for page-size comparison commands.

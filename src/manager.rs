@@ -11,6 +11,7 @@ use crate::time::now_secs;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -44,6 +45,25 @@ fn metric_state_label(state: &SpoolState, write_locked: bool) -> &'static str {
     }
 }
 
+/// Number of configured-page units available to in-flight read responses.
+/// Cache-disabled and sub-page cache budgets still allow exactly one response.
+fn read_response_permit_limit(page_size: usize, max_cache_bytes: usize) -> usize {
+    let max_permits = Semaphore::MAX_PERMITS.min(u32::MAX as usize);
+    (max_cache_bytes / page_size).clamp(1, max_permits)
+}
+
+/// Charge recovered layouts proportionally when their persisted page size is wider
+/// than the current configured page. One oversized response consumes the whole budget.
+fn read_response_permits_for_page(
+    configured_page_size: usize,
+    spool_page_size: usize,
+    permit_limit: usize,
+) -> u32 {
+    spool_page_size
+        .div_ceil(configured_page_size)
+        .min(permit_limit) as u32
+}
+
 pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub spools: Arc<DashMap<String, Arc<Spool<F, M>>>>,
     pub metadata_store: M,
@@ -55,6 +75,11 @@ pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> 
     /// Bounds live spool admission during creation and startup recovery.
     pub admission: Arc<Semaphore>,
     pub max_live_spools: usize,
+    /// Weighted configured-page admission retained for each HTTP response lifetime.
+    read_response_admission: Arc<Semaphore>,
+    read_response_active: Arc<AtomicUsize>,
+    read_response_permits_active: Arc<AtomicUsize>,
+    read_response_permit_limit: usize,
 }
 
 struct CreateTransaction<F: FileIO, M: MetadataStore> {
@@ -64,6 +89,9 @@ struct CreateTransaction<F: FileIO, M: MetadataStore> {
     page_size: usize,
     page_cache: Arc<Mutex<PageCache>>,
     metrics: Arc<BobsMetrics>,
+    read_response_admission: Arc<Semaphore>,
+    read_response_active: Arc<AtomicUsize>,
+    read_response_permits_active: Arc<AtomicUsize>,
 }
 
 impl<F, M> CreateTransaction<F, M>
@@ -158,6 +186,10 @@ where
             self.metadata_store.clone(),
             Arc::clone(&self.metrics),
             Some(permit),
+            Arc::clone(&self.read_response_admission),
+            Arc::clone(&self.read_response_active),
+            Arc::clone(&self.read_response_permits_active),
+            1,
         ));
         self.spools.insert(key, spool);
 
@@ -240,6 +272,8 @@ where
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
         let page_cache = Arc::new(Mutex::new(PageCache::new(max_cache_bytes)));
 
+        let read_response_permit_limit = read_response_permit_limit(page_size, max_cache_bytes);
+        let read_response_admission = Arc::new(Semaphore::new(read_response_permit_limit));
         Ok(Self {
             spools: Arc::new(DashMap::new()),
             metadata_store,
@@ -250,12 +284,33 @@ where
             metrics: Arc::new(BobsMetrics::new(false)),
             admission: Arc::new(Semaphore::new(max_live_spools)),
             max_live_spools,
+            read_response_admission,
+            read_response_active: Arc::new(AtomicUsize::new(0)),
+            read_response_permits_active: Arc::new(AtomicUsize::new(0)),
+            read_response_permit_limit,
         })
     }
 
     /// Set the metrics handle (replaces the default no-op).
     pub fn set_metrics(&mut self, metrics: Arc<BobsMetrics>) {
         self.metrics = metrics;
+    }
+
+    /// Total weighted configured-page units available to read responses.
+    pub fn read_response_permit_limit(&self) -> usize {
+        self.read_response_permit_limit
+    }
+
+    pub fn read_response_available_permits(&self) -> usize {
+        self.read_response_admission.available_permits()
+    }
+
+    pub fn active_read_responses(&self) -> usize {
+        self.read_response_active.load(Ordering::Acquire)
+    }
+
+    pub fn active_read_response_permits(&self) -> usize {
+        self.read_response_permits_active.load(Ordering::Acquire)
     }
 
     pub async fn create_spool(
@@ -292,6 +347,9 @@ where
             page_size: self.page_size,
             page_cache: Arc::clone(&self.page_cache),
             metrics: Arc::clone(&self.metrics),
+            read_response_admission: Arc::clone(&self.read_response_admission),
+            read_response_active: Arc::clone(&self.read_response_active),
+            read_response_permits_active: Arc::clone(&self.read_response_permits_active),
         };
         tokio::spawn(transaction.run(
             key,
@@ -736,6 +794,11 @@ where
             let meta_state_for_init = meta.state.clone();
             let meta_write_locked_for_init = meta.write_locked;
             let meta_total_bytes_for_init = meta.total_bytes_written;
+            let read_response_permits = read_response_permits_for_page(
+                self.page_size,
+                spool_page_size,
+                self.read_response_permit_limit,
+            );
 
             let spool = Arc::new(Spool::new_with_admission(
                 meta,
@@ -745,6 +808,10 @@ where
                 self.metadata_store.clone(),
                 Arc::clone(&self.metrics),
                 Some(permit),
+                Arc::clone(&self.read_response_admission),
+                Arc::clone(&self.read_response_active),
+                Arc::clone(&self.read_response_permits_active),
+                read_response_permits,
             ));
 
             if let Some(partial) = trailing_partial {
@@ -1762,6 +1829,8 @@ mod tests {
         assert_eq!(manager.page_size, 4096);
         assert_eq!(manager.max_cache_bytes, 1024);
         assert_eq!(manager.page_cache.lock().await.max_bytes(), 1024);
+        assert_eq!(manager.read_response_permit_limit(), 1);
+        assert_eq!(manager.read_response_available_permits(), 1);
     }
 
     #[tokio::test]
@@ -1774,6 +1843,23 @@ mod tests {
 
         assert_eq!(manager.max_cache_bytes, 0);
         assert_eq!(manager.page_cache.lock().await.max_bytes(), 0);
+        assert_eq!(manager.read_response_permit_limit(), 1);
+        assert_eq!(manager.read_response_available_permits(), 1);
+    }
+
+    #[test]
+    fn read_response_budget_uses_cache_page_units_and_weights_recovered_layouts() {
+        assert_eq!(
+            read_response_permit_limit(4 * 1024 * 1024, 256 * 1024 * 1024),
+            64
+        );
+        assert_eq!(read_response_permits_for_page(4, 4, 8), 1);
+        assert_eq!(read_response_permits_for_page(4, 9, 8), 3);
+        assert_eq!(
+            read_response_permits_for_page(4, usize::MAX, 8),
+            8,
+            "a page wider than the whole budget must serialize responses"
+        );
     }
 
     #[tokio::test]
@@ -2787,7 +2873,7 @@ mod tests {
         assert_eq!(trailing.as_ref(), &data[page_size * 2..]);
         assert_eq!(
             spool
-                .read_page(0)
+                .read_page_for_test(0)
                 .await
                 .expect("read page 0")
                 .unwrap()
@@ -2796,7 +2882,7 @@ mod tests {
         );
         assert_eq!(
             spool
-                .read_page(1)
+                .read_page_for_test(1)
                 .await
                 .expect("read page 1")
                 .unwrap()
@@ -2855,18 +2941,37 @@ mod tests {
         assert_eq!(meta.final_page_size, Some(19));
 
         assert_eq!(
-            spool.read_page(0).await.expect("page 0").unwrap().as_ref(),
+            spool
+                .read_page_for_test(0)
+                .await
+                .expect("page 0")
+                .unwrap()
+                .as_ref(),
             &data[..page_size]
         );
         assert_eq!(
-            spool.read_page(1).await.expect("page 1").unwrap().as_ref(),
+            spool
+                .read_page_for_test(1)
+                .await
+                .expect("page 1")
+                .unwrap()
+                .as_ref(),
             &data[page_size..page_size * 2]
         );
         assert_eq!(
-            spool.read_page(2).await.expect("page 2").unwrap().as_ref(),
+            spool
+                .read_page_for_test(2)
+                .await
+                .expect("page 2")
+                .unwrap()
+                .as_ref(),
             &data[page_size * 2..]
         );
-        assert!(spool.read_page(3).await.expect("end of spool").is_none());
+        assert!(spool
+            .read_page_for_test(3)
+            .await
+            .expect("end of spool")
+            .is_none());
     }
 
     #[tokio::test]
@@ -2891,14 +2996,28 @@ mod tests {
         assert_eq!(durable.total_pages, 2);
         assert_eq!(durable.final_page_size, Some(37));
         assert_eq!(
-            spool.read_page(0).await.expect("page 0").unwrap().as_ref(),
+            spool
+                .read_page_for_test(0)
+                .await
+                .expect("page 0")
+                .unwrap()
+                .as_ref(),
             &data[..4096]
         );
         assert_eq!(
-            spool.read_page(1).await.expect("page 1").unwrap().as_ref(),
+            spool
+                .read_page_for_test(1)
+                .await
+                .expect("page 1")
+                .unwrap()
+                .as_ref(),
             &data[4096..]
         );
-        assert!(spool.read_page(2).await.expect("exact EOF").is_none());
+        assert!(spool
+            .read_page_for_test(2)
+            .await
+            .expect("exact EOF")
+            .is_none());
         assert!(matches!(
             spool
                 .write(data.len() as u64, Bytes::from_static(b"tail"))
@@ -3456,8 +3575,14 @@ mod tests {
             .expect("recover with persisted page size");
         let spool = manager.get_spool(&key).expect("recovered spool");
         assert_eq!(spool.page_size, 4);
-        assert_eq!(spool.read_page(0).await.unwrap().unwrap().as_ref(), b"abcd");
-        assert_eq!(spool.read_page(1).await.unwrap().unwrap().as_ref(), b"ef");
+        assert_eq!(
+            spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
+            b"abcd"
+        );
+        assert_eq!(
+            spool.read_page_for_test(1).await.unwrap().unwrap().as_ref(),
+            b"ef"
+        );
     }
 
     #[tokio::test]
@@ -3473,9 +3598,18 @@ mod tests {
         manager.recover().await.expect("migrate complete spool");
         let spool = manager.get_spool(&key).expect("spool recovered");
         assert_eq!(spool.page_size, 4);
-        assert_eq!(spool.read_page(0).await.unwrap().unwrap().as_ref(), b"abcd");
-        assert_eq!(spool.read_page(1).await.unwrap().unwrap().as_ref(), b"efgh");
-        assert_eq!(spool.read_page(2).await.unwrap().unwrap().as_ref(), b"ij");
+        assert_eq!(
+            spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
+            b"abcd"
+        );
+        assert_eq!(
+            spool.read_page_for_test(1).await.unwrap().unwrap().as_ref(),
+            b"efgh"
+        );
+        assert_eq!(
+            spool.read_page_for_test(2).await.unwrap().unwrap().as_ref(),
+            b"ij"
+        );
         assert!(data_dir.join(&key).join("spool.dat").exists());
         assert_eq!(persisted_metadata(&manager, &key).await.page_size, 4);
     }
@@ -3497,12 +3631,17 @@ mod tests {
         let one_page = manager.get_spool(&one_page_key).expect("one-page spool");
         assert_eq!(one_page.page_size, 3);
         assert_eq!(
-            one_page.read_page(0).await.unwrap().unwrap().as_ref(),
+            one_page
+                .read_page_for_test(0)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             b"abc"
         );
         let empty = manager.get_spool(&empty_key).expect("empty spool");
         assert_eq!(empty.page_size, 1);
-        assert!(empty.read_page(0).await.unwrap().is_none());
+        assert!(empty.read_page_for_test(0).await.unwrap().is_none());
         assert!(data_dir.join(&one_page_key).join("spool.dat").exists());
         assert!(data_dir.join(&empty_key).join("spool.dat").exists());
     }
@@ -3524,8 +3663,14 @@ mod tests {
         let paged = manager.get_spool(&paged_key).expect("paged active spool");
         assert_eq!(paged.page_size, 4);
         assert_eq!(paged.metadata.lock().await.state, SpoolState::Writing);
-        assert_eq!(paged.read_page(0).await.unwrap().unwrap().as_ref(), b"abcd");
-        assert_eq!(paged.read_page(1).await.unwrap().unwrap().as_ref(), b"efgh");
+        assert_eq!(
+            paged.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
+            b"abcd"
+        );
+        assert_eq!(
+            paged.read_page_for_test(1).await.unwrap().unwrap().as_ref(),
+            b"efgh"
+        );
         assert_eq!(persisted_metadata(&manager, &paged_key).await.page_size, 4);
 
         let zero_page = manager
@@ -3538,7 +3683,12 @@ mod tests {
             .await
             .expect("resume write at durable offset");
         assert_eq!(
-            zero_page.read_page(0).await.unwrap().unwrap().as_ref(),
+            zero_page
+                .read_page_for_test(0)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             b"abcd"
         );
         assert!(data_dir.join(&paged_key).join("spool.dat").exists());
@@ -3604,8 +3754,8 @@ mod tests {
             .complete(Some(9))
             .await
             .expect("idempotent completion validates recovered size");
-        let first = partial.read_page(0).await.unwrap().unwrap();
-        let second = partial.read_page(1).await.unwrap().unwrap();
+        let first = partial.read_page_for_test(0).await.unwrap().unwrap();
+        let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
         assert_eq!(
             read_exact_at::<TokioFileIO>(
@@ -3633,8 +3783,8 @@ mod tests {
             .complete(Some(12))
             .await
             .expect("complete exact salvage");
-        let first = exact.read_page(0).await.unwrap().unwrap();
-        let second = exact.read_page(1).await.unwrap().unwrap();
+        let first = exact.read_page_for_test(0).await.unwrap().unwrap();
+        let second = exact.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), exact_data);
 
         let empty = manager
@@ -3650,7 +3800,7 @@ mod tests {
             .complete(Some(0))
             .await
             .expect("complete empty salvage");
-        assert!(empty.read_page(0).await.unwrap().is_none());
+        assert!(empty.read_page_for_test(0).await.unwrap().is_none());
 
         for (key, expected_bytes) in [
             (&partial_key, partial_data.as_slice()),
@@ -3688,8 +3838,8 @@ mod tests {
             partial.page_size, 6,
             "later config changes must not reinterpret the migrated layout"
         );
-        let first = partial.read_page(0).await.unwrap().unwrap();
-        let second = partial.read_page(1).await.unwrap().unwrap();
+        let first = partial.read_page_for_test(0).await.unwrap().unwrap();
+        let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
     }
 
@@ -3785,8 +3935,8 @@ mod tests {
         assert_eq!(partial_meta.total_bytes_written, 9);
         assert_eq!(partial_meta.total_pages, 2);
         assert_eq!(partial_meta.final_page_size, Some(3));
-        let first = partial.read_page(0).await.unwrap().unwrap();
-        let second = partial.read_page(1).await.unwrap().unwrap();
+        let first = partial.read_page_for_test(0).await.unwrap().unwrap();
+        let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
         assert_eq!(
             read_exact_at::<TokioFileIO>(&partial.file_handle, 2, 6, "reading migrated range",)
@@ -3804,8 +3954,8 @@ mod tests {
         assert_eq!(exact_meta.total_bytes_written, 12);
         assert_eq!(exact_meta.total_pages, 2);
         assert_eq!(exact_meta.final_page_size, None);
-        let first = exact.read_page(0).await.unwrap().unwrap();
-        let second = exact.read_page(1).await.unwrap().unwrap();
+        let first = exact.read_page_for_test(0).await.unwrap().unwrap();
+        let second = exact.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), exact_data);
 
         let empty = manager.get_spool(&empty_key).expect("empty Readable spool");
@@ -3814,7 +3964,7 @@ mod tests {
         assert_eq!(empty_meta.total_bytes_written, 0);
         assert_eq!(empty_meta.total_pages, 0);
         assert_eq!(empty_meta.final_page_size, None);
-        assert!(empty.read_page(0).await.unwrap().is_none());
+        assert!(empty.read_page_for_test(0).await.unwrap().is_none());
 
         for key in [&partial_key, &exact_key, &empty_key] {
             let sidecar = persisted_metadata(&manager, key).await;
