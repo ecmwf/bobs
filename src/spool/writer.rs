@@ -24,6 +24,7 @@ where
         match meta.state {
             SpoolState::Writing | SpoolState::WriteLocked => {
                 meta.last_write_at = meta.last_write_at.max(now);
+                self.record_write_activity();
                 Ok(())
             }
             SpoolState::Complete => Err(BobsError::SpoolClosed),

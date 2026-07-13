@@ -222,6 +222,7 @@ mod tests {
     use crate::io::TokioFileIO;
     use crate::metadata::MetadataStore;
     use crate::spool::{Spool, SpoolMetadata};
+    use crate::time::now_secs;
     use std::collections::HashMap;
     use tempfile::tempdir;
 
