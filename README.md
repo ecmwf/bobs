@@ -139,7 +139,7 @@ BOBS is configured via a YAML file passed as a CLI argument. All fields have sen
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
 | `page_size` | `4096` | Size of individual data pages in bytes. |
-| `max_cache_bytes` | `1048576` | Max in-memory cache size per spool in bytes. |
+| `max_cache_bytes` | `1048576` | Global budget for cache-owned page payloads across all spools. |
 | `writer_inactivity_timeout_secs` | `300` | Seconds of writer silence before cleanup. |
 | `reader_done_ttl_secs` | `60` | TTL after spool completion and reader finishes. |
 | `unread_ttl_secs` | `3600` | TTL for completed spools that were never read. |

@@ -318,11 +318,18 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = Bytes::from(vec![0xABu8; 4096]);
-        let cached_ptr = data.as_ptr();
-        {
+        let source_ptr = data.as_ptr();
+        let cached_ptr = {
             let mut cache = spool.page_cache.lock().await;
             cache.insert(&spool.key, 0, data.clone());
-        }
+            let cached = cache.get(&spool.key, 0).expect("page should be cached");
+            assert_ne!(
+                cached.as_ptr(),
+                source_ptr,
+                "cache admission must isolate the page from its source allocation"
+            );
+            cached.as_ptr()
+        };
         {
             let mut meta = spool.metadata.lock().await;
             meta.total_pages = 1;
@@ -334,7 +341,7 @@ mod tests {
         assert_eq!(
             got.as_ptr(),
             cached_ptr,
-            "cached full pages must be returned as shared Bytes, not copied"
+            "cache hits must share the isolated page allocation, not copy it"
         );
     }
 

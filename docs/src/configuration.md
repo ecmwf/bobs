@@ -36,7 +36,7 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `port` | `3000` | Port for the HTTP server to listen on. |
 | `data_dir` | `./data` | File system path for storing spool files. |
 | `page_size` | `4096` | Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. |
-| `max_cache_bytes` | `1048576` | Global byte budget for the in-memory page cache across all spools. Set to `0` to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk. |
+| `max_cache_bytes` | `1048576` | Global byte budget for cache-owned page allocations across all spools, excluding allocator overhead. Cached slices are isolated from larger transport frames. Set to `0` to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. |
 | `full_read_complete_ttl_secs` | `30` | Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served. |

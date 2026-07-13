@@ -149,6 +149,9 @@ where
             let mut cache = self.page_cache.lock().await;
             for page_bytes in pages {
                 let page_idx = meta.total_pages;
+                // Admission makes one cache-only page-sized copy. The disk append
+                // above consumed the transport-backed Bytes directly; zero-capacity
+                // or too-small caches return here without copying.
                 cache.insert(&self.key, page_idx, page_bytes);
                 meta.total_pages += 1;
             }
