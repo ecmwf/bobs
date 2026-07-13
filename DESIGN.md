@@ -91,7 +91,11 @@ The write-lock state is lifecycle metadata in `meta.json` and is recovered on re
 
 ## Completion and durability boundary
 
-`/complete` validates the optional expected size, then starts an owned transaction that continues even if the request future is cancelled. The transaction syncs `spool.dat`, commits a durable `Completing` marker containing the exact candidate page layout, commits `Complete`, updates in-memory metadata, and finally clears the volatile trailing buffer and optionally populates the page cache. The cache is never authoritative; readers can reconstruct every page from `spool.dat`.
+Each write and completion call first waits on a one-permit, per-spool operation gate before spawning owned work. Waiting callers are cancellable and create no detached task. An admitted owned transaction retains the operation permit and then the lifecycle lock through backend I/O and all metadata, buffer, cache, and notification publication, so a cancelled request cannot overlap a retry with unfinished owned I/O.
+
+The mutation lock order is operation gate, lifecycle lock, then write buffer. Cleanup revalidation, deletion, and read/write activity ordering take the lifecycle lock without taking the operation gate, so no reverse acquisition path exists. Readers release metadata, cache, and file-handle guards before recording lifecycle activity.
+
+`/complete` validates the optional expected size inside the admitted owned transaction. The transaction syncs `spool.dat`, commits a durable `Completing` marker containing the exact candidate page layout, commits `Complete`, updates in-memory metadata, and finally clears the volatile trailing buffer and optionally populates the page cache. The cache is never authoritative; readers can reconstruct every page from `spool.dat`.
 
 After successful completion, `meta.json` is the durable completed-object record. Before the `Completing` marker, BOBS provides process-restart recovery from `spool.dat`, not stable-storage durability for each acknowledged page. Once that marker is durable, writes remain permanently fail-stop and recovery either finalizes its exact candidate or quarantines inconsistent data unchanged.
 

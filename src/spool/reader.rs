@@ -259,7 +259,7 @@ mod tests {
         )
     }
 
-    async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
+    async fn make_spool(dir: &std::path::Path, page_size: usize) -> Arc<Spool<TokioFileIO>> {
         make_spool_with_cache_bytes(dir, page_size, page_size * 256).await
     }
 
@@ -267,7 +267,7 @@ mod tests {
         dir: &std::path::Path,
         page_size: usize,
         cache_bytes: usize,
-    ) -> Spool<TokioFileIO> {
+    ) -> Arc<Spool<TokioFileIO>> {
         let spool_dir = dir.join("test-key");
         tokio::fs::create_dir_all(&spool_dir)
             .await
@@ -300,15 +300,18 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Spool::new(
-            meta,
-            handle,
-            page_size,
-            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                cache_bytes,
-            ))),
-            metadata_store,
-            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        Arc::new(
+            Spool::new(
+                meta,
+                handle,
+                page_size,
+                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                    cache_bytes,
+                ))),
+                metadata_store,
+                Arc::new(crate::metrics::BobsMetrics::new(false)),
+            )
+            .await,
         )
     }
 
