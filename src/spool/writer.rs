@@ -339,8 +339,7 @@ mod tests {
                 ))),
                 metadata_store,
                 Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await,
+            ),
         )
     }
 
