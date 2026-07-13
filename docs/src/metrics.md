@@ -69,6 +69,7 @@ scrape_configs:
 - `mode`: read mode — `follow` (stream until completion), `range` (bounded HTTP range read).
 - `outcome`: read outcome — `success`, `error`, `timeout`, `client_gone`.
 - `state`: active spool state — `writing`, `write_locked`, `complete`, `readable`.
+- `status`: startup recovery snapshot — `configured`, `recovered`, or `quarantined`.
 
 ## Metrics reference
 
@@ -77,7 +78,7 @@ as `_bucket`/`_sum`/`_count` series; duration histograms also receive a
 `_seconds` suffix from the `s` unit annotation. Gauges render as-is.
 
 | OTel instrument | Prometheus series | Type | Labels | What it is |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `bobs.spools.created` | `bobs_spools_created_total` | Counter | caller labels, `otel_scope_name` | Spools successfully created via `POST /spool`. |
 | `bobs.spools.completed` | `bobs_spools_completed_total` | Counter | caller labels, `otel_scope_name` | Spools successfully finalized by the writer via `POST /spool/{key}/complete`. |
 | `bobs.spools.deleted` | `bobs_spools_deleted_total` | Counter | caller labels, `reason`, `otel_scope_name` | Spools deleted — by explicit client request, TTL expiry, writer inactivity timeout, or cleanup. |
@@ -90,6 +91,7 @@ as `_bucket`/`_sum`/`_count` series; duration histograms also receive a
 | `bobs.read.active` | `bobs_read_active` | Gauge | caller labels, `otel_scope_name` | Current active readers. Incremented on reader acquisition, decremented on release. |
 | `bobs.spools.active` | `bobs_spools_active` | Gauge | `state`, `otel_scope_name` | Current active spools broken down by state. Updated on every state transition and spool removal. |
 | `bobs.disk.usage.bytes` | `bobs_disk_usage_bytes` | Gauge | `otel_scope_name` | Disk usage of the spool data directory. Sampled asynchronously at the end of each cleanup sweep. |
+| `bobs.recovery.spools` | `bobs_recovery_spools` | Gauge | `status`, `otel_scope_name` | Startup admission snapshot: configured capacity, successfully recovered spools, and durable spools left quarantined. |
 | `bobs.pages.cache.hits` | `bobs_pages_cache_hits_total` | Counter | `otel_scope_name` | Page reads served from the in-memory page cache. |
 | `bobs.pages.cache.misses` | `bobs_pages_cache_misses_total` | Counter | `otel_scope_name` | Page reads that missed the cache and were loaded from disk. |
 

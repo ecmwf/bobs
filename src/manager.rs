@@ -53,7 +53,7 @@ pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> 
     pub max_cache_bytes: usize,
     pub page_cache: Arc<Mutex<PageCache>>,
     pub metrics: Arc<BobsMetrics>,
-    /// Bounds spools concurrently holding first-read cache memory.
+    /// Bounds live spool admission during creation and startup recovery.
     pub admission: Arc<Semaphore>,
     pub max_live_spools: usize,
 }
@@ -488,7 +488,43 @@ where
         let recovered_keys: HashSet<String> =
             recovered.iter().map(|(key, _)| key.clone()).collect();
 
-        for (key, mut meta) in recovered {
+        // Admission is decided before any candidate data file is inspected or opened.
+        // Most-recently-active spools win; lexical key order breaks ties so the same
+        // on-disk set and configuration always produce the same admitted set.
+        recovered.sort_by(|(left_key, left), (right_key, right)| {
+            recovery_activity_at(right)
+                .cmp(&recovery_activity_at(left))
+                .then_with(|| left_key.cmp(right_key))
+        });
+
+        // Reserve every recovery slot up front. Candidates beyond this boundary stay
+        // entirely on disk: recovery does not stat/open spool.dat, migrate metadata,
+        // classify data corruption, or allocate/load their trailing partial pages.
+        let available_slots = recovered.len().min(self.admission.available_permits());
+        let mut permits = Vec::with_capacity(available_slots);
+        for _ in 0..available_slots {
+            match Arc::clone(&self.admission).try_acquire_owned() {
+                Ok(permit) => permits.push(permit),
+                Err(_) => break,
+            }
+        }
+
+        let excess = recovered.split_off(permits.len());
+        let mut quarantined_count = excess.len();
+        for (key, meta) in &excess {
+            tracing::warn!(
+                "event.name" = "bobs.recovery.spool_quarantined",
+                key = %key,
+                configured = self.max_live_spools,
+                activity_at = recovery_activity_at(meta),
+                reason = "admission_capacity",
+                "recovery: admission capacity exhausted; leaving durable sidecar and data untouched for a later restart"
+            );
+        }
+        drop(excess);
+
+        let mut recovered_count = 0_usize;
+        for ((key, mut meta), permit) in recovered.into_iter().zip(permits) {
             if !meta.data_path.exists() {
                 tracing::warn!(key = %key, "recovery: data file missing, discarding");
                 stale_keys.push(key);
@@ -524,6 +560,7 @@ where
                         reason = %reason,
                         "recovery: inconsistent Completing marker; leaving sidecar and data intact and quarantined (writes will not be accepted)"
                     );
+                    quarantined_count += 1;
                     continue;
                 }
 
@@ -553,6 +590,7 @@ where
                         reason = %reason,
                         "recovery: legacy active spool layout is unsafe to resume; leaving sidecar and data intact and quarantined (API operations will report the spool as unavailable)"
                     );
+                    quarantined_count += 1;
                     continue;
                 }
                 Err(reason) => {
@@ -599,6 +637,7 @@ where
                         error = %error,
                         "recovery: failed to open data file, leaving spool intact and quarantined"
                     );
+                    quarantined_count += 1;
                     continue;
                 }
             };
@@ -664,15 +703,6 @@ where
             let meta_state_for_init = meta.state.clone();
             let meta_write_locked_for_init = meta.write_locked;
             let meta_total_bytes_for_init = meta.total_bytes_written;
-            let permit = Arc::clone(&self.admission).try_acquire_owned().ok();
-            if permit.is_none() {
-                tracing::warn!(
-                    key = %key,
-                    max_live_spools = self.max_live_spools,
-                    recovered_spools = self.spools.len() + 1,
-                    "recovery: spool exceeds admission capacity and has no cache admission permit"
-                );
-            }
 
             let spool = Arc::new(
                 Spool::new_with_admission(
@@ -682,7 +712,7 @@ where
                     Arc::clone(&self.page_cache),
                     self.metadata_store.clone(),
                     Arc::clone(&self.metrics),
-                    permit,
+                    Some(permit),
                 )
                 .await,
             );
@@ -716,6 +746,7 @@ where
             }
 
             self.spools.insert(key, spool);
+            recovered_count += 1;
 
             // Count recovered spool in the active gauge.
             let recovered_label =
@@ -810,9 +841,28 @@ where
             .await
             .map_err(BobsError::IoError)?;
 
+        self.metrics.record_recovery_snapshot(
+            self.max_live_spools,
+            recovered_count,
+            quarantined_count,
+        );
+
+        if quarantined_count > 0 {
+            tracing::warn!(
+                "event.name" = "bobs.recovery.quarantine_summary",
+                configured = self.max_live_spools,
+                recovered = recovered_count,
+                quarantined = quarantined_count,
+                "recovery completed with durable spools quarantined"
+            );
+        }
+
         tracing::info!(
             "event.name" = "bobs.recovery.completed",
-            recovered = self.spools.len(),
+            configured = self.max_live_spools,
+            recovered = recovered_count,
+            quarantined = quarantined_count,
+            active = self.spools.len(),
             stale = stale_keys.len(),
             orphan_deleted = orphan_deleted,
             corrupt_deleted = corrupt_deleted,
@@ -822,6 +872,16 @@ where
         );
         Ok(())
     }
+}
+
+fn recovery_activity_at(metadata: &SpoolMetadata) -> u64 {
+    metadata
+        .last_read_at
+        .into_iter()
+        .chain(metadata.readable_at)
+        .chain([metadata.last_write_at, metadata.created_at])
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1283,6 +1343,76 @@ mod tests {
             handle: Self::Handle,
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
             record_protocol_event(ProtocolEvent::Close);
+            TokioFileIO::close(handle)
+        }
+
+        fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::remove(path)
+        }
+    }
+
+    static RECOVERY_OPEN_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static RECOVERY_READ_BYTES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[derive(Clone)]
+    struct RecoveryCountingFileIO;
+
+    impl FileIO for RecoveryCountingFileIO {
+        type Handle = <TokioFileIO as FileIO>::Handle;
+
+        fn create(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::create(path)
+        }
+
+        fn open(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            async move {
+                let handle = TokioFileIO::open(path).await?;
+                RECOVERY_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(handle)
+            }
+        }
+
+        fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: Bytes,
+        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
+            TokioFileIO::write_at(handle, offset, data)
+        }
+
+        fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+            async move {
+                let bytes = TokioFileIO::read_at(handle, offset, len).await?;
+                RECOVERY_READ_BYTES.fetch_add(bytes.len(), std::sync::atomic::Ordering::SeqCst);
+                Ok(bytes)
+            }
+        }
+
+        fn sync_data(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_data(handle)
+        }
+
+        fn sync_directory(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_directory(path)
+        }
+
+        fn close(
+            handle: Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
             TokioFileIO::close(handle)
         }
 
@@ -2100,6 +2230,121 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.key, key);
         assert_eq!(meta.state, SpoolState::WriteLocked);
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_bounds_partial_tail_reads_and_preserves_excess() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096_usize;
+        let partial_len = 3073_usize;
+        let keys: Vec<String> = (0..64)
+            .map(|index| format!("00000000-0000-4000-8000-{index:012}"))
+            .collect();
+        let fixture_manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 16 * page_size, keys.len())
+                .expect("fixture manager init");
+        let mut durable_sidecars = HashMap::new();
+
+        for (index, key) in keys.iter().enumerate() {
+            let mut metadata =
+                sidecar_fixture_metadata(&data_dir, key, SpoolState::Writing, partial_len as u64);
+            metadata.last_write_at = if index == 3 || index == 7 {
+                1_000
+            } else {
+                100 + index as u64
+            };
+            write_sidecar_fixture(&fixture_manager, metadata, &vec![index as u8; partial_len])
+                .await;
+            durable_sidecars.insert(
+                key.clone(),
+                tokio::fs::read(data_dir.join(key).join("meta.json"))
+                    .await
+                    .expect("snapshot durable sidecar"),
+            );
+        }
+
+        let corrupt_key = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let corrupt_dir = data_dir.join(corrupt_key);
+        tokio::fs::create_dir_all(&corrupt_dir)
+            .await
+            .expect("create corrupt spool directory");
+        tokio::fs::write(corrupt_dir.join("meta.json"), b"{not json")
+            .await
+            .expect("write corrupt sidecar");
+        tokio::fs::write(corrupt_dir.join("spool.dat"), b"bad")
+            .await
+            .expect("write corrupt data");
+        drop(fixture_manager);
+
+        RECOVERY_OPEN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let limited =
+            SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, page_size, 16 * page_size, 3)
+                .expect("limited manager init");
+        limited.recover().await.expect("limited recovery succeeds");
+
+        let expected_admitted = [&keys[3], &keys[7], &keys[63]];
+        let mut actual_admitted = limited.spool_keys();
+        actual_admitted.sort();
+        let mut expected_admitted_sorted: Vec<String> =
+            expected_admitted.into_iter().cloned().collect();
+        expected_admitted_sorted.sort();
+        assert_eq!(actual_admitted, expected_admitted_sorted);
+        assert_eq!(
+            RECOVERY_OPEN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "only admitted spool data files may be opened"
+        );
+        assert_eq!(
+            RECOVERY_READ_BYTES.load(std::sync::atomic::Ordering::SeqCst),
+            3 * partial_len,
+            "only admitted trailing partial pages may be loaded"
+        );
+        assert_eq!(limited.admission.available_permits(), 0);
+        assert!(
+            !corrupt_dir.exists(),
+            "a malformed sidecar remains a per-key deletion and must not affect valid candidates"
+        );
+
+        for key in &keys {
+            assert!(data_dir.join(key).join("spool.dat").exists());
+            if limited.get_spool(key).is_none() {
+                assert_eq!(
+                    tokio::fs::read(data_dir.join(key).join("meta.json"))
+                        .await
+                        .expect("read quarantined sidecar"),
+                    durable_sidecars[key],
+                    "excess durable metadata must remain untouched"
+                );
+            }
+        }
+        drop(limited);
+
+        RECOVERY_OPEN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let expanded = SpoolManager::<RecoveryCountingFileIO>::new(
+            &data_dir,
+            page_size,
+            16 * page_size,
+            keys.len(),
+        )
+        .expect("expanded manager init");
+        expanded
+            .recover()
+            .await
+            .expect("expanded recovery succeeds");
+        assert_eq!(expanded.spools.len(), keys.len());
+        assert!(keys.iter().all(|key| expanded.get_spool(key).is_some()));
+        assert_eq!(
+            RECOVERY_OPEN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            keys.len()
+        );
+        assert_eq!(
+            RECOVERY_READ_BYTES.load(std::sync::atomic::Ordering::SeqCst),
+            keys.len() * partial_len
+        );
+        assert_eq!(expanded.admission.available_permits(), 0);
     }
 
     #[tokio::test]
