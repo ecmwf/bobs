@@ -383,18 +383,14 @@ where
         write_locked: bool,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        let key_lease = self.acquire_key_lock(&key).await;
         let spool_dir = self.data_dir.join(&key);
-        let existing_is_deleting = if let Some(spool) = self.get_spool(&key) {
-            spool.metadata.lock().await.state == SpoolState::Deleting
-        } else {
-            false
-        };
-        if !existing_is_deleting
-            && (self.spools.contains_key(&key)
-                || tokio::fs::try_exists(&spool_dir)
-                    .await
-                    .map_err(BobsError::IoError)?)
+        // A tracked key is always a duplicate, including a failed, retryable
+        // Deleting spool that still owns its admission permit. Reject it before
+        // admission or the per-key gate so create cannot stall deletion retry.
+        if self.spools.contains_key(&key)
+            || tokio::fs::try_exists(&spool_dir)
+                .await
+                .map_err(BobsError::IoError)?
         {
             return Err(BobsError::SpoolAlreadyExists { key });
         }
@@ -416,6 +412,19 @@ where
                     BobsError::IoError(std::io::Error::other("admission semaphore closed"))
                 })?
         };
+
+        // Admission waits never hold the per-key gate. Once admitted, serialize
+        // with a concurrent create or final deletion and repeat the reservation
+        // check. Successful deletion removes the tracked spool only after its
+        // directory is durably gone and its permit has been released.
+        let key_lease = self.acquire_key_lock(&key).await;
+        if self.spools.contains_key(&key)
+            || tokio::fs::try_exists(&spool_dir)
+                .await
+                .map_err(BobsError::IoError)?
+        {
+            return Err(BobsError::SpoolAlreadyExists { key });
+        }
 
         // Once the atomic directory reservation starts, the transaction must outlive
         // its caller. A cancelled request drops only this JoinHandle; the detached
@@ -2273,7 +2282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_then_create_same_key_is_serialized_and_accounted() {
+    async fn test_queued_delete_keeps_duplicate_create_conflicting_until_recreate() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let manager =
@@ -2308,22 +2317,27 @@ mod tests {
                 .create_spool(create_key, None, None, false, HashMap::new())
                 .await
         });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        let create_result = tokio::time::timeout(Duration::from_secs(1), create_task)
+            .await
+            .expect("tracked create must not wait for queued deletion")
+            .expect("create task join");
+        assert!(matches!(
+            create_result,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
         assert!(!delete_task.is_finished());
-        assert!(!create_task.is_finished());
 
         drop(gate_guard);
         delete_task
             .await
             .expect("delete task join")
             .expect("delete wins reservation order");
-        create_task
-            .await
-            .expect("create task join")
-            .expect("create follows completed delete");
+        assert_eq!(manager.admission.available_permits(), 1);
 
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("later create follows completed delete");
         assert_eq!(
             tokio::fs::metadata(data_dir.join(&key).join("spool.dat"))
                 .await
@@ -3454,6 +3468,167 @@ mod tests {
             data
         );
         assert_eq!(tokio::fs::read(&meta_path).await.unwrap(), original_sidecar);
+    }
+
+    #[tokio::test]
+    async fn test_failed_delete_rejects_timed_create_before_admission() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 1).expect("manager init");
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        manager
+            .get_spool(&key)
+            .expect("spool exists")
+            .write(0, Bytes::from_static(b"safe"))
+            .await
+            .expect("write original bytes");
+        let meta_path = data_dir.join(&key).join("meta.json");
+        tokio::fs::remove_file(&meta_path)
+            .await
+            .expect("remove metadata file");
+        tokio::fs::create_dir(&meta_path)
+            .await
+            .expect("replace metadata with directory");
+
+        manager
+            .delete_spool(&key)
+            .await
+            .expect_err("injected delete failure");
+        let duplicate = manager
+            .create_spool_with_admission_timeout(
+                Duration::ZERO,
+                key.clone(),
+                None,
+                None,
+                false,
+                HashMap::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            duplicate,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("read original spool bytes"),
+            b"safe"
+        );
+        assert_eq!(
+            manager
+                .get_spool(&key)
+                .expect("failed delete remains tracked")
+                .metadata
+                .lock()
+                .await
+                .state,
+            SpoolState::Deleting
+        );
+
+        tokio::fs::remove_dir(&meta_path)
+            .await
+            .expect("repair metadata path");
+        manager.delete_spool(&key).await.expect("cleanup spool");
+        assert_eq!(manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failed_delete_rejects_untimed_create_without_blocking_retry_and_recreates() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let manager = Arc::new(
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 1).expect("manager init"),
+        );
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        manager
+            .get_spool(&key)
+            .expect("spool exists")
+            .write(0, Bytes::from_static(b"safe"))
+            .await
+            .expect("write original bytes");
+        let meta_path = data_dir.join(&key).join("meta.json");
+        tokio::fs::remove_file(&meta_path)
+            .await
+            .expect("remove metadata file");
+        tokio::fs::create_dir(&meta_path)
+            .await
+            .expect("replace metadata with directory");
+        manager
+            .delete_spool(&key)
+            .await
+            .expect_err("injected delete failure");
+        tokio::fs::remove_dir(&meta_path)
+            .await
+            .expect("repair metadata path");
+
+        // Hold the key gate so both operations are definitely concurrent. A
+        // duplicate must finish without joining the gate queue, while the retry
+        // waits only for this test guard.
+        let key_gate = manager.key_lock(&key);
+        let key_guard = key_gate.lock().await;
+        let duplicate_manager = Arc::clone(&manager);
+        let duplicate_key = key.clone();
+        let mut duplicate = tokio::spawn(async move {
+            duplicate_manager
+                .create_spool(duplicate_key, None, None, false, HashMap::new())
+                .await
+        });
+        let delete_manager = Arc::clone(&manager);
+        let delete_key = key.clone();
+        let delete_retry =
+            tokio::spawn(async move { delete_manager.delete_spool(&delete_key).await });
+
+        let duplicate_result = tokio::time::timeout(Duration::from_secs(1), &mut duplicate)
+            .await
+            .expect("tracked duplicate must not wait for admission or the key gate")
+            .expect("duplicate task join");
+        assert!(matches!(
+            duplicate_result,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
+        assert!(!delete_retry.is_finished());
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("duplicate must not truncate original bytes"),
+            b"safe"
+        );
+
+        drop(key_guard);
+        tokio::time::timeout(Duration::from_secs(5), delete_retry)
+            .await
+            .expect("delete retry must not be blocked by duplicate create")
+            .expect("delete retry task join")
+            .expect("delete retry succeeds");
+        assert!(manager.get_spool(&key).is_none());
+        assert!(!data_dir.join(&key).exists());
+        assert_eq!(manager.admission.available_permits(), 1);
+
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("recreate after durable deletion");
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(manager.spools.len(), 1);
+        assert_eq!(
+            tokio::fs::metadata(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("replacement data file")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]

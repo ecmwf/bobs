@@ -2255,14 +2255,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_length_oversize_cleanup_failure_returns_500_and_retains_tracked_state() {
+    async fn known_length_oversize_cleanup_failure_keeps_duplicate_create_conflicting() {
         let (app, state) = app_with_config(|config| {
             config.page_size = 4;
             config.max_spool_bytes = 6;
             config.max_live_spools = 1;
         })
         .await;
-        let key = create_key(&app).await;
+        let key = "0123456789abcdefghjkmnpqrs".to_string();
+        let create = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, &key)
+            .body(Body::empty())
+            .expect("create request");
+        assert_eq!(
+            app.clone().oneshot(create).await.unwrap().status(),
+            StatusCode::CREATED
+        );
         let initial_write = Request::builder()
             .method("POST")
             .uri(format!("/api/v1/write/{key}/0"))
@@ -2294,12 +2304,25 @@ mod tests {
             .body(Body::from_stream(overflow_body))
             .expect("overflow request");
         let response = app
+            .clone()
             .oneshot(overflow_request)
             .await
             .expect("overflow response");
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!body_polled.load(Ordering::SeqCst));
+        let duplicate = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, &key)
+            .body(Body::empty())
+            .expect("duplicate create request");
+        let duplicate_response = app
+            .oneshot(duplicate)
+            .await
+            .expect("duplicate create response");
+        assert_eq!(duplicate_response.status(), StatusCode::CONFLICT);
+
         let spool = state
             .manager
             .get_spool(&key)
