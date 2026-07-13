@@ -103,6 +103,8 @@ After successful completion, `meta.json` is the durable completed-object record.
 
 Startup recovery scans `data_dir` for spool directories with `meta.json` sidecars.
 
+Recovery uses one top-level directory scan, reads sidecars individually, and keeps only compact key/activity indexing plus the bounded preferred candidate heap. Each sidecar is statted before allocation and is limited to 1 MiB. Oversized payloads and payloads with unknown fields are preserved unchanged as unsupported quarantine; malformed known-schema JSON is isolated to per-key corrupt cleanup. Selected candidates are reread before admission, and excess candidates never have `spool.dat` opened or tail bytes loaded.
+
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
 - Valid `Completing` markers are deterministically finalized to `Complete`; inconsistent markers and data are quarantined without mutation and are never reopened for writes.
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
