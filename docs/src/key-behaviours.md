@@ -62,7 +62,7 @@ Each current sidecar records its spool's `page_size`. A legacy `Readable` sideca
 
 An ambiguous legacy `Writing` partial spool is quarantined without mutation: BOBS leaves `meta.json` and `spool.dat` intact, does not expose the key through spool APIs, and continues startup. A malformed legacy `WriteLocked` sidecar is handled the same way. BOBS does not guess a stride or delete these bytes.
 
-Recovery admission uses the same non-zero `max_live_spools` bound as normal creation and applies it uniformly to in-progress and complete spools. Candidates with newer persisted activity are admitted first, with the key as a deterministic tie-breaker. Entries beyond the bound stay durable but unavailable: recovery does not open their data file, load a partial tail, rewrite metadata, classify data corruption, or delete the directory. Increasing capacity on a later restart admits more of this quarantined set.
+Recovery admission uses the same non-zero `max_live_spools` bound as normal creation and applies it uniformly to in-progress and complete spools. Candidates with newer persisted activity are considered first, with the key as a deterministic tie-breaker. Metadata-only lifecycle, migration, and layout checks run before admission, so invalid candidates cannot occupy capacity; failed admitted candidates release their permit and recovery continues. Once the bound is successfully filled, metadata-valid excess entries stay durable but unavailable without opening their data file, loading a partial tail, or rewriting their sidecar. Increasing capacity on a later restart admits more of this quarantined set.
 
 A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 
