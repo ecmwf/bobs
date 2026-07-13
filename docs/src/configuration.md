@@ -40,7 +40,7 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `max_live_spools` | `4096` | Non-zero admission bound for live spools. New writers wait when the bound is full. Startup recovers at most this many spools and leaves excess durable entries quarantined for a later restart with capacity. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. |
-| `full_read_complete_ttl_secs` | `30` | Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served. |
+| `full_read_complete_ttl_secs` | `30` | Short TTL after bounded coverage tracking proves every byte was served and no later bytes were served. Adjacent/overlapping ranges coalesce. If genuinely fragmented access exceeds the tracking cap, BOBS stays on the idle TTL until a later completed contiguous full-object response proves coverage exactly. |
 | `reader_done_ttl_secs` | `60` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. |
