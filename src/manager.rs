@@ -1647,6 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_directory_durability_ordering_failures_and_retry_release() {
+        let _protocol_guard = PROTOCOL_TEST_LOCK.lock().await;
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let manager = SpoolManager::<ProtocolFileIO, ProtocolMetadataStore>::with_metadata_store(
@@ -2309,7 +2310,6 @@ mod tests {
         assert_eq!(manager.admission.available_permits(), 1);
         assert_eq!(manager.spools.len(), 1);
     }
-
 
     #[tokio::test]
     async fn test_queued_delete_keeps_duplicate_create_conflicting_until_recreate() {
