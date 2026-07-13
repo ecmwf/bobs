@@ -329,18 +329,16 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Arc::new(
-            Spool::new(
-                meta,
-                handle,
-                page_size,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    page_size * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            ),
-        )
+        Arc::new(Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ))
     }
 
     async fn persisted_metadata(spool: &Spool<TokioFileIO>) -> SpoolMetadata {
