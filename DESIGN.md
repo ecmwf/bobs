@@ -77,7 +77,7 @@ HTTP write staging starts empty, ignores untrusted body-size hints for reservati
 
 The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget (binary default 268435456 bytes / 256 MiB; current Helm chart value 1048576 bytes / 1 MiB). That budget accounts the logical bytes of bounded cache-owned page allocations, excluding allocator overhead, so a small page slice cannot retain a much larger HTTP frame outside the accounting. Cache insertion may make this isolation copy solely to avoid retaining an oversized frame backing; the frame-to-disk path remains zero-copy. Setting `max_cache_bytes` to `0` disables caching without an isolation copy, and pages rejected because they are larger than the cap likewise bypass the cache without one while remaining readable from disk. Cache hits share the isolated `Bytes` without copying page contents. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 
-`max_live_spools` limits the number of spools in the first-read cache phase. When omitted, it derives as `max(1, max_cache_bytes / page_size)`, which is 16 with the 16 MiB/256 MiB binary defaults. Explicit values are preserved; the chart sets 256 for its 4 KiB/1 MiB profile. `/api/v1/create` waits up to `create_admission_timeout_ms` (default 5000) for a slot, then returns `503 Service Unavailable`; a key already tracked in any state returns `409 Conflict` immediately instead of entering that wait.
+`max_live_spools` limits the number of spools in the first-read cache phase. When omitted, it derives as `max(1, max_cache_bytes / page_size)`, which is 16 with the 16 MiB/256 MiB binary defaults. Explicit values are preserved; the chart sets 256 for its 4 KiB/1 MiB profile. `/api/v1/create` waits up to `create_admission_timeout_ms` (default 5000) for a slot, then returns `503 Service Unavailable`; a key already tracked in any state returns `409 Conflict` immediately instead of entering that wait. The first transition to proven full-object coverage frees that spool's cache entries and releases its admission slot immediately; the spool remains readable from disk until cleanup.
 
 A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/api/v1/complete/{key}` publishes it as the final page. A spool accepts at most `max_spool_bytes` (default 8 GiB); an upload that crosses the limit is durably deleted before the server returns `413 Payload Too Large`.
 
@@ -91,7 +91,7 @@ Only a request without `Range` enters follow mode, starting at byte 0. If the ne
 
 If the follow-mode timeout fires before the first page is available, BOBS returns `307 Temporary Redirect` to a read URL for the same key. If a trusted ingress supplies a valid `X-Forwarded-Prefix`, the redirect preserves that external prefix; otherwise it falls back to `/api/v1/read/{key}`. The redirect includes `Cache-Control: no-store` because the location can depend on request headers. A timeout after streaming has begun aborts the transfer with a response-body error rather than redirecting or reporting a clean end of stream.
 
-Range reads update aggregate read-coverage tracking so cleanup can detect when the whole object has been served, even across multiple range requests.
+Range reads update bounded aggregate coverage tracking so cleanup can detect when the whole object has been served across requests. Adjacent and overlapping progress is coalesced; genuinely fragmented access that exceeds the interval cap conservatively stops aggregate tracking and retains first-read admission. It cannot produce a false full-read result, but one later successfully completed contiguous full-object response provides exact evidence, frees first-read cache and admission, and restores the full-read transition.
 
 ## Write-locked spools
 
@@ -132,7 +132,7 @@ Current cleanup triggers are:
 
 - writer inactivity for producers that stop writing without completing (`writer_inactivity_timeout_secs`, default 300);
 - read-idle TTL for readable spools that have not served bytes recently, with never-read spools anchored at `readable_at` (`read_idle_ttl_secs`, default 600);
-- full-read-complete TTL once aggregate coverage shows every byte has been served at least once (`full_read_complete_ttl_secs`, default 30).
+- full-read-complete TTL once bounded aggregate coverage, or one completed contiguous full-object response after fragmented fallback, proves every byte has been served (`full_read_complete_ttl_secs`, default 30).
 
 The legacy `reader_done_ttl_secs` and `unread_ttl_secs` fields are still parsed for config-file compatibility but no longer drive cleanup. `cleanup_sweep_interval_secs` defaults to 30 and must not exceed `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, or `full_read_complete_ttl_secs`.
 

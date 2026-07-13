@@ -68,13 +68,13 @@ A background task periodically sweeps the spool manager and deletes spools based
 
 - **Writer Inactivity**: The producer stopped writing without completing the spool (`writer_inactivity_timeout_secs`, default 300).
 - **Read Idle TTL**: The spool has not served bytes for `read_idle_ttl_secs` (default 600); never-read spools are anchored when they become readable.
-- **Full Read TTL**: Every byte has been served and `full_read_complete_ttl_secs` (default 30) has elapsed since the latest read activity.
+- **Full Read TTL**: Bounded coverage tracking, or an exact completed full-object response after fragmented fallback, has proved every byte was served; `full_read_complete_ttl_secs` (default 30) has elapsed since the latest read activity.
 
 `cleanup_sweep_interval_secs` defaults to 30 and must not exceed any active cleanup timeout. The deprecated `reader_done_ttl_secs` and `unread_ttl_secs` fields remain parseable but do not drive cleanup. Expiry removes the key directory, including `spool.dat`, `meta.json`, and interrupted `meta.json.tmp`.
 
 Cleanup revalidates each expired candidate under the spool lifecycle lock immediately before deletion. Every accepted non-empty HTTP body frame refreshes writer activity under the same lock before it enters the batching buffer. A frame, write, completion, or served byte after the sweep snapshot invalidates that candidate rather than deleting from stale eligibility data.
 
-Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.
+Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. Adjacent and overlapping pre-completion progress is coalesced before the interval cap is applied, keeping ordinary sequential follow reads O(1). If genuinely fragmented access exceeds the cap, BOBS conservatively falls back to the longer idle TTL, retains the first-read admission slot, and cannot falsely report completion. A later successfully completed contiguous full-object response restores exact complete coverage, frees the first-read cache and admission slot immediately, and starts the short TTL while the spool remains disk-readable.
 
 ### 9. HTTP/2 Support
 

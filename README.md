@@ -159,13 +159,13 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `data_dir` | `./data` | Directory for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of individual data pages. Valid range `1..=67108864` (64 MiB), no larger than `max_spool_bytes`. In-progress readers see a page only once it is full; `/api/v1/complete/{key}` publishes the final partial page. |
 | `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO budget for bounded cache-owned page allocations across all spools, excluding allocator overhead. Cache admission may copy solely to avoid retaining an oversized frame backing; disabled caching and pages rejected for exceeding the cap do not make that isolation copy. |
-| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools not yet fully read. Omitted values derive from effective page/cache settings; explicit values are preserved. |
+| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for the first-read cache phase. Omitted values derive from effective page/cache settings; explicit values are preserved. Proven full-object coverage immediately frees the spool's cache and admission slot while leaving it readable from disk. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool; must be at least `page_size`. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
 | `create_admission_timeout_ms` | `5000` | Maximum `/api/v1/create` admission wait before `503 Service Unavailable`. |
 | `writer_inactivity_timeout_secs` | `300` | Writer-silence interval after which an unfinished spool is eligible for cleanup. Must be greater than `0`. |
 | `enable_pprof` | `false` | Enables unauthenticated `/debug/pprof/profile` on the main listener; use only in a controlled environment. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools, anchored when the spool becomes readable and refreshed whenever bytes are served. Must be greater than `0`. |
-| `full_read_complete_ttl_secs` | `30` | Short TTL after aggregate read coverage reaches every byte, refreshed by subsequent read activity. Must be greater than `0`. |
+| `full_read_complete_ttl_secs` | `30` | Short TTL after bounded aggregate coverage reaches every byte. Adjacent and overlapping ranges coalesce; excessive fragmentation retains first-read admission and uses the idle TTL until a later completed contiguous full-object response proves coverage exactly. Must be greater than `0`. |
 | `reader_done_ttl_secs` | `60` | Deprecated compatibility field; parsed but ignored by cleanup. Use `read_idle_ttl_secs`. |
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field; parsed but ignored by cleanup. Use `read_idle_ttl_secs`. |
 | `cleanup_sweep_interval_secs` | `30` | Cleanup scan frequency. Must be greater than `0` and no longer than any active cleanup timeout. |
