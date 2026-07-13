@@ -383,18 +383,14 @@ where
         write_locked: bool,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        let key_lease = self.acquire_key_lock(&key).await;
         let spool_dir = self.data_dir.join(&key);
-        let existing_is_deleting = if let Some(spool) = self.get_spool(&key) {
-            spool.metadata.lock().await.state == SpoolState::Deleting
-        } else {
-            false
-        };
-        if !existing_is_deleting
-            && (self.spools.contains_key(&key)
-                || tokio::fs::try_exists(&spool_dir)
-                    .await
-                    .map_err(BobsError::IoError)?)
+        // A tracked key is always a duplicate, including a failed, retryable
+        // Deleting spool that still owns its admission permit. Reject it before
+        // admission or the per-key gate so create cannot stall deletion retry.
+        if self.spools.contains_key(&key)
+            || tokio::fs::try_exists(&spool_dir)
+                .await
+                .map_err(BobsError::IoError)?
         {
             return Err(BobsError::SpoolAlreadyExists { key });
         }
@@ -416,6 +412,19 @@ where
                     BobsError::IoError(std::io::Error::other("admission semaphore closed"))
                 })?
         };
+
+        // Admission waits never hold the per-key gate. Once admitted, serialize
+        // with a concurrent create or final deletion and repeat the reservation
+        // check. Successful deletion removes the tracked spool only after its
+        // directory is durably gone and its permit has been released.
+        let key_lease = self.acquire_key_lock(&key).await;
+        if self.spools.contains_key(&key)
+            || tokio::fs::try_exists(&spool_dir)
+                .await
+                .map_err(BobsError::IoError)?
+        {
+            return Err(BobsError::SpoolAlreadyExists { key });
+        }
 
         // Once the atomic directory reservation starts, the transaction must outlive
         // its caller. A cancelled request drops only this JoinHandle; the detached
@@ -934,13 +943,32 @@ where
             }
 
             let entry_path = entry.path();
-            // Recognised-key directories without spool markers are preserved:
-            // they may be unrelated operator data, or a future spool shape, and
-            // are not safe orphans unless they contain a known spool marker.
+            // A crash immediately after create_dir can leave a recognised key
+            // directory before any spool marker exists. remove_dir is the atomic
+            // emptiness check: if data appears after inspection it fails rather
+            // than recursively deleting that data.
             let shaped_like_spool =
                 entry_path.join("spool.dat").exists() || entry_path.join("meta.json").exists();
             if !shaped_like_spool {
-                tracing::warn!(orphan = %name, "recovery: skipping spool-key directory without spool markers during orphan sweep");
+                match tokio::fs::remove_dir(&entry_path).await {
+                    Ok(()) => {
+                        orphan_deleted += 1;
+                        tracing::debug!(orphan = %name, "recovery: removed empty pre-marker spool directory; parent sync pending");
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                            tracing::warn!(orphan = %name, "recovery: preserving non-empty spool-key directory without spool markers");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(orphan = %name, error = %error, "recovery: failed to inspect/remove empty pre-marker spool directory");
+                    }
+                }
                 continue;
             }
 
@@ -955,6 +983,15 @@ where
                 }
             }
         }
+
+        // Commit empty pre-marker removals, and retry any parent-directory
+        // durability boundary left uncertain by an earlier failed recovery.
+        // Running this barrier even when this scan made no changes makes a
+        // subsequent startup/recover call a valid retry after unlink + fsync
+        // failure.
+        F::sync_directory(&self.data_dir)
+            .await
+            .map_err(BobsError::IoError)?;
 
         tracing::info!(
             "event.name" = "bobs.recovery.completed",
@@ -1368,6 +1405,7 @@ mod tests {
         MetadataDelete,
     }
 
+    static PROTOCOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static PROTOCOL_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<ProtocolEvent>>> =
         std::sync::OnceLock::new();
     static FAIL_NEXT_PARENT_SYNC: std::sync::atomic::AtomicBool =
@@ -2272,8 +2310,9 @@ mod tests {
         assert_eq!(manager.spools.len(), 1);
     }
 
+
     #[tokio::test]
-    async fn test_delete_then_create_same_key_is_serialized_and_accounted() {
+    async fn test_queued_delete_keeps_duplicate_create_conflicting_until_recreate() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let manager =
@@ -2308,22 +2347,27 @@ mod tests {
                 .create_spool(create_key, None, None, false, HashMap::new())
                 .await
         });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        let create_result = tokio::time::timeout(Duration::from_secs(1), create_task)
+            .await
+            .expect("tracked create must not wait for queued deletion")
+            .expect("create task join");
+        assert!(matches!(
+            create_result,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
         assert!(!delete_task.is_finished());
-        assert!(!create_task.is_finished());
 
         drop(gate_guard);
         delete_task
             .await
             .expect("delete task join")
             .expect("delete wins reservation order");
-        create_task
-            .await
-            .expect("create task join")
-            .expect("create follows completed delete");
+        assert_eq!(manager.admission.available_permits(), 1);
 
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("later create follows completed delete");
         assert_eq!(
             tokio::fs::metadata(data_dir.join(&key).join("spool.dat"))
                 .await
@@ -2824,7 +2868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recovery_orphan_sweep_preserves_uuid_empty_and_uuid_symlink_dirs() {
+    async fn recovery_removes_empty_pre_marker_dir_and_preserves_nonempty_and_symlink_dirs() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         tokio::fs::create_dir_all(&data_dir)
@@ -2833,9 +2877,18 @@ mod tests {
 
         let empty_uuid_key = uuid::Uuid::new_v4().to_string();
         let empty_uuid_dir = data_dir.join(&empty_uuid_key);
-        tokio::fs::create_dir_all(&empty_uuid_dir)
+        tokio::fs::create_dir(&empty_uuid_dir)
             .await
             .expect("create empty UUID dir");
+
+        let nonempty_uuid_key = uuid::Uuid::new_v4().to_string();
+        let nonempty_uuid_dir = data_dir.join(&nonempty_uuid_key);
+        tokio::fs::create_dir(&nonempty_uuid_dir)
+            .await
+            .expect("create nonempty UUID dir");
+        tokio::fs::write(nonempty_uuid_dir.join("operator-data"), b"retain")
+            .await
+            .expect("write unknown data");
 
         #[cfg(unix)]
         let (symlink_path, target_dir) = {
@@ -2859,9 +2912,19 @@ mod tests {
         manager.recover().await.expect("recover succeeds");
 
         assert!(
-            empty_uuid_dir.exists(),
-            "UUID-named empty directories must be preserved"
+            !empty_uuid_dir.exists(),
+            "empty pre-marker key directory must be removed on restart"
         );
+        assert!(
+            nonempty_uuid_dir.join("operator-data").exists(),
+            "non-empty markerless key directory must be quarantined without mutation"
+        );
+        manager
+            .create_spool(empty_uuid_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("the original key can be created after recovery removes its empty directory");
+        assert!(manager.get_spool(&empty_uuid_key).is_some());
+
         if let Some(symlink_path) = symlink_path {
             assert!(
                 tokio::fs::symlink_metadata(&symlink_path)
@@ -2878,6 +2941,57 @@ mod tests {
                 "orphan sweep must not traverse a skipped symlink target"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn empty_pre_marker_parent_sync_failure_is_retryable() {
+        let _protocol_guard = PROTOCOL_TEST_LOCK.lock().await;
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .expect("create data dir");
+        let key = uuid::Uuid::new_v4().to_string();
+        tokio::fs::create_dir(data_dir.join(&key))
+            .await
+            .expect("create empty pre-marker key dir");
+        let manager = SpoolManager::<ProtocolFileIO, ProtocolMetadataStore>::with_metadata_store(
+            ProtocolMetadataStore::new(&data_dir),
+            &data_dir,
+            4096,
+            16 * 4096,
+            256,
+        )
+        .expect("manager init");
+
+        take_protocol_events();
+        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            manager.recover().await,
+            Err(BobsError::IoError(_))
+        ));
+        assert!(
+            !data_dir.join(&key).exists(),
+            "the atomic empty-dir removal may precede an uncertain parent sync"
+        );
+        assert_eq!(
+            take_protocol_events(),
+            vec![ProtocolEvent::ParentDirectorySync]
+        );
+
+        manager
+            .recover()
+            .await
+            .expect("retry re-syncs the parent even though the empty directory is gone");
+        assert_eq!(
+            take_protocol_events(),
+            vec![ProtocolEvent::ParentDirectorySync]
+        );
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create succeeds after the recovery durability retry");
+        assert!(manager.get_spool(&key).is_some());
     }
 
     #[tokio::test]
@@ -3454,6 +3568,167 @@ mod tests {
             data
         );
         assert_eq!(tokio::fs::read(&meta_path).await.unwrap(), original_sidecar);
+    }
+
+    #[tokio::test]
+    async fn test_failed_delete_rejects_timed_create_before_admission() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 1).expect("manager init");
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        manager
+            .get_spool(&key)
+            .expect("spool exists")
+            .write(0, Bytes::from_static(b"safe"))
+            .await
+            .expect("write original bytes");
+        let meta_path = data_dir.join(&key).join("meta.json");
+        tokio::fs::remove_file(&meta_path)
+            .await
+            .expect("remove metadata file");
+        tokio::fs::create_dir(&meta_path)
+            .await
+            .expect("replace metadata with directory");
+
+        manager
+            .delete_spool(&key)
+            .await
+            .expect_err("injected delete failure");
+        let duplicate = manager
+            .create_spool_with_admission_timeout(
+                Duration::ZERO,
+                key.clone(),
+                None,
+                None,
+                false,
+                HashMap::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            duplicate,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("read original spool bytes"),
+            b"safe"
+        );
+        assert_eq!(
+            manager
+                .get_spool(&key)
+                .expect("failed delete remains tracked")
+                .metadata
+                .lock()
+                .await
+                .state,
+            SpoolState::Deleting
+        );
+
+        tokio::fs::remove_dir(&meta_path)
+            .await
+            .expect("repair metadata path");
+        manager.delete_spool(&key).await.expect("cleanup spool");
+        assert_eq!(manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failed_delete_rejects_untimed_create_without_blocking_retry_and_recreates() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let manager = Arc::new(
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 1).expect("manager init"),
+        );
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        manager
+            .get_spool(&key)
+            .expect("spool exists")
+            .write(0, Bytes::from_static(b"safe"))
+            .await
+            .expect("write original bytes");
+        let meta_path = data_dir.join(&key).join("meta.json");
+        tokio::fs::remove_file(&meta_path)
+            .await
+            .expect("remove metadata file");
+        tokio::fs::create_dir(&meta_path)
+            .await
+            .expect("replace metadata with directory");
+        manager
+            .delete_spool(&key)
+            .await
+            .expect_err("injected delete failure");
+        tokio::fs::remove_dir(&meta_path)
+            .await
+            .expect("repair metadata path");
+
+        // Hold the key gate so both operations are definitely concurrent. A
+        // duplicate must finish without joining the gate queue, while the retry
+        // waits only for this test guard.
+        let key_gate = manager.key_lock(&key);
+        let key_guard = key_gate.lock().await;
+        let duplicate_manager = Arc::clone(&manager);
+        let duplicate_key = key.clone();
+        let mut duplicate = tokio::spawn(async move {
+            duplicate_manager
+                .create_spool(duplicate_key, None, None, false, HashMap::new())
+                .await
+        });
+        let delete_manager = Arc::clone(&manager);
+        let delete_key = key.clone();
+        let delete_retry =
+            tokio::spawn(async move { delete_manager.delete_spool(&delete_key).await });
+
+        let duplicate_result = tokio::time::timeout(Duration::from_secs(1), &mut duplicate)
+            .await
+            .expect("tracked duplicate must not wait for admission or the key gate")
+            .expect("duplicate task join");
+        assert!(matches!(
+            duplicate_result,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
+        assert!(!delete_retry.is_finished());
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("duplicate must not truncate original bytes"),
+            b"safe"
+        );
+
+        drop(key_guard);
+        tokio::time::timeout(Duration::from_secs(5), delete_retry)
+            .await
+            .expect("delete retry must not be blocked by duplicate create")
+            .expect("delete retry task join")
+            .expect("delete retry succeeds");
+        assert!(manager.get_spool(&key).is_none());
+        assert!(!data_dir.join(&key).exists());
+        assert_eq!(manager.admission.available_permits(), 1);
+
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("recreate after durable deletion");
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(manager.spools.len(), 1);
+        assert_eq!(
+            tokio::fs::metadata(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("replacement data file")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]

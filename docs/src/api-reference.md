@@ -40,7 +40,7 @@ Returns the health status and hostname of the instance.
 
 ### PUT /api/v1/create
 
-Creates a new spool and returns its key. A valid `X-Polytope-Job-Id` is a 26-character Crockford base32 request ID in either case; uppercase input is normalized to the lowercase canonical key. Otherwise BOBS generates a UUIDv4 key. Create is not idempotent: if that key already exists or is being created, BOBS returns `409 Conflict` without truncating the existing bytes or changing admission accounting. Exactly one concurrent create can succeed, and a successfully deleted key may be created again.
+Creates a new spool and returns its key. A valid `X-Polytope-Job-Id` is a 26-character Crockford base32 request ID in either case; uppercase input is normalized to the lowercase canonical key. Otherwise BOBS generates a UUIDv4 key. Create is not idempotent: if the key is tracked in any lifecycle state, including retryable `Deleting`, BOBS returns `409 Conflict` before waiting for admission or the per-key gate. An existing reserved key directory also conflicts. Duplicate create never truncates existing bytes or changes admission accounting; exactly one concurrent create can succeed, and a durably deleted key may be created again.
 
 **Request Body**:
 
@@ -49,7 +49,7 @@ Creates a new spool and returns its key. A valid `X-Polytope-Job-Id` is a 26-cha
 - `write_locked` (boolean, optional): Default `false`. If `true`, reads return `423 Locked` until the spool is completed.
 - `labels` (object of string values, optional): Caller labels filtered and propagated to metrics.
 
-BOBS rejects unknown JSON fields and `content_type` or `content_encoding` values that cannot safely be represented as HTTP headers with `400 Bad Request`. Repeating or concurrently issuing create with the same valid `X-Polytope-Job-Id` returns `409 Conflict`.
+BOBS rejects unknown JSON fields and `content_type` or `content_encoding` values that cannot safely be represented as HTTP headers with `400 Bad Request`. Repeating or concurrently issuing create with the same valid `X-Polytope-Job-Id` returns `409 Conflict`; this immediate response applies to every tracked state, not only writable or complete spools.
 
 **Example**:
 
@@ -67,7 +67,7 @@ curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "text/plain
 }
 ```
 
-BOBS returns `201 Created` only after `spool.dat`, the key-directory link, and live `Writing` or `WriteLocked` metadata cross their fsync boundaries. The intermediate `Creating` sidecar is internal to crash recovery and is never visible as an active spool. An interrupted create is removed safely during startup recovery.
+BOBS returns `201 Created` only after `spool.dat`, the key-directory link, and live `Writing` or `WriteLocked` metadata cross their fsync boundaries. The intermediate `Creating` sidecar is internal to crash recovery and is never visible as an active spool. Startup recovery removes a recognised pre-marker key directory only when it is truly empty and then fsyncs `data_dir`; non-empty markerless directories are retained unchanged.
 
 If the client disconnects while waiting for admission, no key is reserved. After reservation starts, BOBS completes the create transaction or rolls it back despite client cancellation. A missing response is therefore an unknown outcome: retry with the same `X-Polytope-Job-Id`; `409 Conflict` means the spool now exists.
 

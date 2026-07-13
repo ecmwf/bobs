@@ -46,7 +46,7 @@ Metadata is stored as `<data_dir>/<key>/meta.json`. Each commit writes `<data_di
 
 This protocol keeps metadata off the write hot path while still making lifecycle transitions durable. It also suits shared filesystems because each key has its own directory and sidecar, with one writer per spool rather than one global metadata writer.
 
-Create also crosses the key-directory durability boundary before acknowledgement: BOBS waits for admission before reserving the key, syncs the empty data file and key directory, commits an internal `Creating` sidecar, fsyncs `data_dir`, and only then commits and publishes live metadata. Cancellation before admission leaves no reservation. After reservation, a detached transaction finishes publication or rollback even if the client disconnects, so callers that lose the response should retry with the same request ID and may receive `409 Conflict` for the completed create.
+Create also crosses the key-directory durability boundary before acknowledgement: BOBS waits for admission before reserving the key, syncs the empty data file and key directory, commits an internal `Creating` sidecar, fsyncs `data_dir`, and only then commits and publishes live metadata. A key already tracked in any lifecycle state, including retryable `Deleting`, returns `409 Conflict` before admission or the per-key gate. Cancellation before admission leaves no reservation. After reservation, a detached transaction finishes publication or rollback even if the client disconnects, so callers that lose the response should retry with the same request ID.
 
 Deletion removes sidecar metadata and the key directory, then fsyncs `data_dir` before returning success. Cache entries, admission, and manager membership remain held until that parent-directory sync succeeds, so failed deletion remains tracked and retryable.
 
@@ -54,7 +54,7 @@ Completion is similarly fail-stop once it begins. Internal `Completing` state bl
 
 ### 8. Recovery and Cleanup
 
-On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. For current in-progress `Writing`, `WriteLocked`, and retryable internal `Completing` spools, `spool.dat` is authoritative for byte state. Any persisted `total_bytes_written`, `total_pages`, or `final_page_size` for those states is advisory only and recovery recomputes it from the file.
+On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. A recognised UUID or request-ID directory without any BOBS marker is removed and parent-fsynced only when it is truly empty; non-empty markerless directories are retained unchanged and quarantined. For current in-progress `Writing`, `WriteLocked`, and retryable internal `Completing` spools, `spool.dat` is authoritative for byte state. Any persisted `total_bytes_written`, `total_pages`, or `final_page_size` for those states is advisory only and recovery recomputes it from the file.
 
 Each current sidecar records its spool's `page_size`. A legacy `Readable` sidecar is terminal and migrates to `Complete` by resegmenting the contiguous durable bytes with the configured page size. A legacy `WriteLocked` spool is likewise salvaged from its exact durable length as `Complete`, retains its write-lock provenance, and cannot accept further writes. Both migrations atomically persist their page size and reconstructed terminal metadata before serving.
 
@@ -68,7 +68,7 @@ A background task periodically sweeps the spool manager and deletes spools based
 
 `cleanup_sweep_interval_secs` defaults to 30 and must not exceed any active cleanup timeout. The deprecated `reader_done_ttl_secs` and `unread_ttl_secs` fields remain parseable but do not drive cleanup. Expiry removes the key directory, including `spool.dat`, `meta.json`, and interrupted `meta.json.tmp`.
 
-Cleanup revalidates each expired candidate under the spool lifecycle lock immediately before deletion. A write, completion, or served byte after the sweep snapshot invalidates that candidate rather than deleting from stale eligibility data.
+Cleanup revalidates each expired candidate under the spool lifecycle lock immediately before deletion. Every accepted non-empty HTTP body frame refreshes writer activity under the same lock before it enters the batching buffer. A frame, write, completion, or served byte after the sweep snapshot invalidates that candidate rather than deleting from stale eligibility data.
 
 Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.
 

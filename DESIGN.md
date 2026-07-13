@@ -48,7 +48,7 @@ Each spool is stored in its own directory:
 
 Sidecar metadata commits are atomic at the file level: BOBS writes `meta.json.tmp`, syncs that file, renames it over `meta.json`, and syncs the spool directory. Recovery ignores leftover temporary metadata files.
 
-Creation uses a two-state publication protocol. BOBS syncs the empty `spool.dat` and key directory, commits an internal `Creating` sidecar, fsyncs `data_dir`, then commits live `Writing` or `WriteLocked` metadata before returning success or publishing the spool in memory. `Creating` is not an API-visible lifecycle state. A crash before live publication leaves an unambiguous incomplete marker that recovery can remove without guessing about ordinary or legacy spool data. Cancellation while waiting for admission leaves no key reservation; after directory reservation starts, a detached transaction finishes durable publication or rolls back even if the client disconnects. A client that loses the response should retry with the same request ID and treat `409 Conflict` as evidence that the create completed.
+Creation uses a two-state publication protocol. BOBS syncs the empty `spool.dat` and key directory, commits an internal `Creating` sidecar, fsyncs `data_dir`, then commits live `Writing` or `WriteLocked` metadata before returning success or publishing the spool in memory. `Creating` is not an API-visible lifecycle state. A crash before live publication leaves an unambiguous incomplete marker that recovery can remove without guessing about ordinary or legacy spool data. Cancellation while waiting for admission leaves no key reservation; after directory reservation starts, a detached transaction finishes durable publication or rolls back even if the client disconnects. A client that loses the response should retry with the same request ID. A duplicate for any tracked lifecycle state, including retryable `Deleting`, returns `409 Conflict` before waiting for admission or the per-key gate.
 
 Deletion removes sidecar metadata and the key directory, then fsyncs `data_dir` before acknowledging success. Cache entries, manager membership, and admission accounting remain held across that parent-directory durability boundary so failure leaves a tracked, retryable `Deleting` spool.
 
@@ -75,7 +75,7 @@ Write path:
 
 The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget (binary default 268435456 bytes / 256 MiB; current Helm chart value 1048576 bytes / 1 MiB). `max_cache_bytes` may be smaller than `page_size`: setting it to `0` disables caching, and pages larger than the cap bypass the cache while remaining readable from disk. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 
-`max_live_spools` limits the number of spools in the first-read cache phase. When omitted, it derives as `max(1, max_cache_bytes / page_size)`, which is 16 with the 16 MiB/256 MiB binary defaults. Explicit values are preserved; the chart sets 256 for its 4 KiB/1 MiB profile. `/api/v1/create` waits up to `create_admission_timeout_ms` (default 5000) for a slot, then returns `503 Service Unavailable`.
+`max_live_spools` limits the number of spools in the first-read cache phase. When omitted, it derives as `max(1, max_cache_bytes / page_size)`, which is 16 with the 16 MiB/256 MiB binary defaults. Explicit values are preserved; the chart sets 256 for its 4 KiB/1 MiB profile. `/api/v1/create` waits up to `create_admission_timeout_ms` (default 5000) for a slot, then returns `503 Service Unavailable`; a key already tracked in any state returns `409 Conflict` immediately instead of entering that wait.
 
 A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/api/v1/complete/{key}` publishes it as the final page. A spool accepts at most `max_spool_bytes` (default 8 GiB); an upload that crosses the limit is durably deleted before the server returns `413 Payload Too Large`.
 
@@ -113,7 +113,7 @@ Startup recovery scans `data_dir` for spool directories with `meta.json` sidecar
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
 - Interrupted metadata temp files are ignored.
 - Internal `Creating` and `Deleting` sidecars identify interrupted lifecycle operations. Recovery durably removes those incomplete key directories and fsyncs `data_dir`; the state is never exposed through active spool APIs.
-- Unsafe or unrelated directories are not blindly removed. Orphan cleanup is restricted to recognised UUID or 26-character request-ID directories that contain BOBS spool markers.
+- Unsafe or unrelated directories are not blindly removed. A recognised UUID or request-ID directory with no BOBS marker is removed and parent-fsynced only when it is truly empty, as can happen after a pre-marker create crash. Non-empty markerless directories are retained unchanged and quarantined; ordinary orphan cleanup remains restricted to recognised directories containing BOBS spool markers.
 - Sidecars now persist each spool's `page_size`. For a legacy sidecar without it, recovery derives a stride only when the sidecar and durable file length determine one safely, then atomically commits the upgraded sidecar before exposing or mutating the spool. If the stride is ambiguous or inconsistent, recovery leaves both `meta.json` and `spool.dat` intact and fails rather than guessing or deleting the data.
 - The removed legacy `Readable` state is migrated to terminal `Complete`. Because its durable payload is terminal and contiguous, recovery resegments it using the currently configured `page_size` rather than inferring the old stride, reconstructs terminal byte/page metadata from `spool.dat`, clears the obsolete write lock, and atomically persists the migrated sidecar before serving it.
 
@@ -131,7 +131,7 @@ The legacy `reader_done_ttl_secs` and `unread_ttl_secs` fields are still parsed 
 
 Slow readers keep a spool alive only while they continue making read progress. Stalled connections do not protect a spool forever.
 
-Before deleting an expired candidate, cleanup reacquires the spool lifecycle lock and revalidates its state and monotonic read/write activity. A write, completion, or served byte after the sweep snapshot therefore invalidates the stale deletion candidate.
+Before deleting an expired candidate, cleanup reacquires the spool lifecycle lock and revalidates its state and monotonic read/write activity. Every accepted non-empty HTTP body frame refreshes writer activity under that same lock, even while it remains in the batching buffer. A frame, write, completion, or served byte after the sweep snapshot therefore invalidates the stale deletion candidate.
 
 ## HTTP content safety
 
