@@ -2110,7 +2110,7 @@ mod tests {
         for page in 0..PAGES {
             let start = page * PAGE_SIZE as u64;
             spool
-                .mark_served_and_maybe_fully_read(start, start + PAGE_SIZE as u64, page + 1)
+                .mark_served_and_maybe_fully_read(start, start + PAGE_SIZE as u64)
                 .await;
         }
         assert_eq!(manager.admission.available_permits(), 0);
@@ -2119,7 +2119,7 @@ mod tests {
             .complete(Some(total_size))
             .await
             .expect("complete followed spool");
-        assert!(spool.full_object_read_at.load(Ordering::SeqCst) > 0);
+        assert!(spool.cleanup_anchors().full_object_read_at.is_some());
         assert_eq!(
             manager.admission.available_permits(),
             1,

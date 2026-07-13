@@ -921,7 +921,6 @@ where
                         .mark_contiguous_response_complete_and_maybe_fully_read(
                             response_start,
                             response_end,
-                            now,
                         )
                         .await;
                 }
@@ -975,7 +974,6 @@ where
                     .mark_contiguous_response_complete_and_maybe_fully_read(
                         response_start,
                         response_end,
-                        now_secs(),
                     )
                     .await;
             }
@@ -2646,7 +2644,7 @@ mod tests {
                 "overflow must not claim full coverage"
             );
         }
-        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert!(spool.cleanup_anchors().full_object_read_at.is_none());
         assert_eq!(state.manager.admission.available_permits(), 255);
 
         // A completed partial response is insufficient exact evidence.
@@ -2654,7 +2652,7 @@ mod tests {
             range_read_drain(&app, &key, "bytes=0-4095").await,
             StatusCode::PARTIAL_CONTENT
         );
-        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert!(spool.cleanup_anchors().full_object_read_at.is_none());
         assert_eq!(state.manager.admission.available_permits(), 255);
 
         // Dropping a full-range body after its first page must not commit the
@@ -2677,7 +2675,7 @@ mod tests {
         assert_eq!(first.len(), 4096);
         drop(body);
         tokio::task::yield_now().await;
-        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert!(spool.cleanup_anchors().full_object_read_at.is_none());
         assert_eq!(state.manager.admission.available_permits(), 255);
 
         // A subsequent successfully drained contiguous full range re-establishes
@@ -2686,7 +2684,7 @@ mod tests {
             range_read_drain(&app, &key, "bytes=0-8191").await,
             StatusCode::PARTIAL_CONTENT
         );
-        assert!(spool.full_object_read_at.load(Ordering::SeqCst) > 0);
+        assert!(spool.cleanup_anchors().full_object_read_at.is_some());
         assert_eq!(state.manager.admission.available_permits(), 256);
         assert!(!spool.missing_ranges.lock().await.is_capped());
     }
