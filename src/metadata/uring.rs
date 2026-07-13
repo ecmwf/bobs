@@ -5,7 +5,7 @@
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use super::{
     ensure_sidecar_size, remove_file_if_present, run_blocking, storage_error,
-    MetadataDirectoryEntry, MetadataStore, SyncSidecarMetadataStore, UringSidecarMetadataStore,
+    MetadataDirectoryScan, MetadataStore, SyncSidecarMetadataStore, UringSidecarMetadataStore,
     META_FILE, TMP_FILE,
 };
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
@@ -219,7 +219,7 @@ impl MetadataStore for UringSidecarMetadataStore {
         store.delete(key).await
     }
 
-    async fn scan(&self) -> Result<Vec<MetadataDirectoryEntry>> {
+    async fn scan(&self) -> Result<MetadataDirectoryScan> {
         let store = self.sync_store();
         store.scan().await
     }
@@ -709,9 +709,10 @@ mod tests {
             &meta,
         );
 
-        let entries = store.scan().await.expect("scan metadata");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, meta.key);
+        let mut scan = store.scan().await.expect("scan metadata");
+        let entry = scan.next().await.expect("one entry").expect("valid entry");
+        assert_eq!(entry.name, meta.key);
+        assert!(scan.next().await.is_none());
 
         store.delete(&meta.key).await.expect("delete metadata");
         assert!(store

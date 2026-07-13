@@ -4,14 +4,17 @@
 
 use crate::error::{BobsError, Result};
 use crate::spool::SpoolMetadata;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::task;
 
 const META_FILE: &str = "meta.json";
@@ -19,8 +22,11 @@ const TMP_FILE: &str = "meta.json.tmp";
 /// Sidecars are expected to be small lifecycle records. Bound reads before
 /// allocation so a damaged or hostile file cannot dominate startup memory.
 pub const MAX_SIDECAR_BYTES: u64 = 1024 * 1024;
+/// The producer performs blocking `read_dir` work and may be one item ahead of
+/// this bounded queue. Recovery memory is therefore independent of directory size.
+pub(crate) const METADATA_SCAN_CHANNEL_CAPACITY: usize = 64;
 
-/// Compact result of the single top-level data-directory scan.
+/// One item from the single top-level data-directory scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataDirectoryEntry {
     pub name: String,
@@ -34,6 +40,30 @@ pub enum MetadataDirectoryEntryKind {
     Other,
 }
 
+struct MetadataScanMessage {
+    item: Result<MetadataDirectoryEntry>,
+    #[cfg(test)]
+    _allocation: Option<MetadataScanEntryAllocation>,
+}
+
+/// Bounded stream produced by one blocking top-level `read_dir` traversal.
+pub struct MetadataDirectoryScan {
+    receiver: mpsc::Receiver<MetadataScanMessage>,
+}
+
+impl MetadataDirectoryScan {
+    pub async fn next(&mut self) -> Option<Result<MetadataDirectoryEntry>> {
+        self.receiver.recv().await.map(|message| message.item)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(sender);
+        Self { receiver }
+    }
+}
+
 /// Metadata persistence backend.
 ///
 /// All operations are asynchronous and return `Send` futures for generic
@@ -45,8 +75,8 @@ pub trait MetadataStore: Sync {
     fn write(&self, metadata: &SpoolMetadata) -> impl Future<Output = Result<()>> + Send;
     fn read(&self, key: &str) -> impl Future<Output = Result<Option<SpoolMetadata>>> + Send;
     fn delete(&self, key: &str) -> impl Future<Output = Result<()>> + Send;
-    /// Scan the top-level data directory once without reading sidecar payloads.
-    fn scan(&self) -> impl Future<Output = Result<Vec<MetadataDirectoryEntry>>> + Send;
+    /// Start one bounded top-level data-directory scan without reading sidecar payloads.
+    fn scan(&self) -> impl Future<Output = Result<MetadataDirectoryScan>> + Send;
 }
 
 /// Synchronous sidecar metadata backend selected for fallback benchmarking and
@@ -196,7 +226,7 @@ impl SyncSidecarMetadataStore {
         Ok(())
     }
 
-    fn scan_sync(&self) -> Result<Vec<MetadataDirectoryEntry>> {
+    fn scan_sync(&self, sender: mpsc::Sender<MetadataScanMessage>) -> Result<()> {
         self.invoke_operation_hook();
         #[cfg(test)]
         if let Some(stats) = &self.read_stats {
@@ -204,11 +234,10 @@ impl SyncSidecarMetadataStore {
         }
         let entries = match fs::read_dir(&self.data_dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(storage_error(error)),
         };
 
-        let mut index = Vec::new();
         for entry in entries {
             let entry = entry.map_err(storage_error)?;
             let file_type = entry.file_type().map_err(storage_error)?;
@@ -218,16 +247,33 @@ impl SyncSidecarMetadataStore {
             } else if file_type.is_dir() {
                 let path = entry.path();
                 MetadataDirectoryEntryKind::Directory {
-                    has_sidecar: path.join(META_FILE).exists(),
+                    // lstat both fixed local names. A symlink still counts as a
+                    // marker and is rejected by the later trusted-path checks; it
+                    // must not turn the directory into an orphan deletion.
+                    has_sidecar: fs::symlink_metadata(path.join(META_FILE)).is_ok(),
                     has_data: fs::symlink_metadata(path.join("spool.dat")).is_ok(),
                 }
             } else {
                 MetadataDirectoryEntryKind::Other
             };
-            index.push(MetadataDirectoryEntry { name, kind });
+            #[cfg(test)]
+            let allocation = self
+                .read_stats
+                .as_ref()
+                .map(|stats| stats.track_scan_entry());
+            let message = MetadataScanMessage {
+                item: Ok(MetadataDirectoryEntry { name, kind }),
+                #[cfg(test)]
+                _allocation: allocation,
+            };
+            if sender.blocking_send(message).is_err() {
+                // Recovery was cancelled or failed. Stop traversing immediately
+                // rather than materialising entries nobody can consume.
+                return Ok(());
+            }
         }
 
-        Ok(index)
+        Ok(())
     }
 }
 
@@ -250,9 +296,26 @@ impl MetadataStore for SyncSidecarMetadataStore {
         run_blocking(move || store.delete_sync(&key)).await
     }
 
-    async fn scan(&self) -> Result<Vec<MetadataDirectoryEntry>> {
+    async fn scan(&self) -> Result<MetadataDirectoryScan> {
         let store = self.clone();
-        run_blocking(move || store.scan_sync()).await
+        let (sender, receiver) = mpsc::channel(METADATA_SCAN_CHANNEL_CAPACITY);
+        let error_sender = sender.clone();
+        tokio::spawn(async move {
+            let result = task::spawn_blocking(move || store.scan_sync(sender)).await;
+            let error = match result {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error,
+                Err(error) => BobsError::StorageError(Box::new(io::Error::other(error))),
+            };
+            let _ = error_sender
+                .send(MetadataScanMessage {
+                    item: Err(error),
+                    #[cfg(test)]
+                    _allocation: None,
+                })
+                .await;
+        });
+        Ok(MetadataDirectoryScan { receiver })
     }
 }
 
@@ -274,6 +337,8 @@ pub(crate) struct MetadataReadStats {
     total_allocated_bytes: AtomicUsize,
     live_allocated_bytes: AtomicUsize,
     peak_allocated_bytes: AtomicUsize,
+    live_scan_entries: AtomicUsize,
+    peak_scan_entries: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -287,6 +352,14 @@ impl MetadataReadStats {
         MetadataReadAllocation {
             stats: Arc::clone(self),
             bytes,
+        }
+    }
+
+    fn track_scan_entry(self: &Arc<Self>) -> MetadataScanEntryAllocation {
+        let live = self.live_scan_entries.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_scan_entries.fetch_max(live, Ordering::SeqCst);
+        MetadataScanEntryAllocation {
+            stats: Arc::clone(self),
         }
     }
 
@@ -309,6 +382,14 @@ impl MetadataReadStats {
     pub(crate) fn peak_allocated_bytes(&self) -> usize {
         self.peak_allocated_bytes.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn live_scan_entries(&self) -> usize {
+        self.live_scan_entries.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn peak_scan_entries(&self) -> usize {
+        self.peak_scan_entries.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +407,18 @@ impl Drop for MetadataReadAllocation {
     }
 }
 
+#[cfg(test)]
+struct MetadataScanEntryAllocation {
+    stats: Arc<MetadataReadStats>,
+}
+
+#[cfg(test)]
+impl Drop for MetadataScanEntryAllocation {
+    fn drop(&mut self) {
+        self.stats.live_scan_entries.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn ensure_sidecar_size(actual: u64) -> Result<()> {
     if actual > MAX_SIDECAR_BYTES {
         return Err(BobsError::MetadataTooLarge {
@@ -336,16 +429,44 @@ fn ensure_sidecar_size(actual: u64) -> Result<()> {
     Ok(())
 }
 
+fn open_sidecar_nofollow(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metadata sidecar is not a regular file",
+            ));
+        }
+        OpenOptions::new().read(true).open(path)
+    }
+}
+
 fn read_sidecar(path: &Path) -> Result<Option<Vec<u8>>> {
     // Retry once if a concurrent replacement changes the length between stat and
     // read. Each allocation is still preceded by a checked size from the open fd.
     for attempt in 0..2 {
-        let mut file = match File::open(path) {
+        let mut file = match open_sidecar_nofollow(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(storage_error(error)),
         };
-        let len = file.metadata().map_err(storage_error)?.len();
+        let file_metadata = file.metadata().map_err(storage_error)?;
+        if !file_metadata.is_file() {
+            return Err(storage_error(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metadata sidecar is not a regular file",
+            )));
+        }
+        let len = file_metadata.len();
         ensure_sidecar_size(len)?;
         let len = usize::try_from(len).map_err(|_| BobsError::MetadataTooLarge {
             actual: u64::MAX,
@@ -607,17 +728,18 @@ mod tests {
             &meta,
         );
 
-        let entries = store.scan().await.expect("scan metadata");
+        let mut scan = store.scan().await.expect("scan metadata");
         assert_eq!(
-            entries,
-            vec![MetadataDirectoryEntry {
+            scan.next().await.expect("one entry").expect("valid entry"),
+            MetadataDirectoryEntry {
                 name: meta.key.clone(),
                 kind: MetadataDirectoryEntryKind::Directory {
                     has_sidecar: true,
                     has_data: false,
                 },
-            }]
+            }
         );
+        assert!(scan.next().await.is_none());
 
         store.delete(&meta.key).await.expect("delete metadata");
         assert!(store
@@ -625,16 +747,18 @@ mod tests {
             .await
             .expect("read after delete")
             .is_none());
+        let mut scan = store.scan().await.expect("scan after delete");
         assert_eq!(
-            store.scan().await.expect("scan after delete"),
-            vec![MetadataDirectoryEntry {
+            scan.next().await.expect("one entry").expect("valid entry"),
+            MetadataDirectoryEntry {
                 name: meta.key,
                 kind: MetadataDirectoryEntryKind::Directory {
                     has_sidecar: false,
                     has_data: false,
                 },
-            }]
+            }
         );
+        assert!(scan.next().await.is_none());
     }
 
     #[tokio::test]
@@ -703,16 +827,17 @@ mod tests {
             store.read(&meta.key).await,
             Err(BobsError::SerializationError(_))
         ));
-        let entries = store.scan().await.expect("scan directory");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, meta.key);
+        let mut scan = store.scan().await.expect("scan directory");
+        let entry = scan.next().await.expect("one entry").expect("valid entry");
+        assert_eq!(entry.name, meta.key);
         assert_eq!(
-            entries[0].kind,
+            entry.kind,
             MetadataDirectoryEntryKind::Directory {
                 has_sidecar: true,
                 has_data: false,
             }
         );
+        assert!(scan.next().await.is_none());
     }
 
     #[tokio::test]
@@ -754,7 +879,10 @@ mod tests {
 
         store.write(&meta).await.expect("write metadata");
         store.read(&meta.key).await.expect("read metadata");
-        store.scan().await.expect("scan metadata");
+        let mut scan = store.scan().await.expect("scan metadata");
+        while let Some(entry) = scan.next().await {
+            entry.expect("valid scan entry");
+        }
         store.delete(&meta.key).await.expect("delete metadata");
     }
 
@@ -784,6 +912,46 @@ mod tests {
         assert!(
             heartbeat_elapsed < Duration::from_millis(150),
             "Tokio worker heartbeat was delayed by blocking metadata I/O: {heartbeat_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn million_entry_stream_applies_bounded_backpressure() {
+        const ENTRY_COUNT: usize = 1_000_000;
+        let stats = Arc::new(MetadataReadStats::default());
+        let producer_stats = Arc::clone(&stats);
+        let (sender, receiver) = mpsc::channel(METADATA_SCAN_CHANNEL_CAPACITY);
+        let producer = tokio::task::spawn_blocking(move || {
+            for index in 0..ENTRY_COUNT {
+                let message = MetadataScanMessage {
+                    item: Ok(MetadataDirectoryEntry {
+                        name: format!("synthetic-{index:07}"),
+                        kind: MetadataDirectoryEntryKind::Other,
+                    }),
+                    _allocation: Some(producer_stats.track_scan_entry()),
+                };
+                if sender.blocking_send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut scan = MetadataDirectoryScan { receiver };
+        let mut consumed = 0;
+        while let Some(entry) = scan.next().await {
+            entry.expect("synthetic entry");
+            consumed += 1;
+            if consumed % 100_000 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        producer.await.expect("scan producer");
+
+        assert_eq!(consumed, ENTRY_COUNT);
+        assert_eq!(stats.live_scan_entries(), 0);
+        assert!(
+            stats.peak_scan_entries() <= METADATA_SCAN_CHANNEL_CAPACITY + 2,
+            "bounded stream retained {} entries",
+            stats.peak_scan_entries()
         );
     }
 
