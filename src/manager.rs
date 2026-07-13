@@ -2048,6 +2048,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_follow_over_fragment_cap_releases_single_admission_slot() {
+        const PAGE_SIZE: usize = 4096;
+        const PAGES: u64 = 1025;
+        let total_size = PAGES * PAGE_SIZE as u64;
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&data_dir, PAGE_SIZE, 16 * PAGE_SIZE, 1)
+            .expect("manager init");
+
+        manager
+            .create_spool("followed".into(), None, None, false, HashMap::new())
+            .await
+            .expect("create followed spool");
+        let spool = manager.get_spool("followed").expect("spool exists");
+        spool
+            .write(0, Bytes::from(vec![0xA5; total_size as usize]))
+            .await
+            .expect("write pages");
+
+        // A follow response reports one contiguous chunk per page while total size
+        // is still unknown. This must remain one pending interval, not hit the cap.
+        for page in 0..PAGES {
+            let start = page * PAGE_SIZE as u64;
+            spool
+                .mark_served_and_maybe_fully_read(start, start + PAGE_SIZE as u64, page + 1)
+                .await;
+        }
+        assert_eq!(manager.admission.available_permits(), 0);
+
+        spool
+            .complete(Some(total_size))
+            .await
+            .expect("complete followed spool");
+        assert!(spool.full_object_read_at.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            manager.admission.available_permits(),
+            1,
+            "completion must release max_live_spools=1 admission after full follow coverage"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.create_spool("next".into(), None, None, false, HashMap::new()),
+        )
+        .await
+        .expect("next create must not remain blocked")
+        .expect("next create succeeds");
+    }
+
+    #[tokio::test]
     async fn test_create_and_get() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");

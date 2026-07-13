@@ -56,11 +56,11 @@ A background task periodically sweeps the spool manager and deletes spools based
 
 - **Writer Inactivity**: The producer stopped writing without completing the spool.
 - **Read Idle TTL**: The spool is readable but has not served bytes for `read_idle_ttl_secs`. For never-read spools, this timer starts when the spool becomes readable.
-- **Full Read TTL**: BOBS has served every byte of the object at least once, possibly across multiple range requests, and `full_read_complete_ttl_secs` has elapsed since the latest read activity.
+- **Full Read TTL**: Bounded coverage tracking, or an exact completed full-object response after fragmented fallback, has proved every byte was served; `full_read_complete_ttl_secs` has elapsed since the latest read activity.
 
 Cleanup TTL semantics are unchanged by sidecar metadata. Expired cleanup removes the key directory, including `spool.dat`, `meta.json`, and any interrupted `meta.json.tmp`.
 
-Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.
+Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. Adjacent and overlapping pre-completion progress is coalesced before the interval cap is applied, keeping ordinary sequential follow reads O(1). If genuinely fragmented access exceeds the cap, BOBS conservatively falls back to the longer idle TTL and cannot falsely report completion. A later successfully completed contiguous full-object response restores exact complete coverage and the short-TTL/admission-release transition.
 
 ### 9. HTTP/2 Support
 
