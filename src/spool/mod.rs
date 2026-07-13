@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 pub mod coverage;
@@ -47,7 +47,12 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub notify: Arc<Notify>,
     /// Fired on spool deletion to unblock any waiting readers.
     pub cancel: CancellationToken,
-    /// Serializes terminal lifecycle operations so completion cannot race deletion.
+    /// Orders mutating transactions before they start owned work. Callers wait on
+    /// this bounded gate before spawning, so cancellation leaves no detached waiter
+    /// and at most one write/completion transaction can be active per spool.
+    pub(crate) operation_gate: Arc<Semaphore>,
+    /// Serializes mutation with terminal lifecycle operations and cleanup activity.
+    /// Operation transactions always acquire `operation_gate` before this lock.
     pub(crate) lifecycle_lock: Mutex<()>,
     pub page_size: usize,
     pub data_path: PathBuf,
@@ -115,6 +120,7 @@ where
             metadata_store,
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
+            operation_gate: Arc::new(Semaphore::new(1)),
             lifecycle_lock: Mutex::new(()),
             page_size,
             data_path,

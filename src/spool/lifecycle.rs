@@ -24,12 +24,18 @@ where
     F: FileIO,
     M: crate::metadata::MetadataStore + Clone + Send + Sync + 'static,
 {
-    /// Finalize the spool in a detached, owned transaction. Once this method is
-    /// called, dropping the caller's future cannot cancel a transition that may
-    /// already have made data or lifecycle metadata durable.
+    /// Finalize the spool in a detached, owned transaction. Waiting on the bounded
+    /// per-spool gate is cancellation-safe and does not spawn a task. Once admitted,
+    /// dropping the caller cannot cancel or overlap the active completion transaction.
     pub async fn complete(self: &Arc<Self>, expected_size: Option<u64>) -> Result<()> {
+        let permit = Arc::clone(&self.operation_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                BobsError::IoError(std::io::Error::other("spool operation gate closed"))
+            })?;
         let spool = Arc::clone(self);
-        tokio::spawn(async move { spool.complete_transaction(expected_size).await })
+        tokio::spawn(async move { spool.complete_transaction(expected_size, permit).await })
             .await
             .map_err(|error| BobsError::StorageError(Box::new(error)))?
     }
@@ -37,7 +43,12 @@ where
     /// Durability order: data fdatasync -> Completing marker -> Complete commit ->
     /// in-memory Complete -> optional cache/buffer housekeeping. The marker carries
     /// the final page layout, so recovery never needs the volatile write buffer.
-    async fn complete_transaction(&self, expected_size: Option<u64>) -> Result<()> {
+    async fn complete_transaction(
+        &self,
+        expected_size: Option<u64>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        // Shared mutation lock order: operation gate -> lifecycle -> write buffer.
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let mut buf = self.write_buffer.lock().await;
 
@@ -504,6 +515,8 @@ mod tests {
         point: MetadataGatePoint,
         reached: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        read_calls: Arc<AtomicUsize>,
+        write_calls: Arc<AtomicUsize>,
     }
 
     impl GatedMetadataStore {
@@ -519,6 +532,8 @@ mod tests {
                     point,
                     reached: Arc::clone(&reached),
                     release: Arc::clone(&release),
+                    read_calls: Arc::new(AtomicUsize::new(0)),
+                    write_calls: Arc::new(AtomicUsize::new(0)),
                 },
                 reached,
                 release,
@@ -533,6 +548,7 @@ mod tests {
 
     impl MetadataStore for GatedMetadataStore {
         async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+            self.write_calls.fetch_add(1, AtomicOrdering::SeqCst);
             let gate_before = metadata.state == SpoolState::Completing
                 && matches!(self.point, MetadataGatePoint::BeforeMarker);
             let gate_after = matches!(
@@ -551,6 +567,7 @@ mod tests {
         }
 
         async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+            self.read_calls.fetch_add(1, AtomicOrdering::SeqCst);
             self.inner.read(key).await
         }
 
@@ -1160,6 +1177,99 @@ mod tests {
             wait_for_detached_completion(&spool).await;
             assert_gated_completion_bytes(&spool, b"detached trailing bytes").await;
         }
+    }
+
+    #[tokio::test]
+    async fn completion_burst_is_backpressured_before_spawning_owned_tasks() {
+        let dir = tempdir().expect("create tempdir");
+        let (spool, reached, release) =
+            make_gated_spool(dir.path(), 4096, MetadataGatePoint::BeforeMarker).await;
+        let data = Bytes::from_static(b"single-flight-completion");
+        spool.write(0, data.clone()).await.expect("write succeeds");
+
+        let first_spool = Arc::clone(&spool);
+        let expected_size = data.len() as u64;
+        let first = tokio::spawn(async move { first_spool.complete(Some(expected_size)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+            .await
+            .expect("first completion reached marker gate");
+
+        const BURST: usize = 64;
+        let mut waiters = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let waiter_spool = Arc::clone(&spool);
+            waiters.push(tokio::spawn(async move {
+                waiter_spool.complete(Some(expected_size)).await
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        assert_eq!(spool.operation_gate.available_permits(), 0);
+        assert_eq!(
+            spool
+                .metadata_store
+                .write_calls
+                .load(AtomicOrdering::SeqCst),
+            2,
+            "only the initial sidecar and active marker attempt may start"
+        );
+        assert_eq!(
+            spool.metadata_store.read_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "backpressured retries must not execute idempotency reads"
+        );
+
+        for waiter in &waiters {
+            waiter.abort();
+        }
+        for waiter in waiters {
+            assert!(waiter
+                .await
+                .expect_err("cancelled completion waiter should stop")
+                .is_cancelled());
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            Arc::strong_count(&spool),
+            3,
+            "only main, active caller, and its one owned transaction retain the spool"
+        );
+        assert_eq!(
+            spool
+                .metadata_store
+                .write_calls
+                .load(AtomicOrdering::SeqCst),
+            2
+        );
+        assert_eq!(
+            spool.metadata_store.read_calls.load(AtomicOrdering::SeqCst),
+            0
+        );
+
+        release.notify_one();
+        first
+            .await
+            .expect("first completion task joins")
+            .expect("first completion succeeds");
+        assert_eq!(spool.operation_gate.available_permits(), 1);
+        assert_eq!(
+            spool
+                .metadata_store
+                .write_calls
+                .load(AtomicOrdering::SeqCst),
+            3,
+            "one marker and one Complete commit follow the initial sidecar"
+        );
+
+        spool
+            .complete(Some(expected_size))
+            .await
+            .expect("idempotent completion succeeds");
+        assert_eq!(
+            spool.metadata_store.read_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "one admitted idempotent retry performs one durable-state read"
+        );
     }
 
     #[tokio::test]

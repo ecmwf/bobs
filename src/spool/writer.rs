@@ -38,12 +38,31 @@ where
         }
     }
 
-    /// Append data at the given offset. Writes are strictly sequential — the offset
-    /// must match total_bytes_written exactly. Every accepted non-empty body is
-    /// appended to spool.dat before any in-memory state advances. Full pages are
-    /// published to the cache from the owned input bytes where possible; the write
-    /// buffer is only used to assemble pages that span multiple write calls.
-    pub async fn write(&self, offset: u64, data: Bytes) -> Result<()> {
+    /// Append data at the given offset. Waiting for the per-spool operation gate is
+    /// cancellation-safe and does not spawn work. After admission, an owned task keeps
+    /// the gate and lifecycle lock until backend I/O and all publication have reached
+    /// a stable success or failure, even if the caller disappears.
+    pub async fn write(self: &std::sync::Arc<Self>, offset: u64, data: Bytes) -> Result<()> {
+        let permit = std::sync::Arc::clone(&self.operation_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                BobsError::IoError(std::io::Error::other("spool operation gate closed"))
+            })?;
+        let spool = std::sync::Arc::clone(self);
+        tokio::spawn(async move { spool.write_transaction(offset, data, permit).await })
+            .await
+            .map_err(|error| BobsError::StorageError(Box::new(error)))?
+    }
+
+    async fn write_transaction(
+        &self,
+        offset: u64,
+        data: Bytes,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        // Lock order for mutation is operation gate -> lifecycle -> write buffer.
+        // Cleanup/read activity take lifecycle only; no path takes these in reverse.
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let mut buf = self.write_buffer.lock().await;
 
@@ -155,10 +174,133 @@ mod tests {
     use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
     use crate::spool::SpoolMetadata;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use tempfile::tempdir;
 
-    async fn make_spool(dir: &std::path::Path, page_size: usize) -> Spool<TokioFileIO> {
+    #[derive(Default)]
+    struct DelayedWriteControl {
+        delay_next: AtomicBool,
+        write_calls: AtomicUsize,
+        active_owned_writes: AtomicUsize,
+        max_active_owned_writes: AtomicUsize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    static DELAYED_WRITE_CONTROL: OnceLock<StdMutex<Option<Arc<DelayedWriteControl>>>> =
+        OnceLock::new();
+
+    fn delayed_write_slot() -> &'static StdMutex<Option<Arc<DelayedWriteControl>>> {
+        DELAYED_WRITE_CONTROL.get_or_init(|| StdMutex::new(None))
+    }
+
+    fn install_delayed_write_control() -> Arc<DelayedWriteControl> {
+        let control = Arc::new(DelayedWriteControl {
+            delay_next: AtomicBool::new(true),
+            ..DelayedWriteControl::default()
+        });
+        *delayed_write_slot()
+            .lock()
+            .expect("delayed write control mutex poisoned") = Some(Arc::clone(&control));
+        control
+    }
+
+    #[derive(Clone)]
+    struct DelayedOwnedWriteFileIO;
+
+    impl FileIO for DelayedOwnedWriteFileIO {
+        type Handle = <TokioFileIO as FileIO>::Handle;
+
+        fn create(
+            path: &std::path::Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::create(path)
+        }
+
+        fn open(
+            path: &std::path::Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::open(path)
+        }
+
+        fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: Bytes,
+        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
+            let handle = Arc::clone(handle);
+            let control = delayed_write_slot()
+                .lock()
+                .expect("delayed write control mutex poisoned")
+                .clone();
+            async move {
+                let Some(control) = control else {
+                    return TokioFileIO::write_at(&handle, offset, data).await;
+                };
+                control.write_calls.fetch_add(1, Ordering::SeqCst);
+                if !control.delay_next.swap(false, Ordering::SeqCst) {
+                    return TokioFileIO::write_at(&handle, offset, data).await;
+                }
+
+                // Model an owned io_uring operation: dropping this returned future
+                // detaches, rather than cancels, the submitted backend write.
+                let owned_control = Arc::clone(&control);
+                tokio::spawn(async move {
+                    let active = owned_control
+                        .active_owned_writes
+                        .fetch_add(1, Ordering::SeqCst)
+                        + 1;
+                    owned_control
+                        .max_active_owned_writes
+                        .fetch_max(active, Ordering::SeqCst);
+                    owned_control.started.notify_one();
+                    owned_control.release.notified().await;
+                    let result = TokioFileIO::write_at(&handle, offset, data).await;
+                    owned_control
+                        .active_owned_writes
+                        .fetch_sub(1, Ordering::SeqCst);
+                    result
+                })
+                .await
+                .map_err(std::io::Error::other)?
+            }
+        }
+
+        fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+            TokioFileIO::read_at(handle, offset, len)
+        }
+
+        fn sync_data(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_data(handle)
+        }
+
+        fn sync_directory(
+            path: &std::path::Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_directory(path)
+        }
+
+        fn close(
+            handle: Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::close(handle)
+        }
+
+        fn remove(
+            path: &std::path::Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::remove(path)
+        }
+    }
+
+    async fn make_spool(dir: &std::path::Path, page_size: usize) -> Arc<Spool<TokioFileIO>> {
         let spool_dir = dir.join("test-key");
         tokio::fs::create_dir_all(&spool_dir)
             .await
@@ -190,17 +332,19 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Spool::new(
-            meta,
-            handle,
-            page_size,
-            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                page_size * 256,
-            ))),
-            metadata_store,
-            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        Arc::new(
+            Spool::new(
+                meta,
+                handle,
+                page_size,
+                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                    page_size * 256,
+                ))),
+                metadata_store,
+                Arc::new(crate::metrics::BobsMetrics::new(false)),
+            )
+            .await,
         )
-        .await
     }
 
     async fn persisted_metadata(spool: &Spool<TokioFileIO>) -> SpoolMetadata {
@@ -384,6 +528,124 @@ mod tests {
             .write(0, bytes::Bytes::copy_from_slice(&[1, 2, 3]))
             .await;
         assert!(matches!(result, Err(BobsError::SpoolClosed)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_owned_backend_write_blocks_retry_and_completion_until_stable() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let control = install_delayed_write_control();
+        let manager =
+            crate::manager::SpoolManager::<DelayedOwnedWriteFileIO>::new(dir.path(), 4, 1024, 8)
+                .expect("create manager");
+        manager
+            .create_spool("cancel-safe".to_string(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool("cancel-safe").expect("spool exists");
+
+        let old_spool = Arc::clone(&spool);
+        let old_caller =
+            tokio::spawn(async move { old_spool.write(0, Bytes::from_static(b"AAAA")).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            control.started.notified(),
+        )
+        .await
+        .expect("old owned backend write started");
+        old_caller.abort();
+        assert!(old_caller
+            .await
+            .expect_err("old caller should be cancelled")
+            .is_cancelled());
+        assert_eq!(control.active_owned_writes.load(Ordering::SeqCst), 1);
+
+        let retry_spool = Arc::clone(&spool);
+        let retry =
+            tokio::spawn(async move { retry_spool.write(0, Bytes::from_static(b"BBBB")).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "retry must backpressure behind old I/O"
+        );
+
+        let complete_spool = Arc::clone(&spool);
+        let complete = tokio::spawn(async move { complete_spool.complete(Some(4)).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !complete.is_finished(),
+            "completion must backpressure behind old I/O and queued retry"
+        );
+        assert_eq!(spool.operation_gate.available_permits(), 0);
+        assert_eq!(control.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            control.max_active_owned_writes.load(Ordering::SeqCst),
+            1,
+            "only one owned backend write may be active"
+        );
+
+        control.release.notify_one();
+        let retry_result = tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+            .await
+            .expect("retry should finish after old I/O")
+            .expect("retry task joins");
+        assert!(matches!(
+            retry_result,
+            Err(BobsError::OffsetMismatch {
+                expected: 4,
+                got: 0
+            })
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), complete)
+            .await
+            .expect("completion should finish after retry")
+            .expect("completion task joins")
+            .expect("completion succeeds");
+        assert_eq!(control.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(control.active_owned_writes.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            tokio::fs::read(dir.path().join("cancel-safe/spool.dat"))
+                .await
+                .expect("read disk bytes"),
+            b"AAAA"
+        );
+        assert_eq!(
+            spool
+                .read_page(0)
+                .await
+                .expect("read cached page")
+                .expect("cached page exists")
+                .as_ref(),
+            b"AAAA"
+        );
+        assert_eq!(spool.metadata.lock().await.state, SpoolState::Complete);
+
+        drop(spool);
+        drop(manager);
+        let restarted = crate::manager::SpoolManager::<TokioFileIO>::new(dir.path(), 4, 1024, 8)
+            .expect("create restarted manager");
+        restarted.recover().await.expect("recover completed spool");
+        let recovered = restarted.get_spool("cancel-safe").expect("recover spool");
+        assert_eq!(recovered.metadata.lock().await.state, SpoolState::Complete);
+        assert_eq!(
+            recovered
+                .read_page(0)
+                .await
+                .expect("read recovered page")
+                .expect("recovered page exists")
+                .as_ref(),
+            b"AAAA"
+        );
+        assert_eq!(
+            tokio::fs::read(dir.path().join("cancel-safe/spool.dat"))
+                .await
+                .expect("read restarted disk bytes"),
+            b"AAAA"
+        );
+
+        *delayed_write_slot()
+            .lock()
+            .expect("delayed write control mutex poisoned") = None;
     }
 
     #[tokio::test]
