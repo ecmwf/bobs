@@ -71,11 +71,11 @@ Write path:
 1. HTTP body bytes are accepted at the required sequential offset.
 2. Bytes are written to `spool.dat` through `FileIO`.
 3. Full pages become reader-visible.
-4. Visible pages are offered to the global FIFO page cache and waiting readers are notified.
+4. Visible pages admitted to the global FIFO cache are copied once into page-sized cache-owned allocations, then waiting readers are notified. The preceding frame-to-disk append still uses the transport-backed `Bytes` directly.
 
 HTTP write staging starts empty, ignores untrusted body-size hints for reservation, and only copies cross-frame partial pages. Its per-request staging allocation is therefore lazy and bounded by the 64 MiB page-size maximum.
 
-The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget (binary default 268435456 bytes / 256 MiB; current Helm chart value 1048576 bytes / 1 MiB). `max_cache_bytes` may be smaller than `page_size`: setting it to `0` disables caching, and pages larger than the cap bypass the cache while remaining readable from disk. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
+The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget (binary default 268435456 bytes / 256 MiB; current Helm chart value 1048576 bytes / 1 MiB). That budget accounts the logical bytes of bounded cache-owned page allocations, excluding allocator overhead, so a small page slice cannot retain a much larger HTTP frame outside the accounting. Cache insertion may make this isolation copy solely to avoid retaining an oversized frame backing; the frame-to-disk path remains zero-copy. Setting `max_cache_bytes` to `0` disables caching without an isolation copy, and pages rejected because they are larger than the cap likewise bypass the cache without one while remaining readable from disk. Cache hits share the isolated `Bytes` without copying page contents. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 
 `max_live_spools` limits the number of spools in the first-read cache phase. When omitted, it derives as `max(1, max_cache_bytes / page_size)`, which is 16 with the 16 MiB/256 MiB binary defaults. Explicit values are preserved; the chart sets 256 for its 4 KiB/1 MiB profile. `/api/v1/create` waits up to `create_admission_timeout_ms` (default 5000) for a slot, then returns `503 Service Unavailable`; a key already tracked in any state returns `409 Conflict` immediately instead of entering that wait.
 

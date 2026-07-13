@@ -158,7 +158,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of individual data pages. Valid range `1..=67108864` (64 MiB), no larger than `max_spool_bytes`. In-progress readers see a page only once it is full; `/api/v1/complete/{key}` publishes the final partial page. |
-| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO page-cache budget across all spools. `0` disables caching. A page larger than the budget bypasses the cache and remains readable from disk. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO budget for bounded cache-owned page allocations across all spools, excluding allocator overhead. Cache admission may copy solely to avoid retaining an oversized frame backing; disabled caching and pages rejected for exceeding the cap do not make that isolation copy. |
 | `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools not yet fully read. Omitted values derive from effective page/cache settings; explicit values are preserved. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool; must be at least `page_size`. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
 | `create_admission_timeout_ms` | `5000` | Maximum `/api/v1/create` admission wait before `503 Service Unavailable`. |
