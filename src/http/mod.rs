@@ -8,6 +8,7 @@ use crate::io::FileIO;
 use crate::manager::SpoolManager;
 use crate::metadata::MetadataStore;
 use crate::metrics::BobsMetrics;
+use crate::time::now_secs;
 use async_stream::stream;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
@@ -375,10 +376,13 @@ where
         let write_result: std::result::Result<(), crate::error::BobsError> = async {
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
-                // Receipt itself is writer activity. In particular, sub-page frames
-                // may remain pending for a long time without reaching Spool::write.
-                spool.refresh_write_activity().await;
                 if let Ok(data) = frame.into_data() {
+                    if !data.is_empty() {
+                        // Refresh before buffering the frame. Sub-page frames may not
+                        // reach Spool::write until the request body ends, but cleanup
+                        // must still order this accepted activity against deletion.
+                        spool.refresh_write_activity(now_secs()).await?;
+                    }
                     let mut cursor = 0;
 
                     if !pending.is_empty() {
@@ -2410,8 +2414,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn frame_refresh_rejection_surfaces_completion_and_delete_states() {
+        for delete_before_frame in [false, true] {
+            let (app, state) = app_with_state().await;
+            let key = create_key(&app).await;
+            let spool = state.manager.get_spool(&key).expect("spool exists");
+            let (body_polled_tx, body_polled_rx) = tokio::sync::oneshot::channel();
+            let (release_frame_tx, release_frame_rx) = tokio::sync::oneshot::channel();
+            let body_stream = async_stream::stream! {
+                let _ = body_polled_tx.send(());
+                let _ = release_frame_rx.await;
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"));
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/write/{key}/0"))
+                .body(Body::from_stream(body_stream))
+                .expect("request build");
+            let task = tokio::spawn({
+                let app = app.clone();
+                async move { app.oneshot(request).await.expect("write oneshot") }
+            });
+            body_polled_rx
+                .await
+                .expect("handler captured the spool before lifecycle transition");
+
+            let expected = if delete_before_frame {
+                state
+                    .manager
+                    .delete_spool(&key)
+                    .await
+                    .expect("delete before frame");
+                StatusCode::NOT_FOUND
+            } else {
+                spool.complete(None).await.expect("complete before frame");
+                StatusCode::CONFLICT
+            };
+            release_frame_tx
+                .send(())
+                .expect("handler still polling body");
+            assert_eq!(
+                task.await.expect("write task join").status(),
+                expected,
+                "HTTP must return the lifecycle refresh rejection"
+            );
+            assert_eq!(
+                spool.metadata.lock().await.total_bytes_written,
+                0,
+                "rejected frame must never reach the pending buffer or data file"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
-    // Read-coverage tracking — monotonic full-read and read-activity anchors
+    // Read-coverage tracking — full_object_read_at and last_read_activity_at
     // -----------------------------------------------------------------------
 
     /// A single Range request that covers the entire 8 KiB object must set
