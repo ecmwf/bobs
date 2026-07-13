@@ -465,6 +465,10 @@ where
     }
 
     pub async fn recover(&self) -> Result<()> {
+        self.recover_with_counts().await.map(|_| ())
+    }
+
+    async fn recover_with_counts(&self) -> Result<(usize, usize)> {
         let started = Instant::now();
         let mut recovered: Vec<(String, SpoolMetadata)> = Vec::new();
         let mut stale_keys: Vec<String> = Vec::new();
@@ -488,58 +492,31 @@ where
         let recovered_keys: HashSet<String> =
             recovered.iter().map(|(key, _)| key.clone()).collect();
 
-        // Admission is decided before any candidate data file is inspected or opened.
         // Most-recently-active spools win; lexical key order breaks ties so the same
-        // on-disk set and configuration always produce the same admitted set.
+        // on-disk set and configuration always produce the same recovery order.
         recovered.sort_by(|(left_key, left), (right_key, right)| {
             recovery_activity_at(right)
                 .cmp(&recovery_activity_at(left))
                 .then_with(|| left_key.cmp(right_key))
         });
 
-        // Reserve every recovery slot up front. Candidates beyond this boundary stay
-        // entirely on disk: recovery does not stat/open spool.dat, migrate metadata,
-        // classify data corruption, or allocate/load their trailing partial pages.
-        let available_slots = recovered.len().min(self.admission.available_permits());
-        let mut permits = Vec::with_capacity(available_slots);
-        for _ in 0..available_slots {
-            match Arc::clone(&self.admission).try_acquire_owned() {
-                Ok(permit) => permits.push(permit),
-                Err(_) => break,
-            }
-        }
-
-        let excess = recovered.split_off(permits.len());
-        let mut quarantined_count = excess.len();
-        for (key, meta) in &excess {
-            tracing::warn!(
-                "event.name" = "bobs.recovery.spool_quarantined",
-                key = %key,
-                configured = self.max_live_spools,
-                activity_at = recovery_activity_at(meta),
-                reason = "admission_capacity",
-                "recovery: admission capacity exhausted; leaving durable sidecar and data untouched for a later restart"
-            );
-        }
-        drop(excess);
-
         let mut recovered_count = 0_usize;
-        for ((key, mut meta), permit) in recovered.into_iter().zip(permits) {
-            if !meta.data_path.exists() {
-                tracing::warn!(key = %key, "recovery: data file missing, discarding");
-                stale_keys.push(key);
-                continue;
-            }
+        let mut quarantined_count = 0_usize;
+        let mut rejected_count = 0_usize;
 
+        // Validate candidates in deterministic order. Metadata-only checks happen
+        // before admission, so invalid newer entries cannot displace older valid
+        // spools. Once capacity is full, valid excess entries remain unopened.
+        for (key, mut meta) in recovered {
             match meta.state {
                 SpoolState::Creating => {
                     tracing::debug!(key = %key, "recovery removing incomplete spool (Creating)");
-                    stale_keys.push(key.clone());
+                    stale_keys.push(key);
                     continue;
                 }
                 SpoolState::Deleting => {
                     tracing::debug!(key = %key, "recovery removing incomplete spool (Deleting)");
-                    stale_keys.push(key.clone());
+                    stale_keys.push(key);
                     continue;
                 }
                 SpoolState::Writing
@@ -548,114 +525,70 @@ where
                 | SpoolState::Complete => {}
             }
 
-            let file_size = std::fs::metadata(&meta.data_path)
-                .map(|metadata| metadata.len())
-                .map_err(BobsError::IoError)?;
+            let file_size = match std::fs::metadata(&meta.data_path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(key = %key, "recovery: data file missing, discarding");
+                    stale_keys.push(key);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        key = %key,
+                        error = %error,
+                        "recovery: failed to inspect data file metadata; leaving spool intact and unavailable"
+                    );
+                    rejected_count += 1;
+                    continue;
+                }
+            };
 
-            if meta.state == SpoolState::Completing {
+            let finalized_completing = meta.state == SpoolState::Completing;
+            if finalized_completing {
                 if let Err(reason) = validate_completing_marker(&meta, file_size) {
                     tracing::warn!(
                         key = %key,
                         file_size = file_size,
                         reason = %reason,
-                        "recovery: inconsistent Completing marker; leaving sidecar and data intact and quarantined (writes will not be accepted)"
+                        "recovery: inconsistent Completing marker; leaving sidecar and data intact and unavailable"
                     );
-                    quarantined_count += 1;
+                    rejected_count += 1;
                     continue;
                 }
 
-                // The marker is written only after spool.dat fdatasync and carries
-                // the exact final page layout. Complete this transaction before
-                // constructing an in-memory spool; Completing is never recoverable
-                // as an active writer.
+                // The marker follows spool.dat fdatasync and carries the exact final
+                // layout. Finalization is persisted only if this candidate passes
+                // data validation and is admitted.
                 meta.state = SpoolState::Complete;
                 meta.readable_at.get_or_insert_with(now_secs);
-                self.metadata_store.write(&meta).await?;
-                tracing::info!(
-                    key = %key,
-                    total_bytes = meta.total_bytes_written,
-                    total_pages = meta.total_pages,
-                    "recovery: finalized durable Completing marker"
-                );
             }
-            let legacy_active = meta.page_size == 0
-                && matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked);
+
             let migration = match prepare_recovery_metadata(&mut meta, file_size, self.page_size) {
                 Ok(migration) => migration,
-                Err(reason) if legacy_active => {
+                Err(reason) => {
                     tracing::warn!(
                         key = %key,
                         state = ?meta.state,
                         file_size = file_size,
                         reason = %reason,
-                        "recovery: legacy active spool layout is unsafe to resume; leaving sidecar and data intact and quarantined (API operations will report the spool as unavailable)"
+                        "recovery: candidate metadata cannot be recovered safely; leaving sidecar and data intact and unavailable"
                     );
-                    quarantined_count += 1;
+                    rejected_count += 1;
                     continue;
-                }
-                Err(reason) => {
-                    return Err(BobsError::ConfigurationError(format!(
-                        "cannot safely migrate spool {key}: {reason}; its sidecar and data have been left intact"
-                    )));
                 }
             };
             let spool_page_size = migration.page_size;
-
-            // A legacy sidecar must become self-describing before ordinary
-            // recovery can expose or mutate the spool. MetadataStore::write uses
-            // the same fsync + atomic-rename protocol as every lifecycle commit.
-            if migration.persist {
-                if migration.write_locked_salvage {
-                    tracing::warn!(
-                        key = %key,
-                        page_size = spool_page_size,
-                        file_size = file_size,
-                        "recovery: atomically migrating legacy WriteLocked spool to Complete salvage; further writes are rejected, reads and idempotent completion remain available"
-                    );
-                } else {
-                    tracing::info!(
-                        key = %key,
-                        page_size = spool_page_size,
-                        "recovery: atomically migrating legacy sidecar metadata"
-                    );
-                }
-                self.metadata_store.write(&meta).await?;
-            }
-
-            if matches!(
-                meta.state,
-                SpoolState::Writing | SpoolState::WriteLocked | SpoolState::Completing
-            ) {
-                meta.last_write_at = now_secs();
-            }
-
-            let handle = match F::open(&meta.data_path).await {
-                Ok(h) => h,
-                Err(error) => {
-                    tracing::warn!(
-                        key = %key,
-                        error = %error,
-                        "recovery: failed to open data file, leaving spool intact and quarantined"
-                    );
-                    quarantined_count += 1;
-                    continue;
-                }
-            };
-
-            let mut metadata_corrected = false;
+            let mut metadata_needs_persist = finalized_completing || migration.persist;
             let mut trailing_partial_len = 0;
 
-            // Backfill readable_at for spools that were persisted before this
-            // field existed. Grants a full idle-TTL grace period after upgrade.
+            // Backfill readable_at for spools persisted before this field existed.
+            // The write is deferred until admission and data validation succeed.
             if meta.state == SpoolState::Complete && meta.readable_at.is_none() {
                 meta.readable_at = Some(now_secs());
-                metadata_corrected = true;
+                metadata_needs_persist = true;
             }
 
-            if matches!(
-                meta.state,
-                SpoolState::Writing | SpoolState::WriteLocked | SpoolState::Completing
-            ) {
+            if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
                 let progress = in_progress_progress_from_file(file_size, spool_page_size);
                 trailing_partial_len = progress.trailing_partial_len;
 
@@ -674,13 +607,20 @@ where
                     meta.total_pages = progress.total_pages;
                     meta.final_page_size = None;
                 }
+                meta.last_write_at = now_secs();
             } else {
-                let expected_full_pages_bytes =
-                    complete_layout_bytes(&meta, meta.page_size).map_err(|reason| {
-                        BobsError::ConfigurationError(format!(
-                            "cannot safely recover spool {key}: {reason}; its sidecar and data have been left intact"
-                        ))
-                    })?;
+                let expected_full_pages_bytes = match complete_layout_bytes(&meta, meta.page_size) {
+                    Ok(expected) => expected,
+                    Err(reason) => {
+                        tracing::warn!(
+                            key = %key,
+                            reason = %reason,
+                            "recovery: completed spool metadata is invalid; leaving sidecar and data intact and unavailable"
+                        );
+                        rejected_count += 1;
+                        continue;
+                    }
+                };
 
                 if file_size < expected_full_pages_bytes {
                     tracing::warn!(
@@ -695,8 +635,111 @@ where
                 }
             }
 
-            if metadata_corrected {
-                self.metadata_store.write(&meta).await?;
+            if recovered_count >= self.max_live_spools {
+                quarantined_count += 1;
+                tracing::warn!(
+                    "event.name" = "bobs.recovery.spool_quarantined",
+                    key = %key,
+                    configured = self.max_live_spools,
+                    activity_at = recovery_activity_at(&meta),
+                    reason = "admission_capacity",
+                    "recovery: valid excess candidate left durable and unopened for a later restart"
+                );
+                continue;
+            }
+
+            let permit = match Arc::clone(&self.admission).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    quarantined_count += 1;
+                    tracing::warn!(
+                        "event.name" = "bobs.recovery.spool_quarantined",
+                        key = %key,
+                        configured = self.max_live_spools,
+                        activity_at = recovery_activity_at(&meta),
+                        reason = "admission_capacity",
+                        "recovery: valid excess candidate left durable and unopened for a later restart"
+                    );
+                    continue;
+                }
+            };
+
+            // Opening and loading a partial tail are data validation, so they happen
+            // only while this candidate owns a slot. Any failure drops the permit
+            // immediately and recovery continues with the next ordered candidate.
+            let handle = match F::open(&meta.data_path).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    tracing::warn!(
+                        key = %key,
+                        error = %error,
+                        "recovery: failed to open data file; leaving spool intact and trying the next candidate"
+                    );
+                    rejected_count += 1;
+                    drop(permit);
+                    continue;
+                }
+            };
+
+            let trailing_partial = if trailing_partial_len > 0 {
+                match read_exact_at::<F>(
+                    &handle,
+                    meta.total_bytes_written - trailing_partial_len,
+                    trailing_partial_len as usize,
+                    "loading trailing partial page during recovery",
+                )
+                .await
+                {
+                    Ok(partial) => Some(partial),
+                    Err(error) => {
+                        tracing::warn!(
+                            key = %key,
+                            error = %error,
+                            "recovery: failed to validate trailing partial page; leaving spool intact and trying the next candidate"
+                        );
+                        if let Err(close_error) = F::close(handle).await {
+                            tracing::warn!(key = %key, error = %close_error, "recovery: failed to close rejected data file handle");
+                        }
+                        rejected_count += 1;
+                        drop(permit);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            // A legacy or Completing sidecar becomes self-describing/terminal only
+            // after the admitted candidate's data has passed validation.
+            if metadata_needs_persist {
+                if migration.write_locked_salvage {
+                    tracing::warn!(
+                        key = %key,
+                        page_size = spool_page_size,
+                        file_size = file_size,
+                        "recovery: atomically migrating legacy WriteLocked spool to Complete salvage; further writes are rejected, reads and idempotent completion remain available"
+                    );
+                } else if migration.persist {
+                    tracing::info!(
+                        key = %key,
+                        page_size = spool_page_size,
+                        "recovery: atomically migrating legacy sidecar metadata"
+                    );
+                }
+                if finalized_completing {
+                    tracing::info!(
+                        key = %key,
+                        total_bytes = meta.total_bytes_written,
+                        total_pages = meta.total_pages,
+                        "recovery: finalizing durable Completing marker"
+                    );
+                }
+                if let Err(error) = self.metadata_store.write(&meta).await {
+                    if let Err(close_error) = F::close(handle).await {
+                        tracing::warn!(key = %key, error = %close_error, "recovery: failed to close data file after metadata persistence failure");
+                    }
+                    return Err(error);
+                }
             }
 
             // Capture fields needed for post-init before meta is moved.
@@ -717,13 +760,7 @@ where
                 .await,
             );
 
-            if trailing_partial_len > 0 {
-                let partial = read_exact_logical_range::<F>(
-                    &spool.file_handle,
-                    meta_total_bytes_for_init - trailing_partial_len,
-                    trailing_partial_len as usize,
-                )
-                .await?;
+            if let Some(partial) = trailing_partial {
                 spool.write_buffer.lock().await.extend_from_slice(&partial);
             }
 
@@ -733,10 +770,8 @@ where
                 .last_read_activity_at
                 .store(now_secs(), Ordering::SeqCst);
 
-            // Re-initialize missing ranges for complete spools. No served
-            // ranges are known after restart, so coverage resets to
-            // [0, total_size). full_read_complete_ttl_secs won't trigger
-            // until the object is re-served — safe by design.
+            // No served ranges are known after restart, so complete spool coverage
+            // resets to [0, total_size).
             if matches!(meta_state_for_init, SpoolState::Complete) {
                 spool
                     .missing_ranges
@@ -748,7 +783,6 @@ where
             self.spools.insert(key, spool);
             recovered_count += 1;
 
-            // Count recovered spool in the active gauge.
             let recovered_label =
                 metric_state_label(&meta_state_for_init, meta_write_locked_for_init);
             self.metrics.record_state_transition(None, recovered_label);
@@ -834,9 +868,6 @@ where
 
         // Commit empty pre-marker removals, and retry any parent-directory
         // durability boundary left uncertain by an earlier failed recovery.
-        // Running this barrier even when this scan made no changes makes a
-        // subsequent startup/recover call a valid retry after unlink + fsync
-        // failure.
         F::sync_directory(&self.data_dir)
             .await
             .map_err(BobsError::IoError)?;
@@ -853,7 +884,8 @@ where
                 configured = self.max_live_spools,
                 recovered = recovered_count,
                 quarantined = quarantined_count,
-                "recovery completed with durable spools quarantined"
+                rejected = rejected_count,
+                "recovery completed with valid durable spools quarantined"
             );
         }
 
@@ -862,6 +894,7 @@ where
             configured = self.max_live_spools,
             recovered = recovered_count,
             quarantined = quarantined_count,
+            rejected = rejected_count,
             active = self.spools.len(),
             stale = stale_keys.len(),
             orphan_deleted = orphan_deleted,
@@ -870,7 +903,7 @@ where
             outcome = "success",
             "recovery completed"
         );
-        Ok(())
+        Ok((recovered_count, quarantined_count))
     }
 }
 
@@ -1212,6 +1245,7 @@ fn in_progress_progress_from_file(file_size: u64, page_size: usize) -> InProgres
     }
 }
 
+#[cfg(test)]
 async fn read_exact_logical_range<F: FileIO>(
     file_handle: &Arc<tokio::sync::Mutex<Option<F::Handle>>>,
     offset: u64,
@@ -1351,10 +1385,14 @@ mod tests {
         }
     }
 
+    static RECOVERY_IO_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static RECOVERY_OPEN_ATTEMPTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     static RECOVERY_OPEN_COUNT: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     static RECOVERY_READ_BYTES: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    const RECOVERY_FAIL_OPEN_KEY: &str = "ffffffff-ffff-4fff-8fff-ffffffffff05";
 
     #[derive(Clone)]
     struct RecoveryCountingFileIO;
@@ -1372,6 +1410,17 @@ mod tests {
             path: &Path,
         ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
             async move {
+                RECOVERY_OPEN_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|key| key == RECOVERY_FAIL_OPEN_KEY)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "injected corrupt recovery candidate",
+                    ));
+                }
                 let handle = TokioFileIO::open(path).await?;
                 RECOVERY_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(handle)
@@ -2234,6 +2283,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_admission_bounds_partial_tail_reads_and_preserves_excess() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let page_size = 4096_usize;
@@ -2345,6 +2395,173 @@ mod tests {
             keys.len() * partial_len
         );
         assert_eq!(expanded.admission.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_skips_newer_metadata_invalid_candidates_before_complete_spool() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096_usize;
+        let creating_key = "10000000-0000-4000-8000-000000000001";
+        let deleting_key = "10000000-0000-4000-8000-000000000002";
+        let corrupt_key = "10000000-0000-4000-8000-000000000003";
+        let ambiguous_key = "10000000-0000-4000-8000-000000000004";
+        let complete_key = "10000000-0000-4000-8000-000000000005";
+        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 65536, 8)
+            .expect("fixture manager");
+
+        let mut creating =
+            sidecar_fixture_metadata(&data_dir, creating_key, SpoolState::Creating, 0);
+        creating.last_write_at = 1_000;
+        write_sidecar_fixture(&fixture, creating, b"").await;
+
+        let mut deleting =
+            sidecar_fixture_metadata(&data_dir, deleting_key, SpoolState::Deleting, 0);
+        deleting.last_write_at = 900;
+        write_sidecar_fixture(&fixture, deleting, b"").await;
+
+        let mut corrupt = sidecar_fixture_metadata(&data_dir, corrupt_key, SpoolState::Complete, 8);
+        corrupt.last_write_at = 800;
+        write_sidecar_fixture(&fixture, corrupt, b"bad").await;
+
+        let mut ambiguous =
+            sidecar_fixture_metadata(&data_dir, ambiguous_key, SpoolState::Writing, 9);
+        ambiguous.page_size = 0;
+        ambiguous.total_pages = 2;
+        ambiguous.final_page_size = None;
+        ambiguous.last_write_at = 700;
+        write_sidecar_fixture(&fixture, ambiguous, b"abcdefghi").await;
+        let ambiguous_sidecar = tokio::fs::read(data_dir.join(ambiguous_key).join("meta.json"))
+            .await
+            .expect("snapshot ambiguous sidecar");
+
+        let mut complete =
+            sidecar_fixture_metadata(&data_dir, complete_key, SpoolState::Complete, 4);
+        complete.last_write_at = 600;
+        write_sidecar_fixture(&fixture, complete, b"good").await;
+        drop(fixture);
+
+        RECOVERY_OPEN_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_OPEN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let limited = SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, page_size, 65536, 1)
+            .expect("limited manager");
+        let counts = limited
+            .recover_with_counts()
+            .await
+            .expect("bounded recovery succeeds");
+
+        assert_eq!(
+            counts,
+            (1, 0),
+            "recovery metric source counts only successfully recovered and valid excess spools"
+        );
+        assert!(limited.get_spool(complete_key).is_some());
+        assert_eq!(limited.spool_keys(), vec![complete_key.to_string()]);
+        assert_eq!(
+            RECOVERY_OPEN_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "metadata-invalid candidates must not consume data admission"
+        );
+        assert_eq!(
+            RECOVERY_READ_BYTES.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "complete recovery needs no tail read"
+        );
+        assert!(!data_dir.join(creating_key).exists());
+        assert!(!data_dir.join(deleting_key).exists());
+        assert!(!data_dir.join(corrupt_key).exists());
+        assert_eq!(
+            tokio::fs::read(data_dir.join(ambiguous_key).join("meta.json"))
+                .await
+                .expect("ambiguous sidecar remains"),
+            ambiguous_sidecar,
+            "rejected ambiguous metadata is preserved but is not capacity quarantine"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_releases_failed_permit_and_does_not_read_valid_excess_tail() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let page_size = 4096_usize;
+        let active_key = "ffffffff-ffff-4fff-8fff-ffffffffff06";
+        let excess_key = "ffffffff-ffff-4fff-8fff-ffffffffff07";
+        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 65536, 3)
+            .expect("fixture manager");
+
+        let mut failed =
+            sidecar_fixture_metadata(&data_dir, RECOVERY_FAIL_OPEN_KEY, SpoolState::Writing, 17);
+        failed.last_write_at = 1_000;
+        write_sidecar_fixture(&fixture, failed, b"newer-but-unopenable").await;
+
+        let active_data = b"older-active";
+        let mut active = sidecar_fixture_metadata(
+            &data_dir,
+            active_key,
+            SpoolState::Writing,
+            active_data.len() as u64,
+        );
+        active.last_write_at = 900;
+        write_sidecar_fixture(&fixture, active, active_data).await;
+
+        let excess_data = b"valid-excess-tail";
+        let mut excess = sidecar_fixture_metadata(
+            &data_dir,
+            excess_key,
+            SpoolState::Writing,
+            excess_data.len() as u64,
+        );
+        excess.last_write_at = 800;
+        write_sidecar_fixture(&fixture, excess, excess_data).await;
+        let excess_sidecar = tokio::fs::read(data_dir.join(excess_key).join("meta.json"))
+            .await
+            .expect("snapshot excess sidecar");
+        drop(fixture);
+
+        RECOVERY_OPEN_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_OPEN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let limited = SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, page_size, 65536, 1)
+            .expect("limited manager");
+        let counts = limited
+            .recover_with_counts()
+            .await
+            .expect("bounded recovery succeeds");
+
+        assert_eq!(
+            counts,
+            (1, 1),
+            "only the metadata-valid excess spool contributes to quarantine metrics"
+        );
+        assert!(limited.get_spool(active_key).is_some());
+        assert!(limited.get_spool(RECOVERY_FAIL_OPEN_KEY).is_none());
+        assert!(limited.get_spool(excess_key).is_none());
+        assert_eq!(
+            RECOVERY_OPEN_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "failed candidate releases its permit so the older candidate is attempted"
+        );
+        assert_eq!(
+            RECOVERY_OPEN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            RECOVERY_READ_BYTES.load(std::sync::atomic::Ordering::SeqCst),
+            active_data.len(),
+            "the valid excess tail must remain unopened and unread"
+        );
+        assert_eq!(limited.admission.available_permits(), 0);
+        assert!(data_dir.join(RECOVERY_FAIL_OPEN_KEY).exists());
+        assert_eq!(
+            tokio::fs::read(data_dir.join(excess_key).join("meta.json"))
+                .await
+                .expect("excess sidecar remains"),
+            excess_sidecar,
+            "valid excess metadata remains untouched"
+        );
     }
 
     #[tokio::test]
@@ -3466,13 +3683,12 @@ mod tests {
 
         let manager =
             SpoolManager::<TokioFileIO>::new(&data_dir, 8192, 65536, 256).expect("restart manager");
-        let error = manager
-            .recover()
+        let counts = manager
+            .recover_with_counts()
             .await
-            .expect_err("non-integral stride is ambiguous");
-        assert!(
-            matches!(error, BobsError::ConfigurationError(message) if message.contains(&key) && message.contains("left intact"))
-        );
+            .expect("ambiguous candidate must not block recovery");
+        assert_eq!(counts, (0, 0));
+        assert!(manager.get_spool(&key).is_none());
         assert_eq!(
             tokio::fs::read(spool_dir.join("spool.dat")).await.unwrap(),
             data
