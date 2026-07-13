@@ -91,6 +91,7 @@ impl FileIO for UringFileIO {
     }
 
     async fn write_at(handle: &Self::Handle, offset: u64, data: Bytes) -> Result<usize> {
+        let sqe_len = ring_pool::checked_sqe_len(data.len())?;
         let (tx, rx) = oneshot::channel();
         let pool = Arc::clone(&handle.pool);
         #[cfg(test)]
@@ -105,6 +106,7 @@ impl FileIO for UringFileIO {
                 fd: Arc::clone(&handle.fd),
                 offset,
                 data,
+                sqe_len,
                 tx,
             },
         )
@@ -113,12 +115,7 @@ impl FileIO for UringFileIO {
     }
 
     async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> Result<Bytes> {
-        if len > u32::MAX as usize {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "io_uring reads are limited to u32::MAX bytes",
-            ));
-        }
+        let sqe_len = ring_pool::checked_sqe_len(len)?;
         let (tx, rx) = oneshot::channel();
         let pool = Arc::clone(&handle.pool);
         #[cfg(test)]
@@ -132,7 +129,7 @@ impl FileIO for UringFileIO {
             ring_pool::Request::Read {
                 fd: Arc::clone(&handle.fd),
                 offset,
-                len,
+                sqe_len,
                 tx,
             },
         )
@@ -439,6 +436,34 @@ mod tests {
     #[tokio::test]
     async fn io_uring_fileio_close_and_drop_are_safe() {
         Suite::close_and_drop_are_safe().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_direct_read_is_rejected_before_routing_or_submission() {
+        let Some(oversized_len) = crate::io::MAX_IO_URING_IO_LEN.checked_add(1) else {
+            return;
+        };
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("oversized-read.bin");
+        let pool = Arc::new(
+            RingPool::new_for_test(explicit_test_options(1))
+                .expect("oversized request test ring pool should start"),
+        );
+        let _override = scoped_test_ring_pool_override(Arc::clone(&pool));
+        let handle = UringFileIO::create(&path)
+            .await
+            .expect("create oversized request test file");
+        let routing_events = pool.routing_events().len();
+        let submission_events = pool.submission_events().len();
+
+        let error = UringFileIO::read_at(&handle, 0, oversized_len)
+            .await
+            .expect_err("oversized direct read must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(pool.routing_events().len(), routing_events);
+        assert_eq!(pool.submission_events().len(), submission_events);
+        assert_eq!(pool.in_flight_operations(), 0);
     }
 
     #[derive(Debug)]
