@@ -535,8 +535,8 @@ mod tests {
             .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
-            Ok(Vec::new())
+        async fn scan(&self) -> Result<crate::metadata::MetadataDirectoryScan> {
+            Ok(crate::metadata::MetadataDirectoryScan::empty())
         }
     }
 
@@ -613,7 +613,7 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
+        async fn scan(&self) -> Result<crate::metadata::MetadataDirectoryScan> {
             self.inner.scan().await
         }
     }
@@ -657,8 +657,8 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
-            Ok(Vec::new())
+        async fn scan(&self) -> Result<crate::metadata::MetadataDirectoryScan> {
+            Ok(crate::metadata::MetadataDirectoryScan::empty())
         }
     }
 
@@ -717,7 +717,7 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
+        async fn scan(&self) -> Result<crate::metadata::MetadataDirectoryScan> {
             self.inner.scan().await
         }
     }
