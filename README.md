@@ -43,7 +43,7 @@ Required config fields:
 Operational requirements:
 
 - `HOSTNAME` must be set and include a pod ordinal like `bobs-0`
-- `page_size` must be greater than `0`
+- `page_size` must be between `1` and `67108864` bytes (64 MiB), and no larger than `max_spool_bytes`
 - `BOBS_INTERNAL_BASE_URL_TEMPLATE` must be set and non-empty
 
 Example:
@@ -138,9 +138,10 @@ BOBS reads an optional YAML file passed as a CLI argument. Most fields have Rust
 | `host` | `0.0.0.0` | Address to listen on. |
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
-| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of individual data pages in bytes. |
+| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Page size in bytes; valid range `1..=67108864` (64 MiB), and no larger than `max_spool_bytes`. |
 | `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global in-memory cache budget across all spools. |
 | `max_live_spools` | binary: derived from cache/page capacity (16); chart: `256` | Admission limit; explicit YAML overrides are preserved. |
+| `max_spool_bytes` | `8589934592` (8 GiB) | Per-spool write limit; must be at least `page_size`. |
 | `writer_inactivity_timeout_secs` | `300` | Seconds of writer silence before cleanup. |
 | `reader_done_ttl_secs` | `60` | TTL after spool completion and reader finishes. |
 | `unread_ttl_secs` | `3600` | TTL for completed spools that were never read. |

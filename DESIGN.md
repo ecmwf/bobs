@@ -60,7 +60,7 @@ Accepted write bytes are appended to `spool.dat` before `/write` returns, but th
 
 ## Paging and cache
 
-The byte stream is divided into fixed-size pages (`page_size`). The Rust binary defaults to 16 MiB; the Helm chart overrides this to 4 KiB.
+The byte stream is divided into fixed-size pages (`page_size`). The Rust binary defaults to 16 MiB; the Helm chart overrides this to 4 KiB. Configuration bounds pages at 64 MiB and requires `page_size <= max_spool_bytes`.
 
 Write path:
 
@@ -68,6 +68,8 @@ Write path:
 2. Bytes are written to `spool.dat` through `FileIO`.
 3. Full pages become reader-visible.
 4. Visible pages are inserted into a global FIFO page cache and waiting readers are notified.
+
+HTTP write staging starts empty, ignores untrusted body-size hints for reservation, and only copies cross-frame partial pages. Its per-request staging allocation is therefore lazy and bounded by the 64 MiB page-size maximum.
 
 The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Setting `max_cache_bytes` to `0` disables caching. Pages larger than the cap bypass the cache. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
 

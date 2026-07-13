@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config::validate_page_size;
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
 use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
@@ -269,11 +270,9 @@ where
         max_cache_bytes: usize,
         max_live_spools: usize,
     ) -> Result<Self> {
-        if page_size == 0 {
-            return Err(BobsError::ConfigurationError(
-                "page_size must be greater than 0".to_string(),
-            ));
-        }
+        // Keep this check at the construction boundary: callers outside the binary
+        // may bypass Config::validate, and page-backed I/O allocates from this value.
+        validate_page_size(page_size)?;
         if max_live_spools == 0 {
             return Err(BobsError::ConfigurationError(
                 "max_live_spools must be greater than 0".to_string(),
@@ -2072,6 +2071,37 @@ mod tests {
         let result = SpoolManager::<TokioFileIO>::new(&data_dir, 0, 1024, 256);
 
         assert!(matches!(result, Err(BobsError::ConfigurationError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_new_accepts_maximum_page_size_without_eager_page_allocation() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(
+            &data_dir,
+            crate::config::MAX_PAGE_SIZE_BYTES,
+            1024,
+            256,
+        )
+        .expect("maximum page size should initialize");
+
+        assert_eq!(manager.page_size, crate::config::MAX_PAGE_SIZE_BYTES);
+        assert_eq!(manager.page_cache.lock().await.current_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_new_rejects_oversized_page_before_creating_data_directory() {
+        for page_size in [crate::config::MAX_PAGE_SIZE_BYTES + 1, usize::MAX] {
+            let dir = tempdir().expect("create tempdir");
+            let data_dir = dir.path().join("data");
+            let result = SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 1024, 256);
+
+            assert!(matches!(result, Err(BobsError::ConfigurationError(_))));
+            assert!(
+                !data_dir.exists(),
+                "invalid page size must fail before startup allocation or filesystem setup"
+            );
+        }
     }
 
     #[tokio::test]

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 const DEFAULT_PAGE_SIZE: usize = 16 * 1024 * 1024;
+/// Operational ceiling for one page and its per-request staging buffer.
+pub const MAX_PAGE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 fn derived_max_live_spools(page_size: usize, max_cache_bytes: usize) -> usize {
     max_cache_bytes.checked_div(page_size).unwrap_or(0).max(1)
@@ -17,6 +19,22 @@ fn derived_max_live_spools(page_size: usize, max_cache_bytes: usize) -> usize {
 const DEFAULT_MAX_SPOOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Tokio's bounded MPSC channel stores capacity in a semaphore.
 pub const MAX_IO_URING_QUEUE_CAPACITY: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
+pub(crate) fn validate_page_size(page_size: usize) -> Result<()> {
+    if page_size == 0 {
+        return Err(BobsError::ConfigurationError(
+            "page_size must be greater than 0".to_string(),
+        ));
+    }
+
+    if page_size > MAX_PAGE_SIZE_BYTES {
+        return Err(BobsError::ConfigurationError(format!(
+            "page_size must not exceed {MAX_PAGE_SIZE_BYTES} bytes (64 MiB)"
+        )));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -165,11 +183,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.page_size == 0 {
-            return Err(BobsError::ConfigurationError(
-                "page_size must be greater than 0".to_string(),
-            ));
-        }
+        validate_page_size(self.page_size)?;
 
         if self.max_live_spools == 0 {
             return Err(BobsError::ConfigurationError(
@@ -187,6 +201,12 @@ impl Config {
         if self.max_spool_bytes == 0 {
             return Err(BobsError::ConfigurationError(
                 "max_spool_bytes must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.page_size as u64 > self.max_spool_bytes {
+            return Err(BobsError::ConfigurationError(
+                "page_size must not exceed max_spool_bytes".to_string(),
             ));
         }
 
@@ -414,6 +434,56 @@ route_name: test-route
 
         let err = config.validate().expect_err("validation should fail");
         assert!(matches!(err, BobsError::ConfigurationError(_)));
+    }
+
+    #[test]
+    fn test_validate_accepts_maximum_page_size() {
+        let config = Config {
+            page_size: MAX_PAGE_SIZE_BYTES,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        config.validate().expect("maximum page size should pass");
+    }
+
+    #[test]
+    fn test_validate_rejects_page_size_above_maximum() {
+        for page_size in [MAX_PAGE_SIZE_BYTES + 1, usize::MAX] {
+            let config = Config {
+                page_size,
+                host_prefix: "test".into(),
+                domain: "example.com".into(),
+                route_name: "bobs".into(),
+                ..Config::default()
+            };
+
+            let err = config.validate().expect_err("oversized page must fail");
+            assert!(
+                matches!(err, BobsError::ConfigurationError(ref message) if message.contains("page_size must not exceed") && message.contains(&MAX_PAGE_SIZE_BYTES.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_page_larger_than_spool_limit() {
+        let config = Config {
+            page_size: 4096,
+            max_spool_bytes: 4095,
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("page larger than spool limit must fail");
+        assert!(
+            matches!(err, BobsError::ConfigurationError(ref message) if message.contains("page_size") && message.contains("max_spool_bytes"))
+        );
     }
 
     #[test]
