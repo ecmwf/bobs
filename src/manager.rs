@@ -515,6 +515,32 @@ where
             let file_size = std::fs::metadata(&meta.data_path)
                 .map(|metadata| metadata.len())
                 .map_err(BobsError::IoError)?;
+
+            if meta.state == SpoolState::Completing {
+                if let Err(reason) = validate_completing_marker(&meta, file_size) {
+                    tracing::warn!(
+                        key = %key,
+                        file_size = file_size,
+                        reason = %reason,
+                        "recovery: inconsistent Completing marker; leaving sidecar and data intact and quarantined (writes will not be accepted)"
+                    );
+                    continue;
+                }
+
+                // The marker is written only after spool.dat fdatasync and carries
+                // the exact final page layout. Complete this transaction before
+                // constructing an in-memory spool; Completing is never recoverable
+                // as an active writer.
+                meta.state = SpoolState::Complete;
+                meta.readable_at.get_or_insert_with(now_secs);
+                self.metadata_store.write(&meta).await?;
+                tracing::info!(
+                    key = %key,
+                    total_bytes = meta.total_bytes_written,
+                    total_pages = meta.total_pages,
+                    "recovery: finalized durable Completing marker"
+                );
+            }
             let legacy_active = meta.page_size == 0
                 && matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked);
             let migration = match prepare_recovery_metadata(&mut meta, file_size, self.page_size) {
@@ -1066,6 +1092,28 @@ fn complete_layout_bytes(meta: &SpoolMetadata, page_size: u64) -> std::result::R
             .checked_mul(page_size)
             .ok_or_else(|| "complete spool byte layout overflows u64".into()),
     }
+}
+
+fn validate_completing_marker(
+    meta: &SpoolMetadata,
+    file_size: u64,
+) -> std::result::Result<(), String> {
+    if meta.state != SpoolState::Completing {
+        return Err("metadata is not a Completing marker".into());
+    }
+    let candidate_bytes = complete_layout_bytes(meta, meta.page_size)?;
+    if candidate_bytes != meta.total_bytes_written {
+        return Err(format!(
+            "candidate layout describes {candidate_bytes} bytes but marker records {}",
+            meta.total_bytes_written
+        ));
+    }
+    if file_size != candidate_bytes {
+        return Err(format!(
+            "data file has {file_size} bytes but candidate layout requires exactly {candidate_bytes}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2216,6 +2264,88 @@ mod tests {
             &data[page_size * 2..]
         );
         assert!(spool.read_page(3).await.expect("end of spool").is_none());
+    }
+
+    #[tokio::test]
+    async fn crash_restart_at_completing_marker_finalizes_exact_candidate() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 16).expect("manager init");
+        let key = uuid::Uuid::new_v4().to_string();
+        let data = vec![0xD4u8; 4096 + 37];
+        let marker =
+            sidecar_fixture_metadata(&data_dir, &key, SpoolState::Completing, data.len() as u64);
+        write_sidecar_fixture(&manager, marker, &data).await;
+
+        manager.recover().await.expect("recover marker");
+        let spool = manager
+            .get_spool(&key)
+            .expect("valid marker must finalize and recover");
+        let durable = persisted_metadata(&manager, &key).await;
+        assert_eq!(durable.state, SpoolState::Complete);
+        assert_eq!(durable.total_bytes_written, data.len() as u64);
+        assert_eq!(durable.total_pages, 2);
+        assert_eq!(durable.final_page_size, Some(37));
+        assert_eq!(
+            spool.read_page(0).await.expect("page 0").unwrap().as_ref(),
+            &data[..4096]
+        );
+        assert_eq!(
+            spool.read_page(1).await.expect("page 1").unwrap().as_ref(),
+            &data[4096..]
+        );
+        assert!(spool.read_page(2).await.expect("exact EOF").is_none());
+        assert!(matches!(
+            spool
+                .write(data.len() as u64, Bytes::from_static(b"tail"))
+                .await,
+            Err(BobsError::SpoolClosed)
+        ));
+        spool
+            .complete(Some(data.len() as u64))
+            .await
+            .expect("idempotent completion after recovery");
+    }
+
+    #[tokio::test]
+    async fn inconsistent_completing_markers_are_quarantined_without_mutation() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 16).expect("manager init");
+
+        let short_key = uuid::Uuid::new_v4().to_string();
+        let short_data = vec![0x51u8; 200];
+        let short_marker =
+            sidecar_fixture_metadata(&data_dir, &short_key, SpoolState::Completing, 300);
+        write_sidecar_fixture(&manager, short_marker, &short_data).await;
+
+        let extra_key = uuid::Uuid::new_v4().to_string();
+        let extra_data = vec![0xA7u8; 301];
+        let extra_marker =
+            sidecar_fixture_metadata(&data_dir, &extra_key, SpoolState::Completing, 300);
+        write_sidecar_fixture(&manager, extra_marker, &extra_data).await;
+
+        manager
+            .recover()
+            .await
+            .expect("quarantine is a successful recovery outcome");
+
+        for (key, original) in [(&short_key, &short_data), (&extra_key, &extra_data)] {
+            assert!(
+                manager.get_spool(key).is_none(),
+                "quarantined marker must not expose a writable spool"
+            );
+            let durable = persisted_metadata(&manager, key).await;
+            assert_eq!(durable.state, SpoolState::Completing);
+            assert_eq!(
+                tokio::fs::read(data_dir.join(key).join("spool.dat"))
+                    .await
+                    .expect("quarantined data remains"),
+                *original
+            );
+        }
     }
 
     #[tokio::test]

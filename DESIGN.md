@@ -91,15 +91,16 @@ The write-lock state is lifecycle metadata in `meta.json` and is recovered on re
 
 ## Completion and durability boundary
 
-`/complete` validates the optional expected size before publishing final state. It then publishes any trailing partial page, syncs `spool.dat`, commits final metadata to `meta.json`, updates in-memory state/cache, and notifies readers.
+`/complete` validates the optional expected size, then starts an owned transaction that continues even if the request future is cancelled. The transaction syncs `spool.dat`, commits a durable `Completing` marker containing the exact candidate page layout, commits `Complete`, updates in-memory metadata, and finally clears the volatile trailing buffer and optionally populates the page cache. The cache is never authoritative; readers can reconstruct every page from `spool.dat`.
 
-After successful completion, `meta.json` is the durable completed-object record. Before completion, BOBS provides process-restart recovery from `spool.dat`, not stable-storage durability for each acknowledged page.
+After successful completion, `meta.json` is the durable completed-object record. Before the `Completing` marker, BOBS provides process-restart recovery from `spool.dat`, not stable-storage durability for each acknowledged page. Once that marker is durable, writes remain permanently fail-stop and recovery either finalizes its exact candidate or quarantines inconsistent data unchanged.
 
 ## Recovery
 
 Startup recovery scans `data_dir` for spool directories with `meta.json` sidecars.
 
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
+- Valid `Completing` markers are deterministically finalized to `Complete`; inconsistent markers and data are quarantined without mutation and are never reopened for writes.
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
 - Interrupted metadata temp files are ignored.
 - Unsafe or unrelated directories are not blindly removed. Recognised-key directories left truly empty by a pre-marker create crash are removed with a `data_dir` fsync; non-empty markerless directories are retained unchanged, while ordinary orphan cleanup remains restricted to recognised spool-shaped directories.
