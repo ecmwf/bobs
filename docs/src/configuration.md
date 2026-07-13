@@ -41,7 +41,7 @@ The table distinguishes Rust defaults from chart overrides where they differ. Ot
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
 | `enable_pprof` | `false` | Expose `/debug/pprof/profile` on the main listener. Keep disabled except during controlled profiling because profiling consumes CPU and the endpoint is unauthenticated. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. |
-| `full_read_complete_ttl_secs` | `30` | Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served. |
+| `full_read_complete_ttl_secs` | `30` | Short TTL after bounded coverage tracking proves every byte was served and no later bytes were served. Adjacent/overlapping ranges coalesce. If genuinely fragmented access exceeds the tracking cap, BOBS stays on the idle TTL until a later completed contiguous full-object response proves coverage exactly. |
 | `reader_done_ttl_secs` | `60` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. Must not exceed `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, or `full_read_complete_ttl_secs`. |

@@ -83,7 +83,7 @@ A request without `Range`, or with `Range: bytes=X-`, enters follow mode. If the
 
 When the long-poll timeout fires, BOBS returns `307 Temporary Redirect` to a read URL for the same key. If a trusted ingress supplies a valid `X-Forwarded-Prefix`, the redirect preserves that external prefix; otherwise it falls back to `/api/v1/read/{key}`. The redirect is temporary and includes `Cache-Control: no-store` because the location can depend on request headers.
 
-Range reads update aggregate read-coverage tracking so cleanup can detect when the whole object has been served, even across multiple range requests.
+Range reads update bounded aggregate coverage tracking so cleanup can detect when the whole object has been served across requests. Adjacent and overlapping progress is coalesced; genuinely fragmented access that exceeds the interval cap conservatively stops aggregate tracking. It cannot produce a false full-read result, but one later successfully completed contiguous full-object response provides exact evidence and restores the full-read transition.
 
 ## Write-locked spools
 
@@ -119,6 +119,6 @@ Current cleanup triggers are:
 
 - writer inactivity for producers that stop writing without completing;
 - read-idle TTL for readable spools that have not served bytes recently, with never-read spools anchored at `readable_at`;
-- full-read-complete TTL once aggregate coverage shows every byte has been served at least once.
+- full-read-complete TTL once bounded aggregate coverage, or one completed contiguous full-object response after fragmented fallback, proves every byte has been served.
 
 Slow readers keep a spool alive only while they continue making read progress. Stalled connections do not protect a spool forever.
