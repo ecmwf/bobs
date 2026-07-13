@@ -102,7 +102,7 @@ Startup recovery scans `data_dir` for spool directories with `meta.json` sidecar
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
 - Interrupted metadata temp files are ignored.
-- Unsafe or unrelated directories are not blindly removed. Orphan cleanup is restricted to UUID-shaped spool directories that look like BOBS spool directories.
+- Unsafe or unrelated directories are not blindly removed. Recognised-key directories left truly empty by a pre-marker create crash are removed with a `data_dir` fsync; non-empty markerless directories are retained unchanged, while ordinary orphan cleanup remains restricted to recognised spool-shaped directories.
 
 ## Cleanup rules
 
