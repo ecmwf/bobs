@@ -14,6 +14,29 @@ where
     F: FileIO,
     M: crate::metadata::MetadataStore + Clone + Send + Sync + 'static,
 {
+    /// Refresh writer activity for an accepted HTTP body frame, including frames
+    /// that are too small to flush through [`Self::write`]. The lifecycle lock
+    /// makes the state check and monotonic timestamp update atomic with cleanup
+    /// revalidation and deletion.
+    pub async fn refresh_write_activity(&self, now: u64) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let mut meta = self.metadata.lock().await;
+        match meta.state {
+            SpoolState::Writing | SpoolState::WriteLocked => {
+                meta.last_write_at = meta.last_write_at.max(now);
+                Ok(())
+            }
+            SpoolState::Complete => Err(BobsError::SpoolClosed),
+            SpoolState::Deleting => Err(BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            }),
+            ref other => Err(BobsError::InvalidState {
+                current: format!("{other:?}"),
+                attempted_action: "refresh write activity".to_string(),
+            }),
+        }
+    }
+
     /// Append data at the given offset. Writes are strictly sequential — the offset
     /// must match total_bytes_written exactly. Every accepted non-empty body is
     /// appended to spool.dat before any in-memory state advances. Full pages are
@@ -360,5 +383,46 @@ mod tests {
             .write(0, bytes::Bytes::copy_from_slice(&[1, 2, 3]))
             .await;
         assert!(matches!(result, Err(BobsError::SpoolClosed)));
+    }
+
+    #[tokio::test]
+    async fn frame_refresh_is_monotonic_and_rejects_terminal_states() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+        spool.metadata.lock().await.last_write_at = 10;
+
+        spool
+            .refresh_write_activity(9)
+            .await
+            .expect("writable spool accepts frame refresh");
+        assert_eq!(spool.metadata.lock().await.last_write_at, 10);
+        spool
+            .refresh_write_activity(11)
+            .await
+            .expect("newer frame advances activity");
+        assert_eq!(spool.metadata.lock().await.last_write_at, 11);
+
+        spool.metadata.lock().await.state = SpoolState::Completing;
+        assert!(matches!(
+            spool.refresh_write_activity(12).await,
+            Err(BobsError::InvalidState { .. })
+        ));
+
+        spool.metadata.lock().await.state = SpoolState::Complete;
+        assert!(matches!(
+            spool.refresh_write_activity(12).await,
+            Err(BobsError::SpoolClosed)
+        ));
+
+        spool.metadata.lock().await.state = SpoolState::Deleting;
+        assert!(matches!(
+            spool.refresh_write_activity(12).await,
+            Err(BobsError::SpoolNotFound { .. })
+        ));
+        assert_eq!(
+            spool.metadata.lock().await.last_write_at,
+            11,
+            "rejected frames must not refresh cleanup activity"
+        );
     }
 }
