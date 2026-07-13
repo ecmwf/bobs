@@ -13,12 +13,11 @@ const MAX_PAGE_SIZE_POLICY_BYTES: usize = 64 * 1024 * 1024;
 /// Operational ceiling for one page and its per-request staging buffer.
 ///
 /// The 64 MiB policy remains below the exported one-SQE io_uring length bound.
-pub const MAX_PAGE_SIZE_BYTES: usize =
-    if MAX_PAGE_SIZE_POLICY_BYTES <= MAX_IO_URING_IO_LEN {
-        MAX_PAGE_SIZE_POLICY_BYTES
-    } else {
-        MAX_IO_URING_IO_LEN
-    };
+pub const MAX_PAGE_SIZE_BYTES: usize = if MAX_PAGE_SIZE_POLICY_BYTES <= MAX_IO_URING_IO_LEN {
+    MAX_PAGE_SIZE_POLICY_BYTES
+} else {
+    MAX_IO_URING_IO_LEN
+};
 const DEFAULT_MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 fn derived_max_live_spools(page_size: usize, max_cache_bytes: usize) -> usize {
     max_cache_bytes.checked_div(page_size).unwrap_or(0).max(1)
