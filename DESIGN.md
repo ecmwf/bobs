@@ -99,17 +99,18 @@ The write-lock state is lifecycle metadata in `meta.json` and is recovered on re
 
 ## Completion and durability boundary
 
-`/api/v1/complete/{key}` validates the optional expected size before publishing final state. Repeating completion is idempotent, but any supplied `expected_size` is still checked against the completed length. Initial completion publishes any trailing partial page, syncs `spool.dat`, commits final metadata to `meta.json`, updates in-memory state/cache, and notifies readers.
+`/api/v1/complete/{key}` validates the optional expected size, including on idempotent retries, then starts an owned transaction that continues if the request future is cancelled. Initial completion syncs `spool.dat`, commits a durable `Completing` marker containing the exact candidate page layout, commits `Complete`, updates in-memory metadata, and only then clears the volatile trailing buffer and optionally populates the page cache. The cache is never authoritative; readers reconstruct every page, including the exact tail, from `spool.dat`.
 
-Completion becomes fail-stop once it begins: an internal `Completing` state rejects further writes while the final metadata commit is uncertain. A failed completion can be retried with the same expected size, and recovery preserves this retryable state. `Completing` is not an externally selectable lifecycle state.
+Completion is fail-stop once it begins: further writes are rejected while finalization is uncertain. A failed attempt can be retried with the same expected size. `Completing` is internal and is never exposed as a client-selectable lifecycle state.
 
-After successful completion, `meta.json` is the durable completed-object record. Before completion, BOBS provides process-restart recovery from `spool.dat`, not stable-storage durability for each acknowledged page.
+After successful completion, `meta.json` is the durable completed-object record. Before the `Completing` marker, BOBS provides process-restart recovery from `spool.dat`, not stable-storage durability for each acknowledged page. Once that marker is durable, writes remain permanently fail-stop and recovery either finalizes its exact candidate or quarantines inconsistent data unchanged.
 
 ## Recovery
 
 Startup recovery scans `data_dir` for spool directories with `meta.json` sidecars.
 
-- `Writing`, `WriteLocked`, and internal retryable `Completing` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
+- `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
+- A valid durable `Completing` marker is deterministically finalized to `Complete` using its exact candidate layout. If marker metadata and `spool.dat` disagree, recovery leaves both unchanged, quarantines the spool, and never reopens it for writes.
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
 - Interrupted metadata temp files are ignored.
 - Internal `Creating` and `Deleting` sidecars identify interrupted lifecycle operations. Recovery durably removes those incomplete key directories and fsyncs `data_dir`; the state is never exposed through active spool APIs.

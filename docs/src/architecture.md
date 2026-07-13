@@ -37,7 +37,7 @@ Future Linux optimizations that are intentionally not implemented yet include `I
 2. **Write**: Data arrives through `/api/v1/write/{key}/{offset}`. Accepted bytes are appended to `spool.dat` before the request returns; the data file is authoritative for in-progress bytes.
 3. **Page visibility**: Complete pages become reader-visible, enter the global FIFO cache when they fit, and notify parked readers.
 4. **Read**: `/api/v1/read/{key}` checks the page cache and then `spool.dat`. A trailing partial page remains hidden until it fills or completion finalizes it.
-5. **Complete**: `/api/v1/complete/{key}` validates any `expected_size`, including on idempotent retries. Initial completion publishes the trailing partial page, syncs data, and atomically commits completed metadata. Once completion starts, internal `Completing` state rejects writes until completion succeeds or is retried.
+5. **Complete**: `/api/v1/complete/{key}` validates any `expected_size`, including on idempotent retries, then launches an owned transaction that survives request cancellation. It syncs `spool.dat`, commits a durable `Completing` marker with the exact final page layout, commits `Complete`, updates memory, and only then discards the volatile tail buffer.
 6. **Lifecycle**: Active spools move from `Writing` (or `WriteLocked`) through internal retryable `Completing` to `Complete`, then `Deleting`. `Creating` and `Completing` are not client-selectable states, and a write-locked spool becomes readable only through completion.
 
 ### Persistence Contract
@@ -53,7 +53,7 @@ While a spool is still `Writing` or `WriteLocked`, persisted byte-derived metada
 
 The in-progress durability invariant is recovery from a BOBS restart, not survival of a node or storage crash before `/api/v1/complete/{key}`. A successful `/api/v1/write/{key}/{offset}` requires kernel/file-handle acceptance but not `sync_data()`. Completion is the finished-object durability boundary.
 
-Completed metadata is durable through the sidecar protocol: write `meta.json.tmp`, sync it, rename it to `meta.json`, and sync the parent directory. Recovery treats `meta.json` as all-or-nothing and ignores any leftover `meta.json.tmp` from an interrupted commit.
+Completion cannot be cancelled by a disconnected caller once its owned transaction starts. The transaction syncs `spool.dat` before atomically committing a `Completing` sidecar whose byte and page fields describe the exact terminal layout, then atomically commits `Complete`. Each sidecar commit writes `meta.json.tmp`, syncs it, renames it to `meta.json`, and syncs the spool directory. Final-page cache population is optional; disk remains authoritative for the exact tail.
 
 Create acknowledgement has an additional parent-directory durability boundary. BOBS first makes the empty data inode and its name durable, commits a `Creating` sidecar, and syncs `data_dir` so the key-directory link is durable. Only then does it commit live `Writing` or `WriteLocked` metadata and publish the spool in memory. Cancellation while waiting for admission leaves no reservation; cancellation after reservation does not stop the detached transaction, which either publishes durably or rolls back. A retry with the same request ID may therefore return `409 Conflict` after the original response was lost.
 
@@ -61,7 +61,7 @@ Delete acknowledgement is likewise delayed until removal is durable. BOBS remove
 
 ### Recovery and Shared Filesystems
 
-Startup recovery scans `<data_dir>` for key directories with `meta.json`. Internal `Creating` and `Deleting` sidecars are cleaned up as interrupted lifecycle operations, with the parent directory synced after removal. A recognised UUID or request-ID directory with no BOBS marker is removed and parent-fsynced only if it is truly empty; non-empty markerless directories are retained unchanged and quarantined. Current in-progress `Writing`, `WriteLocked`, and retryable `Completing` spools with a persisted `page_size` are rebuilt from `spool.dat`; completed spools validate that the data file still satisfies the committed logical length before serving.
+Startup recovery scans `<data_dir>` for key directories with `meta.json`. Internal `Creating` and `Deleting` sidecars are cleaned up as interrupted lifecycle operations, with the parent directory synced after removal. A recognised UUID or request-ID directory with no BOBS marker is removed and parent-fsynced only if it is truly empty; non-empty markerless directories are retained unchanged and quarantined. Current `Writing` and `WriteLocked` spools with a persisted `page_size` are rebuilt from `spool.dat`. A valid durable `Completing` marker is finalized to `Complete` from its exact candidate layout; marker/data disagreement leaves the sidecar and data untouched, excludes the key from the live manager, and is logged as quarantine. Completed spools validate that the data file still satisfies the committed logical length before serving.
 
 Current sidecars persist the spool's `page_size`, so a later configuration change cannot reinterpret existing page offsets. When a legacy sidecar has no page size, recovery migrates only cases with a safe interpretation and atomically commits the upgraded sidecar before exposing or mutating the spool.
 

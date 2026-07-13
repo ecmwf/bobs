@@ -97,9 +97,9 @@ For a valid write head, both known-length rejection and a chunked upload crossin
 
 ### POST /api/v1/complete/{key}
 
-Idempotently finalizes the spool. After this, no more writes are allowed. Repeated completion requests succeed, but a supplied `expected_size` is always checked against the actual completed size.
+Idempotently finalizes the spool. A supplied `expected_size` is checked on initial and repeated requests. Completion runs as an owned transaction: if the client disconnects after finalization starts, BOBS continues syncing `spool.dat`, committing the durable `Completing` recovery marker, and committing `Complete`. A missing response is therefore an unknown outcome; retry completion with the same `expected_size`.
 
-If a completion attempt fails after finalization starts, BOBS rejects further writes and keeps completion retryable. Retry `/api/v1/complete/{key}` with the same `expected_size`; the internal `Completing` state is not exposed as an API choice.
+Once completion starts, BOBS rejects further writes. Before the marker is durable, an internal failure leaves completion retryable. A valid marker found during startup is finalized to `Complete`; marker/data disagreement quarantines the key unchanged and never reopens it for writing. The internal `Completing` state is not an API choice.
 
 **Request Body (Optional)**:
 

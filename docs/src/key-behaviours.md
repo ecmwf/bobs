@@ -38,7 +38,7 @@ BOBS supports a single consumer opening multiple concurrent connections for the 
 
 Writes must be strictly sequential. The offset in `/api/v1/write/{key}/{offset}` must exactly match the bytes currently stored. Random-access writes and overwrites are unsupported.
 
-A successful write means BOBS accepted bytes through the kernel/file handle; it does not mean `sync_data()` forced them to stable storage. `/api/v1/complete/{key}` is the durability boundary and syncs `spool.dat` before committing final metadata. `max_spool_bytes` defaults to 8 GiB. Oversize cleanup first atomically checks the write offset and lifecycle state, so a wrong offset or a spool that completed concurrently is rejected without deletion; only an oversized request at the current writable head durably removes the partial spool before returning `413`.
+A successful write means BOBS accepted bytes through the kernel/file handle; it does not mean `sync_data()` forced them to stable storage. `/api/v1/complete/{key}` is the durability boundary: an owned transaction that survives caller cancellation syncs `spool.dat`, commits an exact-layout `Completing` marker, then commits `Complete`. `max_spool_bytes` defaults to 8 GiB. Oversize cleanup first atomically checks the write offset and lifecycle state, so a wrong offset or a spool that completed concurrently is rejected without deletion; only an oversized request at the current writable head durably removes the partial spool before returning `413`.
 
 ### 7. Atomic Sidecar Metadata
 
@@ -50,11 +50,11 @@ Create also crosses the key-directory durability boundary before acknowledgement
 
 Deletion removes sidecar metadata and the key directory, then fsyncs `data_dir` before returning success. Cache entries, admission, and manager membership remain held until that parent-directory sync succeeds, so failed deletion remains tracked and retryable.
 
-Completion is similarly fail-stop once it begins. Internal `Completing` state blocks writes while the final metadata commit is uncertain, remains retryable through `/api/v1/complete/{key}`, and is reconstructed on restart rather than exposed as a client-selectable state.
+Completion is fail-stop once it begins. The owned transaction continues if the request is cancelled, and internal `Completing` blocks writes while the final metadata commit is uncertain. A failed pre-marker attempt can be retried through `/api/v1/complete/{key}`; a durable marker is either finalized during recovery or quarantined unchanged if it disagrees with `spool.dat`. `Completing` is never client-selectable.
 
 ### 8. Recovery and Cleanup
 
-On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. A recognised UUID or request-ID directory without any BOBS marker is removed and parent-fsynced only when it is truly empty; non-empty markerless directories are retained unchanged and quarantined. For current in-progress `Writing`, `WriteLocked`, and retryable internal `Completing` spools, `spool.dat` is authoritative for byte state. Any persisted `total_bytes_written`, `total_pages`, or `final_page_size` for those states is advisory only and recovery recomputes it from the file.
+On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. A recognised UUID or request-ID directory without any BOBS marker is removed and parent-fsynced only when it is truly empty; non-empty markerless directories are retained unchanged and quarantined. For current `Writing` and `WriteLocked` spools, `spool.dat` is authoritative for byte state and persisted byte counters are advisory. A valid `Completing` marker carries the exact candidate byte/page layout and is finalized to `Complete`; if that layout and `spool.dat` disagree, BOBS leaves both unchanged, logs the quarantine, and does not expose the key through spool APIs.
 
 Each current sidecar records its spool's `page_size`. A legacy `Readable` sidecar is terminal and migrates to `Complete` by resegmenting the contiguous durable bytes with the configured page size. A legacy `WriteLocked` spool is likewise salvaged from its exact durable length as `Complete`, retains its write-lock provenance, and cannot accept further writes. Both migrations atomically persist their page size and reconstructed terminal metadata before serving.
 
