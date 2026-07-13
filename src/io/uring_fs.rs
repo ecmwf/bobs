@@ -83,11 +83,16 @@ impl FileIO for UringFileIO {
     type Handle = UringFileHandle;
 
     async fn create(path: &Path) -> Result<Self::Handle> {
-        submit_open(path, O_RDWR | O_CREAT | O_TRUNC, CREATE_MODE).await
+        submit_open(
+            path,
+            O_RDWR | O_CREAT | O_TRUNC | libc::O_NOFOLLOW,
+            CREATE_MODE,
+        )
+        .await
     }
 
     async fn open(path: &Path) -> Result<Self::Handle> {
-        submit_open(path, O_RDWR, 0).await
+        submit_open(path, O_RDWR | libc::O_NOFOLLOW, 0).await
     }
 
     async fn write_at(handle: &Self::Handle, offset: u64, data: Bytes) -> Result<usize> {
@@ -251,7 +256,16 @@ async fn submit_open(path: &Path, flags: i32, mode: u32) -> Result<UringFileHand
         },
     )
     .await?;
-    let fd = recv_result(rx).await?;
+    let fd = Arc::try_unwrap(recv_result(rx).await?)
+        .map_err(|_| Error::other("newly opened data descriptor was unexpectedly shared"))?;
+    let file = File::from(fd);
+    if !file.metadata()?.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("data path is not a regular file: {}", path.display()),
+        ));
+    }
+    let fd = Arc::new(file.into());
     Ok(UringFileHandle::new(fd, pool, ring_index, routed_key))
 }
 
@@ -421,6 +435,11 @@ mod tests {
     #[tokio::test]
     async fn io_uring_fileio_read_beyond_eof_returns_available_then_empty_bytes() {
         Suite::read_beyond_eof_returns_available_then_empty_bytes().await;
+    }
+
+    #[tokio::test]
+    async fn io_uring_fileio_open_rejects_symlink() {
+        Suite::open_rejects_symlink().await;
     }
 
     #[tokio::test]
