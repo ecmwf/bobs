@@ -44,7 +44,7 @@ Each spool is stored in its own directory:
   meta.json
 ```
 
-`spool.dat` contains accepted payload bytes. `meta.json` is a sidecar metadata file containing lifecycle state, content metadata, timestamps, byte counts, page counts, final partial-page size, and the data path.
+`spool.dat` contains accepted payload bytes. `meta.json` is a sidecar metadata file containing lifecycle state, content metadata, timestamps, byte counts, page counts, final partial-page size, and a compatibility `data_path` value. The persisted path is never filesystem authority during recovery.
 
 Sidecar metadata commits are atomic at the file level: BOBS writes `meta.json.tmp`, syncs that file, renames it over `meta.json`, and syncs the spool directory. Recovery ignores leftover temporary metadata files.
 
@@ -116,6 +116,8 @@ After successful completion, `meta.json` is the durable completed-object record.
 ## Recovery
 
 Startup recovery scans `data_dir` for spool directories with `meta.json` sidecars.
+
+Recovery derives the only usable payload path as `<data_dir>/<scanned-key>/spool.dat`; absolute, traversal, stale, and cross-spool `data_path` values from JSON are treated as untrusted metadata and are never statted, opened, written, or deleted. The canonical local entry must be a regular file and is opened without following a final symlink. Missing, symlink, and non-regular payload entries quarantine that key directory unchanged. If the persisted path is stale but the canonical local regular file exists, recovery atomically rewrites `meta.json` to the canonical path before admitting the spool. Corrupt-sidecar cleanup is likewise scoped to the scanned key directory.
 
 Recovery uses one top-level directory scan, reads sidecars individually, and keeps only compact key/activity indexing plus the bounded preferred candidate heap. Each sidecar is statted before allocation and is limited to 1 MiB. Oversized payloads and payloads with unknown fields are preserved unchanged as unsupported quarantine; malformed known-schema JSON is isolated to per-key corrupt cleanup. Selected candidates are reread before admission, and excess candidates never have `spool.dat` opened or tail bytes loaded.
 
