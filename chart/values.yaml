@@ -93,15 +93,19 @@ observability:
 config:
   host: "0.0.0.0"
   port: 3000
+  # Helm deployment profile. These intentionally override the Rust binary defaults
+  # (data_dir ./data, page_size 16 MiB, global cache 256 MiB) with the PVC path
+  # and a lower-latency 4 KiB page / 1 MiB global cache. max_cache_bytes may be
+  # smaller than page_size. It also derives the weighted response-lifetime read
+  # budget as max(1, floor(max_cache_bytes / page_size)); 0 disables caching but
+  # retains one bounded disk-backed response.
   data_dir: "/var/lib/bobs"
-  # The chart favours lower streaming latency than the Rust binary defaults:
-  # it overrides 16 MiB/256 MiB with 4 KiB/1 MiB. Valid page sizes are
-  # 1..=67108864 bytes (64 MiB) and must not exceed max_spool_bytes. Pages
-  # larger than the cache bypass it, so the cache may remain smaller than a page.
+  # Valid page sizes are 1..=67108864 bytes (64 MiB) and must not exceed
+  # max_spool_bytes. Pages larger than the cache bypass it.
   page_size: 4096
   max_cache_bytes: 1048576
-  # Explicit chart admission limit matching max_cache_bytes / page_size.
-  # Operators can override this in the valid 1..=65536 range.
+  # Separate first-read and recovery admission limit. The explicit chart default
+  # matches max_cache_bytes / page_size; operators may override it within 1..=65536.
   max_live_spools: 256
   # Per-spool write limit; must be >= page_size. 8 GiB leaves headroom on the default 10 GiB PVC.
   max_spool_bytes: 8589934592
@@ -118,13 +122,18 @@ config:
   writer_inactivity_timeout_secs: 300
   read_idle_ttl_secs: 600
   full_read_complete_ttl_secs: 30
+  # Deprecated compatibility fields: parsed by BOBS but ignored by cleanup.
   reader_done_ttl_secs: 60
   unread_ttl_secs: 3600
   cleanup_sweep_interval_secs: 30
   long_poll_timeout_ms: 25000
+  # Required deployment routing values. host_prefix and domain are supplied by
+  # the parent chart or operator; route_name intentionally defaults to download.
   host_prefix: ""
   domain: ""
   route_name: "download"
+  # Kubernetes metrics profile: bind on all interfaces and allow only collection.
+  # The Rust binary defaults are 127.0.0.1 and an empty list (allow all labels).
   metrics:
     enabled: false
     bind_address: "0.0.0.0"
