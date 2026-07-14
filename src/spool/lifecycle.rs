@@ -121,9 +121,8 @@ where
             )
         };
 
-        F::sync_data(&self.file_handle)
-            .await
-            .map_err(BobsError::IoError)?;
+        let handle = self.active_file_handle()?;
+        F::sync_data(&handle).await.map_err(BobsError::IoError)?;
 
         // A durable marker certifies that spool.dat was synced and records the
         // complete candidate layout. Recovery either commits this exact candidate
@@ -218,10 +217,12 @@ where
     }
 
     /// First full-read transition hook. At this point every byte has been served
-    /// at least once, so the first-read page cache for this spool is redundant.
+    /// at least once, so both the first-read page cache and the manager-held OS
+    /// file handle are redundant. Active readers keep their cloned handles alive.
     pub async fn on_fully_read(&self) {
         self.page_cache.lock().await.free_spool(&self.key);
         self.release_admission();
+        self.close_file_handle();
     }
 
     pub async fn is_readable(&self) -> bool {

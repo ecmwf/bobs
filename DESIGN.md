@@ -58,6 +58,8 @@ On Linux, the default backend is a sharded `io_uring` pool. Non-Linux builds, an
 
 Accepted write bytes are appended to `spool.dat` before `/write` returns, but they are not forced to stable storage per page. `/complete` syncs the data file before committing final complete metadata.
 
+Writing and completion retain one manager-held handle through the terminal transition. Once a terminal spool has been fully served, BOBS drops that reference along with first-read cache admission; positional I/O already in flight remains safe because each operation owns a cloned handle. Later cache-miss reads reopen the canonical `spool.dat` asynchronously through a single-flight gate, atomically publish one shared handle, then release the gate before positional I/O. The handle-state mutex is never held across filesystem I/O, so independent reads remain concurrent. Deletion drops an open manager reference before unlinking and also works when the terminal spool is already closed.
+
 ## Paging and cache
 
 The byte stream is divided into fixed-size pages (`page_size`, default 4096 bytes).
@@ -107,7 +109,7 @@ Startup recovery scans `data_dir` for spool directories with `meta.json` sidecar
 
 Recovery derives the only usable payload path as `<data_dir>/<scanned-key>/spool.dat`; absolute, traversal, stale, and cross-spool `data_path` values from JSON are treated as untrusted metadata and are never statted, opened, written, or deleted. The canonical local entry must be a regular file and is opened without following a final symlink. Missing, symlink, and non-regular payload entries quarantine that key directory unchanged. If the persisted path is stale but the canonical local regular file exists, recovery atomically rewrites `meta.json` to the canonical path before admitting the spool. Corrupt-sidecar cleanup is likewise scoped to the scanned key directory.
 
-Recovery uses one top-level directory scan, reads sidecars individually, and keeps only compact key/activity indexing plus the bounded preferred candidate heap. Each sidecar is statted before allocation and is limited to 1 MiB. Oversized payloads and payloads with unknown fields are preserved unchanged as unsupported quarantine; malformed known-schema JSON is isolated to per-key corrupt cleanup. Selected candidates are reread before admission, and excess candidates never have `spool.dat` opened or tail bytes loaded.
+Recovery uses one top-level directory scan, reads sidecars individually, and keeps only compact key/activity indexing plus the bounded preferred candidate heap. Each sidecar is statted before allocation and is limited to 1 MiB. Oversized payloads and payloads with unknown fields are preserved unchanged as unsupported quarantine; malformed known-schema JSON is isolated to per-key corrupt cleanup. Selected candidates are reread before admission. Payload openability is preflighted one candidate at a time; terminal `Complete` descriptors are closed immediately and recovered in the deliberate closed state, while only bounded active candidates retain their preflight handle through admission.
 
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
 - Valid `Completing` markers are deterministically finalized to `Complete`; inconsistent markers and data are quarantined without mutation and are never reopened for writes.

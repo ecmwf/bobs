@@ -94,7 +94,8 @@ where
             return Ok(());
         }
 
-        let written = F::write_at(&self.file_handle, offset, data.clone())
+        let handle = self.active_file_handle()?;
+        let written = F::write_at(&handle, offset, data.clone())
             .await
             .map_err(BobsError::IoError)?;
         if written != data.len() {
