@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{validate_page_size, MAX_PAGE_SIZE_BYTES};
+use crate::config::{validate_max_live_spools, validate_page_size, MAX_PAGE_SIZE_BYTES};
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
 use crate::metadata::{
@@ -306,20 +306,10 @@ where
         max_cache_bytes: usize,
         max_live_spools: usize,
     ) -> Result<Self> {
-        // Keep this check at the construction boundary: callers outside the binary
-        // may bypass Config::validate, and page-backed I/O allocates from this value.
+        // Keep these checks at the construction boundary: library callers may bypass
+        // Config::validate, and both page I/O and recovery allocate from these values.
         validate_page_size(page_size)?;
-        if max_live_spools == 0 {
-            return Err(BobsError::ConfigurationError(
-                "max_live_spools must be greater than 0".to_string(),
-            ));
-        }
-        if max_live_spools > Semaphore::MAX_PERMITS {
-            return Err(BobsError::ConfigurationError(format!(
-                "max_live_spools must not exceed {}",
-                Semaphore::MAX_PERMITS
-            )));
-        }
+        validate_max_live_spools(max_live_spools)?;
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
         let page_cache = Arc::new(Mutex::new(PageCache::new(max_cache_bytes)));
 
@@ -756,7 +746,7 @@ where
         let mut rejected_count = 0_usize;
         let mut quarantined_count = 0_usize;
         let mut candidates =
-            RecoveryCandidateBuilder::new(self.max_live_spools, METADATA_SCAN_CHANNEL_CAPACITY);
+            RecoveryCandidateBuilder::new(self.max_live_spools, METADATA_SCAN_CHANNEL_CAPACITY)?;
 
         // This is the only top-level data-directory scan. The blocking producer
         // is backpressured by a fixed-size channel; each sidecar is read and
@@ -1184,12 +1174,25 @@ struct RecoveryCandidateBuilder {
 }
 
 impl RecoveryCandidateBuilder {
-    fn new(admission_capacity: usize, refill_reserve: usize) -> Self {
-        let window_capacity = admission_capacity.saturating_add(refill_reserve);
-        Self {
+    fn new(admission_capacity: usize, refill_reserve: usize) -> Result<Self> {
+        let window_capacity = admission_capacity
+            .checked_add(refill_reserve)
+            .ok_or_else(|| {
+                BobsError::ConfigurationError(
+                    "recovery candidate capacity overflowed usize".to_string(),
+                )
+            })?;
+        let mut preferred = BinaryHeap::new();
+        preferred.try_reserve_exact(window_capacity).map_err(|_| {
+            BobsError::ConfigurationError(format!(
+                "recovery candidate capacity {window_capacity} exceeds allocation limits"
+            ))
+        })?;
+
+        Ok(Self {
             window_capacity,
-            preferred: BinaryHeap::with_capacity(window_capacity),
-        }
+            preferred,
+        })
     }
 
     /// Retain only the best bounded candidate window. The returned summary is
@@ -2310,7 +2313,8 @@ mod tests {
     fn million_key_recovery_index_is_capacity_plus_channel_bounded() {
         const KEY_COUNT: usize = 1_000_000;
         const CAPACITY: usize = 64;
-        let mut builder = RecoveryCandidateBuilder::new(CAPACITY, METADATA_SCAN_CHANNEL_CAPACITY);
+        let mut builder = RecoveryCandidateBuilder::new(CAPACITY, METADATA_SCAN_CHANNEL_CAPACITY)
+            .expect("bounded recovery window");
         let mut discarded = 0;
         for index in 0..KEY_COUNT {
             discarded += usize::from(
@@ -2331,6 +2335,16 @@ mod tests {
             queue.pop().expect("best candidate").activity_at,
             (KEY_COUNT - 1) as u64
         );
+    }
+
+    #[test]
+    fn recovery_candidate_builder_reports_capacity_overflow_without_panicking() {
+        let err = match RecoveryCandidateBuilder::new(usize::MAX, 1) {
+            Ok(_) => panic!("overflowing recovery capacity must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, BobsError::ConfigurationError(_)));
+        assert!(err.to_string().contains("recovery candidate capacity"));
     }
 
     async fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {
@@ -2662,14 +2676,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_rejects_max_live_spools_above_semaphore_limit() {
+    async fn test_new_accepts_max_live_spools_upper_bound() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 1024, crate::config::MAX_LIVE_SPOOLS)
+                .expect("upper bound should initialize");
 
-        let result =
-            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 1024, Semaphore::MAX_PERMITS + 1);
+        assert_eq!(manager.max_live_spools, crate::config::MAX_LIVE_SPOOLS);
+        assert_eq!(
+            manager.admission.available_permits(),
+            crate::config::MAX_LIVE_SPOOLS
+        );
+    }
 
-        assert!(matches!(result, Err(BobsError::ConfigurationError(_))));
+    #[tokio::test]
+    async fn test_new_rejects_max_live_spools_above_policy_bound_before_setup() {
+        for max_live_spools in [crate::config::MAX_LIVE_SPOOLS + 1, usize::MAX] {
+            let dir = tempdir().expect("create tempdir");
+            let data_dir = dir.path().join("data");
+            let result = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 1024, max_live_spools);
+
+            assert!(matches!(result, Err(BobsError::ConfigurationError(_))));
+            assert!(
+                !data_dir.exists(),
+                "invalid admission must fail before startup allocation or filesystem setup"
+            );
+        }
     }
 
     #[tokio::test]

@@ -141,13 +141,15 @@ BOBS reads an optional YAML file passed as a CLI argument. Most fields have Rust
 | `data_dir` | `./data` | Directory for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Page size in bytes; valid range `1..=67108864` (64 MiB), and no larger than `max_spool_bytes`. |
 | `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global cache budget and source for the read-response bound: `max(1, floor(max_cache_bytes / page_size))` page leases held through response-body lifetime. `0` disables caching but still admits one bounded disk-backed response. |
-| `max_live_spools` | binary: derived from cache/page capacity (16); chart: `256` | Admission limit; explicit YAML overrides are preserved. |
+| `max_live_spools` | binary: derived from cache/page capacity (16); chart: `256` | Admission and recovery limit. Derived and explicit values must be in `1..=65536`. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Per-spool write limit; must be at least `page_size`. |
 | `writer_inactivity_timeout_secs` | `300` | Seconds of writer silence before cleanup. |
 | `reader_done_ttl_secs` | `60` | TTL after spool completion and reader finishes. |
 | `unread_ttl_secs` | `3600` | TTL for completed spools that were never read. |
 | `cleanup_sweep_interval_secs` | `30` | Frequency of the background cleanup task. |
 | `long_poll_timeout_ms` | `25000` | Timeout for waiting on new data before redirect. |
+| `metrics.enabled` | `false` | Enable the separate Prometheus metrics listener in telemetry builds. |
+| `metrics.port` | `9464` | Metrics listener port; must differ from the main HTTP `port` when metrics are enabled. |
 | `bob_id` | `unknown` | Unique ID for this instance (set to pod hostname in k8s). |
 
 Example `config.yaml`:
