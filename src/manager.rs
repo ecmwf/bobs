@@ -2,10 +2,13 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::validate_page_size;
+use crate::config::{validate_page_size, MAX_PAGE_SIZE_BYTES};
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
-use crate::metadata::{MetadataDirectoryEntryKind, MetadataStore, SyncSidecarMetadataStore};
+use crate::metadata::{
+    MetadataDirectoryEntryKind, MetadataStore, SyncSidecarMetadataStore,
+    METADATA_SCAN_CHANNEL_CAPACITY,
+};
 use crate::metrics::BobsMetrics;
 use crate::spool::{CleanupAnchors, PageCache, Spool, SpoolMetadata, SpoolState};
 use crate::time::now_secs;
@@ -747,15 +750,20 @@ where
 
     async fn recover_with_counts(&self) -> Result<(usize, usize)> {
         let started = Instant::now();
-        let mut stale_keys = Vec::new();
+        let mut stale_count = 0_usize;
         let mut corrupt_deleted = 0_u64;
         let mut orphan_deleted = 0_u64;
         let mut rejected_count = 0_usize;
-        let mut candidates = RecoveryCandidateBuilder::new(self.max_live_spools);
+        let mut quarantined_count = 0_usize;
+        let mut candidates =
+            RecoveryCandidateBuilder::new(self.max_live_spools, METADATA_SCAN_CHANNEL_CAPACITY);
 
-        // This is the only top-level data-directory scan. Sidecars are then read
-        // individually through the bounded metadata API and immediately dropped.
-        for entry in self.metadata_store.scan().await? {
+        // This is the only top-level data-directory scan. The blocking producer
+        // is backpressured by a fixed-size channel; each sidecar is read and
+        // dropped before the next entry is consumed.
+        let mut scan = self.metadata_store.scan().await?;
+        while let Some(entry) = scan.next().await {
+            let entry = entry?;
             let name = entry.name;
             let (has_sidecar, has_data) = match entry.kind {
                 MetadataDirectoryEntryKind::Symlink => {
@@ -838,7 +846,11 @@ where
                 }
                 Err(error @ BobsError::SerializationError(_)) => {
                     tracing::warn!(key = %name, error = %error, "recovery: corrupt sidecar metadata, discarding affected spool directory");
-                    stale_keys.push(name);
+                    self.metadata_store.delete(&name).await?;
+                    self.remove_spool_directory_durably(&name).await?;
+                    stale_count += 1;
+                    corrupt_deleted += 1;
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                     continue;
                 }
                 Err(error) => {
@@ -850,7 +862,11 @@ where
 
             if meta.key != name {
                 tracing::warn!(directory_key = %name, metadata_key = %meta.key, "recovery: sidecar key does not match directory, discarding");
-                stale_keys.push(name);
+                self.metadata_store.delete(&name).await?;
+                self.remove_spool_directory_durably(&name).await?;
+                stale_count += 1;
+                corrupt_deleted += 1;
+                tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                 continue;
             }
 
@@ -858,14 +874,25 @@ where
             let canonical_data_path = self.data_dir.join(&name).join("spool.dat");
             match prepare_recovery_candidate(meta, &canonical_data_path, self.page_size) {
                 RecoveryMetadataDisposition::Candidate(_) => {
-                    candidates.push(RecoveryCandidateSummary {
+                    if let Some(excess) = candidates.push(RecoveryCandidateSummary {
                         key: name,
                         activity_at,
-                    });
+                    }) {
+                        quarantined_count += 1;
+                        record_capacity_quarantine(
+                            &excess,
+                            self.max_live_spools,
+                            "outside_bounded_candidate_window",
+                        );
+                    }
                 }
                 RecoveryMetadataDisposition::Cleanup { reason } => {
                     tracing::warn!(key = %name, reason = %reason, "recovery: discarding unrecoverable spool directory");
-                    stale_keys.push(name);
+                    self.metadata_store.delete(&name).await?;
+                    self.remove_spool_directory_durably(&name).await?;
+                    stale_count += 1;
+                    corrupt_deleted += 1;
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                 }
                 RecoveryMetadataDisposition::Preserve { reason } => {
                     tracing::warn!(key = %name, reason = %reason, "recovery: candidate left intact and unavailable");
@@ -874,25 +901,16 @@ where
             }
         }
 
-        stale_keys.sort();
-        stale_keys.dedup();
-        let stale_count = stale_keys.len();
-        for key in stale_keys {
-            self.metadata_store.delete(&key).await?;
-            self.remove_spool_directory_durably(&key).await?;
-            corrupt_deleted += 1;
-            tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
-        }
-
         let mut candidates = candidates.finish();
         let mut recovered_count = 0_usize;
         let mut capacity_blocked_candidate = None;
 
-        // The preferred heap is bounded by max_live_spools. Full metadata is
-        // reread only for selected candidates. If data validation fails, the
-        // compact excess index is heapified lazily and supplies the next key.
+        // The candidate heap is bounded by admission capacity plus a fixed refill
+        // reserve. Full metadata is reread only when a key is selected. Rejected
+        // selected candidates release their permit and the next preferred key is
+        // tried without opening data for ordinary excess entries.
         while recovered_count < self.max_live_spools {
-            let Some(summary) = candidates.next() else {
+            let Some(summary) = candidates.pop() else {
                 break;
             };
             let activity_at = summary.activity_at;
@@ -927,7 +945,9 @@ where
                     tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unrecoverable; discarding it and trying the next candidate");
                     self.metadata_store.delete(&key).await?;
                     self.remove_spool_directory_durably(&key).await?;
+                    stale_count += 1;
                     corrupt_deleted += 1;
+                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                     continue;
                 }
                 RecoveryMetadataDisposition::Preserve { reason } => {
@@ -997,9 +1017,9 @@ where
                     tracing::info!(key = %key, data_path = %meta.data_path.display(), "recovery: atomically migrating stale payload path metadata to the canonical local spool");
                 }
                 if migration.write_locked_salvage {
-                    tracing::warn!(key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating legacy WriteLocked spool to Complete salvage; further writes are rejected, reads and idempotent completion remain available");
+                    tracing::warn!(key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating WriteLocked spool to bounded Complete salvage; further writes are rejected, reads and idempotent completion remain available");
                 } else if migration.persist {
-                    tracing::info!(key = %key, page_size = spool_page_size, "recovery: atomically migrating legacy sidecar metadata");
+                    tracing::info!(key = %key, page_size = spool_page_size, "recovery: atomically resegmenting terminal or legacy sidecar metadata");
                 }
                 if finalized_completing {
                     tracing::info!(key = %key, total_bytes = meta.total_bytes_written, total_pages = meta.total_pages, "recovery: finalizing durable Completing marker");
@@ -1012,6 +1032,8 @@ where
                 }
             }
 
+            debug_assert!(spool_page_size <= self.page_size);
+            debug_assert!(spool_page_size <= MAX_PAGE_SIZE_BYTES);
             let meta_state_for_init = meta.state.clone();
             let meta_write_locked_for_init = meta.write_locked;
             let meta_total_bytes_for_init = meta.total_bytes_written;
@@ -1060,23 +1082,13 @@ where
             self.metrics.record_state_transition(None, recovered_label);
         }
 
-        let mut quarantined_count = 0_usize;
-        let mut record_quarantine = |summary: RecoveryCandidateSummary| {
-            quarantined_count += 1;
-            tracing::warn!(
-                "event.name" = "bobs.recovery.spool_quarantined",
-                key = %summary.key,
-                configured = self.max_live_spools,
-                activity_at = summary.activity_at,
-                reason = "admission_capacity",
-                "recovery: valid excess candidate left durable and unopened for a later restart"
-            );
-        };
         if let Some(summary) = capacity_blocked_candidate {
-            record_quarantine(summary);
+            quarantined_count += 1;
+            record_capacity_quarantine(&summary, self.max_live_spools, "admission_capacity");
         }
-        while let Some(summary) = candidates.next() {
-            record_quarantine(summary);
+        while let Some(summary) = candidates.pop() {
+            quarantined_count += 1;
+            record_capacity_quarantine(&summary, self.max_live_spools, "admission_capacity");
         }
 
         // Commit empty pre-marker removals, and retry any parent-directory
@@ -1130,6 +1142,21 @@ fn recovery_activity_at(metadata: &SpoolMetadata) -> u64 {
         .unwrap_or(0)
 }
 
+fn record_capacity_quarantine(
+    summary: &RecoveryCandidateSummary,
+    configured: usize,
+    reason: &'static str,
+) {
+    tracing::warn!(
+        "event.name" = "bobs.recovery.spool_quarantined",
+        key = %summary.key,
+        configured,
+        activity_at = summary.activity_at,
+        reason,
+        "recovery: valid excess candidate left durable and unopened for a later restart"
+    );
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct RecoveryCandidateSummary {
     key: String,
@@ -1152,69 +1179,47 @@ impl PartialOrd for RecoveryCandidateSummary {
 }
 
 struct RecoveryCandidateBuilder {
-    capacity: usize,
+    window_capacity: usize,
     preferred: BinaryHeap<Reverse<RecoveryCandidateSummary>>,
-    excess: Vec<RecoveryCandidateSummary>,
 }
 
 impl RecoveryCandidateBuilder {
-    fn new(capacity: usize) -> Self {
+    fn new(admission_capacity: usize, refill_reserve: usize) -> Self {
+        let window_capacity = admission_capacity.saturating_add(refill_reserve);
         Self {
-            capacity,
-            preferred: BinaryHeap::with_capacity(capacity),
-            excess: Vec::new(),
+            window_capacity,
+            preferred: BinaryHeap::with_capacity(window_capacity),
         }
     }
 
-    fn push(&mut self, candidate: RecoveryCandidateSummary) {
-        if self.preferred.len() < self.capacity {
+    /// Retain only the best bounded candidate window. The returned summary is
+    /// definitely outside that window and can be observed then dropped.
+    fn push(&mut self, candidate: RecoveryCandidateSummary) -> Option<RecoveryCandidateSummary> {
+        if self.preferred.len() < self.window_capacity {
             self.preferred.push(Reverse(candidate));
-            return;
+            return None;
         }
         let replace_worst = self
             .preferred
             .peek()
             .is_some_and(|worst| candidate > worst.0);
         if replace_worst {
-            let Reverse(worst) = self
-                .preferred
-                .pop()
-                .expect("non-empty preferred recovery heap");
-            self.excess.push(worst);
+            let Some(Reverse(worst)) = self.preferred.pop() else {
+                self.preferred.push(Reverse(candidate));
+                return None;
+            };
             self.preferred.push(Reverse(candidate));
+            Some(worst)
         } else {
-            self.excess.push(candidate);
+            Some(candidate)
         }
     }
 
-    fn finish(self) -> RecoveryCandidateQueue {
-        RecoveryCandidateQueue {
-            preferred: self
-                .preferred
-                .into_iter()
-                .map(|Reverse(candidate)| candidate)
-                .collect(),
-            excess: self.excess,
-            refill: None,
-        }
-    }
-}
-
-struct RecoveryCandidateQueue {
-    preferred: BinaryHeap<RecoveryCandidateSummary>,
-    excess: Vec<RecoveryCandidateSummary>,
-    refill: Option<BinaryHeap<RecoveryCandidateSummary>>,
-}
-
-impl RecoveryCandidateQueue {
-    fn next(&mut self) -> Option<RecoveryCandidateSummary> {
-        if let Some(candidate) = self.preferred.pop() {
-            return Some(candidate);
-        }
-        let refill = self
-            .refill
-            .get_or_insert_with(|| BinaryHeap::from(std::mem::take(&mut self.excess)));
-        refill.pop()
+    fn finish(self) -> BinaryHeap<RecoveryCandidateSummary> {
+        self.preferred
+            .into_iter()
+            .map(|Reverse(candidate)| candidate)
+            .collect()
     }
 }
 
@@ -1254,6 +1259,27 @@ fn prepare_recovery_candidate(
         | SpoolState::WriteLocked
         | SpoolState::Completing
         | SpoolState::Complete => {}
+    }
+
+    let configured_page_size_u64 = match u64::try_from(configured_page_size) {
+        Ok(size) if size > 0 && configured_page_size <= MAX_PAGE_SIZE_BYTES => size,
+        _ => {
+            return RecoveryMetadataDisposition::Preserve {
+                reason: "configured recovery page size is outside the supported bound".to_owned(),
+            };
+        }
+    };
+    // Active Writing must preserve its historical offsets. Reject an unsupported
+    // stride before even inspecting the payload, so it cannot drive a sparse-tail
+    // read or allocation. Terminal states are validated arithmetically and then
+    // resegmented; WriteLocked can be terminalized for non-destructive salvage.
+    if meta.state == SpoolState::Writing && meta.page_size > configured_page_size_u64 {
+        return RecoveryMetadataDisposition::Preserve {
+            reason: format!(
+                "active Writing page size {} exceeds supported recovery bound {}",
+                meta.page_size, configured_page_size_u64
+            ),
+        };
     }
 
     // `data_path` came from persisted JSON and is never an authority for a
@@ -1356,31 +1382,66 @@ struct RecoveryMigration {
     write_locked_salvage: bool,
 }
 
-/// Make old-main sidecars self-describing. Legacy `Readable` and
-/// `WriteLocked` objects cannot safely resume writes after a page-size change,
-/// but their files are contiguous durable byte streams. Resegment them with the
-/// current configured page size and terminalize them for read/completion salvage.
-/// Legacy `Writing` objects still require an unambiguous old stride; callers
-/// quarantine ambiguous layouts rather than mutating or deleting them.
+/// Convert every terminal byte stream to the current bounded stride. Active
+/// Writing retains a historical stride only when it is no larger than the current
+/// configured stride. Missing or oversized WriteLocked layouts are terminalized
+/// to bounded Complete salvage because their durable bytes are contiguous.
 fn prepare_recovery_metadata(
     meta: &mut SpoolMetadata,
     file_size: u64,
     configured_page_size: usize,
 ) -> std::result::Result<RecoveryMigration, String> {
-    let missing_page_size = meta.page_size == 0;
-    let legacy_readable = meta.state == SpoolState::Complete && meta.final_page_size == Some(0);
-    let legacy_write_locked = missing_page_size && meta.state == SpoolState::WriteLocked;
-    let resegment_terminal = legacy_readable || legacy_write_locked;
+    let target_page_size = u64::try_from(configured_page_size)
+        .ok()
+        .filter(|size| *size > 0 && configured_page_size <= MAX_PAGE_SIZE_BYTES)
+        .ok_or_else(|| "configured recovery page size is outside the supported bound".to_owned())?;
 
-    let page_size_u64 = if resegment_terminal {
-        u64::try_from(configured_page_size)
+    if meta.state == SpoolState::Complete {
+        let logical_bytes = validated_complete_bytes(meta, file_size)?;
+        let persist = meta.page_size != target_page_size || meta.final_page_size == Some(0);
+        let write_locked = meta.write_locked;
+        resegment_complete_bytes(
+            meta,
+            logical_bytes,
+            target_page_size,
+            write_locked,
+            "terminal recovery",
+        )?;
+        meta.page_size = target_page_size;
+        return Ok(RecoveryMigration {
+            page_size: configured_page_size,
+            persist,
+            write_locked_salvage: false,
+        });
+    }
+
+    let missing_page_size = meta.page_size == 0;
+    let oversized_page_size = meta.page_size > target_page_size
+        || usize::try_from(meta.page_size)
             .ok()
-            .filter(|size| *size > 0)
-            .ok_or_else(|| {
-                "configured page size cannot describe this legacy terminal salvage spool on disk"
-                    .to_string()
-            })?
-    } else if missing_page_size {
+            .is_none_or(|size| size > MAX_PAGE_SIZE_BYTES);
+
+    if meta.state == SpoolState::WriteLocked && (missing_page_size || oversized_page_size) {
+        validate_legacy_active_layout(meta, file_size)?;
+        if !meta.write_locked {
+            return Err("WriteLocked metadata has its write-lock flag cleared".into());
+        }
+        resegment_complete_bytes(
+            meta,
+            file_size,
+            target_page_size,
+            true,
+            "WriteLocked salvage",
+        )?;
+        meta.page_size = target_page_size;
+        return Ok(RecoveryMigration {
+            page_size: configured_page_size,
+            persist: true,
+            write_locked_salvage: true,
+        });
+    }
+
+    let page_size_u64 = if missing_page_size {
         derive_legacy_page_size(meta, file_size)?
     } else {
         meta.page_size
@@ -1391,23 +1452,49 @@ fn prepare_recovery_metadata(
         .ok_or_else(|| {
             "persisted or derived page size is unsupported on this platform".to_string()
         })?;
-
-    if legacy_readable {
-        terminalize_legacy_readable(meta, file_size, page_size_u64)?;
-    } else if legacy_write_locked {
-        terminalize_legacy_write_locked(meta, file_size, page_size_u64)?;
+    if page_size > configured_page_size || page_size > MAX_PAGE_SIZE_BYTES {
+        return Err(format!(
+            "active page size {page_size} exceeds supported recovery bound {}",
+            configured_page_size.min(MAX_PAGE_SIZE_BYTES)
+        ));
     }
 
-    let persist = missing_page_size || legacy_readable;
-    if persist {
+    if missing_page_size {
         meta.page_size = page_size_u64;
     }
-
     Ok(RecoveryMigration {
         page_size,
-        persist,
-        write_locked_salvage: legacy_write_locked,
+        persist: missing_page_size,
+        write_locked_salvage: false,
     })
+}
+
+fn validated_complete_bytes(
+    meta: &SpoolMetadata,
+    file_size: u64,
+) -> std::result::Result<u64, String> {
+    if meta.final_page_size == Some(0) {
+        if meta.total_bytes_written != file_size {
+            return Err(
+                "legacy Readable terminal byte count does not equal durable file length".into(),
+            );
+        }
+        return Ok(file_size);
+    }
+
+    let historical_page_size = if meta.page_size == 0 {
+        derive_legacy_page_size(meta, file_size)?
+    } else {
+        meta.page_size
+    };
+    let logical_bytes = complete_layout_bytes(meta, historical_page_size)?;
+    if logical_bytes != meta.total_bytes_written {
+        return Err(format!(
+            "terminal layout describes {logical_bytes} bytes but metadata records {}",
+            meta.total_bytes_written
+        ));
+    }
+    Ok(logical_bytes)
 }
 
 fn derive_legacy_page_size(
@@ -1538,30 +1625,6 @@ fn validate_legacy_active_layout(
     Ok(())
 }
 
-fn terminalize_legacy_readable(
-    meta: &mut SpoolMetadata,
-    file_size: u64,
-    page_size: u64,
-) -> std::result::Result<(), String> {
-    if meta.final_page_size != Some(0) {
-        return Err("legacy Readable recovery marker is missing".into());
-    }
-    resegment_complete_bytes(meta, file_size, page_size, false, "legacy Readable")
-}
-
-fn terminalize_legacy_write_locked(
-    meta: &mut SpoolMetadata,
-    file_size: u64,
-    page_size: u64,
-) -> std::result::Result<(), String> {
-    validate_legacy_active_layout(meta, file_size)?;
-    if !meta.write_locked {
-        return Err("legacy WriteLocked metadata has its write-lock flag cleared".into());
-    }
-
-    resegment_complete_bytes(meta, file_size, page_size, true, "legacy WriteLocked")
-}
-
 fn resegment_complete_bytes(
     meta: &mut SpoolMetadata,
     file_size: u64,
@@ -1682,7 +1745,7 @@ mod tests {
     use super::*;
     use crate::io::TokioFileIO;
     use bytes::Bytes;
-    use std::sync::Arc;
+    use std::sync::{atomic::Ordering, Arc};
     use tempfile::tempdir;
 
     #[derive(Clone)]
@@ -1875,6 +1938,8 @@ mod tests {
         std::sync::atomic::AtomicUsize::new(0);
     static RECOVERY_READ_BYTES: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    static RECOVERY_MAX_READ_LEN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     const RECOVERY_FAIL_OPEN_KEY: &str = "ffffffff-ffff-4fff-8fff-ffffffffff05";
 
     #[derive(Clone)]
@@ -1923,6 +1988,7 @@ mod tests {
             offset: u64,
             len: usize,
         ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+            RECOVERY_MAX_READ_LEN.fetch_max(len, std::sync::atomic::Ordering::SeqCst);
             async move {
                 let bytes = TokioFileIO::read_at(handle, offset, len).await?;
                 RECOVERY_READ_BYTES.fetch_add(bytes.len(), std::sync::atomic::Ordering::SeqCst);
@@ -2076,7 +2142,7 @@ mod tests {
             self.inner.delete(key).await
         }
 
-        async fn scan(&self) -> Result<Vec<crate::metadata::MetadataDirectoryEntry>> {
+        async fn scan(&self) -> Result<crate::metadata::MetadataDirectoryScan> {
             self.inner.scan().await
         }
     }
@@ -2241,22 +2307,28 @@ mod tests {
     }
 
     #[test]
-    fn million_key_recovery_index_keeps_only_capacity_sized_preferred_heap() {
+    fn million_key_recovery_index_is_capacity_plus_channel_bounded() {
         const KEY_COUNT: usize = 1_000_000;
         const CAPACITY: usize = 64;
-        let mut builder = RecoveryCandidateBuilder::new(CAPACITY);
+        let mut builder = RecoveryCandidateBuilder::new(CAPACITY, METADATA_SCAN_CHANNEL_CAPACITY);
+        let mut discarded = 0;
         for index in 0..KEY_COUNT {
-            builder.push(RecoveryCandidateSummary {
-                key: format!("{index:07}"),
-                activity_at: index as u64,
-            });
+            discarded += usize::from(
+                builder
+                    .push(RecoveryCandidateSummary {
+                        key: format!("{index:07}"),
+                        activity_at: index as u64,
+                    })
+                    .is_some(),
+            );
         }
 
-        assert_eq!(builder.preferred.len(), CAPACITY);
-        assert_eq!(builder.excess.len(), KEY_COUNT - CAPACITY);
+        let retained_bound = CAPACITY + METADATA_SCAN_CHANNEL_CAPACITY;
+        assert_eq!(builder.preferred.len(), retained_bound);
+        assert_eq!(discarded, KEY_COUNT - retained_bound);
         let mut queue = builder.finish();
         assert_eq!(
-            queue.next().expect("best candidate").activity_at,
+            queue.pop().expect("best candidate").activity_at,
             (KEY_COUNT - 1) as u64
         );
     }
@@ -2323,6 +2395,39 @@ mod tests {
             .write(&metadata)
             .await
             .expect("write sidecar metadata");
+    }
+
+    async fn write_sparse_sidecar_fixture(
+        manager: &SpoolManager<TokioFileIO>,
+        metadata: SpoolMetadata,
+        file_len: u64,
+        prefix: &[u8],
+        suffix: &[u8],
+    ) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let spool_dir = manager.data_dir.join(&metadata.key);
+        std::fs::create_dir_all(&spool_dir).expect("create sparse spool dir");
+        let data_path = spool_dir.join("spool.dat");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&data_path)
+            .expect("create sparse payload");
+        file.set_len(file_len).expect("set sparse payload length");
+        file.write_all(prefix).expect("write sparse prefix");
+        if !suffix.is_empty() {
+            file.seek(SeekFrom::Start(file_len - suffix.len() as u64))
+                .expect("seek sparse suffix");
+            file.write_all(suffix).expect("write sparse suffix");
+        }
+        file.sync_data().expect("sync sparse payload");
+        manager
+            .metadata_store
+            .write(&metadata)
+            .await
+            .expect("write sparse sidecar");
     }
 
     /// Write the exact sidecar shape emitted by main before `page_size` was
@@ -3190,7 +3295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_streams_512_large_sidecars_and_rereads_only_selected_metadata() {
+    async fn recovery_streams_real_large_directory_and_rereads_only_selected_metadata() {
         const SIDECAR_COUNT: usize = 512;
         const CAPACITY: usize = 4;
         const PADDING_BYTES: usize = 64 * 1024;
@@ -3243,6 +3348,12 @@ mod tests {
             "instrumentation must observe the aggregate workload"
         );
         assert_eq!(stats.live_allocated_bytes(), 0);
+        assert_eq!(stats.live_scan_entries(), 0);
+        assert!(
+            stats.peak_scan_entries() <= METADATA_SCAN_CHANNEL_CAPACITY + 2,
+            "real directory scan retained {} entries",
+            stats.peak_scan_entries()
+        );
         assert!(
             stats.peak_allocated_bytes() < 70 * 1024,
             "sidecar buffers must be released between keys, peak was {} bytes",
@@ -4366,6 +4477,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_rejects_symlink_sidecar_without_following_or_opening_data() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let spool_dir = data_dir.join(&key);
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .expect("create spool directory");
+        tokio::fs::write(spool_dir.join("spool.dat"), b"local")
+            .await
+            .expect("write local payload");
+
+        let external_sidecar = dir.path().join("external-meta.json");
+        let payload = serde_json::to_vec(&sidecar_fixture_metadata(
+            &data_dir,
+            &key,
+            SpoolState::Complete,
+            5,
+        ))
+        .expect("serialize external sidecar");
+        tokio::fs::write(&external_sidecar, &payload)
+            .await
+            .expect("write external sidecar");
+        std::os::unix::fs::symlink(&external_sidecar, spool_dir.join("meta.json"))
+            .expect("create sidecar symlink");
+
+        RECOVERY_OPEN_ATTEMPTS.store(0, Ordering::SeqCst);
+        let manager = SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+            .expect("manager");
+        manager.recover().await.expect("quarantine sidecar symlink");
+
+        assert!(manager.get_spool(&key).is_none());
+        assert_eq!(RECOVERY_OPEN_ATTEMPTS.load(Ordering::SeqCst), 0);
+        assert!(tokio::fs::symlink_metadata(spool_dir.join("meta.json"))
+            .await
+            .expect("lstat sidecar")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            tokio::fs::read(&external_sidecar)
+                .await
+                .expect("external sidecar unchanged"),
+            payload
+        );
+        assert_eq!(
+            tokio::fs::read(spool_dir.join("spool.dat"))
+                .await
+                .expect("local data unchanged"),
+            b"local"
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_quarantines_missing_canonical_data_without_touching_external_target() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
@@ -4575,7 +4740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recovery_uses_persisted_page_size_after_config_change() {
+    async fn test_recovery_resegments_complete_page_size_after_config_change() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let key = uuid::Uuid::new_v4().to_string();
@@ -4601,14 +4766,178 @@ mod tests {
             .await
             .expect("recover with persisted page size");
         let spool = manager.get_spool(&key).expect("recovered spool");
-        assert_eq!(spool.page_size, 4);
+        assert_eq!(spool.page_size, 8);
         assert_eq!(
             spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
-            b"abcd"
+            b"abcdef"
         );
+        assert!(spool.read_page_for_test(1).await.unwrap().is_none());
+        assert_eq!(persisted_metadata(&manager, &key).await.page_size, 8);
+    }
+
+    #[tokio::test]
+    async fn recovery_resegments_128_mib_complete_without_startup_read_or_large_read_requests() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        const OLD_PAGE_SIZE: u64 = 128 * 1024 * 1024;
+        const PAGE_SIZE: usize = 4096;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, PAGE_SIZE, 16 * PAGE_SIZE, 1)
+            .expect("fixture manager");
+        let mut metadata =
+            sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, OLD_PAGE_SIZE);
+        metadata.page_size = OLD_PAGE_SIZE;
+        metadata.total_pages = 1;
+        metadata.final_page_size = None;
+        write_sparse_sidecar_fixture(&fixture, metadata, OLD_PAGE_SIZE, b"ABCD", b"WXYZ").await;
+        drop(fixture);
+
+        RECOVERY_OPEN_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_OPEN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_MAX_READ_LEN.store(0, std::sync::atomic::Ordering::SeqCst);
+        let manager =
+            SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, PAGE_SIZE, 16 * PAGE_SIZE, 1)
+                .expect("recovery manager");
+        manager
+            .recover()
+            .await
+            .expect("recover sparse complete spool");
+
+        let spool = manager.get_spool(&key).expect("complete spool recovered");
+        let recovered = spool.metadata.lock().await.clone();
+        assert_eq!(spool.page_size, PAGE_SIZE);
+        assert_eq!(recovered.page_size, PAGE_SIZE as u64);
+        assert_eq!(recovered.total_pages, OLD_PAGE_SIZE / PAGE_SIZE as u64);
+        assert_eq!(recovered.final_page_size, None);
+        assert_eq!(RECOVERY_OPEN_ATTEMPTS.load(Ordering::SeqCst), 1);
         assert_eq!(
-            spool.read_page_for_test(1).await.unwrap().unwrap().as_ref(),
-            b"ef"
+            RECOVERY_READ_BYTES.load(Ordering::SeqCst),
+            0,
+            "terminal resegmentation must not preload a 128 MiB page"
+        );
+
+        let first = spool.read_page_for_test(0).await.unwrap().unwrap();
+        let last = spool
+            .read_page_for_test(recovered.total_pages - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..4], b"ABCD");
+        assert_eq!(&last[PAGE_SIZE - 4..], b"WXYZ");
+        assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 2 * PAGE_SIZE);
+        assert_eq!(RECOVERY_MAX_READ_LEN.load(Ordering::SeqCst), PAGE_SIZE);
+        assert_eq!(
+            manager
+                .metadata_store
+                .read(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .page_size,
+            PAGE_SIZE as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_quarantines_128_mib_active_sparse_tail_before_data_open() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        const OLD_PAGE_SIZE: u64 = 128 * 1024 * 1024;
+        const PAGE_SIZE: usize = 4096;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, PAGE_SIZE, 16 * PAGE_SIZE, 1)
+            .expect("fixture manager");
+        let file_len = OLD_PAGE_SIZE - 1;
+        let mut metadata = sidecar_fixture_metadata(&data_dir, &key, SpoolState::Writing, file_len);
+        metadata.page_size = OLD_PAGE_SIZE;
+        metadata.total_pages = 0;
+        metadata.final_page_size = None;
+        let original = metadata.clone();
+        write_sparse_sidecar_fixture(&fixture, metadata, file_len, b"A", b"Z").await;
+        let original_sidecar = tokio::fs::read(data_dir.join(&key).join("meta.json"))
+            .await
+            .expect("snapshot active sidecar");
+        drop(fixture);
+
+        RECOVERY_OPEN_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
+        RECOVERY_MAX_READ_LEN.store(0, std::sync::atomic::Ordering::SeqCst);
+        let manager =
+            SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, PAGE_SIZE, 16 * PAGE_SIZE, 1)
+                .expect("recovery manager");
+        assert_eq!(manager.recover_with_counts().await.unwrap(), (0, 0));
+
+        assert!(manager.get_spool(&key).is_none());
+        assert_eq!(RECOVERY_OPEN_ATTEMPTS.load(Ordering::SeqCst), 0);
+        assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 0);
+        assert_eq!(RECOVERY_MAX_READ_LEN.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key).join("meta.json"))
+                .await
+                .expect("active sidecar remains"),
+            original_sidecar
+        );
+        assert_eq!(original.page_size, OLD_PAGE_SIZE);
+        assert_eq!(
+            tokio::fs::metadata(data_dir.join(&key).join("spool.dat"))
+                .await
+                .unwrap()
+                .len(),
+            file_len
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_salvages_oversized_write_locked_to_bounded_complete() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        const OLD_PAGE_SIZE: u64 = 128 * 1024 * 1024;
+        const PAGE_SIZE: usize = 4096;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, PAGE_SIZE, 16 * PAGE_SIZE, 1)
+            .expect("fixture manager");
+        let file_len = PAGE_SIZE as u64 * 2 + 1;
+        let mut metadata =
+            sidecar_fixture_metadata(&data_dir, &key, SpoolState::WriteLocked, file_len);
+        metadata.page_size = OLD_PAGE_SIZE;
+        metadata.write_locked = true;
+        metadata.total_pages = 0;
+        metadata.final_page_size = None;
+        write_sparse_sidecar_fixture(&fixture, metadata, file_len, b"A", b"Z").await;
+        drop(fixture);
+
+        RECOVERY_OPEN_ATTEMPTS.store(0, Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, Ordering::SeqCst);
+        let manager =
+            SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, PAGE_SIZE, 16 * PAGE_SIZE, 1)
+                .expect("recovery manager");
+        manager.recover().await.expect("salvage WriteLocked spool");
+
+        let spool = manager.get_spool(&key).expect("salvaged spool");
+        let recovered = spool.metadata.lock().await.clone();
+        assert_eq!(spool.page_size, PAGE_SIZE);
+        assert_eq!(recovered.state, SpoolState::Complete);
+        assert!(recovered.write_locked);
+        assert_eq!(recovered.total_pages, 3);
+        assert_eq!(recovered.final_page_size, Some(1));
+        assert_eq!(RECOVERY_OPEN_ATTEMPTS.load(Ordering::SeqCst), 1);
+        assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager
+                .metadata_store
+                .read(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .page_size,
+            PAGE_SIZE as u64
         );
     }
 
@@ -4624,21 +4953,14 @@ mod tests {
             .expect("restart manager with changed config");
         manager.recover().await.expect("migrate complete spool");
         let spool = manager.get_spool(&key).expect("spool recovered");
-        assert_eq!(spool.page_size, 4);
+        assert_eq!(spool.page_size, 8192);
         assert_eq!(
             spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
-            b"abcd"
+            b"abcdefghij"
         );
-        assert_eq!(
-            spool.read_page_for_test(1).await.unwrap().unwrap().as_ref(),
-            b"efgh"
-        );
-        assert_eq!(
-            spool.read_page_for_test(2).await.unwrap().unwrap().as_ref(),
-            b"ij"
-        );
+        assert!(spool.read_page_for_test(1).await.unwrap().is_none());
         assert!(data_dir.join(&key).join("spool.dat").exists());
-        assert_eq!(persisted_metadata(&manager, &key).await.page_size, 4);
+        assert_eq!(persisted_metadata(&manager, &key).await.page_size, 8192);
     }
 
     #[tokio::test]
@@ -4656,7 +4978,7 @@ mod tests {
         manager.recover().await.expect("migrate terminal spools");
 
         let one_page = manager.get_spool(&one_page_key).expect("one-page spool");
-        assert_eq!(one_page.page_size, 3);
+        assert_eq!(one_page.page_size, 8192);
         assert_eq!(
             one_page
                 .read_page_for_test(0)
@@ -4667,7 +4989,7 @@ mod tests {
             b"abc"
         );
         let empty = manager.get_spool(&empty_key).expect("empty spool");
-        assert_eq!(empty.page_size, 1);
+        assert_eq!(empty.page_size, 8192);
         assert!(empty.read_page_for_test(0).await.unwrap().is_none());
         assert!(data_dir.join(&one_page_key).join("spool.dat").exists());
         assert!(data_dir.join(&empty_key).join("spool.dat").exists());
@@ -4862,12 +5184,16 @@ mod tests {
             .get_spool(&partial_key)
             .expect("persisted salvage spool");
         assert_eq!(
-            partial.page_size, 6,
-            "later config changes must not reinterpret the migrated layout"
+            partial.page_size, 7,
+            "later config changes atomically resegment terminal bytes again"
         );
         let first = partial.read_page_for_test(0).await.unwrap().unwrap();
         let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
+        assert_eq!(
+            persisted_metadata(&restarted, &partial_key).await.page_size,
+            7
+        );
     }
 
     #[tokio::test]
