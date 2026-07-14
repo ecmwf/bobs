@@ -4811,16 +4811,21 @@ mod tests {
                 Err(BobsError::SpoolClosed)
             ));
             if expected.is_empty() {
-                assert!(spool.read_page(0).await.unwrap().is_none());
+                assert!(spool.read_page_for_test(0).await.unwrap().is_none());
             } else {
                 assert_eq!(
-                    spool.read_page(0).await.unwrap().unwrap().as_ref(),
+                    spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
                     expected
                 );
                 assert_eq!(
-                    read_exact_logical_range::<TokioFileIO>(&spool.file_handle, 0, expected.len(),)
-                        .await
-                        .expect("read exact salvaged range"),
+                    read_exact_at::<TokioFileIO>(
+                        &spool.file_handle,
+                        0,
+                        expected.len(),
+                        "reading exact salvaged range",
+                    )
+                    .await
+                    .expect("read exact salvaged range"),
                     expected
                 );
             }
@@ -4862,8 +4867,8 @@ mod tests {
         let metadata = partial.metadata.lock().await.clone();
         assert_eq!(metadata.total_pages, 2);
         assert_eq!(metadata.final_page_size, Some(1));
-        let first = partial.read_page(0).await.unwrap().unwrap();
-        let second = partial.read_page(1).await.unwrap().unwrap();
+        let first = partial.read_page_for_test(0).await.unwrap().unwrap();
+        let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), b"abc");
     }
 
@@ -4914,19 +4919,27 @@ mod tests {
         );
 
         assert_eq!(
-            read_exact_logical_range::<RecoveryCountingFileIO>(&spool.file_handle, 0, 4)
-                .await
-                .expect("read sparse prefix"),
+            read_exact_at::<RecoveryCountingFileIO>(
+                &spool.file_handle,
+                0,
+                4,
+                "reading sparse prefix",
+            )
+            .await
+            .expect("read sparse prefix")
+            .as_ref(),
             b"ABCD"
         );
         assert_eq!(
-            read_exact_logical_range::<RecoveryCountingFileIO>(
+            read_exact_at::<RecoveryCountingFileIO>(
                 &spool.file_handle,
                 PAGE_SIZE as u64 - 4,
                 4,
+                "reading sparse suffix",
             )
             .await
-            .expect("read sparse suffix"),
+            .expect("read sparse suffix")
+            .as_ref(),
             b"WXYZ"
         );
         assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 8);
