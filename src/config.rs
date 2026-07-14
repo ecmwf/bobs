@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 const DEFAULT_PAGE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_PAGE_SIZE_POLICY_BYTES: usize = 64 * 1024 * 1024;
-/// Operational ceiling for one page and its per-request staging buffer.
+/// Operational ceiling for one page and its per-request/recovery staging buffer.
 ///
 /// The 64 MiB policy remains below the exported one-SQE io_uring length bound.
 pub const MAX_PAGE_SIZE_BYTES: usize = if MAX_PAGE_SIZE_POLICY_BYTES <= MAX_IO_URING_IO_LEN {
