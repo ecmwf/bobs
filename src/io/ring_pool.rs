@@ -8,6 +8,7 @@
 //! contract is pinned before the dispatch implementation is introduced.
 
 use super::{MAX_IO_URING_IO_LEN, MAX_IO_URING_SHARDS};
+use crate::metadata::{validate_metadata_temp_path, MetadataFileIdentity};
 use bytes::Bytes;
 use io_uring::{opcode, squeue, types, IoUring};
 use siphasher::sip::SipHasher13;
@@ -18,6 +19,7 @@ use std::ffi::CString;
 use std::hash::Hasher;
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -49,6 +51,17 @@ type WriteSender = oneshot::Sender<Result<usize>>;
 type ReadSender = oneshot::Sender<Result<Bytes>>;
 type UnitSender = oneshot::Sender<Result<()>>;
 
+pub(crate) struct MetadataCommitRequest {
+    pub(crate) key: String,
+    pub(crate) tmp_fd: OwnedFd,
+    pub(crate) parent_fd: OwnedFd,
+    pub(crate) tmp_path: PathBuf,
+    pub(crate) tmp_identity: MetadataFileIdentity,
+    pub(crate) tmp_name: CString,
+    pub(crate) final_name: CString,
+    pub(crate) payload: Bytes,
+}
+
 pub(crate) enum Request {
     Open {
         path: CString,
@@ -78,12 +91,7 @@ pub(crate) enum Request {
         tx: UnitSender,
     },
     MetadataCommit {
-        key: String,
-        tmp_fd: OwnedFd,
-        parent_fd: OwnedFd,
-        tmp_name: CString,
-        final_name: CString,
-        payload: Bytes,
+        request: Box<MetadataCommitRequest>,
         payload_len: u32,
         tx: UnitSender,
     },
@@ -344,19 +352,14 @@ impl RingPool {
 
     pub(crate) async fn submit_metadata_commit(
         &self,
-        key: String,
-        tmp_fd: OwnedFd,
-        parent_fd: OwnedFd,
-        tmp_name: CString,
-        final_name: CString,
-        payload: Bytes,
+        request: MetadataCommitRequest,
     ) -> Result<()> {
-        let payload_len = checked_sqe_len(payload.len())?;
-        let ring_index = ring_index_for_key(&key, self.shard_count());
+        let payload_len = checked_sqe_len(request.payload.len())?;
+        let ring_index = ring_index_for_key(&request.key, self.shard_count());
         #[cfg(test)]
         self.record_routing(
             RingPoolOperationKind::MetadataCommit,
-            key.clone(),
+            request.key.clone(),
             ring_index,
         );
 
@@ -364,12 +367,7 @@ impl RingPool {
         self.submit_to_ring(
             ring_index,
             Request::MetadataCommit {
-                key,
-                tmp_fd,
-                parent_fd,
-                tmp_name,
-                final_name,
-                payload,
+                request: Box::new(request),
                 payload_len,
                 tx,
             },
@@ -671,6 +669,8 @@ enum InFlightKind {
         key: String,
         tmp_fd: OwnedFd,
         parent_fd: OwnedFd,
+        tmp_path: PathBuf,
+        tmp_identity: MetadataFileIdentity,
         tmp_name: CString,
         final_name: CString,
         payload: Bytes,
@@ -936,29 +936,38 @@ impl RingDriver {
                 kind: InFlightKind::Remove { path, tx: Some(tx) },
             },
             Request::MetadataCommit {
-                key,
-                tmp_fd,
-                parent_fd,
-                tmp_name,
-                final_name,
-                payload,
+                request,
                 payload_len,
                 tx,
-            } => InFlight {
-                kind: InFlightKind::MetadataCommit {
+            } => {
+                let MetadataCommitRequest {
                     key,
                     tmp_fd,
                     parent_fd,
+                    tmp_path,
+                    tmp_identity,
                     tmp_name,
                     final_name,
                     payload,
-                    payload_len,
-                    phase: MetadataCommitPhase::WriteAndSync,
-                    completed: [false; METADATA_COMMIT_PHASE_LEN],
-                    failure: None,
-                    tx: Some(tx),
-                },
-            },
+                } = *request;
+                InFlight {
+                    kind: InFlightKind::MetadataCommit {
+                        key,
+                        tmp_fd,
+                        parent_fd,
+                        tmp_path,
+                        tmp_identity,
+                        tmp_name,
+                        final_name,
+                        payload,
+                        payload_len,
+                        phase: MetadataCommitPhase::WriteAndSync,
+                        completed: [false; METADATA_COMMIT_PHASE_LEN],
+                        failure: None,
+                        tx: Some(tx),
+                    },
+                }
+            }
         };
 
         let is_metadata_commit = matches!(in_flight.kind, InFlightKind::MetadataCommit { .. });
@@ -1223,6 +1232,8 @@ impl RingDriver {
         if let Some(in_flight) = self.in_flight.get_mut(&id) {
             if let InFlightKind::MetadataCommit {
                 payload,
+                tmp_path,
+                tmp_identity,
                 phase,
                 completed,
                 failure,
@@ -1254,11 +1265,18 @@ impl RingDriver {
                 }
 
                 if completed.iter().all(|done| *done) {
+                    if failure.is_none() && *phase == MetadataCommitPhase::WriteAndSync {
+                        if let Err(error) = validate_metadata_temp_path(tmp_path, *tmp_identity) {
+                            *failure = Some(error);
+                        }
+                    }
+
                     if failure.is_some() || *phase == MetadataCommitPhase::RenameAndSync {
                         should_complete = true;
                     } else {
                         // Durability invariant: rename is not even submitted until the
-                        // complete temporary payload and its fdatasync have both completed.
+                        // complete temporary payload and its fdatasync have both completed,
+                        // and the name still resolves to the inode opened by this commit.
                         *phase = MetadataCommitPhase::RenameAndSync;
                         *completed = [false; METADATA_COMMIT_PHASE_LEN];
                         should_submit_rename = true;
@@ -1586,6 +1604,8 @@ impl InFlight {
                 key,
                 tmp_fd,
                 parent_fd,
+                tmp_path,
+                tmp_identity,
                 tmp_name,
                 final_name,
                 payload,
@@ -1593,12 +1613,16 @@ impl InFlight {
                 mut tx,
                 ..
             } => Request::MetadataCommit {
-                key,
-                tmp_fd,
-                parent_fd,
-                tmp_name,
-                final_name,
-                payload,
+                request: Box::new(MetadataCommitRequest {
+                    key,
+                    tmp_fd,
+                    parent_fd,
+                    tmp_path,
+                    tmp_identity,
+                    tmp_name,
+                    final_name,
+                    payload,
+                }),
                 payload_len,
                 tx: tx.take().expect("metadata commit sender missing"),
             },

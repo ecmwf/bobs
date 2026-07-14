@@ -2,13 +2,18 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(all(test, target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+use super::TMP_FILE;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use super::{
-    remove_file_if_present, storage_error, BoxMetadataFuture, MetadataStore,
-    SyncSidecarMetadataStore, UringSidecarMetadataStore, META_FILE, TMP_FILE,
+    create_metadata_temp, remove_file_if_present, run_blocking, storage_error, CreatedMetadataTemp,
+    MetadataFileIdentity, MetadataStore, SyncSidecarMetadataStore, UringSidecarMetadataStore,
+    META_FILE,
 };
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use crate::error::{BobsError, Result};
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+use crate::io::ring_pool::MetadataCommitRequest;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use crate::spool::SpoolMetadata;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
@@ -16,7 +21,7 @@ use bytes::Bytes;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use std::ffi::CString;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 #[cfg(all(test, target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use std::io;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
@@ -47,10 +52,74 @@ impl Default for UringSidecarMetadataStore {
 }
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+struct TmpCleanupGuard {
+    path: Option<PathBuf>,
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+impl TmpCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("armed tmp cleanup has a path")
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+impl Drop for TmpCleanupGuard {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+
+        // A write future may be dropped on a Tokio worker. Cleanup must remain
+        // best-effort without ever performing unlink synchronously there.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn_blocking(move || {
+                let _ = remove_file_if_present(&path);
+            }));
+        } else {
+            let _ = std::thread::Builder::new()
+                .name("bobs-metadata-tmp-cleanup".to_owned())
+                .spawn(move || {
+                    let _ = remove_file_if_present(&path);
+                });
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+struct PreparedMetadataCommit {
+    tmp_fd: OwnedFd,
+    parent_fd: OwnedFd,
+    tmp_path: PathBuf,
+    tmp_identity: MetadataFileIdentity,
+    tmp_name: CString,
+    final_name: CString,
+    tmp_cleanup: TmpCleanupGuard,
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 impl UringSidecarMetadataStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            #[cfg(test)]
+            operation_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_operation_hook(data_dir: impl Into<PathBuf>, operation_hook: fn()) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            operation_hook: Some(operation_hook),
         }
     }
 
@@ -69,40 +138,81 @@ impl UringSidecarMetadataStore {
     async fn write_uring(&self, metadata: &SpoolMetadata) -> Result<()> {
         let payload = serde_json::to_vec(metadata)
             .map_err(|error| BobsError::SerializationError(error.to_string()))?;
+        let pool = crate::io::ring_pool::global_or_default_ring_pool().map_err(storage_error)?;
 
         let spool_dir = self.spool_dir(&metadata.key);
-        fs::create_dir_all(&spool_dir).map_err(storage_error)?;
-        let tmp_path = spool_dir.join(TMP_FILE);
+        #[cfg(test)]
+        let operation_hook = self.operation_hook;
 
-        let tmp = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .read(true)
-            .open(&tmp_path)
-            .map_err(storage_error)?;
-        let parent = File::open(&spool_dir).map_err(storage_error)?;
+        let PreparedMetadataCommit {
+            tmp_fd,
+            parent_fd,
+            tmp_path,
+            tmp_identity,
+            tmp_name,
+            final_name,
+            mut tmp_cleanup,
+        } = run_blocking(move || {
+            fs::create_dir_all(&spool_dir).map_err(storage_error)?;
+            let CreatedMetadataTemp {
+                file: tmp,
+                path: tmp_path,
+                identity: tmp_identity,
+            } = create_metadata_temp(&spool_dir)?;
+            let tmp_cleanup = TmpCleanupGuard::new(tmp_path.clone());
+            let parent = File::open(&spool_dir).map_err(storage_error)?;
 
-        let tmp_fd: OwnedFd = tmp.into();
-        let parent_fd: OwnedFd = parent.into();
-        let tmp_name = CString::new(TMP_FILE).expect("metadata tmp filename contains no NUL");
-        let final_name = CString::new(META_FILE).expect("metadata filename contains no NUL");
+            #[cfg(test)]
+            if let Some(hook) = operation_hook {
+                hook();
+            }
 
-        let pool = crate::io::ring_pool::global_or_default_ring_pool().map_err(storage_error)?;
-        match pool
-            .submit_metadata_commit(
-                metadata.key.clone(),
+            let tmp_name = CString::new(
+                tmp_path
+                    .file_name()
+                    .expect("metadata temporary path has no filename")
+                    .to_string_lossy()
+                    .as_bytes(),
+            )
+            .expect("metadata temporary filename contains no NUL");
+            Ok(PreparedMetadataCommit {
+                tmp_fd: tmp.into(),
+                parent_fd: parent.into(),
+                tmp_path,
+                tmp_identity,
+                tmp_name,
+                final_name: CString::new(META_FILE).expect("metadata filename contains no NUL"),
+                tmp_cleanup,
+            })
+        })
+        .await?;
+
+        let commit_result = pool
+            .submit_metadata_commit(MetadataCommitRequest {
+                key: metadata.key.clone(),
                 tmp_fd,
                 parent_fd,
+                tmp_path,
+                tmp_identity,
                 tmp_name,
                 final_name,
-                Bytes::from(payload),
-            )
-            .await
-        {
-            Ok(()) => Ok(()),
+                payload: Bytes::from(payload),
+            })
+            .await;
+
+        match commit_result {
+            Ok(()) => {
+                tmp_cleanup.disarm();
+                Ok(())
+            }
             Err(error) => {
-                let _ = remove_file_if_present(&tmp_path);
+                let cleanup_path = tmp_cleanup.path().to_owned();
+                if run_blocking(move || remove_file_if_present(&cleanup_path).map(|_| ()))
+                    .await
+                    .is_ok()
+                {
+                    tmp_cleanup.disarm();
+                }
                 Err(storage_error(error))
             }
         }
@@ -111,25 +221,23 @@ impl UringSidecarMetadataStore {
 
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 impl MetadataStore for UringSidecarMetadataStore {
-    type WriteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ReadFuture<'a> = BoxMetadataFuture<'a, Option<SpoolMetadata>>;
-    type DeleteFuture<'a> = BoxMetadataFuture<'a, ()>;
-    type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
-
-    fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
-        Box::pin(async move { self.write_uring(metadata).await })
+    async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+        self.write_uring(metadata).await
     }
 
-    fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
-        Box::pin(async move { self.sync_store().read_sync(key) })
+    async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+        let store = self.sync_store();
+        store.read(key).await
     }
 
-    fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
-        Box::pin(async move { self.sync_store().delete_sync(key) })
+    async fn delete(&self, key: &str) -> Result<()> {
+        let store = self.sync_store();
+        store.delete(key).await
     }
 
-    fn list(&self) -> Result<Self::ListIter> {
-        self.sync_store().list()
+    async fn list(&self) -> Result<Vec<Result<SpoolMetadata>>> {
+        let store = self.sync_store();
+        store.list().await
     }
 }
 
@@ -529,6 +637,19 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    fn metadata_temp_paths(spool_dir: &Path) -> Vec<PathBuf> {
+        let mut paths = fs::read_dir(spool_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| crate::metadata::is_metadata_temp_name(&entry.file_name()))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
     #[test]
     fn io_uring_linked_chain_emits_hot_commit_sqes_in_order() {
         for shard_index in [0, LINKED_CHAIN_TEST_SHARDS - 1] {
@@ -618,7 +739,9 @@ mod tests {
 
         let listed = store
             .list()
+            .await
             .expect("list metadata")
+            .into_iter()
             .collect::<Result<Vec<_>>>()
             .expect("listed metadata parses");
         assert_eq!(listed.len(), 1);
@@ -630,6 +753,221 @@ mod tests {
             .await
             .expect("read after delete")
             .is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    async fn uring_store_unlinks_stale_tmp_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("create tempdir");
+        let store = UringSidecarMetadataStore::new(dir.path());
+        let mut meta = metadata_for_key_generation("A".to_owned(), 1);
+        let spool_dir = dir.path().join(&meta.key);
+        let target_dir = dir.path().join("B");
+        fs::create_dir_all(&spool_dir).expect("create metadata directory");
+        fs::create_dir_all(&target_dir).expect("create target directory");
+        let target = target_dir.join("spool.dat");
+        let sentinel = b"must not be truncated";
+        fs::write(&target, sentinel).expect("seed symlink target");
+        symlink(&target, spool_dir.join(TMP_FILE)).expect("craft stale temporary symlink");
+        meta.data_path = target.clone();
+
+        store.write(&meta).await.expect("write metadata safely");
+
+        assert_eq!(fs::read(&target).expect("read target"), sentinel);
+        assert!(fs::symlink_metadata(spool_dir.join(TMP_FILE)).is_err());
+        assert!(metadata_temp_paths(&spool_dir).is_empty());
+        assert_metadata_eq(
+            store.read(&meta.key).await.expect("read metadata").unwrap(),
+            &meta,
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    async fn uring_store_recovers_stale_regular_tmp() {
+        let dir = tempdir().expect("create tempdir");
+        let store = UringSidecarMetadataStore::new(dir.path());
+        let meta = metadata_for_key_generation("stale-temp-key".to_owned(), 1);
+        let spool_dir = dir.path().join(&meta.key);
+        fs::create_dir_all(&spool_dir).expect("create spool directory");
+        fs::write(spool_dir.join(TMP_FILE), b"stale partial metadata")
+            .expect("seed stale regular temporary file");
+
+        store
+            .write(&meta)
+            .await
+            .expect("recover stale temporary file");
+
+        assert!(metadata_temp_paths(&spool_dir).is_empty());
+        assert_metadata_eq(
+            store.read(&meta.key).await.expect("read metadata").unwrap(),
+            &meta,
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    async fn uring_store_concurrent_writes_use_independent_temps() {
+        let dir = tempdir().expect("create tempdir");
+        let store = UringSidecarMetadataStore::new(dir.path());
+        let first = metadata_for_key_generation("concurrent-key".to_owned(), 1);
+        let second = metadata_for_key_generation("concurrent-key".to_owned(), 2);
+
+        let (first_result, second_result) = tokio::join!(store.write(&first), store.write(&second));
+        first_result.expect("first concurrent write");
+        second_result.expect("second concurrent write");
+
+        let actual = store
+            .read(&first.key)
+            .await
+            .expect("read final metadata")
+            .unwrap();
+        assert!(
+            actual.total_pages == first.total_pages || actual.total_pages == second.total_pages
+        );
+        assert!(metadata_temp_paths(&dir.path().join(&first.key)).is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    async fn uring_store_rejects_replaced_transaction_temp() {
+        use std::sync::OnceLock;
+
+        static SPOOL_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+        fn replace_temp() {
+            let paths = metadata_temp_paths(SPOOL_DIR.get().expect("test spool path set"));
+            assert_eq!(paths.len(), 1);
+            fs::remove_file(&paths[0]).expect("unlink opened transaction temp");
+            fs::write(&paths[0], b"attacker replacement").expect("replace transaction temp");
+        }
+
+        let dir = tempdir().expect("create tempdir");
+        let meta = metadata_for_key_generation("replaced-temp-key".to_owned(), 1);
+        let spool_dir = dir.path().join(&meta.key);
+        SPOOL_DIR
+            .set(spool_dir.clone())
+            .expect("set test spool path");
+        let store = UringSidecarMetadataStore::with_operation_hook(dir.path(), replace_temp);
+
+        assert!(matches!(
+            store.write(&meta).await,
+            Err(BobsError::StorageError(_))
+        ));
+        assert!(!spool_dir.join(META_FILE).exists());
+        assert!(metadata_temp_paths(&spool_dir).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    async fn uring_store_blocking_preparation_does_not_stall_worker_progress() {
+        use crate::io::ring_pool::{scoped_test_ring_pool_override, RingPool, RingPoolOptions};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        fn slow_blocking_preparation() {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
+        let pool = Arc::new(
+            RingPool::new_for_test(RingPoolOptions {
+                shard_count: 1,
+                queue_capacity: 1024,
+                driver_name_prefix: "bobs-metadata-progress-test".to_owned(),
+            })
+            .expect("metadata progress test ring pool should start"),
+        );
+        let _override = scoped_test_ring_pool_override(pool);
+        let dir = tempdir().expect("create tempdir");
+        let store =
+            UringSidecarMetadataStore::with_operation_hook(dir.path(), slow_blocking_preparation);
+        let metadata = metadata_for_key_generation("progress-key".to_owned(), 1);
+        let started = Instant::now();
+
+        let (heartbeat_elapsed, write_result) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                started.elapsed()
+            },
+            store.write(&metadata),
+        );
+
+        write_result.expect("write metadata with io_uring");
+        assert!(
+            heartbeat_elapsed < Duration::from_millis(150),
+            "Tokio worker heartbeat was delayed by uring metadata preparation: {heartbeat_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    async fn cancelled_uring_preparation_cleans_up_tmp_off_worker() {
+        use crate::io::ring_pool::{scoped_test_ring_pool_override, RingPool, RingPoolOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        static PREPARATION_STARTED: AtomicBool = AtomicBool::new(false);
+
+        fn slow_blocking_preparation() {
+            PREPARATION_STARTED.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
+        PREPARATION_STARTED.store(false, Ordering::SeqCst);
+        let pool = Arc::new(
+            RingPool::new_for_test(RingPoolOptions {
+                shard_count: 1,
+                queue_capacity: 1024,
+                driver_name_prefix: "bobs-metadata-cancellation-test".to_owned(),
+            })
+            .expect("metadata cancellation test ring pool should start"),
+        );
+        let _override = scoped_test_ring_pool_override(pool);
+        let dir = tempdir().expect("create tempdir");
+        let store =
+            UringSidecarMetadataStore::with_operation_hook(dir.path(), slow_blocking_preparation);
+        let metadata = metadata_for_key_generation("cancelled-key".to_owned(), 1);
+        let spool_dir = dir.path().join(&metadata.key);
+        let write = tokio::spawn(async move { store.write(&metadata).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !PREPARATION_STARTED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking preparation should start");
+        assert_eq!(
+            metadata_temp_paths(&spool_dir).len(),
+            1,
+            "one transaction-private temporary file should exist while preparation is blocked"
+        );
+
+        write.abort();
+        assert!(
+            write
+                .await
+                .expect_err("aborted metadata write should be cancelled")
+                .is_cancelled(),
+            "metadata write task should report cancellation"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !metadata_temp_paths(&spool_dir).is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled metadata write should clean up its temporary file");
+        assert!(
+            !tokio::fs::try_exists(dir.path().join("cancelled-key").join(META_FILE))
+                .await
+                .expect("inspect final metadata path"),
+            "a write cancelled before submission must not publish metadata"
+        );
     }
 
     #[tokio::test]

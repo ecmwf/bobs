@@ -225,10 +225,8 @@ mod tests {
     use bytes::Bytes;
     use std::collections::HashMap;
     use std::fs::{self, File};
-    use std::future::Future;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use tempfile::tempdir;
@@ -444,24 +442,26 @@ mod tests {
     }
 
     impl MetadataStore for CountingMetadataStore {
-        type WriteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-        type ReadFuture<'a> =
-            Pin<Box<dyn Future<Output = Result<Option<SpoolMetadata>>> + Send + 'a>>;
-        type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-        type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
-
-        fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
-            Box::pin(async move { self.write_sync(metadata) })
+        async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+            let store = self.clone();
+            let metadata = metadata.clone();
+            tokio::task::spawn_blocking(move || store.write_sync(&metadata))
+                .await
+                .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
-            Box::pin(async move { self.read_sync(key) })
+        async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+            let store = self.clone();
+            let key = key.to_owned();
+            tokio::task::spawn_blocking(move || store.read_sync(&key))
+                .await
+                .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
-            Box::pin(async move {
-                let meta_path = self.meta_path(key);
-                let tmp_path = self.tmp_path(key);
+        async fn delete(&self, key: &str) -> Result<()> {
+            let meta_path = self.meta_path(key);
+            let tmp_path = self.tmp_path(key);
+            tokio::task::spawn_blocking(move || {
                 match fs::remove_file(meta_path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -474,10 +474,12 @@ mod tests {
                 }
                 Ok(())
             })
+            .await
+            .map_err(|error| storage_error(io::Error::other(error)))?
         }
 
-        fn list(&self) -> Result<Self::ListIter> {
-            Ok(Vec::new().into_iter())
+        async fn list(&self) -> Result<Vec<Result<SpoolMetadata>>> {
+            Ok(Vec::new())
         }
     }
 
@@ -501,35 +503,27 @@ mod tests {
     }
 
     impl MetadataStore for FailFirstCompleteMetadataStore {
-        type WriteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-        type ReadFuture<'a> =
-            Pin<Box<dyn Future<Output = Result<Option<SpoolMetadata>>> + Send + 'a>>;
-        type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-        type ListIter = std::vec::IntoIter<Result<SpoolMetadata>>;
-
-        fn write<'a>(&'a self, metadata: &'a SpoolMetadata) -> Self::WriteFuture<'a> {
-            Box::pin(async move {
-                if metadata.state == SpoolState::Complete
-                    && !self.failed_once.swap(true, AtomicOrdering::SeqCst)
-                {
-                    return Err(storage_error(io::Error::other(
-                        "injected complete metadata write failure",
-                    )));
-                }
-                self.inner.write(metadata).await
-            })
+        async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
+            if metadata.state == SpoolState::Complete
+                && !self.failed_once.swap(true, AtomicOrdering::SeqCst)
+            {
+                return Err(storage_error(io::Error::other(
+                    "injected complete metadata write failure",
+                )));
+            }
+            self.inner.write(metadata).await
         }
 
-        fn read<'a>(&'a self, key: &'a str) -> Self::ReadFuture<'a> {
-            Box::pin(async move { self.inner.read(key).await })
+        async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
+            self.inner.read(key).await
         }
 
-        fn delete<'a>(&'a self, key: &'a str) -> Self::DeleteFuture<'a> {
-            Box::pin(async move { self.inner.delete(key).await })
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
         }
 
-        fn list(&self) -> Result<Self::ListIter> {
-            Ok(Vec::new().into_iter())
+        async fn list(&self) -> Result<Vec<Result<SpoolMetadata>>> {
+            Ok(Vec::new())
         }
     }
 
