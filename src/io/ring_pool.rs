@@ -86,6 +86,10 @@ pub(crate) enum Request {
         fd: Arc<OwnedFd>,
         tx: UnitSender,
     },
+    SyncDirectory {
+        fd: Arc<OwnedFd>,
+        tx: UnitSender,
+    },
     Remove {
         path: CString,
         tx: UnitSender,
@@ -122,6 +126,7 @@ pub(crate) enum RingPoolOperationKind {
     DataRead,
     DataSync,
     MetadataCommit,
+    DirectorySync,
 }
 
 #[cfg(test)]
@@ -661,6 +666,10 @@ enum InFlightKind {
         fd: Arc<OwnedFd>,
         tx: Option<UnitSender>,
     },
+    SyncDirectory {
+        fd: Arc<OwnedFd>,
+        tx: Option<UnitSender>,
+    },
     Remove {
         path: CString,
         tx: Option<UnitSender>,
@@ -931,6 +940,9 @@ impl RingDriver {
             },
             Request::SyncData { fd, tx } => InFlight {
                 kind: InFlightKind::SyncData { fd, tx: Some(tx) },
+            },
+            Request::SyncDirectory { fd, tx } => InFlight {
+                kind: InFlightKind::SyncDirectory { fd, tx: Some(tx) },
             },
             Request::Remove { path, tx } => InFlight {
                 kind: InFlightKind::Remove { path, tx: Some(tx) },
@@ -1211,7 +1223,9 @@ impl RingDriver {
                     send_read(tx, Ok(Bytes::from(std::mem::take(buf))));
                 }
             }
-            InFlightKind::SyncData { tx, .. } | InFlightKind::Remove { tx, .. } => {
+            InFlightKind::SyncData { tx, .. }
+            | InFlightKind::SyncDirectory { tx, .. }
+            | InFlightKind::Remove { tx, .. } => {
                 send_unit(tx, Ok(()));
             }
             InFlightKind::MetadataCommit { .. } => {
@@ -1320,6 +1334,7 @@ impl RingDriver {
                 InFlightKind::Write { tx, .. } => send_write(tx, Err(error)),
                 InFlightKind::Read { tx, .. } => send_read(tx, Err(error)),
                 InFlightKind::SyncData { tx, .. }
+                | InFlightKind::SyncDirectory { tx, .. }
                 | InFlightKind::Remove { tx, .. }
                 | InFlightKind::MetadataCommit { tx, .. } => send_unit(tx, Err(error)),
             }
@@ -1475,6 +1490,9 @@ fn build_entry(id: u64, in_flight: &mut InFlight) -> squeue::Entry {
         InFlightKind::SyncData { fd, .. } => opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
             .flags(types::FsyncFlags::DATASYNC)
             .build(),
+        InFlightKind::SyncDirectory { fd, .. } => {
+            opcode::Fsync::new(types::Fd(fd.as_raw_fd())).build()
+        }
         InFlightKind::Remove { path, .. } => {
             opcode::UnlinkAt::new(types::Fd(AT_FDCWD), path.as_ptr()).build()
         }
@@ -1596,6 +1614,10 @@ impl InFlight {
                 fd,
                 tx: tx.take().expect("sync sender missing"),
             },
+            InFlightKind::SyncDirectory { fd, mut tx } => Request::SyncDirectory {
+                fd,
+                tx: tx.take().expect("directory sync sender missing"),
+            },
             InFlightKind::Remove { path, mut tx } => Request::Remove {
                 path,
                 tx: tx.take().expect("remove sender missing"),
@@ -1646,6 +1668,7 @@ fn fail_request(request: Request, error: Error) {
             let _ = tx.send(Err(error));
         }
         Request::SyncData { tx, .. }
+        | Request::SyncDirectory { tx, .. }
         | Request::Remove { tx, .. }
         | Request::MetadataCommit { tx, .. } => {
             let _ = tx.send(Err(error));

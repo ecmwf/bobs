@@ -106,6 +106,7 @@ pub mod reason {
     pub const IDLE_TTL: &str = "idle_ttl";
     pub const FULL_READ_TTL: &str = "full_read_ttl";
     pub const WRITER_TIMEOUT: &str = "writer_timeout";
+    pub const DELETE_RETRY: &str = "delete_retry";
 }
 
 /// Read mode label values.
@@ -127,7 +128,6 @@ pub mod state {
     pub const WRITING: &str = "writing";
     pub const WRITE_LOCKED: &str = "write_locked";
     pub const COMPLETE: &str = "complete";
-    pub const READABLE: &str = "readable";
 }
 
 /// Central metrics handle holding all bobs instruments.
@@ -163,6 +163,7 @@ struct InnerMetrics {
     // System-level
     spools_active: UpDownCounter<i64>,
     disk_usage: Gauge<u64>,
+    recovery_spools: Gauge<u64>,
     cache_hits: Counter<u64>,
     cache_misses: Counter<u64>,
 }
@@ -275,11 +276,17 @@ impl BobsMetrics {
                 .i64_up_down_counter("bobs.spools.active")
                 .with_description("Currently active spools by state")
                 .build(),
-            // Gauge: same rule as byte counter — keep "bytes" in name, omit
+            // Gauge: same rule as byte counter — keep "bytes" in the name, omit
             // unit annotation.
             disk_usage: meter
                 .u64_gauge("bobs.disk.usage.bytes")
                 .with_description("Disk usage of the spool data directory")
+                .build(),
+            recovery_spools: meter
+                .u64_gauge("bobs.recovery.spools")
+                .with_description(
+                    "Configured, recovered, and quarantined spool counts from startup recovery",
+                )
                 .build(),
             cache_hits: meter
                 .u64_counter("bobs.pages.cache.hits")
@@ -480,6 +487,29 @@ impl BobsMetrics {
         }
     }
 
+    /// Record the bounded startup recovery result. `status` is deliberately a
+    /// fixed low-cardinality dimension rather than a spool key.
+    #[allow(unused_variables)]
+    pub fn record_recovery_snapshot(
+        &self,
+        configured: usize,
+        recovered: usize,
+        quarantined: usize,
+    ) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            for (status, value) in [
+                ("configured", configured),
+                ("recovered", recovered),
+                ("quarantined", quarantined),
+            ] {
+                inner
+                    .recovery_spools
+                    .record(value as u64, &[KeyValue::new("status", status)]);
+            }
+        }
+    }
+
     /// Record current disk usage in bytes (called once per cleanup sweep).
     #[allow(unused_variables)]
     pub fn record_disk_usage(&self, bytes: u64) {
@@ -515,6 +545,7 @@ mod tests {
         metrics.record_state_transition(Some(state::WRITING), state::COMPLETE);
         metrics.record_cache_hit();
         metrics.record_cache_miss();
+        metrics.record_recovery_snapshot(3, 2, 1);
     }
 
     #[test]

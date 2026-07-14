@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Operational ceiling for one page and its per-request/recovery staging buffer.
+pub const MAX_PAGE_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -15,8 +18,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub page_size: usize,
     pub max_cache_bytes: usize,
-    /// Maximum number of spools that may concurrently hold first-read cache memory.
-    /// Writers block on create until a slot frees.
+    /// Maximum number of spools admitted to the live registry and cache lifecycle.
+    /// Writers wait for a slot; startup leaves excess durable spools quarantined.
     pub max_live_spools: usize,
     pub writer_inactivity_timeout_secs: u64,
     /// Idle TTL (seconds) anchored on the time the spool became readable,
@@ -111,10 +114,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> std::io::Result<()> {
-        if self.page_size == 0 {
+        if self.page_size == 0 || self.page_size > MAX_PAGE_SIZE_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "page_size must be greater than 0",
+                format!("page_size must be in 1..={MAX_PAGE_SIZE_BYTES} bytes (64 MiB)"),
             ));
         }
 
@@ -328,6 +331,22 @@ route_name: test-route
 
         let err = config.validate().expect_err("validation should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_page_size_above_maximum() {
+        for page_size in [MAX_PAGE_SIZE_BYTES + 1, usize::MAX] {
+            let config = Config {
+                page_size,
+                host_prefix: "test".into(),
+                domain: "example.com".into(),
+                route_name: "bobs".into(),
+                ..Config::default()
+            };
+            let error = config.validate().expect_err("oversized page must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("64 MiB"));
+        }
     }
 
     #[test]

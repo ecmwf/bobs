@@ -44,7 +44,7 @@ Each spool is stored in its own directory:
   meta.json
 ```
 
-`spool.dat` contains accepted payload bytes. `meta.json` is a sidecar metadata file containing lifecycle state, content metadata, timestamps, byte counts, page counts, final partial-page size, and the data path.
+`spool.dat` contains accepted payload bytes. `meta.json` is a sidecar metadata file containing lifecycle state, content metadata, timestamps, byte counts, page counts, final partial-page size, and a compatibility `data_path` value. The persisted path is never filesystem authority during recovery.
 
 Sidecar metadata commits are atomic at the file level: BOBS writes `meta.json.tmp`, syncs that file, renames it over `meta.json`, and syncs the spool directory. Recovery ignores leftover temporary metadata files.
 
@@ -81,7 +81,7 @@ A request without `Range`, or with `Range: bytes=X-`, enters follow mode. If the
 
 When the long-poll timeout fires, BOBS returns `307 Temporary Redirect` to a read URL for the same key. If a trusted ingress supplies a valid `X-Forwarded-Prefix`, the redirect preserves that external prefix; otherwise it falls back to `/api/v1/read/{key}`. The redirect is temporary and includes `Cache-Control: no-store` because the location can depend on request headers.
 
-Range reads update aggregate read-coverage tracking so cleanup can detect when the whole object has been served, even across multiple range requests.
+Range reads update bounded aggregate coverage tracking so cleanup can detect when the whole object has been served across requests. Adjacent and overlapping progress is coalesced; genuinely fragmented access that exceeds the interval cap conservatively stops aggregate tracking. It cannot produce a false full-read result, but one later successfully completed contiguous full-object response provides exact evidence and restores the full-read transition.
 
 ## Write-locked spools
 
@@ -91,18 +91,27 @@ The write-lock state is lifecycle metadata in `meta.json` and is recovered on re
 
 ## Completion and durability boundary
 
-`/complete` validates the optional expected size before publishing final state. It then publishes any trailing partial page, syncs `spool.dat`, commits final metadata to `meta.json`, updates in-memory state/cache, and notifies readers.
+Each write and completion call first waits on a one-permit, per-spool operation gate before spawning owned work. Waiting callers are cancellable and create no detached task. An admitted owned transaction retains the operation permit and then the lifecycle lock through backend I/O and all metadata, buffer, cache, and notification publication, so a cancelled request cannot overlap a retry with unfinished owned I/O.
 
-After successful completion, `meta.json` is the durable completed-object record. Before completion, BOBS provides process-restart recovery from `spool.dat`, not stable-storage durability for each acknowledged page.
+The mutation lock order is operation gate, lifecycle lock, then write buffer. Cleanup revalidation, deletion, and read/write activity ordering take the lifecycle lock without taking the operation gate, so no reverse acquisition path exists. Readers release metadata, cache, and file-handle guards before recording lifecycle activity.
+
+`/complete` validates the optional expected size inside the admitted owned transaction. The transaction syncs `spool.dat`, commits a durable `Completing` marker containing the exact candidate page layout, commits `Complete`, updates in-memory metadata, and finally clears the volatile trailing buffer and optionally populates the page cache. The cache is never authoritative; readers can reconstruct every page from `spool.dat`.
+
+After successful completion, `meta.json` is the durable completed-object record. Before the `Completing` marker, BOBS provides process-restart recovery from `spool.dat`, not stable-storage durability for each acknowledged page. Once that marker is durable, writes remain permanently fail-stop and recovery either finalizes its exact candidate or quarantines inconsistent data unchanged.
 
 ## Recovery
 
 Startup recovery scans `data_dir` for spool directories with `meta.json` sidecars.
 
+Recovery derives the only usable payload path as `<data_dir>/<scanned-key>/spool.dat`; absolute, traversal, stale, and cross-spool `data_path` values from JSON are treated as untrusted metadata and are never statted, opened, written, or deleted. The canonical local entry must be a regular file and is opened without following a final symlink. Missing, symlink, and non-regular payload entries quarantine that key directory unchanged. If the persisted path is stale but the canonical local regular file exists, recovery atomically rewrites `meta.json` to the canonical path before admitting the spool. Corrupt-sidecar cleanup is likewise scoped to the scanned key directory.
+
+Recovery uses one top-level directory scan, reads sidecars individually, and keeps only compact key/activity indexing plus the bounded preferred candidate heap. Each sidecar is statted before allocation and is limited to 1 MiB. Oversized payloads and payloads with unknown fields are preserved unchanged as unsupported quarantine; malformed known-schema JSON is isolated to per-key corrupt cleanup. Every metadata-valid candidate is no-follow open-preflighted, while retained descriptors remain bounded by `max_live_spools`; excess candidates are closed without payload reads or sidecar rewrites. Selected candidates are reread before admission.
+
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
+- Valid `Completing` markers are deterministically finalized to `Complete`; inconsistent markers and data are quarantined without mutation and are never reopened for writes.
 - `Complete` spools are accepted only if `spool.dat` satisfies the committed logical length.
 - Interrupted metadata temp files are ignored.
-- Unsafe or unrelated directories are not blindly removed. Orphan cleanup is restricted to UUID-shaped spool directories that look like BOBS spool directories.
+- Unsafe or unrelated directories are not blindly removed. Recognised-key directories left truly empty by a pre-marker create crash are removed with a `data_dir` fsync; non-empty markerless directories are retained unchanged, while ordinary orphan cleanup remains restricted to recognised spool-shaped directories.
 
 ## Cleanup rules
 
@@ -112,6 +121,6 @@ Current cleanup triggers are:
 
 - writer inactivity for producers that stop writing without completing;
 - read-idle TTL for readable spools that have not served bytes recently, with never-read spools anchored at `readable_at`;
-- full-read-complete TTL once aggregate coverage shows every byte has been served at least once.
+- full-read-complete TTL once bounded aggregate coverage, or one completed contiguous full-object response after fragmented fallback, proves every byte has been served.
 
 Slow readers keep a spool alive only while they continue making read progress. Stalled connections do not protect a spool forever.

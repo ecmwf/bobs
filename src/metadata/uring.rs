@@ -6,9 +6,9 @@
 use super::TMP_FILE;
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use super::{
-    create_metadata_temp, remove_file_if_present, run_blocking, storage_error, CreatedMetadataTemp,
-    MetadataFileIdentity, MetadataStore, SyncSidecarMetadataStore, UringSidecarMetadataStore,
-    META_FILE,
+    create_metadata_temp, ensure_sidecar_size, remove_file_if_present, run_blocking, storage_error,
+    CreatedMetadataTemp, MetadataDirectoryScan, MetadataFileIdentity, MetadataStore,
+    SyncSidecarMetadataStore, UringSidecarMetadataStore, META_FILE,
 };
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 use crate::error::{BobsError, Result};
@@ -138,6 +138,7 @@ impl UringSidecarMetadataStore {
     async fn write_uring(&self, metadata: &SpoolMetadata) -> Result<()> {
         let payload = serde_json::to_vec(metadata)
             .map_err(|error| BobsError::SerializationError(error.to_string()))?;
+        ensure_sidecar_size(payload.len() as u64)?;
         let pool = crate::io::ring_pool::global_or_default_ring_pool().map_err(storage_error)?;
 
         let spool_dir = self.spool_dir(&metadata.key);
@@ -235,9 +236,9 @@ impl MetadataStore for UringSidecarMetadataStore {
         store.delete(key).await
     }
 
-    async fn list(&self) -> Result<Vec<Result<SpoolMetadata>>> {
+    async fn scan(&self) -> Result<MetadataDirectoryScan> {
         let store = self.sync_store();
-        store.list().await
+        store.scan().await
     }
 }
 
@@ -596,6 +597,7 @@ mod tests {
             last_write_at: 20 + generation,
             last_read_at: None,
             readable_at: Some(30 + generation),
+            page_size: 4096,
             total_bytes_written: generation * 4096,
             total_pages: generation,
             final_page_size: if generation == 0 { None } else { Some(4096) },
@@ -718,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-    async fn uring_store_write_read_delete_and_list() {
+    async fn uring_store_write_read_delete_and_scan() {
         let dir = tempdir().expect("create tempdir");
         let store = UringSidecarMetadataStore::new(dir.path());
         let meta = metadata_for_key_generation("sidecar-test-key".to_string(), 1);
@@ -737,15 +739,10 @@ mod tests {
             &meta,
         );
 
-        let listed = store
-            .list()
-            .await
-            .expect("list metadata")
-            .into_iter()
-            .collect::<Result<Vec<_>>>()
-            .expect("listed metadata parses");
-        assert_eq!(listed.len(), 1);
-        assert_metadata_eq(listed.into_iter().next().expect("listed metadata"), &meta);
+        let mut scan = store.scan().await.expect("scan metadata");
+        let entry = scan.next().await.expect("one entry").expect("valid entry");
+        assert_eq!(entry.name, meta.key);
+        assert!(scan.next().await.is_none());
 
         store.delete(&meta.key).await.expect("delete metadata");
         assert!(store

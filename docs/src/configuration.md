@@ -37,9 +37,10 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `data_dir` | `./data` | File system path for storing spool files. |
 | `page_size` | `4096` | Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. |
 | `max_cache_bytes` | `1048576` | Global byte budget for the in-memory page cache across all spools. Set to `0` to disable caching. If an individual page is larger than this cap, that page bypasses the cache and remains readable from disk. |
+| `max_live_spools` | `4096` | Non-zero admission bound for live spools. New writers wait when the bound is full. Startup recovers at most this many spools and leaves excess durable entries quarantined for a later restart with capacity. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. |
-| `full_read_complete_ttl_secs` | `30` | Short TTL after BOBS has served every byte of the object at least once, possibly across multiple range requests, and no further bytes have been served. |
+| `full_read_complete_ttl_secs` | `30` | Short TTL after bounded coverage tracking proves every byte was served and no later bytes were served. Adjacent/overlapping ranges coalesce. If genuinely fragmented access exceeds the tracking cap, BOBS stays on the idle TTL until a later completed contiguous full-object response proves coverage exactly. |
 | `reader_done_ttl_secs` | `60` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. |
@@ -54,6 +55,8 @@ cargo build --release --bins --features tokio-fileio-fallback
 | `metrics.allowed_labels` | `[]` | Caller-provided label keys forwarded as metric attributes. Empty list means all caller labels pass through. Set to a non-empty list to restrict label cardinality. |
 | `metrics.max_label_value_length` | `128` | Maximum byte length for label values. Values exceeding this limit are truncated before recording. |
 
+Recovery metadata has a fixed safety policy rather than a configuration field: `meta.json` is limited to 1 MiB and its size is checked before read allocation. Oversized or unknown-field payloads are preserved unchanged but unavailable, allowing operator inspection or a newer compatible binary to recover them.
+
 ## Example
 
 ```yaml
@@ -62,6 +65,7 @@ port: 3000
 data_dir: /data/bobs
 page_size: 4096
 max_cache_bytes: 1048576          # global page-cache byte budget; set to 0 to disable caching
+max_live_spools: 4096              # live create/recovery admission bound; must be non-zero
 writer_inactivity_timeout_secs: 300
 read_idle_ttl_secs: 600
 full_read_complete_ttl_secs: 30

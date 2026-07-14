@@ -19,7 +19,6 @@ use axum::{Json, Router};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -376,6 +375,10 @@ where
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
                 if let Ok(data) = frame.into_data() {
+                    // Refresh before buffering the frame. Sub-page frames may not
+                    // reach Spool::write until the request body ends, but cleanup
+                    // must still order this accepted activity against deletion.
+                    spool.refresh_write_activity(now_secs()).await?;
                     let mut cursor = 0;
                     while cursor < data.len() {
                         let remaining_batch_space = write_batch_size - pending.len();
@@ -494,6 +497,42 @@ struct ResolvedReadRange {
     start: u64,
     end: Option<u64>,
     follow: bool,
+}
+
+#[derive(Debug)]
+struct ContiguousResponseProgress {
+    start: u64,
+    next: u64,
+    contiguous: bool,
+}
+
+impl ContiguousResponseProgress {
+    fn new(start: u64) -> Self {
+        Self {
+            start,
+            next: start,
+            contiguous: true,
+        }
+    }
+
+    fn record(&mut self, start: u64, end: u64) {
+        if !self.contiguous || start != self.next || start >= end {
+            self.contiguous = false;
+            return;
+        }
+        self.next = end;
+    }
+
+    fn successful_completion(
+        &self,
+        expected_end: u64,
+        outcome: &'static str,
+    ) -> Option<(u64, u64)> {
+        (self.contiguous
+            && self.next == expected_end
+            && outcome == crate::metrics::outcome::SUCCESS)
+            .then_some((self.start, self.next))
+    }
 }
 
 fn resolve_read_range(
@@ -683,10 +722,17 @@ where
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
 
-        if !spool.is_readable().await {
-            return Err(ApiError(BobsError::SpoolLocked));
+        {
+            let _lifecycle_guard = spool.lifecycle_lock.lock().await;
+            let meta = spool.metadata.lock().await;
+            if meta.state == crate::spool::SpoolState::Deleting {
+                return Err(ApiError(BobsError::SpoolNotFound { key: key.clone() }));
+            }
+            if !meta.state.is_readable() || (meta.state == crate::spool::SpoolState::Writing && meta.write_locked) {
+                return Err(ApiError(BobsError::SpoolLocked));
+            }
+            spool.acquire_reader();
         }
-        spool.acquire_reader();
 
         let read_labels = spool.metadata.lock().await.labels.clone();
         let read_mode = if matches!(request_range, ReadRequestRange::Follow) {
@@ -710,10 +756,7 @@ where
         let page_size = spool.page_size as u64;
         let metadata = {
             let meta = spool.metadata.lock().await;
-            let is_complete = matches!(
-                meta.state,
-                crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting
-            );
+            let is_complete = meta.state == crate::spool::SpoolState::Complete;
             let complete_size = if is_complete {
                 Some(meta.total_bytes_written)
             } else {
@@ -771,6 +814,7 @@ where
         let mut bytes_served = 0_u64;
         let mut outcome = crate::metrics::outcome::SUCCESS;
         let mut prefetched = first_page;
+        let mut response_progress = ContiguousResponseProgress::new(start);
 
         loop {
             if let Some(end) = end {
@@ -833,28 +877,34 @@ where
                 bytes_served += chunk_len;
                 lease.bytes_served = bytes_served;
                 let chunk_end = offset;
+                response_progress.record(chunk_start, chunk_end);
 
-                // 1. Refresh activity timestamp (atomic, lock-free).
+                // Refresh activity and coverage under the lifecycle lock so cleanup
+                // cannot act on a stale eligibility snapshot.
                 let now = now_secs();
-                spool.last_read_activity_at.store(now, Ordering::Relaxed);
-
-                // 2. Record coverage and run the full-read transition when this
-                // chunk completes first coverage of the whole object.
                 spool
                     .mark_served_and_maybe_fully_read(chunk_start, chunk_end, now)
                     .await;
 
-                // 3. Keep legacy last_read_at for observability (not used in new cleanup).
-                {
-                    let mut meta = spool.metadata.lock().await;
-                    meta.last_read_at = Some(now);
+                // If this chunk completes a bounded response, record its exact
+                // contiguous extent before yielding. Hyper may not poll again once
+                // Content-Length is satisfied. In fragmented fallback, only a
+                // completed full-object response can recover coverage.
+                let completed_response = end.and_then(|expected_end| {
+                    response_progress.successful_completion(expected_end, outcome)
+                });
+                if let Some((response_start, response_end)) = completed_response {
+                    spool
+                        .mark_contiguous_response_complete_and_maybe_fully_read(
+                            response_start,
+                            response_end,
+                            now,
+                        )
+                        .await;
                 }
 
-                // 4. If this chunk completes a bounded read, record duration
-                //    NOW before yielding. hyper drops the response body
-                //    without a final poll once Content-Length is satisfied,
-                //    so the post-loop cleanup would never execute.
-                if end.is_some_and(|e| offset >= e) && !lease.duration_recorded {
+                // Record duration before yielding for the same final-poll reason.
+                if completed_response.is_some() && !lease.duration_recorded {
                     let completion_span = request_span(
                         stream_job_id.as_deref(),
                         Some(&stream_key),
@@ -875,7 +925,7 @@ where
                 // loop back and long-poll for more data.
                 let done = {
                     let meta = spool.metadata.lock().await;
-                    matches!(meta.state, crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting)
+                    meta.state == crate::spool::SpoolState::Complete
                         && offset >= meta.total_bytes_written
                 };
                 if done {
@@ -886,6 +936,28 @@ where
                 break;
             }
         }
+        // A chunked follow response can only provide fallback recovery after a
+        // clean end at the completed object's exact size. Error, timeout, client
+        // cancellation, partial and gapped streams never reach this transition.
+        if end.is_none() {
+            let completed_size = {
+                let meta = spool.metadata.lock().await;
+                (meta.state == crate::spool::SpoolState::Complete)
+                    .then_some(meta.total_bytes_written)
+            };
+            if let Some((response_start, response_end)) = completed_size.and_then(|size| {
+                response_progress.successful_completion(size, outcome)
+            }) {
+                spool
+                    .mark_contiguous_response_complete_and_maybe_fully_read(
+                        response_start,
+                        response_end,
+                        now_secs(),
+                    )
+                    .await;
+            }
+        }
+
         // Post-loop fallback for chunked responses (follow mode on
         // in-progress spools) where Content-Length is not set and hyper
         // polls the stream to completion normally.
@@ -1070,6 +1142,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
             BobsError::SpoolNotFound { .. } => StatusCode::NOT_FOUND,
+            BobsError::SpoolAlreadyExists { .. } => StatusCode::CONFLICT,
             BobsError::OffsetMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::SizeMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::InvalidRange(_) => StatusCode::BAD_REQUEST,
@@ -1113,6 +1186,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use serde_json::Value;
+    use std::sync::atomic::Ordering;
     use tower::ServiceExt;
 
     fn test_config(dir: &std::path::Path) -> Arc<Config> {
@@ -1242,6 +1316,42 @@ mod tests {
             chunk.as_ptr(),
             unsafe { page.as_ptr().add(slice_start) },
             "chunk should point into the cached page allocation"
+        );
+    }
+
+    #[test]
+    fn contiguous_response_progress_rejects_gaps_partial_errors_and_timeouts() {
+        let mut partial = ContiguousResponseProgress::new(0);
+        partial.record(0, 50);
+        assert_eq!(
+            partial.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            None
+        );
+
+        let mut gapped = ContiguousResponseProgress::new(0);
+        gapped.record(0, 50);
+        gapped.record(51, 100);
+        assert_eq!(
+            gapped.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            None
+        );
+
+        let mut full = ContiguousResponseProgress::new(0);
+        full.record(0, 50);
+        full.record(50, 100);
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::ERROR),
+            None,
+            "errored response must not recover coverage"
+        );
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::TIMEOUT),
+            None,
+            "timed-out response must not recover coverage"
+        );
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            Some((0, 100))
         );
     }
 
@@ -1619,6 +1729,22 @@ mod tests {
             .expect("request build");
         let resp = app.oneshot(req).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_read_deleting_spool_returns_not_found() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        spool.metadata.lock().await.state = crate::spool::SpoolState::Deleting;
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2201,6 +2327,107 @@ mod tests {
         assert_eq!(meta.total_bytes_written, 8192);
     }
 
+    #[tokio::test]
+    async fn sub_page_frame_refreshes_activity_before_spool_write() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        spool.metadata.lock().await.last_write_at = 1;
+        let (frame_consumed_tx, frame_consumed_rx) = tokio::sync::oneshot::channel();
+        let (finish_body_tx, finish_body_rx) = tokio::sync::oneshot::channel();
+
+        let body_stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"sub-page"));
+            let _ = frame_consumed_tx.send(());
+            let _ = finish_body_rx.await;
+        };
+        let write_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from_stream(body_stream))
+            .expect("request build");
+        let write_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.oneshot(write_req).await.expect("write oneshot") }
+        });
+
+        frame_consumed_rx
+            .await
+            .expect("handler must consume the sub-page frame before waiting for body end");
+        let meta = spool.metadata.lock().await;
+        assert!(
+            meta.last_write_at > 1,
+            "the frame itself must refresh writer activity"
+        );
+        assert_eq!(
+            meta.total_bytes_written, 0,
+            "sub-page data must still be pending, proving Spool::write did not refresh it"
+        );
+        drop(meta);
+
+        finish_body_tx
+            .send(())
+            .expect("write request still waiting");
+        assert_eq!(
+            write_task.await.expect("write task join").status(),
+            StatusCode::OK
+        );
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 8);
+    }
+
+    #[tokio::test]
+    async fn frame_refresh_rejection_surfaces_completion_and_delete_states() {
+        for delete_before_frame in [false, true] {
+            let (app, state) = app_with_state().await;
+            let key = create_key(&app).await;
+            let spool = state.manager.get_spool(&key).expect("spool exists");
+            let (body_polled_tx, body_polled_rx) = tokio::sync::oneshot::channel();
+            let (release_frame_tx, release_frame_rx) = tokio::sync::oneshot::channel();
+            let body_stream = async_stream::stream! {
+                let _ = body_polled_tx.send(());
+                let _ = release_frame_rx.await;
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"));
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/write/{key}/0"))
+                .body(Body::from_stream(body_stream))
+                .expect("request build");
+            let task = tokio::spawn({
+                let app = app.clone();
+                async move { app.oneshot(request).await.expect("write oneshot") }
+            });
+            body_polled_rx
+                .await
+                .expect("handler captured the spool before lifecycle transition");
+
+            let expected = if delete_before_frame {
+                state
+                    .manager
+                    .delete_spool(&key)
+                    .await
+                    .expect("delete before frame");
+                StatusCode::NOT_FOUND
+            } else {
+                spool.complete(None).await.expect("complete before frame");
+                StatusCode::CONFLICT
+            };
+            release_frame_tx
+                .send(())
+                .expect("handler still polling body");
+            assert_eq!(
+                task.await.expect("write task join").status(),
+                expected,
+                "HTTP must return the lifecycle refresh rejection"
+            );
+            assert_eq!(
+                spool.metadata.lock().await.total_bytes_written,
+                0,
+                "rejected frame must never reach the pending buffer or data file"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Read-coverage tracking — full_object_read_at and last_read_activity_at
     // -----------------------------------------------------------------------
@@ -2248,6 +2475,72 @@ mod tests {
             cache.contains(&key, 0) || cache.contains(&key, 1),
             "partial reads must not free this spool's page cache entries"
         );
+    }
+
+    #[tokio::test]
+    async fn fragmented_fallback_requires_one_completed_full_range() {
+        let (app, state) = app_with_state().await;
+        let key = write_and_complete(&app, vec![7u8; 8192]).await;
+        let spool = state.manager.get_spool(&key).expect("spool must exist");
+
+        {
+            let mut missing = spool.missing_ranges.lock().await;
+            for fragment in 0u64..1025 {
+                let start = fragment * 2;
+                missing.mark_served(start, start + 1);
+            }
+            assert!(
+                missing.is_capped(),
+                ">1024 disjoint fragments must cap tracking"
+            );
+            assert!(
+                !missing.is_complete(),
+                "overflow must not claim full coverage"
+            );
+        }
+        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // A completed partial response is insufficient exact evidence.
+        assert_eq!(
+            range_read_drain(&app, &key, "bytes=0-4095").await,
+            StatusCode::PARTIAL_CONTENT
+        );
+        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // Dropping a full-range body after its first page must not commit the
+        // response-level fallback, even though per-page activity was recorded.
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header(axum::http::header::RANGE, "bytes=0-8191")
+            .body(Body::empty())
+            .expect("build range request");
+        let response = app.clone().oneshot(request).await.expect("range oneshot");
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("first frame")
+            .expect("first frame succeeds")
+            .into_data()
+            .expect("data frame");
+        assert_eq!(first.len(), 4096);
+        drop(body);
+        tokio::task::yield_now().await;
+        assert_eq!(spool.full_object_read_at.load(Ordering::SeqCst), 0);
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // A subsequent successfully drained contiguous full range re-establishes
+        // exact coverage and releases this spool's admission permit.
+        assert_eq!(
+            range_read_drain(&app, &key, "bytes=0-8191").await,
+            StatusCode::PARTIAL_CONTENT
+        );
+        assert!(spool.full_object_read_at.load(Ordering::SeqCst) > 0);
+        assert_eq!(state.manager.admission.available_permits(), 256);
+        assert!(!spool.missing_ranges.lock().await.is_capped());
     }
 
     /// Two non-overlapping ranges that together cover the full 8 KiB object
@@ -2393,6 +2686,20 @@ mod tests {
         );
     }
 
+    async fn wait_for_spool_removal(
+        state: &AppState<DefaultFileIO, DefaultMetadataStore>,
+        key: &str,
+    ) {
+        for _ in 0..2_000 {
+            if state.manager.get_spool(key).is_none() {
+                return;
+            }
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+                .await
+                .expect("removal wait task panicked");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Cleanup TTL integration — HTTP read → cleanup deletion
     //
@@ -2434,6 +2741,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&state, &key).await;
         assert!(
             state.manager.get_spool(&key).is_none(),
             "spool must be deleted after full-read TTL expires"
@@ -2466,6 +2774,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
 
+        wait_for_spool_removal(&state, &key).await;
         assert!(
             state.manager.get_spool(&key).is_none(),
             "unread spool must be deleted after idle TTL expires"
@@ -2515,10 +2824,9 @@ mod tests {
         spool.last_read_activity_at.store(1, Ordering::SeqCst);
 
         tokio::time::advance(Duration::from_secs(3)).await;
-        // measure_disk_usage is now spawned fire-and-forget, so the cleanup
-        // loop returns to interval.tick() without blocking on spawn_blocking
-        // I/O.  A single yield is enough for the deletion sweep to run.
+        // Deletion now stays visible until metadata and directory removal finish.
         tokio::task::yield_now().await;
+        wait_for_spool_removal(&state, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),

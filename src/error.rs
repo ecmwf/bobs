@@ -9,6 +9,9 @@ pub enum BobsError {
     #[error("spool not found: {key}")]
     SpoolNotFound { key: String },
 
+    #[error("spool already exists: {key}")]
+    SpoolAlreadyExists { key: String },
+
     #[error("spool is closed")]
     SpoolClosed,
 
@@ -30,6 +33,9 @@ pub enum BobsError {
     #[error("range not satisfiable: {reason}")]
     RangeNotSatisfiable { total: Option<u64>, reason: String },
 
+    #[error("configuration error: {0}")]
+    ConfigurationError(String),
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
@@ -38,6 +44,12 @@ pub enum BobsError {
 
     #[error("serialization error: {0}")]
     SerializationError(String),
+
+    #[error("metadata sidecar is too large: {actual} bytes exceeds {maximum}-byte limit")]
+    MetadataTooLarge { actual: u64, maximum: u64 },
+
+    #[error("metadata sidecar contains unsupported field: {field}")]
+    MetadataUnknownField { field: String },
 
     #[error("invalid state transition: cannot {attempted_action} when in {current} state")]
     InvalidState {

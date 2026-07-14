@@ -50,15 +50,21 @@ This protocol keeps metadata off the write hot path while still making lifecycle
 
 On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. For in-progress `Writing` and `WriteLocked` spools, `spool.dat` is authoritative for byte state. Any persisted `total_bytes_written`, `total_pages`, or `final_page_size` for those states is advisory only and recovery recomputes it from the file.
 
+Persisted `data_path` is untrusted during recovery. BOBS derives the payload location solely from the scanned directory key as `<data_dir>/<key>/spool.dat`; it never follows an absolute, traversal, or cross-spool path stored in JSON. The local entry must be a regular file and is opened without following a final symlink. Missing, symlink, and non-regular entries are quarantined non-destructively. A stale path from a relocated `data_dir` is atomically rewritten only when the canonical local regular file exists, and corrupt cleanup remains confined to the scanned key directory.
+
+Recovery admission uses the same non-zero `max_live_spools` bound as normal creation and applies it uniformly to in-progress and complete spools. Candidates with newer persisted activity are considered first, with the key as a deterministic tie-breaker. Metadata-only lifecycle, migration, and layout checks run before admission, so invalid candidates cannot occupy capacity; failed admitted candidates release their permit and recovery continues. Every metadata-valid candidate is no-follow open-preflighted, but only a `max_live_spools`-bounded preferred set retains handles and only admitted in-progress spools load partial tails. Excess entries are closed after preflight and stay durable but unavailable without data reads or sidecar rewrites. Increasing capacity on a later restart admits more of this quarantined set.
+
+Recovery performs one top-level directory scan and processes sidecars with bounded reads. `meta.json` is limited to 1 MiB; the open file's size is checked before allocating its read buffer. Oversized sidecars and sidecars with unknown JSON fields are preserved unchanged and quarantined as unsupported, while malformed sidecars are handled as per-key corruption. Candidate ordering keeps compact key/activity summaries, and full metadata is retained only for the candidate currently being validated or admitted.
+
 A background task periodically sweeps the spool manager and deletes spools based on three triggers:
 
 - **Writer Inactivity**: The producer stopped writing without completing the spool.
 - **Read Idle TTL**: The spool is readable but has not served bytes for `read_idle_ttl_secs`. For never-read spools, this timer starts when the spool becomes readable.
-- **Full Read TTL**: BOBS has served every byte of the object at least once, possibly across multiple range requests, and `full_read_complete_ttl_secs` has elapsed since the latest read activity.
+- **Full Read TTL**: Bounded coverage tracking, or an exact completed full-object response after fragmented fallback, has proved every byte was served; `full_read_complete_ttl_secs` has elapsed since the latest read activity.
 
 Cleanup TTL semantics are unchanged by sidecar metadata. Expired cleanup removes the key directory, including `spool.dat`, `meta.json`, and any interrupted `meta.json.tmp`.
 
-Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. If range access is extremely fragmented, BOBS falls back to the longer idle TTL rather than risking early deletion.
+Coverage tracking uses missing byte ranges rather than per-byte state, so large objects do not require large memory allocations. Adjacent and overlapping pre-completion progress is coalesced before the interval cap is applied, keeping ordinary sequential follow reads O(1). If genuinely fragmented access exceeds the cap, BOBS conservatively falls back to the longer idle TTL and cannot falsely report completion. A later successfully completed contiguous full-object response restores exact complete coverage and the short-TTL/admission-release transition.
 
 ### 9. HTTP/2 Support
 
