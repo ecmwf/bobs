@@ -488,7 +488,7 @@ where
     started_at: Instant,
     duration_recorded: bool,
     bytes_served: u64,
-    response_permit: Option<crate::spool::ReadResponsePermit>,
+    response_permit: Option<crate::spool::ReadResponsePermit<F>>,
 }
 
 fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
