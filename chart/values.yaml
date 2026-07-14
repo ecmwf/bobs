@@ -112,8 +112,8 @@ config:
   # max_spool_bytes. Pages larger than the cache bypass it.
   page_size: 4096
   max_cache_bytes: 1048576
-  # Separate first-read/live-spool admission limit. The explicit chart default
-  # matches max_cache_bytes / page_size; operators may override it in 1..=65536.
+  # Separate first-read and recovery admission limit. The explicit chart default
+  # matches max_cache_bytes / page_size; operators may override it within 1..=65536.
   max_live_spools: 256
   # Per-spool write limit; must be >= page_size. 8 GiB leaves headroom on the default 10 GiB PVC.
   max_spool_bytes: 8589934592
@@ -146,6 +146,7 @@ config:
   metrics:
     enabled: false
     bind_address: "0.0.0.0"
+    # Must differ from config.port when enabled in a telemetry build.
     port: 9464
     allowed_labels:
       - collection
