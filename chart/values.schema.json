@@ -85,13 +85,8 @@
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "data_dir": {
           "type": "string",
-          "pattern": "^/",
-          "not": {
-            "anyOf": [
-              { "const": "/etc/bobs" },
-              { "pattern": "^/etc/bobs/config\\.yaml(/|$)" }
-            ]
-          }
+          "pattern": "^/var/lib/bobs(?:/[^/]+)*$",
+          "not": { "pattern": "(^|/)\\.\\.?(/|$)" }
         },
         "page_size": { "type": "integer", "minimum": 1, "maximum": 67108864 },
         "max_cache_bytes": { "type": "integer", "minimum": 0 },

@@ -116,7 +116,7 @@ spec:
               readOnly: true
             - name: data
               # prettier-ignore
-              mountPath: {{ .Values.config.data_dir | quote }}
+              mountPath: {{ include "bobs.dataDir" . | quote }}
       volumes:
         - name: config
           configMap:

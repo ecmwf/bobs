@@ -153,33 +153,59 @@ cat "${label_renders[@]}" | "$kubeconform_bin" \
   -strict -kubernetes-version 1.31.0 -summary \
   -schema-location default -schema-location "$crd_schema_location"
 
-assert_schema_rejects data-dir-empty --set-string config.data_dir=
-assert_schema_rejects data-dir-relative --set-string config.data_dir=./data
-assert_template_rejects data-dir-empty-template \
-	'config.data_dir must be a non-empty absolute filesystem path' \
-	--set-string config.data_dir=
-assert_template_rejects data-dir-relative-template \
-	'config.data_dir must be a non-empty absolute filesystem path' \
-	--set-string config.data_dir=./data
+safe_data_dirs=(
+  /var/lib/bobs
+  /var/lib/bobs/spools
+  /var/lib/bobs/tenant-a/spools.v1
+)
+for index in "${!safe_data_dirs[@]}"; do
+  safe_data_dir=${safe_data_dirs[$index]}
+  safe_render="$tmp_dir/data-dir-safe-$index.yaml"
+  helm template bobs "$chart_dir" "${common_values[@]}" \
+    --set-string config.data_dir="$safe_data_dir" >"$safe_render"
+  assert_contains "mountPath: \"$safe_data_dir\"" "$safe_render"
+done
 
-assert_schema_rejects data-dir-config-mount --set-string config.data_dir=/etc/bobs
-assert_template_rejects data-dir-config-mount-template \
-	'config.data_dir must not resolve to /etc/bobs because that path is reserved for the config volume mount' \
-	--set-string config.data_dir=/etc/bobs
-assert_template_rejects data-dir-config-mount-trailing-slash-template \
-	'config.data_dir must not resolve to /etc/bobs because that path is reserved for the config volume mount' \
-	--set-string config.data_dir=/etc/bobs/
-assert_template_rejects data-dir-config-mount-cleaned-template \
-	'config.data_dir must not resolve to /etc/bobs because that path is reserved for the config volume mount' \
-	--set-string config.data_dir=/etc/./bobs
-assert_schema_rejects data-dir-config-file --set-string config.data_dir=/etc/bobs/config.yaml
-assert_schema_rejects data-dir-config-file-child --set-string config.data_dir=/etc/bobs/config.yaml/data
-assert_template_rejects data-dir-config-file-template \
-  'config.data_dir must not overlap /etc/bobs/config.yaml because that path is the mounted configuration file' \
-  --set-string config.data_dir=/etc/bobs/config.yaml
-assert_template_rejects data-dir-config-file-cleaned-template \
-  'config.data_dir must not overlap /etc/bobs/config.yaml because that path is the mounted configuration file' \
-  --set-string config.data_dir=/etc/bobs/./config.yaml/data
+unsafe_data_dir_names=(
+  empty
+  relative
+  root
+  usr
+  usr-local-bin
+  etc
+  tmp
+  prefix-lookalike
+  parent-alias
+  dot-alias
+  repeated-slash-root
+  repeated-slash-descendant
+  trailing-slash
+)
+unsafe_data_dirs=(
+  ""
+  ./data
+  /
+  /usr
+  /usr/local/bin
+  /etc
+  /tmp
+  /var/lib/bobs-data
+  /var/lib/bobs/../bobs
+  /var/lib/bobs/./spools
+  /var/lib//bobs
+  /var/lib/bobs//spools
+  /var/lib/bobs/
+)
+for index in "${!unsafe_data_dirs[@]}"; do
+  name=${unsafe_data_dir_names[$index]}
+  unsafe_data_dir=${unsafe_data_dirs[$index]}
+  assert_schema_rejects "data-dir-$name" \
+    --set-string config.data_dir="$unsafe_data_dir"
+  assert_template_rejects "data-dir-$name-template" \
+    'config.data_dir must be /var/lib/bobs or a normalized descendant' \
+    --show-only templates/statefulset.yaml \
+    --set-string config.data_dir="$unsafe_data_dir"
+done
 
 valid_route=$(printf 'r%.0s' {1..63})
 helm template bobs "$chart_dir" "${common_values[@]}" \

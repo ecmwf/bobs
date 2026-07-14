@@ -102,9 +102,10 @@ config:
   host: "0.0.0.0"
   port: 3000
   # Helm deployment profile. These intentionally override the Rust binary defaults
-  # (data_dir ./data, page_size 16 MiB, global cache 256 MiB) with an absolute PVC
-  # path and a lower-latency 4 KiB page / 1 MiB global cache. data_dir must not
-  # resolve to /etc/bobs, which is reserved for the chart's read-only config mount.
+  # (data_dir ./data, page_size 16 MiB, global cache 256 MiB) with a lower-latency
+  # 4 KiB page / 1 MiB global cache. The chart mounts its data volume only at the
+  # normalized /var/lib/bobs path or a descendant so it cannot hide image or system
+  # paths. The standalone binary still accepts other runtime data_dir locations.
   # max_cache_bytes may be smaller than page_size. It also derives the weighted
   # response-lifetime read budget as max(1, floor(max_cache_bytes / page_size)); 0
   # disables caching but retains one bounded disk-backed response.
@@ -159,9 +160,8 @@ config:
       interval: 30s
       labels: {}
 
-# BOBS requires data_dir to be a mounted filesystem directory distinct from the
-# fixed /etc/bobs config mount. Raw Block PVCs are unsupported;
-# persistence.volumeMode is fixed to Filesystem.
+# The chart mounts BOBS data only at /var/lib/bobs or a normalized descendant.
+# Raw Block PVCs are unsupported; persistence.volumeMode is fixed to Filesystem.
 
 persistence:
   enabled: true

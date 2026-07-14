@@ -16,7 +16,7 @@ data:
   config.yaml: |
     host: {{ .Values.config.host | quote }}
     port: {{ .Values.config.port }}
-    data_dir: {{ .Values.config.data_dir | quote }}
+    data_dir: {{ include "bobs.dataDir" . | quote }}
     page_size: {{ int .Values.config.page_size }}
     max_cache_bytes: {{ int .Values.config.max_cache_bytes }}
     max_live_spools: {{ int .Values.config.max_live_spools }}

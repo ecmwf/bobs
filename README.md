@@ -212,13 +212,14 @@ route_name: download
 `chart/` is the source of truth for the BOBS Helm chart. `polytope-chart`
 vendors a packaged copy and verifies it against a pinned commit from this repository.
 
-The chart requires `config.data_dir` to be a non-empty absolute path mounted as
-a directory. It rejects `/etc/bobs` (including path aliases that clean to it)
-because that path is already the fixed config volume mount. It also rejects the
-mounted `/etc/bobs/config.yaml` file and descendants, where a directory mount
-would hide or descend through the required config file. It supports only
-`persistence.volumeMode: Filesystem`; raw `Block` PVCs are rejected and are
-never rendered as `volumeDevices`. Chart values also limit
+The chart restricts `config.data_dir` to `/var/lib/bobs` or a normalized
+descendant and mounts the managed PVC or `emptyDir` there. `.` and `..` segments,
+repeated slashes, and trailing slashes are rejected, so chart-managed storage
+cannot hide the image root, executables, or system paths. This mount restriction
+applies only to this Helm chart: BOBS itself still accepts other runtime
+`data_dir` locations, including relative paths, when deployed without the chart.
+The chart supports only `persistence.volumeMode: Filesystem`; raw `Block` PVCs
+are rejected and are never rendered as `volumeDevices`. Chart values also limit
 `config.max_live_spools` to `65536`. When metrics are enabled,
 `config.metrics.port` must differ from `config.port`; Helm's template validation
 enforces this cross-field rule because JSON Schema cannot compare the two ports.

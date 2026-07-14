@@ -129,19 +129,20 @@ requires an explicit existing headless Service in the release namespace.
 {{- end -}}
 {{- end -}}
 
-{{/* Keep Helm's contract consistent with Config::validate and mounted paths safe. */}}
-{{- define "bobs.validateConfigBounds" -}}
-{{- $dataDir := .Values.config.data_dir | default "" -}}
-{{- if not (hasPrefix "/" $dataDir) -}}
-{{- fail "config.data_dir must be a non-empty absolute filesystem path" -}}
-{{- end -}}
+{{/* Restrict chart-managed data volume mounts to a normalized application-owned subtree. */}}
+{{- define "bobs.dataDir" -}}
+{{- $dataDir := .Values.config.data_dir | default "" | toString -}}
 {{- $cleanDataDir := clean $dataDir -}}
-{{- if eq $cleanDataDir "/etc/bobs" -}}
-{{- fail "config.data_dir must not resolve to /etc/bobs because that path is reserved for the config volume mount" -}}
+{{- $isSupported := or (eq $dataDir "/var/lib/bobs") (hasPrefix "/var/lib/bobs/" $dataDir) -}}
+{{- if or (ne $dataDir $cleanDataDir) (not $isSupported) -}}
+{{- fail "config.data_dir must be /var/lib/bobs or a normalized descendant (no '.', '..', repeated '/', or trailing '/') because the chart mounts it as the data volume" -}}
 {{- end -}}
-{{- if or (eq $cleanDataDir "/etc/bobs/config.yaml") (hasPrefix "/etc/bobs/config.yaml/" $cleanDataDir) -}}
-{{- fail "config.data_dir must not overlap /etc/bobs/config.yaml because that path is the mounted configuration file" -}}
+{{- $dataDir -}}
 {{- end -}}
+
+{{/* Validate chart-level config invariants before rendering. */}}
+{{- define "bobs.validateConfigBounds" -}}
+{{- $_ := include "bobs.dataDir" . -}}
 {{- $_ := include "bobs.routeName" . -}}
 {{- if gt (int64 .Values.config.page_size) (int64 .Values.config.max_spool_bytes) -}}
 {{- fail "config.page_size must not exceed config.max_spool_bytes" -}}
