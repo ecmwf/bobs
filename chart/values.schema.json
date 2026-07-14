@@ -83,7 +83,16 @@
       "properties": {
         "host": { "type": "string", "minLength": 1 },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "data_dir": { "type": "string", "pattern": "^/" },
+        "data_dir": {
+          "type": "string",
+          "pattern": "^/",
+          "not": {
+            "anyOf": [
+              { "const": "/etc/bobs" },
+              { "pattern": "^/etc/bobs/config\\.yaml(/|$)" }
+            ]
+          }
+        },
         "page_size": { "type": "integer", "minimum": 1, "maximum": 67108864 },
         "max_cache_bytes": { "type": "integer", "minimum": 0 },
         "max_live_spools": { "type": "integer", "minimum": 1, "maximum": 65536 },
@@ -101,7 +110,12 @@
         "long_poll_timeout_ms": { "type": "integer", "minimum": 1 },
         "host_prefix": { "type": "string", "minLength": 1 },
         "domain": { "type": "string", "minLength": 1 },
-        "route_name": { "type": "string", "minLength": 1 },
+        "route_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[A-Za-z0-9]([A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$"
+        },
         "metrics": {
           "type": "object",
           "required": ["enabled", "bind_address", "port", "allowed_labels", "max_label_value_length", "serviceMonitor"],

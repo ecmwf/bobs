@@ -175,7 +175,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `io_uring_queue_capacity` | `1024` | Submission queue capacity for each Linux `io_uring` shard. Must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`); invalid values fail startup with `ConfigurationError`, including in fallback builds. Otherwise ignored by fallback I/O. |
 | `host_prefix` | `""` | External download host prefix used to build `read_url`; must be set. |
 | `domain` | `""` | External download domain used to build `read_url`; must be set. |
-| `route_name` | `""` | External download route prefix used to build `read_url`; must be set. |
+| `route_name` | `""` | External download route prefix used to build `read_url`; must be set. The chart restricts it to one 1-63 character segment containing ASCII letters, digits, `_`, or `-`, starting and ending with an alphanumeric character. |
 | `metrics.enabled` | `false` | Enables the Prometheus metrics endpoint in builds with the `telemetry` feature. |
 | `metrics.bind_address` | `127.0.0.1` | Metrics endpoint bind address. |
 | `metrics.port` | `9464` | Metrics listener port. When metrics are enabled, it must differ from the main HTTP `port`; startup rejects a conflict before either listener binds. |
@@ -214,11 +214,17 @@ route_name: download
 vendors a packaged copy and verifies it against a pinned commit from this repository.
 
 The chart requires `config.data_dir` to be a non-empty absolute path mounted as
-a directory. It supports only `persistence.volumeMode: Filesystem`; raw `Block`
-PVCs are rejected and are never rendered as `volumeDevices`. Chart values also
-limit `config.max_live_spools` to `65536`. When metrics are enabled,
+a directory. It rejects `/etc/bobs` (including path aliases that clean to it)
+because that path is already the fixed config volume mount. It also rejects the
+mounted `/etc/bobs/config.yaml` file and descendants, where a directory mount
+would hide or descend through the required config file. It supports only
+`persistence.volumeMode: Filesystem`; raw `Block` PVCs are rejected and are
+never rendered as `volumeDevices`. Chart values also limit
+`config.max_live_spools` to `65536`. When metrics are enabled,
 `config.metrics.port` must differ from `config.port`; Helm's template validation
 enforces this cross-field rule because JSON Schema cannot compare the two ports.
+`config.route_name` must match `[A-Za-z0-9]([A-Za-z0-9_-]{0,61}[A-Za-z0-9])?`;
+the templates also validate it and quote YAML plus escape its NGINX regex use.
 
 The StatefulSet governing Service is controlled by `headlessService`: with
 `enabled: true`, an empty `name` preserves the managed `<fullname>-svc` default
@@ -227,9 +233,11 @@ must identify an existing headless Service in the release namespace. The chart
 rejects governing names that collide with its main or per-replica Services.
 Generated DNS labels stay within 63 characters. Long bases retain a short digest,
 dotted release names are mapped to DNS labels, and per-replica names retain their
-ordinal suffix. Ingress still uses the chart's per-replica Services.
+ordinal suffix. Ingress still uses the chart's per-replica Services. All rendered
+Kubernetes label and selector values, including ServiceMonitor labels, are emitted
+as YAML strings so boolean-, null-, and numeric-looking names cannot change type.
 
-Validate chart changes with:
+Validate chart changes with Helm and `kubeconform` v0.8.0:
 
 ```bash
 ./scripts/test-chart.sh
@@ -238,4 +246,6 @@ helm package chart --destination /tmp
 
 ## License
 
-[Apache License 2.0](LICENSE) In applying this licence, ECMWF does not waive the privileges and immunities granted to it by virtue of its status as an intergovernmental organisation nor does it submit to any jurisdiction.
+[Apache License 2.0](LICENSE). In applying this licence, ECMWF does not waive
+the privileges and immunities granted to it by virtue of its status as an
+intergovernmental organisation, nor does it submit to any jurisdiction.

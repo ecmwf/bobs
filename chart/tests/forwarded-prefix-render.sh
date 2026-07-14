@@ -34,8 +34,8 @@ assert_count 2 'kind: Ingress' "$community"
 assert_count 1 'nginx.ingress.kubernetes.io/x-forwarded-prefix: /download-0' "$community"
 assert_count 1 'nginx.ingress.kubernetes.io/x-forwarded-prefix: /download-1' "$community"
 assert_count 2 'example.com/preserved: kept' "$community"
-assert_count 1 "path: '/download-0/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$'" "$community"
-assert_count 1 "path: '/download-1/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$'" "$community"
+assert_count 1 'path: "/download-0/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$"' "$community"
+assert_count 1 'path: "/download-1/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$"' "$community"
 assert_count 2 'nginx.ingress.kubernetes.io/rewrite-target: /api/v1/read/$2' "$community"
 
 # Exercise the rendered redirect contract: the public Location produced by BOBS
@@ -48,9 +48,9 @@ rendered = open(sys.argv[1], encoding="utf-8").read().splitlines()
 path_line = next(
     line.strip()
     for line in rendered
-    if line.strip().startswith("- path: '/download-0/")
+    if line.strip().startswith('- path: "/download-0/')
 )
-pattern = path_line.split("'", 2)[1]
+pattern = path_line.split('"', 2)[1]
 rewrite_line = next(
     line.strip()
     for line in rendered

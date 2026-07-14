@@ -2,21 +2,24 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-{{- if .Values.ingress.enabled -}}
-{{- $fullName := include "bobs.fullname" . -}}
-{{- $routeName := required "config.route_name must be set" .Values.config.route_name -}}
-{{- $port := .Values.service.port -}}
-{{- $host := printf "%s.%s" .Values.config.host_prefix .Values.config.domain -}}
-{{- $userAnnotations := .Values.ingress.annotations | default dict -}}
-{{- $controller := include "bobs.ingressController" . -}}
-{{- if eq $controller "nginx-inc" }}
+# {{- if .Values.ingress.enabled -}}
+# {{- $fullName := include "bobs.fullname" . -}}
+# {{- $routeName := include "bobs.routeName" . -}}
+# {{- $routePattern := regexQuoteMeta $routeName -}}
+# {{- $port := .Values.service.port -}}
+# {{- $host := printf "%s.%s" .Values.config.host_prefix .Values.config.domain -}}
+# {{- $userAnnotations := .Values.ingress.annotations | default dict -}}
+# {{- $controller := include "bobs.ingressController" . -}}
+# {{- if eq $controller "nginx-inc" }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: '{{ $fullName }}'
+  name: "{{ $fullName }}"
   labels:
-    app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-    app.kubernetes.io/instance: '{{ .Release.Name }}'
+    # prettier-ignore
+    app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+    # prettier-ignore
+    app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
   annotations:
     nginx.org/mergeable-ingress-type: minion
     nginx.org/location-snippets: |
@@ -25,7 +28,7 @@ metadata:
       # callers can also set X-Forwarded-Prefix directly; the app validates it as
       # a short relative path prefix before using it in Location.
       set $bobs_forwarded_prefix "";
-      if ($uri ~ ^(/{{ $routeName }}-\d+)(?:/|$)) {
+      if ($uri ~ ^(/{{ $routePattern }}-\d+)(?:/|$)) {
         set $bobs_forwarded_prefix $1;
       }
       proxy_set_header X-Forwarded-Prefix $bobs_forwarded_prefix;
@@ -36,35 +39,39 @@ metadata:
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
       {{- end }}
-      rewrite ^/{{ $routeName }}-\d+/([0-9a-zA-Z-]+)$ /api/v1/read/$1 break;
-      rewrite ^/{{ $routeName }}-\d+/api/v1/read/([^/]+)$ /api/v1/read/$1 break;
-      rewrite ^/{{ $routeName }}-\d+/api/v1/([0-9a-zA-Z-]+)$ /api/v1/read/$1 break;
-    {{- with $userAnnotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
+      rewrite ^/{{ $routePattern }}-\d+/([0-9a-zA-Z-]+)$ /api/v1/read/$1 break;
+      rewrite ^/{{ $routePattern }}-\d+/api/v1/read/([^/]+)$ /api/v1/read/$1 break;
+      rewrite ^/{{ $routePattern }}-\d+/api/v1/([0-9a-zA-Z-]+)$ /api/v1/read/$1 break;
+    # {{- with $userAnnotations }}
+    # {{- toYaml . | nindent 4 }}
+    # {{- end }}
 spec:
-  {{- if .Values.ingress.className }}
+  # {{- if .Values.ingress.className }}
+  # prettier-ignore
   ingressClassName: {{ .Values.ingress.className | quote }}
-  {{- end }}
+  # {{- end }}
   rules:
+    # prettier-ignore
     - host: {{ $host | quote }}
       http:
         paths:
-          {{- range $i, $e := until (int $.Values.replicaCount) }}
+          # {{- range $i, $e := until (int $.Values.replicaCount) }}
           # {{- $podName := include "bobs.podName" (dict "root" $ "ordinal" $i) }}
-          - path: '/{{ $routeName }}-{{ $i }}'
+          # prettier-ignore
+          - path: {{ printf "/%s-%d" $routeName $i | quote }}
             pathType: Prefix
             backend:
               service:
-                name: '{{ $podName }}'
+                name: "{{ $podName }}"
                 port:
+                  # prettier-ignore
                   number: {{ $port }}
-          {{- end }}
-  {{- if .Values.ingress.tls }}
+          # {{- end }}
+  # {{- if .Values.ingress.tls }}
   tls:
-    {{- toYaml .Values.ingress.tls | nindent 4 }}
-  {{- end }}
-{{- else if eq $controller "nginx-community" }}
-{{- include "bobs.communityIngresses" . -}}
-{{- end }}
-{{- end }}
+    # {{- toYaml .Values.ingress.tls | nindent 4 }}
+  # {{- end }}
+# {{- else if eq $controller "nginx-community" }}
+# {{- include "bobs.communityIngresses" . -}}
+# {{- end }}
+# {{- end }}

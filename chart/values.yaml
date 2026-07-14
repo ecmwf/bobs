@@ -103,10 +103,11 @@ config:
   port: 3000
   # Helm deployment profile. These intentionally override the Rust binary defaults
   # (data_dir ./data, page_size 16 MiB, global cache 256 MiB) with an absolute PVC
-  # path and a lower-latency 4 KiB page / 1 MiB global cache. max_cache_bytes may
-  # be smaller than page_size. It also derives the weighted response-lifetime read
-  # budget as max(1, floor(max_cache_bytes / page_size)); 0 disables caching but
-  # retains one bounded disk-backed response.
+  # path and a lower-latency 4 KiB page / 1 MiB global cache. data_dir must not
+  # resolve to /etc/bobs, which is reserved for the chart's read-only config mount.
+  # max_cache_bytes may be smaller than page_size. It also derives the weighted
+  # response-lifetime read budget as max(1, floor(max_cache_bytes / page_size)); 0
+  # disables caching but retains one bounded disk-backed response.
   data_dir: "/var/lib/bobs"
   # Valid page sizes are 1..=67108864 bytes (64 MiB) and must not exceed
   # max_spool_bytes. Pages larger than the cache bypass it.
@@ -137,6 +138,8 @@ config:
   long_poll_timeout_ms: 25000
   # Required deployment routing values. host_prefix and domain are supplied by
   # the parent chart or operator; route_name intentionally defaults to download.
+  # route_name is one 1-63 character path segment: ASCII letters, digits, '_' and
+  # '-' only, starting and ending with an alphanumeric character.
   host_prefix: ""
   domain: ""
   route_name: "download"
@@ -156,8 +159,9 @@ config:
       interval: 30s
       labels: {}
 
-# BOBS requires data_dir to be a mounted filesystem directory. Raw Block PVCs
-# are unsupported; persistence.volumeMode is fixed to Filesystem.
+# BOBS requires data_dir to be a mounted filesystem directory distinct from the
+# fixed /etc/bobs config mount. Raw Block PVCs are unsupported;
+# persistence.volumeMode is fixed to Filesystem.
 
 persistence:
   enabled: true

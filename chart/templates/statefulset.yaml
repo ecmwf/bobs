@@ -7,50 +7,63 @@ kind: StatefulSet
 metadata:
   name: '{{ include "bobs.statefulsetName" . }}'
   labels:
-    app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-    app.kubernetes.io/instance: '{{ .Release.Name }}'
+    # prettier-ignore
+    app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+    # prettier-ignore
+    app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
 spec:
   serviceName: '{{ include "bobs.governingServiceName" . }}'
+  # prettier-ignore
   replicas: {{ .Values.replicaCount }}
   podManagementPolicy: Parallel
   persistentVolumeClaimRetentionPolicy:
+    # prettier-ignore
     whenDeleted: {{ .Values.persistence.retentionPolicy.whenDeleted }}
+    # prettier-ignore
     whenScaled: {{ .Values.persistence.retentionPolicy.whenScaled }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-      app.kubernetes.io/instance: '{{ .Release.Name }}'
+      # prettier-ignore
+      app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+      # prettier-ignore
+      app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
   template:
     metadata:
       # {{- with .Values.podAnnotations }}
       annotations:
-        {{- toYaml . | nindent 8 }}
+        # {{- toYaml . | nindent 8 }}
       # {{- end }}
       labels:
-        app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-        app.kubernetes.io/instance: '{{ .Release.Name }}'
+        # prettier-ignore
+        app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+        # prettier-ignore
+        app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
     spec:
       # BOBS runs non-root (image USER 10001); fsGroup makes mounted PVCs
       # group-writable so the process can write its spool data + sidecar metadata.
       securityContext:
-        {{- include "bobs.podSecurityContext" . | nindent 8 }}
+        # {{- include "bobs.podSecurityContext" . | nindent 8 }}
       # {{- if .Values.podAntiAffinityHostname }}
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchLabels:
-                  app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-                  app.kubernetes.io/instance: '{{ .Release.Name }}'
+                  # prettier-ignore
+                  app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+                  # prettier-ignore
+                  app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
               topologyKey: kubernetes.io/hostname
       # {{- end }}
       # {{- include "bobs.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: bobs
+          # prettier-ignore
           image: {{ include "bobs.image" . | quote }}
           imagePullPolicy: '{{ .Values.image.pullPolicy }}'
           env:
             - name: RUST_LOG
+              # prettier-ignore
               value: {{ .Values.rustLog | quote }}
             - name: K8S_NAMESPACE_NAME
               valueFrom:
@@ -61,34 +74,24 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: BOBS_DEPLOYMENT_ENV
-              # {{- if .Values.observability.deploymentEnv }}
-              value: {{ .Values.observability.deploymentEnv | quote }}
-              # {{- else }}
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ .Values.observability.deploymentEnvConfigMapName | default (printf "%s-observability-env" .Release.Name) | quote }}
-                  key: {{ .Values.observability.deploymentEnvConfigMapKey | default "BOBS_DEPLOYMENT_ENV" | quote }}
-                  optional: true
-              # {{- end }}
+              # {{- include "bobs.deploymentEnvEntry" . | nindent 14 }}
             - name: BOBS_INTERNAL_BASE_URL_TEMPLATE
-              # {{- if .Values.internalBaseUrlTemplate }}
-              value: {{ tpl .Values.internalBaseUrlTemplate . | quote }}
-              # {{- else }}
-              value: 'http://{{ include "bobs.statefulsetName" . }}-{ordinal}.{{ include "bobs.headlessServiceName" . }}:{{ .Values.service.port }}/api/v1'
-              # {{- end }}
+              # {{- include "bobs.internalBaseUrlEntry" . | nindent 14 }}
           command: ["bobs"]
           args: ["/etc/bobs/config.yaml"]
           ports:
             - name: http
+              # prettier-ignore
               containerPort: {{ .Values.config.port }}
               protocol: TCP
             # {{- if .Values.config.metrics.enabled }}
             - name: metrics
+              # prettier-ignore
               containerPort: {{ .Values.config.metrics.port }}
               protocol: TCP
             # {{- end }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            # {{- toYaml .Values.resources | nindent 12 }}
           # {{- if .Values.probes.enabled }}
           readinessProbe:
             httpGet:
@@ -105,14 +108,15 @@ spec:
           # {{- end }}
           # {{- with .Values.containerSecurityContext }}
           securityContext:
-            {{- toYaml . | nindent 12 }}
+            # {{- toYaml . | nindent 12 }}
           # {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/bobs
               readOnly: true
             - name: data
-              mountPath: '{{ .Values.config.data_dir }}'
+              # prettier-ignore
+              mountPath: {{ .Values.config.data_dir | quote }}
       volumes:
         - name: config
           configMap:
@@ -121,8 +125,10 @@ spec:
         - name: data
           emptyDir:
             # {{- with .Values.persistence.emptyDir.medium }}
+            # prettier-ignore
             medium: {{ . | quote }}
             # {{- end }}
+            # prettier-ignore
             sizeLimit: {{ required "persistence.emptyDir.sizeLimit must be set" .Values.persistence.emptyDir.sizeLimit | quote }}
       # {{- end }}
 # {{- if .Values.persistence.enabled }}
@@ -139,6 +145,7 @@ spec:
         volumeMode: Filesystem
         resources:
           requests:
+            # prettier-ignore
             storage: {{ .Values.persistence.size | quote }}
         # {{- include "bobs.storageClassName" . | nindent 8 }}
 # {{- end }}

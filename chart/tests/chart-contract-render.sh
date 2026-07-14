@@ -39,6 +39,27 @@ assert_schema_rejects() {
 	assert_contains "values don't meet the specifications" "$tmp_dir/$name.log"
 }
 
+assert_label_strings() {
+	local file=$1 release_name=$2 app_name=$3
+	assert_contains "app.kubernetes.io/instance: \"$release_name\"" "$file"
+	assert_contains "app.kubernetes.io/name: \"$app_name\"" "$file"
+	assert_contains 'helm.sh/chart: "bobs-0.1.2"' "$file"
+	assert_contains 'app.kubernetes.io/version: "0.1.0"' "$file"
+	assert_contains 'app.kubernetes.io/managed-by: "Helm"' "$file"
+	assert_contains 'boolean-like: "true"' "$file"
+	assert_contains 'false-like: "false"' "$file"
+	assert_contains 'null-like: "null"' "$file"
+	assert_contains 'numeric-like: "123"' "$file"
+	if grep -Fq -- "app.kubernetes.io/instance: $release_name" "$file"; then
+		printf 'Found unquoted release label value %s in %s\n' "$release_name" "$file" >&2
+		exit 1
+	fi
+	if grep -Fq -- "app.kubernetes.io/name: $app_name" "$file"; then
+		printf 'Found unquoted app label value %s in %s\n' "$app_name" "$file" >&2
+		exit 1
+	fi
+}
+
 assert_generated_name_contract() {
 	local file=$1 fullname=$2 governing_name=$3 replicas=$4
 	python3 - "$file" "$fullname" "$governing_name" "$replicas" <<'PY'
@@ -96,6 +117,42 @@ for ordinal, pod_name in enumerate(pod_names):
 PY
 }
 
+kubeconform_bin=${KUBECONFORM_BIN:-kubeconform}
+if ! command -v "$kubeconform_bin" >/dev/null 2>&1; then
+	printf 'kubeconform is required for strict Kubernetes schema tests\n' >&2
+	exit 1
+fi
+
+label_renders=()
+for release_name in true false null 123 1e3; do
+  label_render="$tmp_dir/labels-$release_name.yaml"
+  service_monitor_render="$tmp_dir/service-monitor-labels-$release_name.yaml"
+  ambiguous_label_values=(
+    --set-string nameOverride="$release_name"
+    --set-string fullnameOverride="$release_name-full"
+    --set ingress.enabled=true
+    --set global.ingress.controller=nginx-community
+    --set config.metrics.enabled=true
+    --set config.metrics.serviceMonitor.enabled=true
+    --set-string config.metrics.serviceMonitor.labels.boolean-like=true
+    --set-string config.metrics.serviceMonitor.labels.false-like=false
+    --set-string config.metrics.serviceMonitor.labels.null-like=null
+    --set-string config.metrics.serviceMonitor.labels.numeric-like=123
+  )
+  helm template "$release_name" "$chart_dir" "${common_values[@]}" \
+    "${ambiguous_label_values[@]}" >"$label_render"
+  helm template "$release_name" "$chart_dir" "${common_values[@]}" \
+    "${ambiguous_label_values[@]}" \
+    --show-only templates/servicemonitor.yaml >"$service_monitor_render"
+  assert_label_strings "$label_render" "$release_name" "$release_name"
+  assert_label_strings "$service_monitor_render" "$release_name" "$release_name"
+  label_renders+=("$label_render")
+done
+crd_schema_location='https://raw.githubusercontent.com/datreeio/CRDs-catalog/34cef0fc2698bbb611f475515e555a2d7ca85b6c/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+cat "${label_renders[@]}" | "$kubeconform_bin" \
+  -strict -kubernetes-version 1.31.0 -summary \
+  -schema-location default -schema-location "$crd_schema_location"
+
 assert_schema_rejects data-dir-empty --set-string config.data_dir=
 assert_schema_rejects data-dir-relative --set-string config.data_dir=./data
 assert_template_rejects data-dir-empty-template \
@@ -104,6 +161,54 @@ assert_template_rejects data-dir-empty-template \
 assert_template_rejects data-dir-relative-template \
 	'config.data_dir must be a non-empty absolute filesystem path' \
 	--set-string config.data_dir=./data
+
+assert_schema_rejects data-dir-config-mount --set-string config.data_dir=/etc/bobs
+assert_template_rejects data-dir-config-mount-template \
+	'config.data_dir must not resolve to /etc/bobs because that path is reserved for the config volume mount' \
+	--set-string config.data_dir=/etc/bobs
+assert_template_rejects data-dir-config-mount-trailing-slash-template \
+	'config.data_dir must not resolve to /etc/bobs because that path is reserved for the config volume mount' \
+	--set-string config.data_dir=/etc/bobs/
+assert_template_rejects data-dir-config-mount-cleaned-template \
+	'config.data_dir must not resolve to /etc/bobs because that path is reserved for the config volume mount' \
+	--set-string config.data_dir=/etc/./bobs
+assert_schema_rejects data-dir-config-file --set-string config.data_dir=/etc/bobs/config.yaml
+assert_schema_rejects data-dir-config-file-child --set-string config.data_dir=/etc/bobs/config.yaml/data
+assert_template_rejects data-dir-config-file-template \
+  'config.data_dir must not overlap /etc/bobs/config.yaml because that path is the mounted configuration file' \
+  --set-string config.data_dir=/etc/bobs/config.yaml
+assert_template_rejects data-dir-config-file-cleaned-template \
+  'config.data_dir must not overlap /etc/bobs/config.yaml because that path is the mounted configuration file' \
+  --set-string config.data_dir=/etc/bobs/./config.yaml/data
+
+valid_route=$(printf 'r%.0s' {1..63})
+helm template bobs "$chart_dir" "${common_values[@]}" \
+	--set-string config.route_name="$valid_route" \
+	--set ingress.enabled=true \
+	--set global.ingress.controller=nginx-inc \
+	>"$tmp_dir/route-valid.yaml"
+assert_contains "route_name: \"$valid_route\"" "$tmp_dir/route-valid.yaml"
+assert_contains "path: \"/$valid_route-0\"" "$tmp_dir/route-valid.yaml"
+
+too_long_route=${valid_route}r
+invalid_routes=(
+	'bad/route'
+	'bad.route'
+	'bad*route'
+	'bad$route'
+	'bad"route'
+	"bad'route"
+	'bad-route-'
+	"$too_long_route"
+	$'bad\nroute'
+)
+for index in "${!invalid_routes[@]}"; do
+	invalid_route=${invalid_routes[$index]}
+	assert_schema_rejects "route-invalid-$index" --set-string config.route_name="$invalid_route"
+	assert_template_rejects "route-invalid-$index-template" \
+		"config.route_name must be 1-63 characters" \
+		--set-string config.route_name="$invalid_route"
+done
 
 assert_schema_rejects fullname-invalid --set-string fullnameOverride=Bad_Name
 assert_template_rejects fullname-invalid-template \

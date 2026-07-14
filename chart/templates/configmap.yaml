@@ -8,8 +8,10 @@ kind: ConfigMap
 metadata:
   name: '{{ include "bobs.nameWithSuffix" (dict "base" (include "bobs.fullname" .) "suffix" "-config") }}'
   labels:
-    app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-    app.kubernetes.io/instance: "{{ .Release.Name }}"
+    # prettier-ignore
+    app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+    # prettier-ignore
+    app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
 data:
   config.yaml: |
     host: {{ .Values.config.host | quote }}
@@ -38,7 +40,7 @@ data:
     long_poll_timeout_ms: {{ .Values.config.long_poll_timeout_ms }}
     host_prefix: {{ required "bobs.config.host_prefix must be set" .Values.config.host_prefix | quote }}
     domain: {{ required "bobs.config.domain must be set" .Values.config.domain | quote }}
-    route_name: {{ required "bobs.config.route_name must be set" .Values.config.route_name | quote }}
+    route_name: {{ include "bobs.routeName" . | quote }}
     {{- if .Values.config.metrics }}
     metrics:
       enabled: {{ .Values.config.metrics.enabled }}

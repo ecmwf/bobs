@@ -129,12 +129,20 @@ requires an explicit existing headless Service in the release namespace.
 {{- end -}}
 {{- end -}}
 
-{{/* Keep Helm's contract consistent with Config::validate. */}}
+{{/* Keep Helm's contract consistent with Config::validate and mounted paths safe. */}}
 {{- define "bobs.validateConfigBounds" -}}
 {{- $dataDir := .Values.config.data_dir | default "" -}}
 {{- if not (hasPrefix "/" $dataDir) -}}
 {{- fail "config.data_dir must be a non-empty absolute filesystem path" -}}
 {{- end -}}
+{{- $cleanDataDir := clean $dataDir -}}
+{{- if eq $cleanDataDir "/etc/bobs" -}}
+{{- fail "config.data_dir must not resolve to /etc/bobs because that path is reserved for the config volume mount" -}}
+{{- end -}}
+{{- if or (eq $cleanDataDir "/etc/bobs/config.yaml") (hasPrefix "/etc/bobs/config.yaml/" $cleanDataDir) -}}
+{{- fail "config.data_dir must not overlap /etc/bobs/config.yaml because that path is the mounted configuration file" -}}
+{{- end -}}
+{{- $_ := include "bobs.routeName" . -}}
 {{- if gt (int64 .Values.config.page_size) (int64 .Values.config.max_spool_bytes) -}}
 {{- fail "config.page_size must not exceed config.max_spool_bytes" -}}
 {{- end -}}
@@ -144,6 +152,15 @@ requires an explicit existing headless Service in the release namespace.
 {{- if and .Values.config.metrics.enabled (eq (int64 .Values.config.port) (int64 .Values.config.metrics.port)) -}}
 {{- fail "config.metrics.port must differ from config.port when metrics are enabled" -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Restrict route_name to one literal URL/NGINX path segment. */}}
+{{- define "bobs.routeName" -}}
+{{- $routeName := .Values.config.route_name | default "" | toString -}}
+{{- if or (gt (len $routeName) 63) (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$" $routeName)) -}}
+{{- fail "config.route_name must be 1-63 characters, contain only ASCII letters, digits, '_' or '-', and start and end with an alphanumeric character" -}}
+{{- end -}}
+{{- $routeName -}}
 {{- end -}}
 
 {{/* Reject governing Service names that alias another Service in this release. */}}
@@ -173,6 +190,27 @@ requires an explicit existing headless Service in the release namespace.
 {{- $name -}}
 {{- end -}}
 
+{{/* Render mutually exclusive environment variable sources as one YAML entry. */}}
+{{- define "bobs.deploymentEnvEntry" -}}
+{{- if .Values.observability.deploymentEnv -}}
+value: {{ .Values.observability.deploymentEnv | quote }}
+{{- else -}}
+valueFrom:
+  configMapKeyRef:
+    name: {{ .Values.observability.deploymentEnvConfigMapName | default (printf "%s-observability-env" .Release.Name) | quote }}
+    key: {{ .Values.observability.deploymentEnvConfigMapKey | default "BOBS_DEPLOYMENT_ENV" | quote }}
+    optional: true
+{{- end -}}
+{{- end -}}
+
+{{- define "bobs.internalBaseUrlEntry" -}}
+{{- if .Values.internalBaseUrlTemplate -}}
+value: {{ tpl .Values.internalBaseUrlTemplate . | quote }}
+{{- else -}}
+value: '{{ printf "http://%s-{ordinal}.%s:%d/api/v1" (include "bobs.statefulsetName" .) (include "bobs.headlessServiceName" .) (int .Values.service.port) }}'
+{{- end -}}
+{{- end -}}
+
 {{/* Keep the fsGroup fallback outside YAML so an empty context still mounts writable PVCs. */}}
 {{- define "bobs.podSecurityContext" -}}
 {{- if .Values.podSecurityContext -}}
@@ -192,16 +230,32 @@ storageClassName: ""
 {{- end -}}
 
 {{- define "bobs.labels" -}}
-helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
-app.kubernetes.io/name: {{ include "bobs.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name (.Chart.Version | replace "+" "_") | quote }}
+app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | toString | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service | toString | quote }}
 {{- end -}}
 
 {{- define "bobs.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "bobs.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
+{{- end -}}
+
+{{/* Merge ServiceMonitor labels once and force every value to a YAML string. */}}
+{{- define "bobs.serviceMonitorLabels" -}}
+{{- $labels := dict
+  "helm.sh/chart" (printf "%s-%s" .Chart.Name (.Chart.Version | replace "+" "_"))
+  "app.kubernetes.io/name" (include "bobs.name" .)
+  "app.kubernetes.io/instance" (.Release.Name | toString)
+  "app.kubernetes.io/version" (.Chart.AppVersion | toString)
+  "app.kubernetes.io/managed-by" (.Release.Service | toString) -}}
+{{- range $key, $value := .Values.config.metrics.serviceMonitor.labels | default dict -}}
+{{- $_ := set $labels $key ($value | toString) -}}
+{{- end -}}
+{{- range $key := keys $labels | sortAlpha }}
+{{ $key }}: {{ get $labels $key | toString | quote }}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -280,8 +334,7 @@ kind: Service
 metadata:
   name: '{{ include "bobs.podName" (dict "root" $ "ordinal" $ordinal) }}'
   labels:
-    app.kubernetes.io/name: '{{ include "bobs.name" $ }}'
-    app.kubernetes.io/instance: '{{ $.Release.Name }}'
+    {{- include "bobs.selectorLabels" $ | nindent 4 }}
 spec:
   ports:
     - port: {{ $port }}
@@ -295,7 +348,8 @@ spec:
 {{/* Render community ingress-nginx resources, including per-pod forwarded prefixes. */}}
 {{- define "bobs.communityIngresses" -}}
 {{- $fullName := include "bobs.fullname" . -}}
-{{- $routeName := required "config.route_name must be set" .Values.config.route_name -}}
+{{- $routeName := include "bobs.routeName" . -}}
+{{- $routePattern := regexQuoteMeta $routeName -}}
 {{- $port := .Values.service.port -}}
 {{- $host := printf "%s.%s" .Values.config.host_prefix .Values.config.domain -}}
 {{- $userAnnotations := .Values.ingress.annotations | default dict -}}
@@ -329,8 +383,7 @@ kind: Ingress
 metadata:
   name: {{ $podName | quote }}
   labels:
-    app.kubernetes.io/name: '{{ include "bobs.name" $ }}'
-    app.kubernetes.io/instance: '{{ $.Release.Name }}'
+    {{- include "bobs.selectorLabels" $ | nindent 4 }}
   annotations:
     {{- toYaml $podAnnotations | nindent 4 }}
 spec:
@@ -341,7 +394,7 @@ spec:
     - host: {{ $host | quote }}
       http:
         paths:
-          - path: '/{{ $routeName }}-{{ $index }}/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$'
+          - path: {{ printf "/%s-%d/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$" $routePattern $index | quote }}
             pathType: ImplementationSpecific
             backend:
               service:
@@ -357,10 +410,9 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: '{{ $fullName }}'
+  name: {{ $fullName | quote }}
   labels:
-    app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-    app.kubernetes.io/instance: '{{ .Release.Name }}'
+    {{- include "bobs.selectorLabels" . | nindent 4 }}
   annotations:
     {{- toYaml $annotations | nindent 4 }}
 spec:
@@ -373,7 +425,7 @@ spec:
         paths:
           {{- range $index, $_ := until (int $.Values.replicaCount) }}
           {{- $podName := include "bobs.podName" (dict "root" $ "ordinal" $index) }}
-          - path: '/{{ $routeName }}-{{ $index }}/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$'
+          - path: {{ printf "/%s-%d/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$" $routePattern $index | quote }}
             pathType: ImplementationSpecific
             backend:
               service:
@@ -386,4 +438,5 @@ spec:
     {{- toYaml .Values.ingress.tls | nindent 4 }}
   {{- end }}
 {{- end }}
+{{ print "\n" -}}
 {{- end -}}
