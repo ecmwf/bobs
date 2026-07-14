@@ -50,7 +50,7 @@ Write and completion mutations are single-flight per spool. Each caller waits on
 
 ### 7. Atomic Sidecar Metadata
 
-Metadata is stored as `<data_dir>/<key>/meta.json`. Each commit writes `<data_dir>/<key>/meta.json.tmp`, syncs the temporary file's data, atomically renames it over `meta.json`, and syncs the spool directory. Recovery ignores leftover temporary files and accepts only complete `meta.json` sidecars.
+Metadata is stored as `<data_dir>/<key>/meta.json`. Each commit creates a private, non-following `<data_dir>/<key>/meta.json.tmp.<uuid>` entry, writes and syncs the opened file, verifies that the pathname still identifies it, atomically renames it over `meta.json`, and syncs the spool directory. The `io_uring` backend keeps this as two durability phases and never submits rename before write and file sync complete. Failed or cancelled operations clean only their own private entry.
 
 This protocol keeps metadata off the write hot path while still making lifecycle transitions durable. It also suits shared filesystems because each key has its own directory and sidecar, with one writer per spool rather than one global metadata writer.
 
@@ -62,7 +62,7 @@ Completion is fail-stop once it begins. The owned transaction continues if the r
 
 ### 8. Recovery and Cleanup
 
-On restart, BOBS scans `<data_dir>` for key directories containing `meta.json`. A recognised UUID or request-ID directory without any BOBS marker is removed and parent-fsynced only when it is truly empty; non-empty markerless directories are retained unchanged and quarantined. For current `Writing` and `WriteLocked` spools, `spool.dat` is authoritative for byte state and persisted byte counters are advisory. A valid `Completing` marker carries the exact candidate byte/page layout and is finalized to `Complete`; if that layout and `spool.dat` disagree, BOBS leaves both unchanged, logs the quarantine, and does not expose the key through spool APIs.
+On restart, BOBS scans `<data_dir>` for key directories containing the fixed `meta.json` sidecar. It unlinks stale legacy `meta.json.tmp` and valid `meta.json.tmp.<uuid>` files or symlinks without following them before marker classification; temporary UUID names are never accepted as sidecars. A recognised UUID or request-ID directory without any BOBS marker is removed and parent-fsynced only when it is truly empty; non-empty markerless directories are retained unchanged and quarantined. For current `Writing` and `WriteLocked` spools, `spool.dat` is authoritative for byte state and persisted byte counters are advisory. A valid `Completing` marker carries the exact candidate byte/page layout and is finalized to `Complete`; if that layout and `spool.dat` disagree, BOBS leaves both unchanged, logs the quarantine, and does not expose the key through spool APIs.
 
 Every current sidecar records its spool's `page_size`. A completed spool is validated against its historical layout and resegmented to the current configured page size before serving; a changed terminal layout is committed atomically. The migration is arithmetic and does not read page payloads during startup, so even a persisted 128 MiB sparse page can migrate without a 128 MiB allocation or read request. The configured target is at most 64 MiB and cannot exceed `max_spool_bytes`.
 
@@ -82,7 +82,7 @@ A background task periodically sweeps the spool manager and deletes spools based
 - **Read Idle TTL**: The spool has not served bytes for `read_idle_ttl_secs` (default 600); never-read spools are anchored when they become readable.
 - **Full Read TTL**: Bounded coverage tracking, or an exact completed full-object response after fragmented fallback, has proved every byte was served; `full_read_complete_ttl_secs` (default 30) has elapsed since the latest read activity.
 
-`cleanup_sweep_interval_secs` defaults to 30 and must not exceed any active cleanup timeout. The deprecated `reader_done_ttl_secs` and `unread_ttl_secs` fields remain parseable but do not drive cleanup. Expiry removes the key directory, including `spool.dat`, `meta.json`, and interrupted `meta.json.tmp`.
+`cleanup_sweep_interval_secs` defaults to 30 and must not exceed any active cleanup timeout. The deprecated `reader_done_ttl_secs` and `unread_ttl_secs` fields remain parseable but do not drive cleanup. Expiry removes the key directory, including `spool.dat`, `meta.json`, and interrupted private metadata transaction files.
 
 Cleanup revalidates each expired candidate under the spool lifecycle lock immediately before deletion. Every accepted non-empty HTTP body frame refreshes writer activity under the same lock before it enters the batching buffer. A frame, write, completion, or served byte after the sweep snapshot invalidates that candidate rather than deleting from stale eligibility data.
 

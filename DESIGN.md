@@ -46,7 +46,7 @@ Each spool is stored in its own directory:
 
 `spool.dat` contains accepted payload bytes. `meta.json` is a sidecar metadata file containing lifecycle state, content metadata, timestamps, byte counts, page counts, final partial-page size, and a compatibility `data_path` value. The persisted path is never filesystem authority during recovery.
 
-Sidecar metadata commits are atomic at the file level: BOBS writes `meta.json.tmp`, syncs that file, renames it over `meta.json`, and syncs the spool directory. Recovery ignores leftover temporary metadata files.
+Sidecar metadata commits use a transaction-private `meta.json.tmp.<uuid>` entry created without following links. BOBS writes and syncs the open temporary file, verifies that its pathname still identifies the opened file, renames it over `meta.json`, and syncs the spool directory. The `io_uring` backend does not submit rename and directory sync until write and file sync have completed successfully. Startup recovery and durable deletion unlink stale legacy `meta.json.tmp` and UUID transaction entries without following symlinks; only the fixed `meta.json` name is ever classified or parsed as a sidecar.
 
 Creation uses a two-state publication protocol. BOBS syncs the empty `spool.dat` and key directory, commits an internal `Creating` sidecar, fsyncs `data_dir`, then commits live `Writing` or `WriteLocked` metadata before returning success or publishing the spool in memory. `Creating` is not an API-visible lifecycle state. A crash before live publication leaves an unambiguous incomplete marker that recovery can remove without guessing about ordinary or legacy spool data. Cancellation while waiting for admission leaves no key reservation; after directory reservation starts, a detached transaction finishes durable publication or rolls back even if the client disconnects. A client that loses the response should retry with the same request ID. A duplicate for any tracked lifecycle state, including retryable `Deleting`, returns `409 Conflict` before waiting for admission or the per-key gate.
 
@@ -134,7 +134,7 @@ Recovery uses one top-level directory scan, reads sidecars individually, and kee
 
 ## Cleanup rules
 
-A background cleanup task removes expired spools and their key directories, including `spool.dat`, `meta.json`, and interrupted `meta.json.tmp` files.
+A background cleanup task removes expired spools and their key directories, including `spool.dat`, `meta.json`, and interrupted `meta.json.tmp.<uuid>` transaction files. Startup recovery also cleans those private temp entries before marker classification.
 
 Current cleanup triggers are:
 
