@@ -9,13 +9,12 @@ use crate::io::{read_exact_at, FileIO};
 use crate::metadata::METADATA_SCAN_CHANNEL_CAPACITY;
 use crate::metadata::{MetadataDirectoryEntryKind, MetadataStore, SyncSidecarMetadataStore};
 use crate::metrics::BobsMetrics;
-use crate::spool::{PageCache, Spool, SpoolMetadata, SpoolState};
+use crate::spool::{CleanupAnchors, PageCache, Spool, SpoolMetadata, SpoolState};
 use crate::time::now_secs;
 use dashmap::DashMap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -362,14 +361,14 @@ where
     /// Delete only if a candidate snapshot is still current while holding the
     /// spool lifecycle lock. Returning `Ok(None)` means activity or a state
     /// transition invalidated the candidate and no deletion was attempted.
-    pub async fn delete_spool_with_reason_if<P>(
+    pub(crate) async fn delete_spool_with_reason_if<P>(
         &self,
         key: &str,
         reason: DeleteReason,
         predicate: P,
     ) -> Result<Option<HashMap<String, String>>>
     where
-        P: FnOnce(&SpoolMetadata, u64, u64) -> bool,
+        P: FnOnce(&SpoolMetadata, CleanupAnchors) -> bool,
     {
         let Some(spool) = self.spools.get(key).map(|entry| Arc::clone(entry.value())) else {
             return Ok(None);
@@ -378,9 +377,8 @@ where
 
         let labels = {
             let meta = spool.metadata.lock().await;
-            let last_read_activity = spool.last_read_activity_at.load(Ordering::SeqCst);
-            let full_object_read_at = spool.full_object_read_at.load(Ordering::SeqCst);
-            if !predicate(&meta, last_read_activity, full_object_read_at) {
+            let anchors = spool.cleanup_anchors();
+            if !predicate(&meta, anchors) {
                 return Ok(None);
             }
             meta.labels.clone()
@@ -933,9 +931,13 @@ where
             if let Some(partial) = trailing_partial {
                 spool.write_buffer.lock().await.extend_from_slice(&partial);
             }
-            spool
-                .last_read_activity_at
-                .store(now_secs(), Ordering::SeqCst);
+
+            // Spool construction reseeds monotonic cleanup anchors. Recovered
+            // writers and readable objects therefore receive a full TTL grace period,
+            // independent of persisted wall-clock timestamps.
+
+            // No served ranges are known after restart, so complete spool coverage
+            // resets to [0, total_size).
             if matches!(meta_state_for_init, SpoolState::Complete) {
                 spool
                     .missing_ranges
@@ -1207,7 +1209,6 @@ fn prepare_recovery_candidate(
         meta.total_bytes_written = progress.total_bytes_written;
         meta.total_pages = progress.total_pages;
         meta.final_page_size = None;
-        meta.last_write_at = now_secs();
     } else {
         let expected_bytes = match complete_layout_bytes(&meta, meta.page_size) {
             Ok(expected) => expected,
@@ -1643,7 +1644,7 @@ mod tests {
     use super::*;
     use crate::io::TokioFileIO;
     use bytes::Bytes;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{atomic::Ordering, Arc, OnceLock};
     use tempfile::tempdir;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2695,7 +2696,7 @@ mod tests {
         for page in 0..PAGES {
             let start = page * PAGE_SIZE as u64;
             spool
-                .mark_served_and_maybe_fully_read(start, start + PAGE_SIZE as u64, page + 1)
+                .mark_served_and_maybe_fully_read(start, start + PAGE_SIZE as u64)
                 .await;
         }
         assert_eq!(manager.admission.available_permits(), 0);
@@ -2704,7 +2705,7 @@ mod tests {
             .complete(Some(total_size))
             .await
             .expect("complete followed spool");
-        assert!(spool.full_object_read_at.load(Ordering::SeqCst) > 0);
+        assert!(spool.cleanup_anchors().full_object_read_at.is_some());
         assert_eq!(
             manager.admission.available_permits(),
             1,
@@ -3682,11 +3683,10 @@ mod tests {
     // New tests — recovery seeds in-memory fields
     // -----------------------------------------------------------------------
 
-    /// After recovery, `last_read_activity_at` must be nonzero so that the
-    /// recovered spool gets a full `read_idle_ttl_secs` grace period before
-    /// the cleanup loop can fire.
+    /// Recovery reseeds monotonic cleanup anchors instead of deriving TTL age
+    /// from persisted wall-clock timestamps.
     #[tokio::test]
-    async fn test_recovery_seeds_last_read_activity_at() {
+    async fn test_recovery_reseeds_cleanup_anchors() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
 
@@ -3695,27 +3695,27 @@ mod tests {
                 .expect("manager init");
             let key = uuid::Uuid::new_v4().to_string();
             manager
-                .create_spool(key.clone(), None, None, true, HashMap::new()) // WriteLocked
+                .create_spool(key.clone(), None, None, true, HashMap::new())
                 .await
                 .expect("create spool");
             key
         };
 
+        let before_recovery = Instant::now();
         let manager2 = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover should succeed");
 
         let spool = manager2.get_spool(&key).expect("recovered spool exists");
-        let activity = spool.last_read_activity_at.load(Ordering::SeqCst);
-        assert!(
-            activity > 0,
-            "last_read_activity_at must be seeded to nonzero on recovery, got {activity}"
-        );
+        let anchors = spool.cleanup_anchors();
+        assert!(anchors.last_write_at >= before_recovery);
+        assert!(anchors.last_read_activity_at.is_none());
+        assert!(anchors.full_object_read_at.is_none());
     }
 
-    /// After recovering a Complete spool, `missing_ranges` must be initialised
-    /// so that its `total_size` matches what was written and `gap_count() == 1`
-    /// (the entire object is an unserved gap until re-served after restart).
+    /// After recovering a Complete spool, monotonic cleanup anchors must grant a
+    /// fresh idle-TTL grace period and `missing_ranges` must cover the full object
+    /// until its bytes are re-served.
     #[tokio::test]
     async fn test_recovery_initializes_missing_ranges_for_complete_spool() {
         let dir = tempdir().expect("create tempdir");
@@ -3738,11 +3738,21 @@ mod tests {
             key
         };
 
+        let before_recovery = Instant::now();
         let manager2 = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
             .expect("manager2 init");
         manager2.recover().await.expect("recover should succeed");
 
         let spool = manager2.get_spool(&key).expect("recovered spool exists");
+        let anchors = spool.cleanup_anchors();
+        assert!(
+            anchors
+                .readable_at
+                .is_some_and(|anchor| anchor >= before_recovery),
+            "recovered complete spool must receive a fresh monotonic readable anchor"
+        );
+        assert!(anchors.last_read_activity_at.is_none());
+        assert!(anchors.full_object_read_at.is_none());
         let mr = spool.missing_ranges.lock().await;
         assert_eq!(
             mr.total_size,

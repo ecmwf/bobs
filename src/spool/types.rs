@@ -128,7 +128,6 @@ impl<'de> Deserialize<'de> for SpoolMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_is_readable_per_state() {
         assert!(!SpoolState::Creating.is_readable());

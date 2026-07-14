@@ -7,7 +7,6 @@ use crate::io::FileIO;
 use crate::metrics;
 use crate::spool::types::SpoolState;
 use crate::time::now_secs;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::Spool;
@@ -143,6 +142,7 @@ where
                 crate::metrics::state::COMPLETE,
             );
         }
+        self.record_readable();
 
         // From here the sidecar and in-memory metadata are authoritative. Cache
         // population is only an optimisation; skip it rather than wait on a busy
@@ -159,11 +159,7 @@ where
         let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.initialize(total_size);
-            mr.is_complete()
-                && self
-                    .full_object_read_at
-                    .compare_exchange(0, now_secs(), Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            mr.is_complete() && self.record_fully_read()
         };
         if became_fully_read {
             self.on_fully_read().await;
@@ -177,26 +173,22 @@ where
     /// Record byte-serving activity and coverage under the lifecycle lock used
     /// by cleanup revalidation. A stale cleanup candidate therefore orders either
     /// before this activity or after it; it cannot delete from an old snapshot.
-    pub async fn mark_served_and_maybe_fully_read(&self, start: u64, end: u64, now: u64) {
+    pub async fn mark_served_and_maybe_fully_read(&self, start: u64, end: u64) {
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
         {
             let mut meta = self.metadata.lock().await;
             if meta.state == SpoolState::Deleting {
                 return;
             }
-            self.last_read_activity_at.fetch_max(now, Ordering::SeqCst);
+            self.record_read_activity();
+            let now = now_secs();
             meta.last_read_at = Some(meta.last_read_at.unwrap_or(0).max(now));
         }
 
         let became_fully_read = {
             let mut mr = self.missing_ranges.lock().await;
             mr.mark_served(start, end);
-            mr.is_complete()
-                && self.full_object_read_at.load(Ordering::SeqCst) == 0
-                && self
-                    .full_object_read_at
-                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            mr.is_complete() && self.record_fully_read()
         };
 
         if became_fully_read {
@@ -211,7 +203,6 @@ where
         &self,
         start: u64,
         end: u64,
-        now: u64,
     ) {
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
         if self.metadata.lock().await.state == SpoolState::Deleting {
@@ -221,12 +212,7 @@ where
         let became_fully_read = {
             let mut missing_ranges = self.missing_ranges.lock().await;
             missing_ranges.mark_contiguous_response_complete(start, end);
-            missing_ranges.is_complete()
-                && self.full_object_read_at.load(Ordering::SeqCst) == 0
-                && self
-                    .full_object_read_at
-                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            missing_ranges.is_complete() && self.record_fully_read()
         };
 
         if became_fully_read {
