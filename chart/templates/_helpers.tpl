@@ -60,6 +60,13 @@ requires an explicit existing headless Service in the release namespace.
 {{- end -}}
 {{- end -}}
 
+{{/* Keep Helm's contract consistent with Config::validate. */}}
+{{- define "bobs.validateConfigBounds" -}}
+{{- if gt (int64 .Values.config.page_size) (int64 .Values.config.max_spool_bytes) -}}
+{{- fail "config.page_size must not exceed config.max_spool_bytes" -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Validate chart-wide invariants while resolving the StatefulSet serviceName. */}}
 {{- define "bobs.governingServiceName" -}}
 {{- include "bobs.validatePersistence" . -}}

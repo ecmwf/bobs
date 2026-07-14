@@ -180,6 +180,9 @@ assert_schema_rejects cache-negative --set config.max_cache_bytes=-1
 assert_schema_rejects live-spools-zero --set config.max_live_spools=0
 assert_schema_rejects live-spools-high --set config.max_live_spools=2305843009213693952
 assert_schema_rejects spool-size-zero --set config.max_spool_bytes=0
+assert_template_rejects page-larger-than-spool-template \
+  'config.page_size must not exceed config.max_spool_bytes' \
+  --set config.page_size=4096 --set config.max_spool_bytes=4095
 assert_schema_rejects admission-timeout-zero --set config.create_admission_timeout_ms=0
 assert_schema_rejects pprof-type --set-string config.enable_pprof=no
 assert_schema_rejects shards-zero --set config.io_uring_shards=0
