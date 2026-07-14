@@ -64,13 +64,21 @@ pub fn init_meter_provider(
     (provider, registry)
 }
 
-/// Spawn a minimal HTTP server exposing `GET /metrics` for Prometheus scraping.
+/// Serve `GET /metrics` on an already-bound listener until `shutdown` resolves,
+/// then drain connections using the same deadline as the main HTTP server.
+///
+/// Binding is deliberately owned by startup so every configured listener is
+/// validated before either server begins accepting requests.
 #[cfg(feature = "telemetry")]
-pub async fn serve_metrics(
+pub async fn serve_metrics<F>(
+    listener: tokio::net::TcpListener,
     registry: prometheus::Registry,
-    bind_address: &str,
-    port: u16,
-) -> Result<(), std::io::Error> {
+    shutdown: F,
+    drain_timeout: std::time::Duration,
+) -> Result<crate::server::DrainReport, std::io::Error>
+where
+    F: std::future::Future<Output = ()>,
+{
     use axum::extract::State;
     use axum::response::IntoResponse;
     use axum::{routing::get, Router};
@@ -93,11 +101,10 @@ pub async fn serve_metrics(
     let app = Router::new()
         .route("/metrics", get(handler))
         .with_state(registry);
+    let addr = listener.local_addr()?;
 
-    let listener = tokio::net::TcpListener::bind(format!("{bind_address}:{port}")).await?;
-
-    tracing::info!(port, "prometheus /metrics endpoint listening");
-    axum::serve(listener, app).await
+    tracing::info!(addr = %addr, port = addr.port(), "prometheus /metrics endpoint listening");
+    crate::server::serve_http(listener, app, shutdown, drain_timeout).await
 }
 
 /// Deletion reason label values.

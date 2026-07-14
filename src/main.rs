@@ -16,6 +16,8 @@ use tokio::net::TcpListener;
 
 #[cfg(feature = "telemetry")]
 use bobs::metrics::{init_meter_provider, serve_metrics};
+#[cfg(feature = "telemetry")]
+use tokio_util::sync::CancellationToken;
 
 fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
     let (_, ordinal) = hostname.rsplit_once('-').ok_or_else(|| {
@@ -105,25 +107,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = TcpListener::bind(&addr).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to bind main HTTP listener at {addr}: {error}"),
+        )
+    })?;
+
     #[cfg(feature = "telemetry")]
-    let _meter_provider = if config.metrics.enabled {
+    let metrics_listener = if config.metrics.enabled {
+        let metrics_addr = format!("{}:{}", config.metrics.bind_address, config.metrics.port);
+        let listener = TcpListener::bind(&metrics_addr).await.map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to bind metrics HTTP listener at {metrics_addr}: {error}"),
+            )
+        })?;
+        Some((listener, metrics_addr))
+    } else {
+        None
+    };
+
+    #[cfg(feature = "telemetry")]
+    let (_meter_provider, metrics_server) = if let Some((listener, metrics_addr)) = metrics_listener
+    {
         let (provider, registry) = init_meter_provider(&hostname);
-        let metrics_bind_address = config.metrics.bind_address.clone();
-        let metrics_port = config.metrics.port;
-        tokio::spawn(async move {
-            if let Err(e) = serve_metrics(registry, &metrics_bind_address, metrics_port).await {
-                tracing::error!(port = metrics_port, error = %e, "metrics server failed");
-            }
-        });
         tracing::info!(
             "event.name" = "startup.metrics.enabled",
             outcome = "success",
-            port = metrics_port,
+            addr = %metrics_addr,
+            host = %config.metrics.bind_address,
+            port = config.metrics.port,
             "prometheus /metrics scrape endpoint enabled"
         );
-        Some(provider)
+        (Some(provider), Some((listener, registry)))
     } else {
-        None
+        (None, None)
     };
 
     let metrics = Arc::new(BobsMetrics::new(config.metrics.enabled));
@@ -138,7 +158,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     manager.set_metrics(Arc::clone(&metrics));
     let manager = Arc::new(manager);
 
-    manager.recover().await?;
+    manager
+        .recover_with_max_spool_bytes(config.max_spool_bytes)
+        .await?;
     let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
     let state = Arc::new(AppState {
@@ -150,10 +172,72 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metrics,
     });
     let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(state);
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
     tracing::info!("event.name" = "startup.server.listening", outcome = "success", addr = %addr, host = %config.host, port = config.port, "server listening");
 
+    #[cfg(feature = "telemetry")]
+    let (drain, metrics_drain) = if let Some((metrics_listener, registry)) = metrics_server {
+        let cancellation = CancellationToken::new();
+        let main_cancellation = cancellation.clone();
+        let metrics_cancellation = cancellation.clone();
+        let main_server = serve_http(
+            listener,
+            app,
+            async move { main_cancellation.cancelled().await },
+            SHUTDOWN_DRAIN_TIMEOUT,
+        );
+        let metrics_server = serve_metrics(
+            metrics_listener,
+            registry,
+            async move { metrics_cancellation.cancelled().await },
+            SHUTDOWN_DRAIN_TIMEOUT,
+        );
+        tokio::pin!(main_server);
+        tokio::pin!(metrics_server);
+
+        tokio::select! {
+            _ = shutdown::shutdown_signal() => {
+                tracing::info!(
+                    "event.name" = "startup.shutdown.received",
+                    outcome = "success",
+                    drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                    "shutdown signal received; stopping accepts and draining connections"
+                );
+                cancellation.cancel();
+                let (main_result, metrics_result) =
+                    tokio::join!(main_server.as_mut(), metrics_server.as_mut());
+                (main_result?, Some(metrics_result?))
+            }
+            main_result = main_server.as_mut() => {
+                cancellation.cancel();
+                let metrics_result = metrics_server.as_mut().await;
+                (main_result?, Some(metrics_result?))
+            }
+            metrics_result = metrics_server.as_mut() => {
+                cancellation.cancel();
+                let main_result = main_server.as_mut().await;
+                (main_result?, Some(metrics_result?))
+            }
+        }
+    } else {
+        let drain = serve_http(
+            listener,
+            app,
+            async {
+                shutdown::shutdown_signal().await;
+                tracing::info!(
+                    "event.name" = "startup.shutdown.received",
+                    outcome = "success",
+                    drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                    "shutdown signal received; stopping accepts and draining connections"
+                );
+            },
+            SHUTDOWN_DRAIN_TIMEOUT,
+        )
+        .await?;
+        (drain, None)
+    };
+
+    #[cfg(not(feature = "telemetry"))]
     let drain = serve_http(
         listener,
         app,
@@ -169,14 +253,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SHUTDOWN_DRAIN_TIMEOUT,
     )
     .await?;
+
     if drain.timed_out {
         tracing::warn!(
             "event.name" = "startup.shutdown.drain_timeout",
             outcome = "timeout",
+            listener = "main",
             drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
             aborted_connections = drain.aborted_connections,
             "HTTP drain deadline reached; aborted remaining connections"
         );
+    }
+
+    #[cfg(feature = "telemetry")]
+    if let Some(metrics_drain) = metrics_drain {
+        if metrics_drain.timed_out {
+            tracing::warn!(
+                "event.name" = "startup.shutdown.drain_timeout",
+                outcome = "timeout",
+                listener = "metrics",
+                drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                aborted_connections = metrics_drain.aborted_connections,
+                "HTTP drain deadline reached; aborted remaining connections"
+            );
+        }
     }
 
     // Drop HTTP entrypoints and background manager users before tearing down
