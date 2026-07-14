@@ -472,7 +472,17 @@ where
         self.recover_with_counts().await.map(|_| ())
     }
 
+    /// Recover durable spools whose canonical payload length does not exceed `maximum`.
+    /// This explicit bound lets callers apply their write-time spool limit at startup.
+    pub async fn recover_with_max_spool_bytes(&self, maximum: u64) -> Result<()> {
+        self.recover_with_counts_limit(maximum).await.map(|_| ())
+    }
+
     async fn recover_with_counts(&self) -> Result<(usize, usize)> {
+        self.recover_with_counts_limit(u64::MAX).await
+    }
+
+    async fn recover_with_counts_limit(&self, maximum_spool_bytes: u64) -> Result<(usize, usize)> {
         let started = Instant::now();
         let mut stale_count = 0_usize;
         let mut corrupt_deleted = 0_u64;
@@ -599,20 +609,89 @@ where
 
             let activity_at = recovery_activity_at(&meta);
             let canonical_data_path = self.data_dir.join(&name).join("spool.dat");
-            match prepare_recovery_candidate(meta, &canonical_data_path, self.page_size) {
-                RecoveryMetadataDisposition::Candidate(prepared) => {
-                    let preflight_file_size = prepared.file_size;
-                    // Validate payload openability before it can occupy the bounded
-                    // preferred set. Do not read active tails here: excess candidates
-                    // must cost only one streamed sidecar, one stat, and one open.
+
+            // Incomplete transactions are metadata-only cleanup decisions. Do not
+            // require their payload to exist or be openable.
+            if matches!(meta.state, SpoolState::Creating | SpoolState::Deleting) {
+                let reason = if meta.state == SpoolState::Creating {
+                    "incomplete Creating transition"
+                } else {
+                    "incomplete Deleting transition"
+                };
+                tracing::warn!(key = %name, reason, "recovery: discarding unrecoverable spool directory");
+                self.metadata_store.delete(&name).await?;
+                self.remove_spool_directory_durably(&name).await?;
+                stale_count += 1;
+                corrupt_deleted += 1;
+                tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+                continue;
+            }
+
+            // Inspect the canonical path without following its final symlink. FileIO
+            // keeps this potentially blocking metadata call off Tokio workers.
+            let file_metadata = match F::symlink_metadata(&canonical_data_path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(key = %name, "recovery: canonical data file missing; leaving spool intact and continuing scan");
+                    rejected_count += 1;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(key = %name, error = %error, "recovery: canonical payload metadata preflight failed; leaving spool intact and continuing scan");
+                    rejected_count += 1;
+                    continue;
+                }
+            };
+            if !file_metadata.file_type().is_file() {
+                let reason = if file_metadata.file_type().is_symlink() {
+                    "canonical data file is a symlink"
+                } else {
+                    "canonical data file is not a regular file"
+                };
+                tracing::warn!(key = %name, reason, "recovery: candidate left intact and unavailable");
+                rejected_count += 1;
+                continue;
+            }
+            let preflight_file_size = file_metadata.len();
+
+            match prepare_recovery_candidate(
+                meta,
+                &canonical_data_path,
+                self.page_size,
+                preflight_file_size,
+                maximum_spool_bytes,
+            ) {
+                RecoveryMetadataDisposition::Candidate(_) => {
+                    // Every metadata-valid candidate is open-preflighted, including
+                    // excess entries. Only admitted active tails are read.
                     let handle = match F::open(&canonical_data_path).await {
                         Ok(handle) => handle,
                         Err(error) => {
-                            tracing::warn!(key = %name, error = %error, "recovery: canonical payload preflight failed; leaving spool intact and continuing scan");
+                            tracing::warn!(key = %name, error = %error, "recovery: canonical payload open preflight failed; leaving spool intact and continuing scan");
                             rejected_count += 1;
                             continue;
                         }
                     };
+                    let opened_file_size = match F::file_size(&handle).await {
+                        Ok(file_size) => file_size,
+                        Err(error) => {
+                            tracing::warn!(key = %name, error = %error, "recovery: opened payload metadata preflight failed; leaving spool intact and continuing scan");
+                            if let Err(close_error) = F::close(handle).await {
+                                tracing::warn!(key = %name, error = %close_error, "recovery: failed to close metadata-rejected preflight payload handle");
+                            }
+                            rejected_count += 1;
+                            continue;
+                        }
+                    };
+                    if opened_file_size != preflight_file_size {
+                        tracing::warn!(key = %name, preflight_file_size, opened_file_size, "recovery: canonical payload size changed during preflight; leaving spool intact and continuing scan");
+                        if let Err(error) = F::close(handle).await {
+                            tracing::warn!(key = %name, error = %error, "recovery: failed to close size-raced preflight payload handle");
+                        }
+                        rejected_count += 1;
+                        continue;
+                    }
+
                     let excess = candidates.push(RecoveryCandidateSummary {
                         key: name.clone(),
                         activity_at,
@@ -708,10 +787,23 @@ where
             };
 
             let canonical_data_path = self.data_dir.join(&key).join("spool.dat");
+            let file_size = match F::file_size(&preflight_handle).await {
+                Ok(file_size) => file_size,
+                Err(error) => {
+                    tracing::warn!(key = %key, error = %error, "recovery: selected canonical payload metadata check failed; leaving spool intact and trying the next candidate");
+                    if let Err(close_error) = F::close(preflight_handle).await {
+                        tracing::warn!(key = %key, error = %close_error, "recovery: failed to close metadata-rejected preflight payload handle");
+                    }
+                    rejected_count += 1;
+                    continue;
+                }
+            };
             let prepared = match prepare_recovery_candidate(
                 meta,
                 &canonical_data_path,
                 self.page_size,
+                file_size,
+                maximum_spool_bytes,
             ) {
                 RecoveryMetadataDisposition::Candidate(prepared) => *prepared,
                 RecoveryMetadataDisposition::Cleanup { reason } => {
@@ -1026,6 +1118,8 @@ fn prepare_recovery_candidate(
     mut meta: SpoolMetadata,
     canonical_data_path: &Path,
     configured_page_size: usize,
+    file_size: u64,
+    maximum_spool_bytes: u64,
 ) -> RecoveryMetadataDisposition {
     match meta.state {
         SpoolState::Creating => {
@@ -1071,29 +1165,13 @@ fn prepare_recovery_candidate(
     let data_path_migrated = meta.data_path != canonical_data_path;
     meta.data_path = canonical_data_path.to_path_buf();
 
-    let file_metadata = match std::fs::symlink_metadata(canonical_data_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return RecoveryMetadataDisposition::Preserve {
-                reason: "canonical data file missing".to_owned(),
-            };
-        }
-        Err(error) => {
-            return RecoveryMetadataDisposition::Preserve {
-                reason: format!("failed to inspect canonical data file metadata: {error}"),
-            };
-        }
-    };
-    if !file_metadata.file_type().is_file() {
+    if file_size > maximum_spool_bytes {
         return RecoveryMetadataDisposition::Preserve {
-            reason: if file_metadata.file_type().is_symlink() {
-                "canonical data file is a symlink".to_owned()
-            } else {
-                "canonical data file is not a regular file".to_owned()
-            },
+            reason: format!(
+                "canonical payload has {file_size} bytes, exceeding the recovery spool limit {maximum_spool_bytes}"
+            ),
         };
     }
-    let file_size = file_metadata.len();
 
     let finalized_completing = meta.state == SpoolState::Completing;
     if finalized_completing {
@@ -1169,10 +1247,10 @@ struct RecoveryMigration {
 
 /// Convert every terminal byte stream to the current bounded stride. Active
 /// Writing retains a known historical stride no larger than the current configured
-/// stride. Legacy zero-page Writing is terminalized only when all contiguous durable
-/// bytes fit in one current page; ambiguous legacy multi-page layouts are preserved.
-/// Missing or oversized WriteLocked layouts are terminalized to bounded Complete
-/// salvage because their durable bytes are contiguous.
+/// stride. Legacy zero-page Writing is a contiguous byte stream and is terminalized
+/// into as many current bounded pages as checked arithmetic requires. Missing or
+/// oversized WriteLocked layouts are terminalized to bounded Complete salvage because
+/// their durable bytes are contiguous.
 fn prepare_recovery_metadata(
     meta: &mut SpoolMetadata,
     file_size: u64,
@@ -1215,11 +1293,6 @@ fn prepare_recovery_metadata(
             return Err(
                 "active legacy multi-page layout has no authoritative historical stride".into(),
             );
-        }
-        if file_size > target_page_size {
-            return Err(format!(
-                "zero-page legacy Writing payload has {file_size} bytes, exceeding the bounded terminal salvage page size {target_page_size}"
-            ));
         }
 
         let write_locked = meta.write_locked;
@@ -1629,6 +1702,12 @@ mod tests {
             TokioFileIO::open(path)
         }
 
+        fn file_size(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
+            TokioFileIO::file_size(handle)
+        }
+
         fn write_at(
             handle: &Self::Handle,
             offset: u64,
@@ -1733,6 +1812,12 @@ mod tests {
             }
         }
 
+        fn file_size(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
+            TokioFileIO::file_size(handle)
+        }
+
         fn write_at(
             handle: &Self::Handle,
             offset: u64,
@@ -1752,6 +1837,87 @@ mod tests {
                 RECOVERY_READ_BYTES.fetch_add(bytes.len(), std::sync::atomic::Ordering::SeqCst);
                 Ok(bytes)
             }
+        }
+
+        fn sync_data(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_data(handle)
+        }
+
+        fn sync_directory(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::sync_directory(path)
+        }
+
+        fn close(
+            handle: Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::close(handle)
+        }
+
+        fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::remove(path)
+        }
+    }
+
+    static DELAYED_PREFLIGHT_METADATA_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[derive(Clone)]
+    struct DelayedRecoveryPreflightFileIO;
+
+    impl FileIO for DelayedRecoveryPreflightFileIO {
+        type Handle = <TokioFileIO as FileIO>::Handle;
+
+        fn create(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::create(path)
+        }
+
+        fn open(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
+            TokioFileIO::open(path)
+        }
+
+        fn symlink_metadata(
+            path: &Path,
+        ) -> impl std::future::Future<Output = std::io::Result<std::fs::Metadata>> + Send {
+            let path = path.to_path_buf();
+            async move {
+                DELAYED_PREFLIGHT_METADATA_STARTED.store(true, Ordering::SeqCst);
+                tokio::task::spawn_blocking(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    std::fs::symlink_metadata(path)
+                })
+                .await
+                .map_err(std::io::Error::other)?
+            }
+        }
+
+        fn file_size(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
+            TokioFileIO::file_size(handle)
+        }
+
+        fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: Bytes,
+        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
+            TokioFileIO::write_at(handle, offset, data)
+        }
+
+        fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+            TokioFileIO::read_at(handle, offset, len)
         }
 
         fn sync_data(
@@ -1820,6 +1986,12 @@ mod tests {
             path: &Path,
         ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
             TokioFileIO::open(path)
+        }
+
+        fn file_size(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
+            TokioFileIO::file_size(handle)
         }
 
         fn write_at(
@@ -1944,7 +2116,7 @@ mod tests {
         );
     }
 
-    async fn persisted_metadata(manager: &SpoolManager<TokioFileIO>, key: &str) -> SpoolMetadata {
+    async fn persisted_metadata<F: FileIO>(manager: &SpoolManager<F>, key: &str) -> SpoolMetadata {
         manager
             .metadata_store
             .read(key)
@@ -4002,7 +4174,7 @@ mod tests {
         assert_eq!(
             RECOVERY_OPEN_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "a symlink payload must be rejected before FileIO::open"
+            "the no-follow metadata preflight must reject a symlink before open"
         );
         assert!(tokio::fs::symlink_metadata(spool_dir.join("spool.dat"))
             .await
@@ -4638,15 +4810,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn recovery_sparse_zero_page_64_mib_salvage_has_bounded_rss_and_no_tail_read() {
+    async fn recovery_sparse_zero_page_64_mib_plus_one_salvage_is_bounded_and_exact() {
         let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
         const PAGE_SIZE: usize = MAX_PAGE_SIZE_BYTES;
+        const FILE_LEN: u64 = PAGE_SIZE as u64 + 1;
 
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let key = uuid::Uuid::new_v4().to_string();
-        write_sparse_old_main_writing_fixture(&data_dir, &key, PAGE_SIZE as u64, b"ABCD", b"WXYZ")
-            .await;
+        write_sparse_old_main_writing_fixture(&data_dir, &key, FILE_LEN, b"ABCD", b"WXYZ").await;
 
         RECOVERY_OPEN_ATTEMPTS.store(0, Ordering::SeqCst);
         RECOVERY_OPEN_COUNT.store(0, Ordering::SeqCst);
@@ -4666,15 +4838,15 @@ mod tests {
         let metadata = spool.metadata.lock().await.clone();
         assert_eq!(metadata.state, SpoolState::Complete);
         assert_eq!(metadata.page_size, PAGE_SIZE as u64);
-        assert_eq!(metadata.total_bytes_written, PAGE_SIZE as u64);
-        assert_eq!(metadata.total_pages, 1);
-        assert_eq!(metadata.final_page_size, None);
+        assert_eq!(metadata.total_bytes_written, FILE_LEN);
+        assert_eq!(metadata.total_pages, 2);
+        assert_eq!(metadata.final_page_size, Some(1));
         assert_eq!(RECOVERY_OPEN_ATTEMPTS.load(Ordering::SeqCst), 1);
         assert_eq!(RECOVERY_OPEN_COUNT.load(Ordering::SeqCst), 1);
         assert_eq!(
             RECOVERY_READ_BYTES.load(Ordering::SeqCst),
             0,
-            "terminal salvage must not allocate or load a 64 MiB active tail"
+            "terminal salvage must not allocate or load a page-sized active tail"
         );
         assert_eq!(RECOVERY_MAX_READ_LEN.load(Ordering::SeqCst), 0);
         assert!(
@@ -4691,15 +4863,141 @@ mod tests {
         assert_eq!(
             read_exact_logical_range::<RecoveryCountingFileIO>(
                 &spool.file_handle,
-                PAGE_SIZE as u64 - 4,
+                FILE_LEN - 4,
                 4,
             )
             .await
-            .expect("read sparse suffix"),
+            .expect("read exact cross-page suffix"),
             b"WXYZ"
         );
         assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 8);
         assert_eq!(RECOVERY_MAX_READ_LEN.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn recovery_sparse_zero_page_multi_gib_salvage_is_metadata_only() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        const PAGE_SIZE: usize = MAX_PAGE_SIZE_BYTES;
+        const FILE_LEN: u64 = 5 * 1024 * 1024 * 1024 + 123;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        write_sparse_old_main_writing_fixture(&data_dir, &key, FILE_LEN, b"HEAD", b"TAIL").await;
+
+        RECOVERY_OPEN_ATTEMPTS.store(0, Ordering::SeqCst);
+        RECOVERY_OPEN_COUNT.store(0, Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, Ordering::SeqCst);
+        RECOVERY_MAX_READ_LEN.store(0, Ordering::SeqCst);
+        let manager =
+            SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, PAGE_SIZE, 16 * 1024, 1)
+                .expect("recovery manager");
+        manager
+            .recover_with_max_spool_bytes(FILE_LEN)
+            .await
+            .expect("salvage multi-GiB sparse writer");
+
+        let spool = manager.get_spool(&key).expect("terminal sparse salvage");
+        let metadata = spool.metadata.lock().await.clone();
+        assert_eq!(metadata.state, SpoolState::Complete);
+        assert_eq!(metadata.total_bytes_written, FILE_LEN);
+        assert_eq!(metadata.total_pages, 81);
+        assert_eq!(metadata.final_page_size, Some(123));
+        assert_eq!(RECOVERY_OPEN_ATTEMPTS.load(Ordering::SeqCst), 1);
+        assert_eq!(RECOVERY_OPEN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 0);
+        assert_eq!(RECOVERY_MAX_READ_LEN.load(Ordering::SeqCst), 0);
+
+        let persisted = persisted_metadata(&manager, &key).await;
+        assert_eq!(persisted.total_bytes_written, FILE_LEN);
+        assert_eq!(persisted.total_pages, 81);
+        assert_eq!(persisted.final_page_size, Some(123));
+    }
+
+    #[tokio::test]
+    async fn recovery_quarantines_payload_above_caller_spool_limit() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        const PAGE_SIZE: usize = MAX_PAGE_SIZE_BYTES;
+        const FILE_LEN: u64 = PAGE_SIZE as u64 + 1;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        write_sparse_old_main_writing_fixture(&data_dir, &key, FILE_LEN, b"HEAD", b"TAIL").await;
+        let spool_dir = data_dir.join(&key);
+        let sidecar_before = tokio::fs::read(spool_dir.join("meta.json"))
+            .await
+            .expect("snapshot sidecar");
+
+        RECOVERY_READ_BYTES.store(0, Ordering::SeqCst);
+        let manager =
+            SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, PAGE_SIZE, 16 * 1024, 1)
+                .expect("recovery manager");
+        manager
+            .recover_with_max_spool_bytes(PAGE_SIZE as u64)
+            .await
+            .expect("quarantine over-limit sparse writer");
+
+        assert!(manager.get_spool(&key).is_none());
+        assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tokio::fs::metadata(spool_dir.join("spool.dat"))
+                .await
+                .expect("payload remains")
+                .len(),
+            FILE_LEN
+        );
+        assert_eq!(
+            tokio::fs::read(spool_dir.join("meta.json"))
+                .await
+                .expect("sidecar remains"),
+            sidecar_before
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_recovery_metadata_preflight_keeps_current_thread_progressing() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        write_old_main_sidecar_fixture(&data_dir, &key, "Writing", b"abc", 0, None).await;
+
+        DELAYED_PREFLIGHT_METADATA_STARTED.store(false, Ordering::SeqCst);
+        let manager = Arc::new(
+            SpoolManager::<DelayedRecoveryPreflightFileIO>::new(&data_dir, 4, 1024, 1)
+                .expect("recovery manager"),
+        );
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker_ticks = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                ticker_ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let recovery_manager = Arc::clone(&manager);
+        let recovery = tokio::spawn(async move { recovery_manager.recover().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !DELAYED_PREFLIGHT_METADATA_STARTED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("metadata preflight started");
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 3,
+            "delayed descriptor metadata must not block current-thread timers"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), recovery)
+            .await
+            .expect("recovery remained live")
+            .expect("recovery task joined")
+            .expect("recovery succeeded");
+        ticker.abort();
+        assert!(manager.get_spool(&key).is_some());
     }
 
     #[tokio::test]

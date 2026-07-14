@@ -263,6 +263,12 @@ mod tests {
             TokioFileIO::open(path)
         }
 
+        fn file_size(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
+            TokioFileIO::file_size(handle)
+        }
+
         fn write_at(
             handle: &Self::Handle,
             offset: u64,

@@ -47,6 +47,17 @@ impl FileIO for TokioFileIO {
         }
     }
 
+    fn file_size(
+        handle: &Self::Handle,
+    ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
+        let file = Arc::clone(handle);
+        async move {
+            task::spawn_blocking(move || file.metadata().map(|metadata| metadata.len()))
+                .await
+                .map_err(join_error_to_io)?
+        }
+    }
+
     fn write_at(
         handle: &Self::Handle,
         offset: u64,
