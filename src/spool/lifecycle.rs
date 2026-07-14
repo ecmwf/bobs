@@ -221,8 +221,10 @@ where
     /// file handle are redundant. Active readers keep their cloned handles alive.
     pub async fn on_fully_read(&self) {
         self.page_cache.lock().await.free_spool(&self.key);
-        self.release_admission();
+        // Retire manager ownership before publishing released admission so every
+        // reopen observed after that boundary is response-scoped.
         self.close_file_handle();
+        self.release_admission();
     }
 
     pub async fn is_readable(&self) -> bool {
