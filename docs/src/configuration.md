@@ -35,7 +35,7 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages. Valid range: `1..=67108864` (64 MiB), and it must not exceed `max_spool_bytes`. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. |
 | `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global budget for the logical bytes of bounded cache-owned page allocations across all spools, excluding allocator overhead. It also derives the read-response permit budget as `max(1, floor(max_cache_bytes / page_size))`; weighted permits are held until response bodies are dropped. Cache insertion may copy a page solely to avoid retaining an oversized transport-frame backing; the frame-to-disk path remains zero-copy. Set to `0` to disable caching while retaining a one-page response bound. A page rejected because it exceeds the cap likewise bypasses the cache without an isolation copy and remains readable from disk. |
-| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools in the first-read cache phase and for startup recovery. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. The first proven full-object read frees that spool's cache and admission slot immediately while leaving it readable from disk. Startup admits at most this many durable spools and leaves excess entries unopened and unchanged for a later restart with more capacity. |
+| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools in the first-read cache phase and for startup recovery. Valid range: `1..=65536`; the bound applies to explicit and derived values. YAML omission derives it from effective page/cache settings. The first proven full-object read frees that spool's cache and admission slot while leaving it readable from disk. Startup retains exactly this many preflighted candidates and leaves excess entries unchanged for a later restart with more capacity. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests. Must be greater than `0` and at least `page_size`. |
 | `create_admission_timeout_ms` | `5000` | Maximum time `/api/v1/create` waits for a `max_live_spools` slot before returning `503 Service Unavailable`. Must be greater than `0`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup timeout for an unfinished spool whose writer has stopped sending data. Must be greater than `0`. |
@@ -53,13 +53,14 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `route_name` | `""` | External download route prefix. Must be non-empty. |
 | `metrics.enabled` | `false` | Enable OpenTelemetry metrics export. Requires a build with `--features telemetry`; has no effect without that feature. |
 | `metrics.bind_address` | `127.0.0.1` | Bind address for the Prometheus `/metrics` scrape endpoint. Use `0.0.0.0` in Kubernetes so the pod is scrapable. |
-| `metrics.port` | `9464` | Port for the Prometheus `/metrics` scrape endpoint (the conventional OTel Prometheus exporter port). Runs on a separate port from the main data port. |
+| `metrics.port` | `9464` | Port for the Prometheus `/metrics` scrape endpoint (the conventional OTel Prometheus exporter port). When telemetry and metrics are enabled, this must differ from the main HTTP `port`; startup rejects a collision before either listener is started. |
 | `metrics.allowed_labels` | `[]` | Caller-provided label keys forwarded as metric attributes. Empty list means all caller labels pass through. Set to a non-empty list to restrict label cardinality. |
 | `metrics.max_label_value_length` | `128` | Maximum byte length for label values. Values exceeding this limit are truncated before recording. |
+| `bob_id` | `unknown` | Unique instance ID. The chart sets it to the pod hostname. |
 
-Recovery metadata has fixed safety bounds rather than extra configuration fields. `meta.json` is limited to 1 MiB and its open-file size is checked before allocation. The directory scan uses a fixed-capacity channel and retains only `max_live_spools` candidate summaries plus a fixed refill reserve, keeping scan memory O(capacity) even for millions of directories. Oversized or unknown-field sidecars are preserved unchanged but unavailable.
+Recovery metadata has fixed safety bounds rather than extra configuration fields. `meta.json` is limited to 1 MiB and its open-file size is checked before allocation. The directory scan uses a fixed-capacity channel and retains exactly `max_live_spools` candidate summaries and preflight handles. Payload open failures are rejected during the streaming scan before they can occupy the bounded candidate set, so repeated newer failures cannot starve an older valid spool. Excess payloads are closed after preflight without reading an active tail. Oversized or unknown-field sidecars are preserved unchanged but unavailable.
 
-Persisted page layouts are also brought under the current limits before admission. Completed data is resegmented arithmetically to the configured `page_size` without reading payload pages at startup. A `Writing` spool whose historical stride exceeds the configured size is quarantined unchanged before payload open; an oversized `WriteLocked` spool is salvaged as bounded `Complete`. Since startup requires `page_size <= min(67108864, max_spool_bytes)`, no recovered page exceeds the final 64 MiB or spool-size constraint.
+Persisted page layouts are brought under the current limits before admission. Completed data is resegmented arithmetically to the configured `page_size` without reading payload pages at startup. A legacy `Writing` sidecar with zero recorded pages and at most one configured page of durable data is terminalized as `Complete`; its exact bytes remain readable and further writes are rejected. A multi-page `Writing` spool with no trustworthy historical stride stays quarantined unchanged. Oversized `WriteLocked` spools are also salvaged as bounded `Complete`. Since startup requires `page_size <= min(67108864, max_spool_bytes)`, no recovered page exceeds the 64 MiB or spool-size constraint.
 
 ## Helm ingress and shutdown settings
 
@@ -75,9 +76,9 @@ port: 3000
 data_dir: /data/bobs
 page_size: 16777216
 max_cache_bytes: 268435456      # cache and slow-reader response budget; 0 disables cache
-# max_live_spools omitted: derives 16 here and bounds startup recovery
-max_spool_bytes: 8589934592   # 8 GiB per spool
-create_admission_timeout_ms: 5000
+# max_live_spools omitted: derives 16; valid range 1..=65536 and bounds recovery
+max_spool_bytes: 8589934592       # 8 GiB per spool
+create_admission_timeout_ms: 5000 # return 503 rather than waiting indefinitely
 writer_inactivity_timeout_secs: 300
 enable_pprof: false            # only enable for controlled, trusted profiling
 read_idle_ttl_secs: 600
@@ -94,7 +95,7 @@ route_name: download
 metrics:
   enabled: false         # requires --features telemetry; see Metrics page
   bind_address: "127.0.0.1"  # loopback only; use 0.0.0.0 in k8s
-  port: 9464             # separate Prometheus scrape port (OTel convention)
+  port: 9464             # must differ from the main port when metrics are enabled
   allowed_labels: []     # empty = all caller labels; set a list to restrict cardinality
   max_label_value_length: 128
 ```
