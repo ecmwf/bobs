@@ -699,9 +699,9 @@ where
         }
 
         spool.cancel.cancel();
-        // Drop the manager-held descriptor before unlinking. In-flight readers own
-        // cloned Arcs and remain safe; a closed or already fully-read spool is a no-op.
-        spool.close_file_handle();
+        // Stop publishing handles before unlinking. In-flight readers own cloned Arcs
+        // through their response permits and remain safe until those bodies drop.
+        spool.invalidate_file_handle();
         self.metadata_store.delete(key).await?;
         self.remove_spool_directory_durably(key).await?;
 
@@ -1964,6 +1964,8 @@ fn in_progress_progress_from_file(file_size: u64, page_size: usize) -> InProgres
 mod tests {
     use super::*;
     use crate::io::TokioFileIO;
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    use crate::io::{RingPool, RingPoolOptions, UringFileIO};
     use bytes::Bytes;
     use std::sync::{atomic::Ordering, Arc};
     use tempfile::tempdir;
@@ -2262,13 +2264,36 @@ mod tests {
     static HANDLE_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static REOPEN_OPEN_COUNT: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    static REOPEN_ACTIVE_OPENS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static REOPEN_ACTIVE_HANDLES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     static REOPEN_ACTIVE_READS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     static REOPEN_MAX_ACTIVE_READS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    static REOPEN_BLOCK_OPENS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     static REOPEN_BLOCK_READS: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static REOPEN_OPEN_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
     static REOPEN_READ_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+
+    fn reset_reopen_test_state() {
+        while let Ok(permit) = REOPEN_OPEN_GATE.try_acquire() {
+            permit.forget();
+        }
+        while let Ok(permit) = REOPEN_READ_GATE.try_acquire() {
+            permit.forget();
+        }
+        assert_eq!(REOPEN_ACTIVE_OPENS.load(Ordering::SeqCst), 0);
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert_eq!(REOPEN_ACTIVE_READS.load(Ordering::SeqCst), 0);
+        REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
+        REOPEN_MAX_ACTIVE_READS.store(0, Ordering::SeqCst);
+        REOPEN_BLOCK_OPENS.store(false, Ordering::SeqCst);
+        REOPEN_BLOCK_READS.store(false, Ordering::SeqCst);
+    }
 
     #[derive(Clone)]
     struct ReopenTestFileIO;
@@ -2277,21 +2302,36 @@ mod tests {
         inner: <TokioFileIO as FileIO>::Handle,
     }
 
+    impl Drop for ReopenTestHandle {
+        fn drop(&mut self) {
+            REOPEN_ACTIVE_HANDLES.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn track_reopen_handle(inner: <TokioFileIO as FileIO>::Handle) -> ReopenTestHandle {
+        REOPEN_ACTIVE_HANDLES.fetch_add(1, Ordering::SeqCst);
+        ReopenTestHandle { inner }
+    }
+
     impl FileIO for ReopenTestFileIO {
         type Handle = ReopenTestHandle;
 
         async fn create(path: &Path) -> std::io::Result<Self::Handle> {
-            Ok(ReopenTestHandle {
-                inner: TokioFileIO::create(path).await?,
-            })
+            Ok(track_reopen_handle(TokioFileIO::create(path).await?))
         }
 
         async fn open(path: &Path) -> std::io::Result<Self::Handle> {
             REOPEN_OPEN_COUNT.fetch_add(1, Ordering::SeqCst);
+            if REOPEN_BLOCK_OPENS.load(Ordering::SeqCst) {
+                REOPEN_ACTIVE_OPENS.fetch_add(1, Ordering::SeqCst);
+                let permit = REOPEN_OPEN_GATE.acquire().await.map_err(|_| {
+                    std::io::Error::other("reopen test open gate unexpectedly closed")
+                })?;
+                permit.forget();
+                REOPEN_ACTIVE_OPENS.fetch_sub(1, Ordering::SeqCst);
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            Ok(ReopenTestHandle {
-                inner: TokioFileIO::open(path).await?,
-            })
+            Ok(track_reopen_handle(TokioFileIO::open(path).await?))
         }
 
         async fn file_size(handle: &Self::Handle) -> std::io::Result<u64> {
@@ -3468,18 +3508,20 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn many_full_read_cycles_keep_tracked_spool_fd_count_bounded() {
+    async fn create_complete_full_read_then_repeated_cache_misses_beyond_rlimit_are_bounded() {
         let _guard = HANDLE_LIFECYCLE_TEST_LOCK.lock().await;
-        const CYCLES: usize = 128;
+        const CYCLES: usize = SYNTHETIC_FD_LIMIT * 4;
+        const REPEATED_READS: usize = 3;
         const PAGE_SIZE: usize = 64;
 
-        LIMITED_ACTIVE_HANDLES.store(0, Ordering::SeqCst);
+        assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
         LIMITED_MAX_ACTIVE_HANDLES.store(0, Ordering::SeqCst);
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let manager =
             SpoolManager::<LimitedRecoveryFileIO>::new(&data_dir, PAGE_SIZE, 4 * PAGE_SIZE, 1)
                 .expect("manager init");
+        let fd_before = open_fd_count();
 
         for sequence in 0..CYCLES {
             let key = format!("fd-cycle-{sequence:024}");
@@ -3497,7 +3539,10 @@ mod tests {
                 .complete(Some(PAGE_SIZE as u64))
                 .await
                 .expect("complete spool");
-            assert_eq!(spool.read_page_for_test(0).await.unwrap(), Some(payload),);
+            assert_eq!(
+                spool.read_page_for_test(0).await.unwrap(),
+                Some(payload.clone()),
+            );
             spool
                 .mark_served_and_maybe_fully_read(0, PAGE_SIZE as u64)
                 .await;
@@ -3510,15 +3555,100 @@ mod tests {
                 0,
                 "completed cycle retained a synthetic data descriptor"
             );
+
+            for _ in 0..REPEATED_READS {
+                let permit = spool
+                    .acquire_read_response_permit()
+                    .await
+                    .expect("acquire repeated read response");
+                assert_eq!(
+                    spool.read_page(0, &permit).await.unwrap(),
+                    Some(payload.clone()),
+                );
+                assert!(!spool.has_open_file_handle());
+                assert!(spool.has_live_response_file_handle());
+                assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 1);
+                drop(permit);
+                assert!(!spool.has_live_response_file_handle());
+                assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+            }
         }
 
+        let fd_after = open_fd_count();
         assert_eq!(manager.spools.len(), CYCLES);
         assert_eq!(manager.admission.available_permits(), 1);
         assert_eq!(
             LIMITED_MAX_ACTIVE_HANDLES.load(Ordering::SeqCst),
             1,
-            "sequential cycles must keep at most one data descriptor active"
+            "response admission must bound cache-miss reopen handles"
         );
+        assert!(
+            fd_after < fd_before + CYCLES / 2,
+            "terminal spool descriptors did not settle: before={fd_before}, after={fd_after}"
+        );
+    }
+
+    async fn repeated_terminal_reads_are_response_scoped_for_backend<F: FileIO>() {
+        const PAGE_SIZE: usize = 4096;
+        let dir = tempdir().expect("create backend tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<F>::new(&data_dir, PAGE_SIZE, 4 * PAGE_SIZE, 1)
+            .expect("backend manager init");
+        let key = "backend-response-scope".to_string();
+        let payload = Bytes::from(vec![0x6b; PAGE_SIZE]);
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create backend spool");
+        let spool = manager.get_spool(&key).expect("backend spool");
+        spool.write(0, payload.clone()).await.expect("write page");
+        spool
+            .complete(Some(PAGE_SIZE as u64))
+            .await
+            .expect("complete backend spool");
+        assert_eq!(
+            spool.read_page_for_test(0).await.unwrap(),
+            Some(payload.clone()),
+        );
+        spool
+            .mark_served_and_maybe_fully_read(0, PAGE_SIZE as u64)
+            .await;
+        assert!(!spool.has_open_file_handle());
+
+        for _ in 0..3 {
+            let permit = spool
+                .acquire_read_response_permit()
+                .await
+                .expect("acquire backend response");
+            assert_eq!(
+                spool.read_page(0, &permit).await.unwrap(),
+                Some(payload.clone()),
+            );
+            assert!(!spool.has_open_file_handle());
+            assert!(spool.has_live_response_file_handle());
+            drop(permit);
+            assert!(!spool.has_live_response_file_handle());
+        }
+    }
+
+    #[tokio::test]
+    async fn tokio_terminal_reopens_are_response_scoped() {
+        repeated_terminal_reads_are_response_scoped_for_backend::<TokioFileIO>().await;
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    #[tokio::test]
+    async fn uring_terminal_reopens_are_response_scoped() {
+        let pool = Arc::new(
+            RingPool::new_for_test(RingPoolOptions {
+                shard_count: 1,
+                queue_capacity: 64,
+                driver_name_prefix: "bobs-terminal-response-scope-test".to_owned(),
+            })
+            .expect("response-scope io_uring pool should start"),
+        );
+        let _override = crate::io::ring_pool::scoped_test_ring_pool_override(Arc::clone(&pool));
+        repeated_terminal_reads_are_response_scoped_for_backend::<UringFileIO>().await;
     }
 
     #[cfg(target_os = "linux")]
@@ -3528,13 +3658,7 @@ mod tests {
         const READERS: usize = 8;
         const PAGE_SIZE: usize = 4096;
 
-        while let Ok(permit) = REOPEN_READ_GATE.try_acquire() {
-            permit.forget();
-        }
-        REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
-        REOPEN_ACTIVE_READS.store(0, Ordering::SeqCst);
-        REOPEN_MAX_ACTIVE_READS.store(0, Ordering::SeqCst);
-        REOPEN_BLOCK_READS.store(false, Ordering::SeqCst);
+        reset_reopen_test_state();
 
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
@@ -3562,6 +3686,7 @@ mod tests {
             .mark_served_and_maybe_fully_read(0, PAGE_SIZE as u64)
             .await;
         assert!(!spool.has_open_file_handle());
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
         let fd_closed = open_fd_count();
 
         REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
@@ -3594,6 +3719,8 @@ mod tests {
             READERS,
             "the reopen gate must be released before positional reads"
         );
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 1);
+        assert!(spool.has_live_response_file_handle());
         let fd_during_reads = open_fd_count();
         assert!(
             fd_during_reads <= fd_closed + READERS * 8,
@@ -3619,11 +3746,121 @@ mod tests {
         }
         REOPEN_BLOCK_READS.store(false, Ordering::SeqCst);
         assert_eq!(REOPEN_ACTIVE_READS.load(Ordering::SeqCst), 0);
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert!(!spool.has_live_response_file_handle());
         let fd_after_reads = open_fd_count();
         assert!(
             fd_after_reads <= fd_closed + READERS * 8,
             "descriptors did not settle after delete/read completion: closed={fd_closed}, after={fd_after_reads}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_read_transition_during_reopen_never_restores_manager_handle() {
+        let _guard = HANDLE_LIFECYCLE_TEST_LOCK.lock().await;
+        reset_reopen_test_state();
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+            .expect("fixture manager");
+        let key = "coverage-reopen-race".to_string();
+        let metadata = sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, 1);
+        write_sidecar_fixture(&fixture, metadata, b"x").await;
+        drop(fixture);
+
+        let manager = SpoolManager::<ReopenTestFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+            .expect("race manager");
+        manager
+            .recover()
+            .await
+            .expect("recover closed terminal spool");
+        let spool = manager.get_spool(&key).expect("recovered race spool");
+        assert!(!spool.has_open_file_handle());
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+
+        REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
+        REOPEN_BLOCK_OPENS.store(true, Ordering::SeqCst);
+        let reader_spool = Arc::clone(&spool);
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while REOPEN_ACTIVE_OPENS.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cache-miss reopen entered gate");
+
+        spool.mark_served_and_maybe_fully_read(0, 1).await;
+        assert!(!spool.has_open_file_handle());
+        REOPEN_OPEN_GATE.add_permits(1);
+        assert_eq!(
+            reader.await.expect("reader join").expect("reader result"),
+            Some(Bytes::from_static(b"x")),
+        );
+        REOPEN_BLOCK_OPENS.store(false, Ordering::SeqCst);
+        assert_eq!(REOPEN_OPEN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert!(!spool.has_open_file_handle());
+        assert!(!spool.has_live_response_file_handle());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_during_response_scoped_reopen_leaves_no_handle() {
+        let _guard = HANDLE_LIFECYCLE_TEST_LOCK.lock().await;
+        reset_reopen_test_state();
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = Arc::new(
+            SpoolManager::<ReopenTestFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+                .expect("delete race manager"),
+        );
+        let key = "delete-reopen-race".to_string();
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create race spool");
+        let spool = manager.get_spool(&key).expect("race spool");
+        spool
+            .write(0, Bytes::from_static(b"x"))
+            .await
+            .expect("write race byte");
+        spool.complete(Some(1)).await.expect("complete race spool");
+        assert_eq!(
+            spool.read_page_for_test(0).await.unwrap(),
+            Some(Bytes::from_static(b"x")),
+        );
+        spool.mark_served_and_maybe_fully_read(0, 1).await;
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+
+        REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
+        REOPEN_BLOCK_OPENS.store(true, Ordering::SeqCst);
+        let reader_spool = Arc::clone(&spool);
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while REOPEN_ACTIVE_OPENS.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete-raced reopen entered gate");
+
+        manager
+            .delete_spool(&key)
+            .await
+            .expect("delete while reopen is pending");
+        REOPEN_OPEN_GATE.add_permits(1);
+        assert!(matches!(
+            reader.await.expect("reader join"),
+            Err(BobsError::SpoolNotFound { .. })
+        ));
+        REOPEN_BLOCK_OPENS.store(false, Ordering::SeqCst);
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert!(!spool.has_open_file_handle());
+        assert!(!spool.has_live_response_file_handle());
     }
 
     #[cfg(target_os = "linux")]
@@ -5860,8 +6097,12 @@ mod tests {
                     spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
                     expected
                 );
+                let permit = spool
+                    .acquire_read_response_permit()
+                    .await
+                    .expect("acquire salvage read response");
                 let handle = spool
-                    .acquire_file_handle()
+                    .acquire_file_handle(&permit)
                     .await
                     .expect("reopen salvaged payload");
                 assert_eq!(
@@ -5964,8 +6205,12 @@ mod tests {
             rss_growth < (PAGE_SIZE / 4) as u64,
             "sparse terminal salvage grew RSS by {rss_growth} bytes"
         );
+        let permit = spool
+            .acquire_read_response_permit()
+            .await
+            .expect("acquire sparse salvage response");
         let handle = spool
-            .acquire_file_handle()
+            .acquire_file_handle(&permit)
             .await
             .expect("reopen sparse salvage");
         assert_eq!(
@@ -6179,8 +6424,12 @@ mod tests {
         let first = partial.read_page_for_test(0).await.unwrap().unwrap();
         let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
+        let permit = partial
+            .acquire_read_response_permit()
+            .await
+            .expect("acquire WriteLocked salvage response");
         let handle = partial
-            .acquire_file_handle()
+            .acquire_file_handle(&permit)
             .await
             .expect("reopen WriteLocked salvage");
         assert_eq!(
@@ -6363,8 +6612,12 @@ mod tests {
         let first = partial.read_page_for_test(0).await.unwrap().unwrap();
         let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
+        let permit = partial
+            .acquire_read_response_permit()
+            .await
+            .expect("acquire migrated range response");
         let handle = partial
-            .acquire_file_handle()
+            .acquire_file_handle(&permit)
             .await
             .expect("reopen migrated range");
         assert_eq!(

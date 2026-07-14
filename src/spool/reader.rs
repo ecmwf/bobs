@@ -33,7 +33,7 @@ where
     pub async fn read_page(
         &self,
         page_idx: u64,
-        _response_permit: &ReadResponsePermit,
+        response_permit: &ReadResponsePermit<F>,
     ) -> Result<Option<Bytes>> {
         loop {
             if self.metadata.lock().await.state == SpoolState::Deleting {
@@ -69,7 +69,7 @@ where
             };
 
             if let Some((file_offset, page_len)) = disk_read {
-                let handle = self.acquire_file_handle().await?;
+                let handle = self.acquire_file_handle(response_permit).await?;
                 let disk_buf = read_exact_at::<F>(
                     &handle,
                     file_offset,
