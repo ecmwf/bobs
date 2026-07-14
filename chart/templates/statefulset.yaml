@@ -60,7 +60,7 @@ spec:
         - name: bobs
           # prettier-ignore
           image: {{ include "bobs.image" . | quote }}
-          imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+          imagePullPolicy: "{{ .Values.image.pullPolicy }}"
           env:
             - name: RUST_LOG
               # prettier-ignore
@@ -121,7 +121,7 @@ spec:
         - name: config
           configMap:
             name: '{{ include "bobs.nameWithSuffix" (dict "base" (include "bobs.fullname" .) "suffix" "-config") }}'
-      # {{- if not .Values.persistence.enabled }}
+        # {{- if not .Values.persistence.enabled }}
         - name: data
           emptyDir:
             # {{- with .Values.persistence.emptyDir.medium }}
@@ -131,7 +131,7 @@ spec:
             # prettier-ignore
             sizeLimit: {{ required "persistence.emptyDir.sizeLimit must be set" .Values.persistence.emptyDir.sizeLimit | quote }}
       # {{- end }}
-# {{- if .Values.persistence.enabled }}
+  # {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
         name: data

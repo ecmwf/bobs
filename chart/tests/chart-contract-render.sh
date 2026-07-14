@@ -125,86 +125,86 @@ fi
 
 label_renders=()
 for release_name in true false null 123 1e3; do
-  label_render="$tmp_dir/labels-$release_name.yaml"
-  service_monitor_render="$tmp_dir/service-monitor-labels-$release_name.yaml"
-  ambiguous_label_values=(
-    --set-string nameOverride="$release_name"
-    --set-string fullnameOverride="$release_name-full"
-    --set ingress.enabled=true
-    --set global.ingress.controller=nginx-community
-    --set config.metrics.enabled=true
-    --set config.metrics.serviceMonitor.enabled=true
-    --set-string config.metrics.serviceMonitor.labels.boolean-like=true
-    --set-string config.metrics.serviceMonitor.labels.false-like=false
-    --set-string config.metrics.serviceMonitor.labels.null-like=null
-    --set-string config.metrics.serviceMonitor.labels.numeric-like=123
-  )
-  helm template "$release_name" "$chart_dir" "${common_values[@]}" \
-    "${ambiguous_label_values[@]}" >"$label_render"
-  helm template "$release_name" "$chart_dir" "${common_values[@]}" \
-    "${ambiguous_label_values[@]}" \
-    --show-only templates/servicemonitor.yaml >"$service_monitor_render"
-  assert_label_strings "$label_render" "$release_name" "$release_name"
-  assert_label_strings "$service_monitor_render" "$release_name" "$release_name"
-  label_renders+=("$label_render")
+	label_render="$tmp_dir/labels-$release_name.yaml"
+	service_monitor_render="$tmp_dir/service-monitor-labels-$release_name.yaml"
+	ambiguous_label_values=(
+		--set-string nameOverride="$release_name"
+		--set-string fullnameOverride="$release_name-full"
+		--set ingress.enabled=true
+		--set global.ingress.controller=nginx-community
+		--set config.metrics.enabled=true
+		--set config.metrics.serviceMonitor.enabled=true
+		--set-string config.metrics.serviceMonitor.labels.boolean-like=true
+		--set-string config.metrics.serviceMonitor.labels.false-like=false
+		--set-string config.metrics.serviceMonitor.labels.null-like=null
+		--set-string config.metrics.serviceMonitor.labels.numeric-like=123
+	)
+	helm template "$release_name" "$chart_dir" "${common_values[@]}" \
+		"${ambiguous_label_values[@]}" >"$label_render"
+	helm template "$release_name" "$chart_dir" "${common_values[@]}" \
+		"${ambiguous_label_values[@]}" \
+		--show-only templates/servicemonitor.yaml >"$service_monitor_render"
+	assert_label_strings "$label_render" "$release_name" "$release_name"
+	assert_label_strings "$service_monitor_render" "$release_name" "$release_name"
+	label_renders+=("$label_render")
 done
 crd_schema_location='https://raw.githubusercontent.com/datreeio/CRDs-catalog/34cef0fc2698bbb611f475515e555a2d7ca85b6c/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
 cat "${label_renders[@]}" | "$kubeconform_bin" \
-  -strict -kubernetes-version 1.31.0 -summary \
-  -schema-location default -schema-location "$crd_schema_location"
+	-strict -kubernetes-version 1.31.0 -summary \
+	-schema-location default -schema-location "$crd_schema_location"
 
 safe_data_dirs=(
-  /var/lib/bobs
-  /var/lib/bobs/spools
-  /var/lib/bobs/tenant-a/spools.v1
+	/var/lib/bobs
+	/var/lib/bobs/spools
+	/var/lib/bobs/tenant-a/spools.v1
 )
 for index in "${!safe_data_dirs[@]}"; do
-  safe_data_dir=${safe_data_dirs[$index]}
-  safe_render="$tmp_dir/data-dir-safe-$index.yaml"
-  helm template bobs "$chart_dir" "${common_values[@]}" \
-    --set-string config.data_dir="$safe_data_dir" >"$safe_render"
-  assert_contains "mountPath: \"$safe_data_dir\"" "$safe_render"
+	safe_data_dir=${safe_data_dirs[$index]}
+	safe_render="$tmp_dir/data-dir-safe-$index.yaml"
+	helm template bobs "$chart_dir" "${common_values[@]}" \
+		--set-string config.data_dir="$safe_data_dir" >"$safe_render"
+	assert_contains "mountPath: \"$safe_data_dir\"" "$safe_render"
 done
 
 unsafe_data_dir_names=(
-  empty
-  relative
-  root
-  usr
-  usr-local-bin
-  etc
-  tmp
-  prefix-lookalike
-  parent-alias
-  dot-alias
-  repeated-slash-root
-  repeated-slash-descendant
-  trailing-slash
+	empty
+	relative
+	root
+	usr
+	usr-local-bin
+	etc
+	tmp
+	prefix-lookalike
+	parent-alias
+	dot-alias
+	repeated-slash-root
+	repeated-slash-descendant
+	trailing-slash
 )
 unsafe_data_dirs=(
-  ""
-  ./data
-  /
-  /usr
-  /usr/local/bin
-  /etc
-  /tmp
-  /var/lib/bobs-data
-  /var/lib/bobs/../bobs
-  /var/lib/bobs/./spools
-  /var/lib//bobs
-  /var/lib/bobs//spools
-  /var/lib/bobs/
+	""
+	./data
+	/
+	/usr
+	/usr/local/bin
+	/etc
+	/tmp
+	/var/lib/bobs-data
+	/var/lib/bobs/../bobs
+	/var/lib/bobs/./spools
+	/var/lib//bobs
+	/var/lib/bobs//spools
+	/var/lib/bobs/
 )
 for index in "${!unsafe_data_dirs[@]}"; do
-  name=${unsafe_data_dir_names[$index]}
-  unsafe_data_dir=${unsafe_data_dirs[$index]}
-  assert_schema_rejects "data-dir-$name" \
-    --set-string config.data_dir="$unsafe_data_dir"
-  assert_template_rejects "data-dir-$name-template" \
-    'config.data_dir must be /var/lib/bobs or a normalized descendant' \
-    --show-only templates/statefulset.yaml \
-    --set-string config.data_dir="$unsafe_data_dir"
+	name=${unsafe_data_dir_names[$index]}
+	unsafe_data_dir=${unsafe_data_dirs[$index]}
+	assert_schema_rejects "data-dir-$name" \
+		--set-string config.data_dir="$unsafe_data_dir"
+	assert_template_rejects "data-dir-$name-template" \
+		'config.data_dir must be /var/lib/bobs or a normalized descendant' \
+		--show-only templates/statefulset.yaml \
+		--set-string config.data_dir="$unsafe_data_dir"
 done
 
 valid_route=$(printf 'r%.0s' {1..63})
