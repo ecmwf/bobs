@@ -57,6 +57,9 @@ prometheus = { version = "0.14", optional = true, default-features = false }
 serde_norway = "0.9.42"
 pprof = { version = "0.14", features = ["flamegraph"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Low-level Linux interface chosen over tokio-uring and compio to avoid a
 # separate runtime model and retain linked-SQE control; chosen over rio because
