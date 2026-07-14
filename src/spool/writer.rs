@@ -94,7 +94,8 @@ where
             return Ok(());
         }
 
-        let written = F::write_at(&self.file_handle, offset, data.clone())
+        let handle = self.active_file_handle()?;
+        let written = F::write_at(&handle, offset, data.clone())
             .await
             .map_err(BobsError::IoError)?;
         if written != data.len() {
@@ -223,6 +224,12 @@ mod tests {
             path: &std::path::Path,
         ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
             TokioFileIO::open(path)
+        }
+
+        fn file_size(
+            handle: &Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
+            TokioFileIO::file_size(handle)
         }
 
         fn write_at(

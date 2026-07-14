@@ -92,8 +92,24 @@ pub trait FileIO: Send + Sync + Clone + 'static {
     /// Create a new regular file at the given path without following a final symlink.
     fn create(path: &Path) -> impl Future<Output = std::io::Result<Self::Handle>> + Send;
 
+    /// Inspect a canonical path without following its final symlink or blocking a Tokio worker.
+    fn symlink_metadata(
+        path: &Path,
+    ) -> impl Future<Output = std::io::Result<std::fs::Metadata>> + Send {
+        let path = path.to_path_buf();
+        async move {
+            tokio::task::spawn_blocking(move || std::fs::symlink_metadata(path))
+                .await
+                .map_err(std::io::Error::other)?
+        }
+    }
+
     /// Open an existing regular file at the given path without following a final symlink.
     fn open(path: &Path) -> impl Future<Output = std::io::Result<Self::Handle>> + Send;
+
+    /// Return the current length of an opened regular file without blocking a Tokio worker.
+    /// Implementations must inspect the open descriptor rather than resolving the path again.
+    fn file_size(handle: &Self::Handle) -> impl Future<Output = std::io::Result<u64>> + Send;
 
     /// Write owned data at a specific byte offset in the file.
     fn write_at(
