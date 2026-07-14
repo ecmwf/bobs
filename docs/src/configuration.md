@@ -6,21 +6,17 @@ SPDX-License-Identifier: Apache-2.0
 
 # Configuration
 
-BOBS is configured via a YAML file passed as a CLI argument. All fields have sensible defaults — a partial file is fine, missing fields use defaults.
+BOBS reads an optional YAML file passed as a CLI argument. Most fields have Rust defaults, so a partial file is fine, but startup validation requires `host_prefix`, `domain`, and `route_name`. The service also requires `HOSTNAME` with a StatefulSet-style numeric ordinal and a non-empty `BOBS_INTERNAL_BASE_URL_TEMPLATE`. The binary therefore does not run from its default configuration alone.
 
 ```bash
+HOSTNAME=bobs-0 \
+BOBS_INTERNAL_BASE_URL_TEMPLATE='http://bobs-{ordinal}:3000/api/v1' \
 ./target/release/bobs config.yaml
-```
-
-Without a config file, BOBS runs with defaults:
-
-```bash
-./target/release/bobs
 ```
 
 Backend selection is build-feature based, not a YAML option: Linux builds without extra features use the `io_uring` FileIO and sidecar metadata backend; builds with `--features tokio-fileio-fallback`, and non-Linux builds, use the Tokio/blocking fallback backend with the same on-disk `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json` layout. These backend settings do not change the HTTP API and do not require an on-disk migration.
 
-Default Linux builds use sharded `io_uring` rings. `io_uring_shards` is optional. If `io_uring_shards` is unset, BOBS resolves it to `max(1, num_cpus / 4)`. Explicit values must be between `1` and `256`, inclusive. File operations are assigned to shards by stable object-key hashing, and each object's data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.
+Default Linux builds use sharded `io_uring` rings. `io_uring_shards` is optional. If `io_uring_shards` is unset, BOBS resolves it to `max(1, num_cpus / 4)`. File operations are assigned to shards by stable object-key hashing, and each object's data-file operations and metadata sidecar commits are routed to the same shard. CPU pinning is not enabled by default.
 
 The default Linux backend requires Linux 5.11+ because BOBS submits operations against raw file descriptors, and it requires a container/runtime policy that permits `io_uring_setup`. If `io_uring_setup` is blocked, use a runtime seccomp/sysctl policy that permits it or build the fallback binary:
 
@@ -30,32 +26,44 @@ cargo build --release --bins --features tokio-fileio-fallback
 
 ## Fields
 
+The table distinguishes Rust defaults from chart overrides where they differ. Other listed defaults apply to both unless the chart's `values.yaml` says otherwise.
+
 | Field | Default | Description |
 | ------- | --------- | ------------- |
 | `host` | `0.0.0.0` | Address for the HTTP server to bind to. |
 | `port` | `3000` | Port for the HTTP server to listen on. |
-| `data_dir` | `./data` | File system path for storing spool files. |
-| `page_size` | `4096` | Size of internal data pages in bytes. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. |
-| `max_cache_bytes` | `1048576` | Global byte budget for cache-owned page allocations across all spools, excluding allocator overhead. Cached slices are isolated from larger transport frames. It also derives the read-response permit budget as `max(1, floor(max_cache_bytes / page_size))`; permits are held until response bodies are dropped. Set to `0` to disable caching while retaining a one-page response bound. If an individual page is larger than this cap, it bypasses the cache and remains readable from disk. |
-| `max_live_spools` | `4096` | Non-zero admission bound for live spools. New writers wait when the bound is full. Startup recovers at most this many spools and leaves excess durable entries quarantined for a later restart with capacity. |
+| `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. |
+| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages in bytes. Valid range: `1..=67108864` (64 MiB), and it must not exceed `max_spool_bytes`. Reader visibility is page-based: a page becomes visible only when it is full, or when `/complete` finalizes a trailing partial page. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global byte budget for bounded cache-owned page allocations across all spools, excluding allocator overhead. Cached slices are isolated from larger transport frames. It also derives the read-response permit budget as `max(1, floor(max_cache_bytes / page_size))`; permits are held until response bodies are dropped. Set to `0` to disable caching while retaining a one-page response bound. If an individual page is larger than this cap, it bypasses the cache and remains readable from disk. |
+| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (16); chart: `256` | Admission limit for spools not yet fully read and for startup recovery. Valid range: `1..=65536`. YAML omission derives it from the effective page/cache settings; derived and explicit values must both stay within the range. Startup admits at most this many durable spools and leaves excess entries quarantined in place for a later restart with more capacity. The chart value matches its 1 MiB/4 KiB capacity. |
+| `max_spool_bytes` | `8589934592` | Maximum bytes accepted for one spool across write requests. The default leaves headroom on the chart's default 10 GiB volume. |
+| `create_admission_timeout_ms` | `5000` | Maximum time `/create` waits for a `max_live_spools` admission slot before returning `503 Service Unavailable`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup spool if the writer doesn't send data for this long. |
+| `enable_pprof` | `false` | Expose `/debug/pprof/profile` on the main listener. Keep disabled except during controlled profiling because profiling consumes CPU and the endpoint is unauthenticated. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools that are not actively serving bytes. Starts when the spool becomes readable and refreshes whenever bytes are served. |
 | `full_read_complete_ttl_secs` | `30` | Short TTL after bounded coverage tracking proves every byte was served and no later bytes were served. Adjacent/overlapping ranges coalesce. If genuinely fragmented access exceeds the tracking cap, BOBS stays on the idle TTL until a later completed contiguous full-object response proves coverage exactly. |
 | `reader_done_ttl_secs` | `60` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
 | `unread_ttl_secs` | `3600` | Deprecated compatibility field. Parsed but no longer drives cleanup. |
-| `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. |
+| `cleanup_sweep_interval_secs` | `30` | How often the background cleanup task runs. Must not exceed `writer_inactivity_timeout_secs`, `read_idle_ttl_secs`, or `full_read_complete_ttl_secs`. |
 | `long_poll_timeout_ms` | `25000` | Maximum time in ms to wait for new data during a read before redirecting. |
 | `io_uring_shards` | unset | Linux default-backend ring-pool shard count. Leave unset to resolve to `max(1, num_cpus / 4)`. Keys are mapped to shards with stable hashing. Explicit values must be between `1` and `256`, inclusive. Ignored by fallback builds. |
+| `io_uring_queue_capacity` | `1024` | Per-shard bounded request-channel capacity for the Linux default backend. Must be between `1` and Tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): `2305843009213693951` on 64-bit targets or `536870911` on 32-bit targets. Ignored by fallback I/O after validation. |
 | `host_prefix` | `""` | External download host prefix used when generating read URLs. |
 | `domain` | `""` | External download domain used when generating read URLs. |
 | `route_name` | `""` | External download route prefix, for example `download`. |
 | `metrics.enabled` | `false` | Enable OpenTelemetry metrics export. Requires a build with `--features telemetry`; has no effect without that feature. |
 | `metrics.bind_address` | `127.0.0.1` | Bind address for the Prometheus `/metrics` scrape endpoint. Use `0.0.0.0` in Kubernetes so the pod is scrapable. |
-| `metrics.port` | `9464` | Port for the Prometheus `/metrics` scrape endpoint (the conventional OTel Prometheus exporter port). Runs on a separate port from the main data port. |
+| `metrics.port` | `9464` | Port for the Prometheus `/metrics` scrape endpoint (the conventional OTel Prometheus exporter port). When telemetry and metrics are enabled, this must differ from the main HTTP `port`; startup rejects a collision before either listener is started. |
 | `metrics.allowed_labels` | `[]` | Caller-provided label keys forwarded as metric attributes. Empty list means all caller labels pass through. Set to a non-empty list to restrict label cardinality. |
 | `metrics.max_label_value_length` | `128` | Maximum byte length for label values. Values exceeding this limit are truncated before recording. |
 
 Recovery metadata has a fixed safety policy rather than a configuration field: `meta.json` is limited to 1 MiB and its size is checked before read allocation. Oversized or unknown-field payloads are preserved unchanged but unavailable, allowing operator inspection or a newer compatible binary to recover them.
+
+## Helm ingress and shutdown settings
+
+`ingress.forwardedPrefix.enabled` defaults to `false`. Enable it when an ingress rewrites a public per-pod route such as `/download-0/...` to `/api/v1/read/...`. The chart then supplies `X-Forwarded-Prefix: /download-0`, allowing a long-poll `307` to return `/download-0/api/v1/read/<key>`. NGINX Inc uses `nginx.org/location-snippets`; community ingress-nginx renders one Ingress per pod with the native `nginx.ingress.kubernetes.io/x-forwarded-prefix` annotation. This per-replica Ingress topology is an architectural change: when forwarded prefixes are enabled, each replica needs its own exact prefix annotation because community ingress-nginx cannot derive a dynamic prefix per regex match. Other entries in `ingress.annotations` are preserved on every rendered Ingress.
+
+BOBS stops accepts and gracefully drains all HTTP connections for at most 25 seconds, then aborts leftovers. The chart leaves `terminationGracePeriodSeconds` unset, so standard Kubernetes uses its 30-second default. If a parent chart or platform sets it explicitly, keep it above 25 seconds so forced aborts and final storage/telemetry teardown can run before SIGKILL.
 
 ## Example
 
@@ -64,9 +72,12 @@ host: 0.0.0.0
 port: 3000
 data_dir: /data/bobs
 page_size: 4096
-max_cache_bytes: 1048576          # page cache and derived slow-reader response budget; 0 disables cache
-max_live_spools: 4096              # live create/recovery admission bound; must be non-zero
+max_cache_bytes: 1048576          # cache and slow-reader response budget; 0 disables cache
+# max_live_spools omitted: derives 256; valid range 1..=65536 and bounds recovery
+max_spool_bytes: 8589934592       # 8 GiB per spool
+create_admission_timeout_ms: 5000 # return 503 rather than waiting indefinitely
 writer_inactivity_timeout_secs: 300
+enable_pprof: false               # only enable for controlled, trusted profiling
 read_idle_ttl_secs: 600
 full_read_complete_ttl_secs: 30
 reader_done_ttl_secs: 60      # deprecated compatibility field
@@ -74,13 +85,14 @@ unread_ttl_secs: 3600         # deprecated compatibility field
 cleanup_sweep_interval_secs: 30
 long_poll_timeout_ms: 25000
 io_uring_shards: 4              # optional; valid range 1..=256; omit to use max(1, num_cpus / 4)
+io_uring_queue_capacity: 1024      # 1..=Tokio Semaphore::MAX_PERMITS (usize::MAX >> 3)
 host_prefix: polytope-example
 domain: example.com
 route_name: download
 metrics:
   enabled: false         # requires --features telemetry; see Metrics page
   bind_address: "127.0.0.1"  # loopback only; use 0.0.0.0 in k8s
-  port: 9464             # separate Prometheus scrape port (OTel convention)
+  port: 9464             # must differ from the main port when metrics are enabled
   allowed_labels: []     # empty = all caller labels; set a list to restrict cardinality
   max_label_value_length: 128
 ```
@@ -113,7 +125,7 @@ Future optimizations not implemented in the current backend are `IORING_REGISTER
 
 ## Page size tuning
 
-The default `page_size` is intentionally kept at `4096`. It is a correctness-neutral default and should not be changed just because in-progress metadata commits have been removed from the write hot path.
+The Rust binary defaults to `16777216` (16 MiB); the Helm chart deliberately overrides this to `4096` (4 KiB) for lower streaming latency. The operational maximum is `67108864` (64 MiB), which bounds page reads and lazy per-request partial-page staging. `page_size` must also be no larger than `max_spool_bytes`. Treat valid values as deployment choices and benchmark representative workloads before changing them.
 
 Larger pages such as `1048576` (1 MiB), `4194304` (4 MiB), and `16777216` (16 MiB) may improve write/read throughput by reducing per-page overhead, but they change streaming behaviour:
 
@@ -121,6 +133,6 @@ Larger pages such as `1048576` (1 MiB), `4194304` (4 MiB), and `16777216` (16 Mi
 - larger pages consume more of the global cache budget per cached page, so they can reduce cache reach unless `max_cache_bytes` is increased;
 - benchmark representative object sizes and write chunk sizes before changing production defaults.
 
-`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely, but the manager still admits one read response at a time so disk-backed page buffers remain bounded. Otherwise it admits `floor(max_cache_bytes / page_size)` ordinary configured-page responses, with a minimum of one. Admission is acquired before page lookup or disk I/O and stays with the response body, so slow or unconsumed clients queue rather than each retaining another page allocation. Recovered spools whose persisted page size is wider than the current configured page consume proportionally more permit units. A page larger than the cache cap still bypasses the cache while disk-backed reads continue to work.
+`page_size` does not need to be less than or equal to `max_cache_bytes`. Setting `max_cache_bytes` to `0` disables caching entirely, but the manager still admits one read response at a time so disk-backed page buffers remain bounded. Otherwise it admits `floor(max_cache_bytes / page_size)` ordinary configured-page responses, with a minimum of one. Admission is acquired before page lookup or disk I/O and stays with the response body, so slow or unconsumed clients queue rather than each retaining another page allocation. Recovered spools whose persisted page size is wider than the current configured page consume proportionally more permit units. A page larger than the cache cap still bypasses the cache while disk-backed reads continue to work. This cache-skipping behaviour is independent of the required `page_size <= max_spool_bytes` relationship. When `max_live_spools` is omitted, BOBS derives it from the effective cache/page ratio with a minimum of one; set it explicitly when workflow concurrency should differ from cache page capacity. Derived and explicit values above Tokio's semaphore limit are rejected during startup validation.
 
 See the standalone benchmark guide for page-size comparison commands.

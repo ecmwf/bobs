@@ -124,9 +124,10 @@ where
 
         // Publish full pages from the incoming owned buffer without cloning their
         // contents. Only cross-call partial pages use `write_buffer` assembly.
-        while cursor + self.page_size <= data.len() {
-            completed_pages.push(data.slice(cursor..cursor + self.page_size));
-            cursor += self.page_size;
+        while data.len() - cursor >= self.page_size {
+            let end = cursor + self.page_size;
+            completed_pages.push(data.slice(cursor..end));
+            cursor = end;
         }
 
         if cursor < data.len() {
@@ -344,7 +345,7 @@ mod tests {
             handle,
             page_size,
             Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                page_size * 256,
+                page_size.saturating_mul(256),
             ))),
             metadata_store,
             Arc::new(crate::metrics::BobsMetrics::new(false)),
@@ -531,9 +532,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_empty_is_noop() {
+    async fn test_write_empty_validates_without_refreshing_activity() {
         let dir = tempdir().expect("failed to create tempdir");
         let spool = make_spool(dir.path(), 4096).await;
+        let activity_before = spool.cleanup_anchors().last_write_at;
 
         spool
             .write(0, bytes::Bytes::new())
@@ -543,6 +545,35 @@ mod tests {
         let meta = spool.metadata.lock().await;
         assert_eq!(meta.total_pages, 0);
         assert_eq!(meta.total_bytes_written, 0);
+        drop(meta);
+        assert_eq!(spool.cleanup_anchors().last_write_at, activity_before);
+
+        assert!(matches!(
+            spool.write(1, bytes::Bytes::new()).await,
+            Err(BobsError::OffsetMismatch {
+                expected: 0,
+                got: 1
+            })
+        ));
+        spool.metadata.lock().await.state = SpoolState::Complete;
+        assert!(matches!(
+            spool.write(0, bytes::Bytes::new()).await,
+            Err(BobsError::SpoolClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_huge_page_size_does_not_allocate_page_sized_staging() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let spool = make_spool(dir.path(), usize::MAX).await;
+
+        spool
+            .write(0, bytes::Bytes::from_static(b"tiny"))
+            .await
+            .expect("small write with huge page size should not panic or allocate eagerly");
+
+        assert_eq!(spool.write_buffer.lock().await.as_ref(), b"tiny");
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
     }
 
     #[tokio::test]

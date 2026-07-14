@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::MAX_PAGE_SIZE_BYTES;
+use crate::config::{validate_max_live_spools, validate_page_size, MAX_PAGE_SIZE_BYTES};
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
 #[cfg(test)]
@@ -17,12 +17,13 @@ use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteReason {
     Explicit,
+    Oversize,
     Ttl,
     Orphan,
     Corrupt,
@@ -32,6 +33,7 @@ impl DeleteReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
+            Self::Oversize => "oversize",
             Self::Ttl => "ttl",
             Self::Orphan => "orphan",
             Self::Corrupt => "corrupt",
@@ -79,6 +81,8 @@ pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> 
     /// Bounds live spool admission during creation and startup recovery.
     pub admission: Arc<Semaphore>,
     pub max_live_spools: usize,
+    /// Per-key gates serialize create and delete without blocking unrelated keys.
+    key_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Weighted configured-page admission retained for each HTTP response lifetime.
     read_response_admission: Arc<Semaphore>,
     read_response_active: Arc<AtomicUsize>,
@@ -98,6 +102,22 @@ struct CreateTransaction<F: FileIO, M: MetadataStore> {
     read_response_permits_active: Arc<AtomicUsize>,
 }
 
+struct KeyLockLease {
+    key_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    key: String,
+    lock: Arc<Mutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for KeyLockLease {
+    fn drop(&mut self) {
+        self.guard.take();
+        self.key_locks.remove_if(&self.key, |_, current| {
+            Arc::ptr_eq(current, &self.lock) && Arc::strong_count(current) == 2
+        });
+    }
+}
+
 impl<F, M> CreateTransaction<F, M>
 where
     F: FileIO,
@@ -111,10 +131,40 @@ where
         write_locked: bool,
         labels: HashMap<String, String>,
         permit: OwnedSemaphorePermit,
+        _key_lease: KeyLockLease,
+    ) -> Result<()> {
+        let result = self
+            .run_reserved(
+                key.clone(),
+                content_type,
+                content_encoding,
+                write_locked,
+                labels,
+                permit,
+            )
+            .await;
+        result
+    }
+
+    async fn run_reserved(
+        &self,
+        key: String,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        write_locked: bool,
+        labels: HashMap<String, String>,
+        permit: OwnedSemaphorePermit,
     ) -> Result<()> {
         let spool_dir = self.data_dir.join(&key);
-        let data_path = spool_dir.join("spool.dat");
+        if self.spools.contains_key(&key)
+            || tokio::fs::try_exists(&spool_dir)
+                .await
+                .map_err(BobsError::IoError)?
+        {
+            return Err(BobsError::SpoolAlreadyExists { key });
+        }
 
+        let data_path = spool_dir.join("spool.dat");
         match tokio::fs::create_dir(&spool_dir).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -155,15 +205,11 @@ where
         };
 
         let durability_result = async {
-            // Persist the empty data inode and its name before publishing any
-            // metadata that can make this spool recoverable.
             F::sync_data(&handle).await.map_err(BobsError::IoError)?;
             F::sync_directory(&spool_dir)
                 .await
                 .map_err(BobsError::IoError)?;
 
-            // First make a recoverable tombstone durable. If creation crashes
-            // before the final sidecar commit, recovery removes Creating spools.
             let mut creating = metadata.clone();
             creating.state = SpoolState::Creating;
             self.metadata_store.write(&creating).await?;
@@ -171,8 +217,6 @@ where
                 .await
                 .map_err(BobsError::IoError)?;
 
-            // This key directory is now durably linked from data_dir. Publishing
-            // the live state only changes names inside the already-durable key dir.
             self.metadata_store.write(&metadata).await
         }
         .await;
@@ -226,8 +270,6 @@ where
             }
         }
 
-        // Sync even when the directory is already absent: a previous removal may
-        // have reached the filesystem but failed at this durability boundary.
         if let Err(error) = F::sync_directory(&self.data_dir).await {
             tracing::warn!(key = %key, error = %error, "failed to sync data directory while rolling back spool creation");
         }
@@ -263,16 +305,10 @@ where
         max_cache_bytes: usize,
         max_live_spools: usize,
     ) -> Result<Self> {
-        if page_size == 0 || page_size > MAX_PAGE_SIZE_BYTES {
-            return Err(BobsError::ConfigurationError(format!(
-                "page_size must be in 1..={MAX_PAGE_SIZE_BYTES} bytes (64 MiB)"
-            )));
-        }
-        if max_live_spools == 0 {
-            return Err(BobsError::ConfigurationError(
-                "max_live_spools must be greater than 0".to_string(),
-            ));
-        }
+        // Keep these checks at the construction boundary: library callers may bypass
+        // Config::validate, and both page I/O and recovery allocate from these values.
+        validate_page_size(page_size)?;
+        validate_max_live_spools(max_live_spools)?;
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
         let page_cache = Arc::new(Mutex::new(PageCache::new(max_cache_bytes)));
 
@@ -288,6 +324,7 @@ where
             metrics: Arc::new(BobsMetrics::new(false)),
             admission: Arc::new(Semaphore::new(max_live_spools)),
             max_live_spools,
+            key_locks: Arc::new(DashMap::new()),
             read_response_admission,
             read_response_active: Arc::new(AtomicUsize::new(0)),
             read_response_permits_active: Arc::new(AtomicUsize::new(0)),
@@ -298,6 +335,32 @@ where
     /// Set the metrics handle (replaces the default no-op).
     pub fn set_metrics(&mut self, metrics: Arc<BobsMetrics>) {
         self.metrics = metrics;
+    }
+
+    fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.key_locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .value(),
+        )
+    }
+
+    fn release_key_lock(&self, key: &str, lock: &Arc<Mutex<()>>) {
+        self.key_locks.remove_if(key, |_, current| {
+            Arc::ptr_eq(current, lock) && Arc::strong_count(current) == 2
+        });
+    }
+
+    async fn acquire_key_lock(&self, key: &str) -> KeyLockLease {
+        let lock = self.key_lock(key);
+        let guard = Arc::clone(&lock).lock_owned().await;
+        KeyLockLease {
+            key_locks: Arc::clone(&self.key_locks),
+            key: key.to_string(),
+            lock,
+            guard: Some(guard),
+        }
     }
 
     /// Total weighted configured-page units available to read responses.
@@ -325,7 +388,52 @@ where
         write_locked: bool,
         labels: HashMap<String, String>,
     ) -> Result<()> {
+        self.create_spool_inner(
+            None,
+            key,
+            content_type,
+            content_encoding,
+            write_locked,
+            labels,
+        )
+        .await
+    }
+
+    /// Create a spool after waiting at most `timeout` for admission capacity.
+    /// The timeout covers only semaphore admission, before any key reservation.
+    pub async fn create_spool_with_admission_timeout(
+        &self,
+        timeout: Duration,
+        key: String,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        write_locked: bool,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
+        self.create_spool_inner(
+            Some(timeout),
+            key,
+            content_type,
+            content_encoding,
+            write_locked,
+            labels,
+        )
+        .await
+    }
+
+    async fn create_spool_inner(
+        &self,
+        admission_timeout: Option<Duration>,
+        key: String,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        write_locked: bool,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
         let spool_dir = self.data_dir.join(&key);
+        // A tracked key is always a duplicate, including a failed, retryable
+        // Deleting spool that still owns its admission permit. Reject it before
+        // admission or the per-key gate so create cannot stall deletion retry.
         if self.spools.contains_key(&key)
             || tokio::fs::try_exists(&spool_dir)
                 .await
@@ -336,14 +444,38 @@ where
 
         // Waiting for admission is cancellation-safe: no caller-key filesystem
         // reservation exists yet, and dropping this future releases any acquired permit.
-        let permit = Arc::clone(&self.admission)
-            .acquire_owned()
-            .await
-            .map_err(|_| BobsError::IoError(std::io::Error::other("admission semaphore closed")))?;
+        let permit = if let Some(timeout) = admission_timeout {
+            tokio::time::timeout(timeout, Arc::clone(&self.admission).acquire_owned())
+                .await
+                .map_err(|_| BobsError::AdmissionTimeout)?
+                .map_err(|_| {
+                    BobsError::IoError(std::io::Error::other("admission semaphore closed"))
+                })?
+        } else {
+            Arc::clone(&self.admission)
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    BobsError::IoError(std::io::Error::other("admission semaphore closed"))
+                })?
+        };
+
+        // Admission waits never hold the per-key gate. Once admitted, serialize
+        // with a concurrent create or final deletion and repeat the reservation
+        // check. Successful deletion removes the tracked spool only after its
+        // directory is durably gone and its permit has been released.
+        let key_lease = self.acquire_key_lock(&key).await;
+        if self.spools.contains_key(&key)
+            || tokio::fs::try_exists(&spool_dir)
+                .await
+                .map_err(BobsError::IoError)?
+        {
+            return Err(BobsError::SpoolAlreadyExists { key });
+        }
 
         // Once the atomic directory reservation starts, the transaction must outlive
-        // its caller. A cancelled HTTP request drops only this JoinHandle; the detached
-        // task either publishes a fully durable live spool or rolls the reservation back.
+        // its caller. A cancelled request drops only this JoinHandle; the detached
+        // transaction either publishes a fully durable spool or rolls back.
         let transaction = CreateTransaction::<F, M> {
             spools: Arc::clone(&self.spools),
             metadata_store: self.metadata_store.clone(),
@@ -362,6 +494,7 @@ where
             write_locked,
             labels,
             permit,
+            key_lease,
         ))
         .await
         .map_err(|error| {
@@ -393,24 +526,66 @@ where
         reason: DeleteReason,
         job_id: Option<&str>,
     ) -> Result<()> {
+        let key_lock = self.key_lock(key);
+        let key_guard = key_lock.lock().await;
         let result = self.delete_spool_inner(key).await;
-        match &result {
+        drop(key_guard);
+        self.release_key_lock(key, &key_lock);
+        self.record_delete_result(key, reason, job_id, &result);
+        result
+    }
+
+    /// Delete an oversized spool only if `offset` is still its valid write head.
+    /// Validation and the durable Deleting transition share the same lifecycle/write
+    /// gates used by write, complete, and explicit delete.
+    pub async fn delete_oversize_spool_if_write_head(
+        &self,
+        key: &str,
+        offset: u64,
+        job_id: Option<&str>,
+    ) -> Result<()> {
+        let key_lock = self.key_lock(key);
+        let key_guard = key_lock.lock().await;
+        let result = self
+            .delete_oversize_spool_if_write_head_inner(key, offset)
+            .await;
+        drop(key_guard);
+        self.release_key_lock(key, &key_lock);
+        self.record_delete_result(key, DeleteReason::Oversize, job_id, &result);
+        result
+    }
+
+    fn record_delete_result(
+        &self,
+        key: &str,
+        reason: DeleteReason,
+        job_id: Option<&str>,
+        result: &Result<()>,
+    ) {
+        let deletion_span = tracing::info_span!(
+            "bobs.spool.delete",
+            "request.id" = tracing::field::Empty,
+            "bobs.spool.key" = %key,
+            reason = reason.as_str(),
+            outcome = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
+        if let Some(job_id) = job_id {
+            deletion_span.record("request.id", job_id);
+        }
+        match result {
             Ok(()) => {
-                if let Some(job_id) = job_id {
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "request.id" = %job_id, reason = reason.as_str(), outcome = "success", "spool deleted");
-                } else {
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "success", "spool deleted");
-                }
+                deletion_span.record("outcome", "success");
+                let _entered = deletion_span.enter();
+                tracing::info!("event.name" = "bobs.spool.deleted", "spool deleted");
             }
             Err(error) => {
-                if let Some(job_id) = job_id {
-                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, "request.id" = %job_id, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
-                } else {
-                    tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
-                }
+                deletion_span.record("outcome", "error");
+                deletion_span.record("error", tracing::field::display(error));
+                let _entered = deletion_span.enter();
+                tracing::error!("event.name" = "bobs.spool.deleted", "spool deletion failed");
             }
         }
-        result
     }
 
     /// Delete only if a candidate snapshot is still current while holding the
@@ -463,6 +638,48 @@ where
         self.delete_spool_locked(key, &spool).await
     }
 
+    async fn delete_oversize_spool_if_write_head_inner(
+        &self,
+        key: &str,
+        offset: u64,
+    ) -> Result<()> {
+        let spool = self
+            .spools
+            .get(key)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| BobsError::SpoolNotFound {
+                key: key.to_string(),
+            })?;
+        let _lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        {
+            let meta = spool.metadata.lock().await;
+            match meta.state {
+                SpoolState::Writing | SpoolState::WriteLocked => {}
+                SpoolState::Complete => return Err(BobsError::SpoolClosed),
+                SpoolState::Deleting => {
+                    return Err(BobsError::SpoolNotFound {
+                        key: key.to_string(),
+                    });
+                }
+                ref other => {
+                    return Err(BobsError::InvalidState {
+                        current: format!("{other:?}"),
+                        attempted_action: "write oversized request".to_string(),
+                    });
+                }
+            }
+            if offset != meta.total_bytes_written {
+                return Err(BobsError::OffsetMismatch {
+                    expected: meta.total_bytes_written,
+                    got: offset,
+                });
+            }
+        }
+
+        self.delete_spool_locked(key, &spool).await
+    }
+
     async fn delete_spool_locked(&self, key: &str, spool: &Arc<Spool<F, M>>) -> Result<()> {
         let old_label = {
             let mut meta = spool.metadata.lock().await;
@@ -509,8 +726,7 @@ where
             Err(error) => return Err(BobsError::IoError(error)),
         }
 
-        // This is the commit point for deletion. Cache entries, map membership,
-        // and admission remain held until the directory unlink is durable.
+        // Deletion is acknowledged only after the key-directory unlink is durable.
         F::sync_directory(&self.data_dir)
             .await
             .map_err(BobsError::IoError)
@@ -1723,13 +1939,13 @@ pub(crate) fn is_recognised_spool_key(name: &str) -> bool {
     uuid::Uuid::parse_str(name).is_ok() || is_request_id_key(name)
 }
 
-/// True for a 26-character lower-case Crockford base32 request ID (the format
-/// BITS mints and clients quote). Crockford base32 excludes i, l, o and u.
+/// True for a 26-character Crockford base32 request ID. Validation is
+/// case-insensitive; HTTP callers are canonicalized to lower case before use.
 pub(crate) fn is_request_id_key(name: &str) -> bool {
     name.len() == 26
         && name.bytes().all(|b| {
             matches!(
-                b,
+                b.to_ascii_lowercase(),
                 b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z'
             )
         })
@@ -1751,7 +1967,7 @@ mod tests {
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     use crate::io::{RingPool, RingPoolOptions, UringFileIO};
     use bytes::Bytes;
-    use std::sync::{atomic::Ordering, Arc, OnceLock};
+    use std::sync::{atomic::Ordering, Arc};
     use tempfile::tempdir;
 
     #[derive(Clone)]
@@ -1763,8 +1979,10 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
     }
 
-    static BLOCKING_WRITE_CONTROL: OnceLock<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)> =
-        OnceLock::new();
+    static BLOCKING_WRITE_CONTROL: std::sync::OnceLock<(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    )> = std::sync::OnceLock::new();
 
     impl FileIO for BlockingWriteFileIO {
         type Handle = BlockingWriteHandle;
@@ -1798,14 +2016,18 @@ mod tests {
         async fn write_at(
             handle: &Self::Handle,
             offset: u64,
-            data: Bytes,
+            data: bytes::Bytes,
         ) -> std::io::Result<usize> {
             handle.entered.notify_one();
             handle.release.notified().await;
             TokioFileIO::write_at(&handle.inner, offset, data).await
         }
 
-        async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        async fn read_at(
+            handle: &Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> std::io::Result<bytes::Bytes> {
             TokioFileIO::read_at(&handle.inner, offset, len).await
         }
 
@@ -1834,22 +2056,19 @@ mod tests {
         ParentDirectorySync,
         MetadataWrite(SpoolState),
         MetadataDelete,
-        Close,
     }
 
     static PROTOCOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    static PROTOCOL_EVENTS: OnceLock<std::sync::Mutex<Vec<ProtocolEvent>>> = OnceLock::new();
+    static PROTOCOL_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<ProtocolEvent>>> =
+        std::sync::OnceLock::new();
     static FAIL_NEXT_PARENT_SYNC: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     static FAIL_NEXT_LIVE_METADATA_WRITE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    fn protocol_events() -> &'static std::sync::Mutex<Vec<ProtocolEvent>> {
-        PROTOCOL_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-    }
-
     fn record_protocol_event(event: ProtocolEvent) {
-        protocol_events()
+        PROTOCOL_EVENTS
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
             .lock()
             .expect("protocol event log mutex poisoned")
             .push(event);
@@ -1857,7 +2076,8 @@ mod tests {
 
     fn take_protocol_events() -> Vec<ProtocolEvent> {
         std::mem::take(
-            &mut *protocol_events()
+            &mut *PROTOCOL_EVENTS
+                .get_or_init(|| std::sync::Mutex::new(Vec::new()))
                 .lock()
                 .expect("protocol event log mutex poisoned"),
         )
@@ -1891,7 +2111,7 @@ mod tests {
         fn write_at(
             handle: &Self::Handle,
             offset: u64,
-            data: Bytes,
+            data: bytes::Bytes,
         ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
             TokioFileIO::write_at(handle, offset, data)
         }
@@ -1900,7 +2120,7 @@ mod tests {
             handle: &Self::Handle,
             offset: u64,
             len: usize,
-        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
+        ) -> impl std::future::Future<Output = std::io::Result<bytes::Bytes>> + Send {
             TokioFileIO::read_at(handle, offset, len)
         }
 
@@ -1935,7 +2155,6 @@ mod tests {
         fn close(
             handle: Self::Handle,
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            record_protocol_event(ProtocolEvent::Close);
             TokioFileIO::close(handle)
         }
 
@@ -2475,11 +2694,157 @@ mod tests {
         assert!(is_recognised_spool_key(&uuid::Uuid::new_v4().to_string()));
         assert!(is_recognised_spool_key("0123456789abcdefghjkmnpqrs"));
         assert!(is_request_id_key("0123456789abcdefghjkmnpqrs"));
+        assert!(is_request_id_key("0123456789ABCDEFGHJKMNPQRS"));
         // Junk directory names are not recognised (orphan sweep leaves them).
         assert!(!is_recognised_spool_key("not-a-key"));
         assert!(!is_request_id_key("0123456789abcdefghjkmnpqr")); // 25 chars
         assert!(!is_request_id_key("0123456789abcdefghijklmnop")); // i, l, o excluded
-        assert!(!is_request_id_key("0123456789ABCDEFGHJKMNPQRS")); // upper-case excluded
+    }
+
+    #[tokio::test]
+    async fn test_directory_durability_ordering_failures_and_retry_release() {
+        let _protocol_guard = PROTOCOL_TEST_LOCK.lock().await;
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<ProtocolFileIO, ProtocolMetadataStore>::with_metadata_store(
+            ProtocolMetadataStore::new(&data_dir),
+            &data_dir,
+            4,
+            64,
+            1,
+        )
+        .expect("manager init");
+
+        take_protocol_events();
+        let first_key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(first_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("durable create succeeds");
+        assert_eq!(
+            take_protocol_events(),
+            vec![
+                ProtocolEvent::DataCreate,
+                ProtocolEvent::DataSync,
+                ProtocolEvent::SpoolDirectorySync,
+                ProtocolEvent::MetadataWrite(SpoolState::Creating),
+                ProtocolEvent::ParentDirectorySync,
+                ProtocolEvent::MetadataWrite(SpoolState::Writing),
+            ],
+            "create must durably publish Creating before the live sidecar"
+        );
+        assert_eq!(
+            manager
+                .get_spool(&first_key)
+                .expect("created spool is published")
+                .metadata
+                .lock()
+                .await
+                .state,
+            SpoolState::Writing,
+            "Creating must never be exposed through the production spool map"
+        );
+
+        manager
+            .delete_spool(&first_key)
+            .await
+            .expect("durable delete succeeds");
+        assert_eq!(
+            take_protocol_events(),
+            vec![
+                ProtocolEvent::MetadataDelete,
+                ProtocolEvent::ParentDirectorySync,
+            ],
+            "delete acknowledgement must follow the parent-directory fsync"
+        );
+
+        let failed_create_key = uuid::Uuid::new_v4().to_string();
+        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = manager
+            .create_spool(failed_create_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect_err("parent fsync failure must not acknowledge create");
+        assert!(matches!(error, BobsError::IoError(_)));
+        let failed_create_events = take_protocol_events();
+        assert!(failed_create_events.contains(&ProtocolEvent::MetadataWrite(SpoolState::Creating)));
+        assert!(
+            !failed_create_events.contains(&ProtocolEvent::MetadataWrite(SpoolState::Writing)),
+            "a failed parent fsync must not publish live metadata"
+        );
+        assert!(failed_create_events.contains(&ProtocolEvent::MetadataDelete));
+        assert!(manager.get_spool(&failed_create_key).is_none());
+        assert!(!data_dir.join(&failed_create_key).exists());
+        assert_eq!(manager.admission.available_permits(), 1);
+
+        let failed_live_key = uuid::Uuid::new_v4().to_string();
+        FAIL_NEXT_LIVE_METADATA_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = manager
+            .create_spool(failed_live_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect_err("final metadata failure must not acknowledge create");
+        assert!(matches!(error, BobsError::StorageError(_)));
+        let failed_live_events = take_protocol_events();
+        assert_eq!(
+            &failed_live_events[..5],
+            &[
+                ProtocolEvent::DataCreate,
+                ProtocolEvent::DataSync,
+                ProtocolEvent::SpoolDirectorySync,
+                ProtocolEvent::MetadataWrite(SpoolState::Creating),
+                ProtocolEvent::ParentDirectorySync,
+            ],
+            "Creating and the parent link must precede the live commit"
+        );
+        assert!(failed_live_events.contains(&ProtocolEvent::MetadataDelete));
+        assert!(manager.get_spool(&failed_live_key).is_none());
+        assert!(!data_dir.join(&failed_live_key).exists());
+        assert_eq!(manager.admission.available_permits(), 1);
+
+        let retry_key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(retry_key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create retry fixture");
+        take_protocol_events();
+        manager
+            .page_cache
+            .lock()
+            .await
+            .insert(&retry_key, 0, bytes::Bytes::from_static(b"data"));
+
+        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            manager.delete_spool(&retry_key).await.is_err(),
+            "parent fsync failure must not acknowledge deletion"
+        );
+        let deleting = manager
+            .get_spool(&retry_key)
+            .expect("failed deletion remains tracked");
+        assert_eq!(deleting.metadata.lock().await.state, SpoolState::Deleting);
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert!(manager.page_cache.lock().await.contains(&retry_key, 0));
+        assert_eq!(
+            take_protocol_events(),
+            vec![
+                ProtocolEvent::MetadataDelete,
+                ProtocolEvent::ParentDirectorySync,
+            ]
+        );
+
+        manager
+            .delete_spool(&retry_key)
+            .await
+            .expect("retry syncs parent even when the key directory is absent");
+        assert_eq!(
+            take_protocol_events(),
+            vec![
+                ProtocolEvent::MetadataDelete,
+                ProtocolEvent::ParentDirectorySync,
+            ]
+        );
+        assert!(manager.get_spool(&retry_key).is_none());
+        assert!(!manager.page_cache.lock().await.contains(&retry_key, 0));
+        assert_eq!(manager.admission.available_permits(), 1);
     }
 
     #[test]
@@ -2869,15 +3234,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_new_accepts_maximum_page_size_without_eager_page_allocation() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(
+            &data_dir,
+            crate::config::MAX_PAGE_SIZE_BYTES,
+            1024,
+            256,
+        )
+        .expect("maximum page size should initialize");
+
+        assert_eq!(manager.page_size, crate::config::MAX_PAGE_SIZE_BYTES);
+        assert_eq!(manager.page_cache.lock().await.current_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn test_new_rejects_oversized_page_before_creating_data_directory() {
-        for page_size in [MAX_PAGE_SIZE_BYTES + 1, usize::MAX] {
+        for page_size in [crate::config::MAX_PAGE_SIZE_BYTES + 1, usize::MAX] {
             let dir = tempdir().expect("create tempdir");
             let data_dir = dir.path().join("data");
             let result = SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 1024, 256);
+
             assert!(matches!(result, Err(BobsError::ConfigurationError(_))));
             assert!(
                 !data_dir.exists(),
-                "invalid page size must fail before filesystem setup"
+                "invalid page size must fail before startup allocation or filesystem setup"
             );
         }
     }
@@ -2890,6 +3272,36 @@ mod tests {
         let result = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 1024, 0);
 
         assert!(matches!(result, Err(BobsError::ConfigurationError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_new_accepts_max_live_spools_upper_bound() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 1024, crate::config::MAX_LIVE_SPOOLS)
+                .expect("upper bound should initialize");
+
+        assert_eq!(manager.max_live_spools, crate::config::MAX_LIVE_SPOOLS);
+        assert_eq!(
+            manager.admission.available_permits(),
+            crate::config::MAX_LIVE_SPOOLS
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_rejects_max_live_spools_above_policy_bound_before_setup() {
+        for max_live_spools in [crate::config::MAX_LIVE_SPOOLS + 1, usize::MAX] {
+            let dir = tempdir().expect("create tempdir");
+            let data_dir = dir.path().join("data");
+            let result = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 1024, max_live_spools);
+
+            assert!(matches!(result, Err(BobsError::ConfigurationError(_))));
+            assert!(
+                !data_dir.exists(),
+                "invalid admission must fail before startup allocation or filesystem setup"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3134,8 +3546,15 @@ mod tests {
             spool
                 .mark_served_and_maybe_fully_read(0, PAGE_SIZE as u64)
                 .await;
-            assert!(!spool.has_open_file_handle());
-            assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+            assert!(
+                !spool.has_open_file_handle(),
+                "full-read terminal spool must release its manager descriptor"
+            );
+            assert_eq!(
+                LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst),
+                0,
+                "completed cycle retained a synthetic data descriptor"
+            );
 
             for _ in 0..REPEATED_READS {
                 let permit = spool
@@ -3589,140 +4008,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_directory_durability_ordering_failures_and_retry_release() {
-        let _protocol_guard = PROTOCOL_TEST_LOCK.lock().await;
+    async fn test_recovered_key_rejects_create_without_truncating_or_leaking_admission() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
-        let manager = SpoolManager::<ProtocolFileIO, ProtocolMetadataStore>::with_metadata_store(
-            ProtocolMetadataStore::new(&data_dir),
-            &data_dir,
-            4,
-            64,
-            1,
-        )
-        .expect("manager init");
+        let key = uuid::Uuid::new_v4().to_string();
 
-        take_protocol_events();
-        let first_key = uuid::Uuid::new_v4().to_string();
-        manager
-            .create_spool(first_key.clone(), None, None, false, HashMap::new())
-            .await
-            .expect("durable create succeeds");
-        assert_eq!(
-            take_protocol_events(),
-            vec![
-                ProtocolEvent::DataCreate,
-                ProtocolEvent::DataSync,
-                ProtocolEvent::SpoolDirectorySync,
-                ProtocolEvent::MetadataWrite(SpoolState::Creating),
-                ProtocolEvent::ParentDirectorySync,
-                ProtocolEvent::MetadataWrite(SpoolState::Writing),
-            ],
-            "create must durably publish the key directory with a Creating tombstone before the live sidecar"
-        );
+        {
+            let manager =
+                SpoolManager::<TokioFileIO>::new(&data_dir, 4, 64, 2).expect("manager init");
+            manager
+                .create_spool(key.clone(), None, None, false, HashMap::new())
+                .await
+                .expect("create spool");
+            manager
+                .get_spool(&key)
+                .expect("spool exists")
+                .write(0, bytes::Bytes::from_static(b"safe"))
+                .await
+                .expect("write original bytes");
+        }
 
-        manager
-            .delete_spool(&first_key)
-            .await
-            .expect("durable delete succeeds");
-        assert_eq!(
-            take_protocol_events(),
-            vec![
-                ProtocolEvent::MetadataDelete,
-                ProtocolEvent::ParentDirectorySync,
-            ],
-            "delete must remove and key-dir-sync the sidecar before committing the key-dir unlink in data_dir"
-        );
-
-        let failed_create_key = uuid::Uuid::new_v4().to_string();
-        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
-        let error = manager
-            .create_spool(failed_create_key.clone(), None, None, false, HashMap::new())
-            .await
-            .expect_err("parent fsync failure must not acknowledge create");
-        assert!(matches!(error, BobsError::IoError(_)));
-        let failed_create_events = take_protocol_events();
-        assert!(failed_create_events.contains(&ProtocolEvent::MetadataWrite(SpoolState::Creating)));
-        assert!(
-            !failed_create_events.contains(&ProtocolEvent::MetadataWrite(SpoolState::Writing)),
-            "a failed parent fsync must not publish live metadata"
-        );
-        assert!(failed_create_events.contains(&ProtocolEvent::MetadataDelete));
-        assert!(manager.get_spool(&failed_create_key).is_none());
-        assert!(!data_dir.join(&failed_create_key).exists());
+        let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4, 64, 2).expect("manager init");
+        manager.recover().await.expect("recover spool");
         assert_eq!(manager.admission.available_permits(), 1);
 
-        let failed_live_key = uuid::Uuid::new_v4().to_string();
-        FAIL_NEXT_LIVE_METADATA_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
-        let error = manager
-            .create_spool(failed_live_key.clone(), None, None, false, HashMap::new())
-            .await
-            .expect_err("final metadata failure must not acknowledge create");
-        assert!(matches!(error, BobsError::StorageError(_)));
-        let failed_live_events = take_protocol_events();
+        let result = manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await;
+        assert!(matches!(
+            result,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
         assert_eq!(
-            &failed_live_events[..5],
-            &[
-                ProtocolEvent::DataCreate,
-                ProtocolEvent::DataSync,
-                ProtocolEvent::SpoolDirectorySync,
-                ProtocolEvent::MetadataWrite(SpoolState::Creating),
-                ProtocolEvent::ParentDirectorySync,
-            ],
-            "the crash-safe Creating sidecar and parent link precede the live commit attempt"
+            tokio::fs::read(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("read recovered bytes"),
+            b"safe"
         );
-        assert!(failed_live_events.contains(&ProtocolEvent::MetadataDelete));
-        assert!(manager.get_spool(&failed_live_key).is_none());
-        assert!(!data_dir.join(&failed_live_key).exists());
+        assert_eq!(manager.admission.available_permits(), 1);
+        assert_eq!(manager.spools.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_queued_delete_keeps_duplicate_create_conflicting_until_recreate() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager =
+            Arc::new(SpoolManager::<TokioFileIO>::new(&data_dir, 4, 64, 1).expect("manager init"));
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create original spool");
+        manager
+            .get_spool(&key)
+            .expect("original spool exists")
+            .write(0, bytes::Bytes::from_static(b"safe"))
+            .await
+            .expect("write original bytes");
+
+        let gate = manager.key_lock(&key);
+        let gate_guard = gate.lock().await;
+
+        let delete_manager = Arc::clone(&manager);
+        let delete_key = key.clone();
+        let delete_task =
+            tokio::spawn(async move { delete_manager.delete_spool(&delete_key).await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let create_manager = Arc::clone(&manager);
+        let create_key = key.clone();
+        let create_task = tokio::spawn(async move {
+            create_manager
+                .create_spool(create_key, None, None, false, HashMap::new())
+                .await
+        });
+        let create_result = tokio::time::timeout(Duration::from_secs(1), create_task)
+            .await
+            .expect("tracked create must not wait for queued deletion")
+            .expect("create task join");
+        assert!(matches!(
+            create_result,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
+        assert!(!delete_task.is_finished());
+
+        drop(gate_guard);
+        delete_task
+            .await
+            .expect("delete task join")
+            .expect("delete wins reservation order");
         assert_eq!(manager.admission.available_permits(), 1);
 
-        let retry_key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(retry_key.clone(), None, None, false, HashMap::new())
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
-            .expect("create retry fixture");
-        take_protocol_events();
-        manager
-            .page_cache
-            .lock()
-            .await
-            .insert(&retry_key, 0, Bytes::from_static(b"data"));
-        assert!(manager.page_cache.lock().await.contains(&retry_key, 0));
-
-        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            manager.delete_spool(&retry_key).await.is_err(),
-            "parent fsync failure must not acknowledge deletion"
+            .expect("later create follows completed delete");
+        assert_eq!(
+            tokio::fs::metadata(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("replacement data file")
+                .len(),
+            0
         );
-        assert!(!data_dir.join(&retry_key).exists());
-        let deleting = manager
-            .get_spool(&retry_key)
-            .expect("failed deletion remains tracked");
-        assert_eq!(deleting.metadata.lock().await.state, SpoolState::Deleting);
+        assert_eq!(manager.spools.len(), 1);
         assert_eq!(manager.admission.available_permits(), 0);
-        assert!(manager.page_cache.lock().await.contains(&retry_key, 0));
-        assert_eq!(
-            take_protocol_events(),
-            vec![
-                ProtocolEvent::MetadataDelete,
-                ProtocolEvent::ParentDirectorySync,
-            ]
-        );
-
-        manager
-            .delete_spool(&retry_key)
-            .await
-            .expect("retry syncs parent even though key directory is already absent");
-        assert_eq!(
-            take_protocol_events(),
-            vec![
-                ProtocolEvent::MetadataDelete,
-                ProtocolEvent::ParentDirectorySync,
-            ]
-        );
-        assert!(manager.get_spool(&retry_key).is_none());
-        assert!(!manager.page_cache.lock().await.contains(&retry_key, 0));
-        assert_eq!(manager.admission.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -6306,6 +6698,167 @@ mod tests {
             data
         );
         assert_eq!(tokio::fs::read(&meta_path).await.unwrap(), original_sidecar);
+    }
+
+    #[tokio::test]
+    async fn test_failed_delete_rejects_timed_create_before_admission() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let manager =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 1).expect("manager init");
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        manager
+            .get_spool(&key)
+            .expect("spool exists")
+            .write(0, Bytes::from_static(b"safe"))
+            .await
+            .expect("write original bytes");
+        let meta_path = data_dir.join(&key).join("meta.json");
+        tokio::fs::remove_file(&meta_path)
+            .await
+            .expect("remove metadata file");
+        tokio::fs::create_dir(&meta_path)
+            .await
+            .expect("replace metadata with directory");
+
+        manager
+            .delete_spool(&key)
+            .await
+            .expect_err("injected delete failure");
+        let duplicate = manager
+            .create_spool_with_admission_timeout(
+                Duration::ZERO,
+                key.clone(),
+                None,
+                None,
+                false,
+                HashMap::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            duplicate,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("read original spool bytes"),
+            b"safe"
+        );
+        assert_eq!(
+            manager
+                .get_spool(&key)
+                .expect("failed delete remains tracked")
+                .metadata
+                .lock()
+                .await
+                .state,
+            SpoolState::Deleting
+        );
+
+        tokio::fs::remove_dir(&meta_path)
+            .await
+            .expect("repair metadata path");
+        manager.delete_spool(&key).await.expect("cleanup spool");
+        assert_eq!(manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failed_delete_rejects_untimed_create_without_blocking_retry_and_recreates() {
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        let manager = Arc::new(
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 1).expect("manager init"),
+        );
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        manager
+            .get_spool(&key)
+            .expect("spool exists")
+            .write(0, Bytes::from_static(b"safe"))
+            .await
+            .expect("write original bytes");
+        let meta_path = data_dir.join(&key).join("meta.json");
+        tokio::fs::remove_file(&meta_path)
+            .await
+            .expect("remove metadata file");
+        tokio::fs::create_dir(&meta_path)
+            .await
+            .expect("replace metadata with directory");
+        manager
+            .delete_spool(&key)
+            .await
+            .expect_err("injected delete failure");
+        tokio::fs::remove_dir(&meta_path)
+            .await
+            .expect("repair metadata path");
+
+        // Hold the key gate so both operations are definitely concurrent. A
+        // duplicate must finish without joining the gate queue, while the retry
+        // waits only for this test guard.
+        let key_gate = manager.key_lock(&key);
+        let key_guard = key_gate.lock().await;
+        let duplicate_manager = Arc::clone(&manager);
+        let duplicate_key = key.clone();
+        let mut duplicate = tokio::spawn(async move {
+            duplicate_manager
+                .create_spool(duplicate_key, None, None, false, HashMap::new())
+                .await
+        });
+        let delete_manager = Arc::clone(&manager);
+        let delete_key = key.clone();
+        let delete_retry =
+            tokio::spawn(async move { delete_manager.delete_spool(&delete_key).await });
+
+        let duplicate_result = tokio::time::timeout(Duration::from_secs(1), &mut duplicate)
+            .await
+            .expect("tracked duplicate must not wait for admission or the key gate")
+            .expect("duplicate task join");
+        assert!(matches!(
+            duplicate_result,
+            Err(BobsError::SpoolAlreadyExists { key: ref existing }) if existing == &key
+        ));
+        assert!(!delete_retry.is_finished());
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("duplicate must not truncate original bytes"),
+            b"safe"
+        );
+
+        drop(key_guard);
+        tokio::time::timeout(Duration::from_secs(5), delete_retry)
+            .await
+            .expect("delete retry must not be blocked by duplicate create")
+            .expect("delete retry task join")
+            .expect("delete retry succeeds");
+        assert!(manager.get_spool(&key).is_none());
+        assert!(!data_dir.join(&key).exists());
+        assert_eq!(manager.admission.available_permits(), 1);
+
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("recreate after durable deletion");
+        assert_eq!(manager.admission.available_permits(), 0);
+        assert_eq!(manager.spools.len(), 1);
+        assert_eq!(
+            tokio::fs::metadata(data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("replacement data file")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]

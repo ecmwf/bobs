@@ -12,6 +12,7 @@ pub mod manager;
 pub mod metadata;
 pub mod metrics;
 pub mod observability;
+pub mod server;
 pub mod shutdown;
 pub mod spool;
 pub mod time;

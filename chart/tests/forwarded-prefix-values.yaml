@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+#
+# SPDX-License-Identifier: Apache-2.0
+
+replicaCount: 2
+
+global:
+  ingress:
+    controller: nginx-community
+
+config:
+  host_prefix: downloads
+  domain: example.com
+  route_name: download
+
+ingress:
+  enabled: true
+  forwardedPrefix:
+    enabled: true
+  annotations:
+    example.com/preserved: kept

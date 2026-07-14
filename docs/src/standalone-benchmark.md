@@ -114,14 +114,14 @@ cargo run --release --bin bobs-benchmark -- \
 
 ## Page size comparison
 
-Keep the runtime default at `4096` unless benchmark evidence says otherwise. Wider pages can reduce per-page overhead and may improve throughput, especially after removal of write-hot-path metadata commits. They also delay reader visibility until a full page is available and consume more of the global cache budget per cached page, so cache reach may fall unless `max_cache_bytes` is increased. `page_size` may be larger than `max_cache_bytes`; oversized pages simply bypass the cache.
+The Rust binary defaults to 16 MiB pages and a 256 MiB cache; the Helm chart overrides these to 4 KiB and 1 MiB. Wider pages can reduce per-page overhead, but delay reader visibility until a full page is available. `page_size` may exceed `max_cache_bytes`; oversized pages simply bypass the cache.
 
-Compare at least the default, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The example below uses a global cache budget sized to hold roughly 256 pages for each run, if the workload and eviction order allow.
+Compare 4 KiB, 1 MiB, 4 MiB, and 16 MiB pages with representative object sizes. The examples below use a global cache budget sized to hold roughly 256 pages for each run, if the workload and eviction order allow.
 
 Start one BOBS server per page size, run the matching benchmark, then stop the server before moving to the next size:
 
 ```bash
-# 4 KiB default-page run
+# 4 KiB chart-default page run
 cat >/tmp/bobs-bench-4096.yaml <<'YAML'
 host: 127.0.0.1
 port: 3000

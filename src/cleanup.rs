@@ -344,6 +344,7 @@ mod tests {
                 .await
                 .expect("removal wait task panicked");
         }
+        panic!("spool {key} was not removed before the cleanup deadline");
     }
 
     async fn rewrite_persisted_metadata<F: FileIO>(

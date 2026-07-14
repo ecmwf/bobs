@@ -94,17 +94,25 @@ config:
   host: "0.0.0.0"
   port: 3000
   data_dir: "/var/lib/bobs"
-  # Spool write page size. BOBS fsyncs a metadata commit per page on write, so
-  # larger pages amortise fsync cost over more data. max_cache_bytes must be >= page_size.
+  # The chart favours lower streaming latency than the Rust binary defaults:
+  # it overrides 16 MiB/256 MiB with 4 KiB/1 MiB. Valid page sizes are
+  # 1..=67108864 bytes (64 MiB) and must not exceed max_spool_bytes. Pages
+  # larger than the cache bypass it, so the cache may remain smaller than a page.
   page_size: 4096
   max_cache_bytes: 1048576
-  # Admission limit: max spools concurrently holding an in-memory page cache
-  # (created but not yet fully read). create blocks until a slot frees, applying
-  # backpressure to writers instead of growing memory without bound.
-  max_live_spools: 4096
+  # Explicit chart admission limit matching max_cache_bytes / page_size.
+  # Operators can override this in the valid 1..=65536 range.
+  max_live_spools: 256
+  # Per-spool write limit; must be >= page_size. 8 GiB leaves headroom on the default 10 GiB PVC.
+  max_spool_bytes: 8589934592
+  # Bound create admission waits; exhausted capacity returns HTTP 503.
+  create_admission_timeout_ms: 5000
+  # Exposes an unauthenticated, CPU-intensive profiler on the main listener.
+  enable_pprof: false
   # io_uring tuning. When unset, BOBS auto-resolves shards = (num_cpus/4).max(1)
-  # and a queue capacity of 1024. Explicit shard counts must be in 1..=256;
-  # override within that range for higher per-volume write parallelism.
+  # and a queue capacity of 1024. Explicit shard counts must be in 1..=256.
+  # Queue capacity must be 1..=Tokio's Semaphore::MAX_PERMITS
+  # (usize::MAX >> 3; 2305843009213693951 on 64-bit).
   # io_uring_shards: 8
   # io_uring_queue_capacity: 4096
   writer_inactivity_timeout_secs: 300
@@ -120,6 +128,7 @@ config:
   metrics:
     enabled: false
     bind_address: "0.0.0.0"
+    # Must differ from config.port when enabled in a telemetry build.
     port: 9464
     allowed_labels:
       - collection
@@ -139,10 +148,10 @@ ingress:
   className: nginx
   annotations: {}
   tls: []
-  # X-Forwarded-Prefix location snippet for the nginx-inc ingress. Off by default
-  # (parity with the deployed/vendored chart). When enabled, the ingress preserves
-  # the external route prefix (/{route_name}-N) for BOBS long-poll redirects and
-  # re-asserts the standard forwarded headers explicitly.
+  # Preserve the exact external /{route_name}-N pod prefix in BOBS long-poll
+  # redirects. Off by default for deployment parity. NGINX Inc uses a location
+  # snippet; community ingress-nginx renders one Ingress per replica with its
+  # native x-forwarded-prefix annotation. Existing user annotations are retained.
   forwardedPrefix:
     enabled: false
 
