@@ -58,12 +58,12 @@ assert_schema_rejects() {
   assert_contains "values don't meet the specifications" "$tmpdir/$name.log"
 }
 
-# Exercise standalone defaults and both supported ingress controllers. The
-# community forwarded-prefix fixture uses two replicas and verifies that each pod
-# gets its own ingress; the NGINX Inc lint uses the single-replica mode.
+# Exercise schema-valid defaults and both supported ingress controllers. Neither
+# render opts into forwarded-prefix handling: ingress-enabled defaults must make
+# long-poll redirect Locations routable. The community fixture uses two replicas
+# and verifies that each pod gets its own Ingress; NGINX Inc uses one Ingress.
 helm lint "$chart" --strict "${common_values[@]}" \
   --set ingress.enabled=true \
-  --set ingress.forwardedPrefix.enabled=true \
   --set global.ingress.controller=nginx-inc \
   --set replicaCount=1
 helm lint "$chart" --strict --values "$chart/tests/forwarded-prefix-values.yaml"

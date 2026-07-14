@@ -184,11 +184,13 @@ ingress:
   annotations: {}
   tls: []
   # Preserve the exact external /{route_name}-N pod prefix in BOBS long-poll
-  # redirects. Off by default for deployment parity. NGINX Inc uses a location
-  # snippet; community ingress-nginx renders one Ingress per replica with its
-  # native x-forwarded-prefix annotation. Existing user annotations are retained.
+  # redirects whenever ingress is enabled. NGINX Inc uses a location snippet;
+  # community ingress-nginx renders one Ingress per replica with its native
+  # x-forwarded-prefix annotation. Existing user annotations are retained.
+  # Explicit false is rejected with ingress.enabled=true because it would emit
+  # unroutable redirect Location paths.
   forwardedPrefix:
-    enabled: false
+    enabled: true
 
 # StatefulSet governing Service and stable pod DNS. When enabled, the chart creates
 # a headless Service. An empty name preserves the <fullname>-svc default; set a

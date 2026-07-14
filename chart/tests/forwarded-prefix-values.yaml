@@ -13,9 +13,9 @@ config:
   domain: example.com
   route_name: download
 
+# Deliberately omit ingress.forwardedPrefix: the chart default must keep
+# long-poll redirect Locations routable for every replica.
 ingress:
   enabled: true
-  forwardedPrefix:
-    enabled: true
   annotations:
     example.com/preserved: kept

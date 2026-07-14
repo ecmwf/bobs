@@ -39,6 +39,45 @@ assert_schema_rejects() {
 	assert_contains "values don't meet the specifications" "$tmp_dir/$name.log"
 }
 
+render_config_checksum() {
+	local name=$1
+	shift
+	local render="$tmp_dir/checksum-$name.yaml"
+	helm template bobs "$chart_dir" "${common_values[@]}" \
+		--show-only templates/statefulset.yaml "$@" >"$render"
+	python3 - "$render" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+checksums = re.findall(
+    r'^\s+checksum/config:\s*["\x27]?([0-9a-f]{64})["\x27]?\s*$',
+    text,
+    flags=re.MULTILINE,
+ )
+if len(checksums) != 1:
+    raise SystemExit(f"expected exactly one checksum/config annotation, found {checksums}")
+print(checksums[0])
+PY
+}
+
+assert_checksum_differs() {
+	local baseline=$1 actual=$2 description=$3
+	if [[ "$baseline" == "$actual" ]]; then
+		printf 'Expected %s to alter checksum/config (%s)\n' "$description" "$baseline" >&2
+		exit 1
+	fi
+}
+
+assert_checksum_matches() {
+	local baseline=$1 actual=$2 description=$3
+	if [[ "$baseline" != "$actual" ]]; then
+		printf 'Expected %s not to alter checksum/config (%s != %s)\n' \
+			"$description" "$baseline" "$actual" >&2
+		exit 1
+	fi
+}
+
 assert_label_strings() {
 	local file=$1 release_name=$2 app_name=$3
 	assert_contains "app.kubernetes.io/instance: \"$release_name\"" "$file"
@@ -116,6 +155,22 @@ for ordinal, pod_name in enumerate(pod_names):
         raise SystemExit(f"controller-generated PVC name is invalid: {pvc_name}")
 PY
 }
+
+# checksum/config is a digest of the canonical ConfigMap payload only. Every
+# represented runtime-config category below changes it, while repeat renders and
+# values outside ConfigMap data do not.
+baseline_checksum=$(render_config_checksum baseline)
+assert_checksum_matches "$baseline_checksum" "$(render_config_checksum repeat)" "an identical render"
+assert_checksum_differs "$baseline_checksum" "$(render_config_checksum page --set config.page_size=8192)" "config.page_size"
+assert_checksum_differs "$baseline_checksum" "$(render_config_checksum ttl --set config.read_idle_ttl_secs=601)" "config.read_idle_ttl_secs"
+assert_checksum_differs "$baseline_checksum" "$(render_config_checksum routing --set-string config.route_name=download-v2)" "config.route_name"
+assert_checksum_differs "$baseline_checksum" "$(render_config_checksum pprof --set config.enable_pprof=true)" "config.enable_pprof"
+assert_checksum_matches "$baseline_checksum" "$(render_config_checksum replicas --set replicaCount=2)" "replicaCount"
+assert_checksum_matches "$baseline_checksum" "$(render_config_checksum image --set-string image.tag=unrelated)" "image.tag"
+assert_checksum_matches "$baseline_checksum" "$(render_config_checksum persistence --set-string persistence.size=20Gi)" "persistence.size"
+assert_checksum_matches "$baseline_checksum" "$(render_config_checksum fullname --set-string fullnameOverride=renamed-bobs)" "ConfigMap metadata/name changes"
+assert_checksum_matches "$baseline_checksum" "$(render_config_checksum annotation --set-string 'podAnnotations.example\.com/unrelated=yes')" "podAnnotations"
+assert_checksum_matches "$baseline_checksum" "$(render_config_checksum reserved-annotation --set-string 'podAnnotations.checksum/config=override')" "a user checksum/config override"
 
 kubeconform_bin=${KUBECONFORM_BIN:-kubeconform}
 if ! command -v "$kubeconform_bin" >/dev/null 2>&1; then
@@ -235,6 +290,12 @@ for index in "${!invalid_routes[@]}"; do
 		"config.route_name must be 1-63 characters" \
 		--set-string config.route_name="$invalid_route"
 done
+
+assert_schema_rejects ingress-forwarded-prefix-disabled \
+	--set ingress.enabled=true --set ingress.forwardedPrefix.enabled=false
+assert_template_rejects ingress-forwarded-prefix-disabled-template \
+	'ingress.forwardedPrefix.enabled must be true when ingress.enabled=true so long-poll redirect Location paths remain routable' \
+	--set ingress.enabled=true --set ingress.forwardedPrefix.enabled=false
 
 assert_schema_rejects fullname-invalid --set-string fullnameOverride=Bad_Name
 assert_template_rejects fullname-invalid-template \

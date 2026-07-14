@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # {{- if .Values.ingress.enabled -}}
+# {{- if not .Values.ingress.forwardedPrefix.enabled -}}
+# {{- fail "ingress.forwardedPrefix.enabled must be true when ingress.enabled=true so long-poll redirect Location paths remain routable" -}}
+# {{- end -}}
 # {{- $fullName := include "bobs.fullname" . -}}
 # {{- $routeName := include "bobs.routeName" . -}}
 # {{- $routePattern := regexQuoteMeta $routeName -}}

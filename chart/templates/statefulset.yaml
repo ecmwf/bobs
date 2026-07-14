@@ -29,10 +29,10 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
   template:
     metadata:
-      # {{- with .Values.podAnnotations }}
+      # {{- $podAnnotations := deepCopy (.Values.podAnnotations | default dict) }}
+      # {{- $_ := set $podAnnotations "checksum/config" (include "bobs.configYaml" . | sha256sum) }}
       annotations:
-        # {{- toYaml . | nindent 8 }}
-      # {{- end }}
+        # {{- toYaml $podAnnotations | nindent 8 }}
       labels:
         # prettier-ignore
         app.kubernetes.io/name: {{ include "bobs.name" . | quote }}

@@ -237,6 +237,18 @@ ordinal suffix. Ingress still uses the chart's per-replica Services. All rendere
 Kubernetes label and selector values, including ServiceMonitor labels, are emitted
 as YAML strings so boolean-, null-, and numeric-looking names cannot change type.
 
+The StatefulSet pod template carries `checksum/config`, a deterministic digest of
+the rendered `config.yaml` ConfigMap payload. Runtime configuration changes
+therefore roll every pod, while unrelated release metadata and workload values do
+not perturb the digest.
+
+Ingress-enabled renders preserve each public `/{route_name}-N` prefix by default so
+long-poll redirects remain routable. NGINX Inc derives the exact prefix in its
+location snippet; community ingress-nginx renders one Ingress per replica with a
+matching `nginx.ingress.kubernetes.io/x-forwarded-prefix`. Setting
+`ingress.forwardedPrefix.enabled: false` while ingress is enabled is rejected rather
+than rendering a broken redirect contract.
+
 Validate chart changes with Helm and `kubeconform` v0.8.0:
 
 ```bash
