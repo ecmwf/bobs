@@ -158,7 +158,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     manager.set_metrics(Arc::clone(&metrics));
     let manager = Arc::new(manager);
 
-    manager.recover().await?;
+    manager
+        .recover_with_max_spool_bytes(config.max_spool_bytes)
+        .await?;
     let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
     let state = Arc::new(AppState {
