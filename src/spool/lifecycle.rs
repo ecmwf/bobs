@@ -121,12 +121,8 @@ where
             )
         };
 
-        {
-            let handle_guard = self.file_handle.lock().await;
-            if let Some(handle) = handle_guard.as_ref() {
-                F::sync_data(handle).await.map_err(BobsError::IoError)?;
-            }
-        }
+        let handle = self.active_file_handle()?;
+        F::sync_data(&handle).await.map_err(BobsError::IoError)?;
 
         // A durable marker certifies that spool.dat was synced and records the
         // complete candidate layout. Recovery either commits this exact candidate
@@ -221,9 +217,13 @@ where
     }
 
     /// First full-read transition hook. At this point every byte has been served
-    /// at least once, so the first-read page cache for this spool is redundant.
+    /// at least once, so both the first-read page cache and the manager-held OS
+    /// file handle are redundant. Active readers keep their cloned handles alive.
     pub async fn on_fully_read(&self) {
         self.page_cache.lock().await.free_spool(&self.key);
+        // Retire manager ownership before publishing released admission so every
+        // reopen observed after that boundary is response-scoped.
+        self.close_file_handle();
         self.release_admission();
     }
 
@@ -811,19 +811,16 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Arc::new(
-            Spool::new(
-                meta,
-                handle,
-                page_size,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    page_size * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await,
-        )
+        Arc::new(Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ))
     }
 
     async fn persisted_metadata<F, M>(spool: &Spool<F, M>) -> SpoolMetadata
@@ -874,19 +871,16 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Arc::new(
-            Spool::new(
-                meta,
-                handle,
-                page_size,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    page_size * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await,
-        )
+        Arc::new(Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ))
     }
 
     async fn make_fail_first_metadata_spool(
@@ -922,19 +916,16 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Arc::new(
-            Spool::new(
-                meta,
-                handle,
-                page_size,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    page_size * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await,
-        )
+        Arc::new(Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ))
     }
 
     async fn make_post_rename_failing_spool(
@@ -971,19 +962,16 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Arc::new(
-            Spool::new(
-                meta,
-                handle,
-                page_size,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    page_size * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await,
-        )
+        Arc::new(Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ))
     }
 
     async fn make_gated_spool(
@@ -1024,19 +1012,16 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        let spool = Arc::new(
-            Spool::new(
-                meta,
-                handle,
-                page_size,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    page_size * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await,
-        );
+        let spool = Arc::new(Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ));
         (spool, reached, release)
     }
 
@@ -1075,19 +1060,16 @@ mod tests {
             .await
             .expect("insert initial metadata");
 
-        Arc::new(
-            Spool::new(
-                meta,
-                handle,
-                page_size,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    page_size * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await,
-        )
+        Arc::new(Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ))
     }
 
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
@@ -1139,19 +1121,16 @@ mod tests {
             .expect("completion event log mutex poisoned")
             .clear();
 
-        Arc::new(
-            Spool::new(
-                meta,
-                handle,
-                page_size,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    page_size * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            )
-            .await,
-        )
+        Arc::new(Spool::new(
+            meta,
+            handle,
+            page_size,
+            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                page_size * 256,
+            ))),
+            metadata_store,
+            Arc::new(crate::metrics::BobsMetrics::new(false)),
+        ))
     }
 
     async fn wait_for_detached_completion(spool: &Arc<Spool<TokioFileIO, GatedMetadataStore>>) {
@@ -1180,12 +1159,16 @@ mod tests {
             data
         );
         let page = spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read final page")
             .expect("final page exists");
         assert_eq!(page.as_ref(), data);
-        assert!(spool.read_page(1).await.expect("read exact EOF").is_none());
+        assert!(spool
+            .read_page_for_test(1)
+            .await
+            .expect("read exact EOF")
+            .is_none());
     }
 
     #[tokio::test]
@@ -1397,13 +1380,13 @@ mod tests {
             .get_spool("test-key")
             .expect("completed spool recovers");
         let recovered_page = recovered_spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read recovered final page")
             .expect("recovered final page exists");
         assert_eq!(recovered_page.as_ref(), b"cache-contention-tail");
         assert!(recovered_spool
-            .read_page(1)
+            .read_page_for_test(1)
             .await
             .expect("read recovered EOF")
             .is_none());
@@ -1465,7 +1448,10 @@ mod tests {
         assert_eq!(meta.final_page_size, Some(1000));
         drop(meta);
 
-        let got = spool.read_page(0).await.expect("read partial final page");
+        let got = spool
+            .read_page_for_test(0)
+            .await
+            .expect("read partial final page");
         assert_eq!(got.as_deref(), Some(partial_data.as_slice()));
     }
 
@@ -1599,19 +1585,16 @@ mod tests {
                 .write(&meta)
                 .await
                 .expect("insert routed initial metadata");
-            let routed_spool = Arc::new(
-                Spool::<UringFileIO, UringSidecarMetadataStore>::new(
-                    meta,
-                    handle,
-                    4096,
-                    Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                        4096 * 256,
-                    ))),
-                    metadata_store,
-                    Arc::new(crate::metrics::BobsMetrics::new(false)),
-                )
-                .await,
-            );
+            let routed_spool = Arc::new(Spool::<UringFileIO, UringSidecarMetadataStore>::new(
+                meta,
+                handle,
+                4096,
+                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
+                    4096 * 256,
+                ))),
+                metadata_store,
+                Arc::new(crate::metrics::BobsMetrics::new(false)),
+            ));
             routed_spool
                 .write(0, bytes::Bytes::copy_from_slice(&data))
                 .await
@@ -1744,16 +1727,16 @@ mod tests {
         drop(meta);
 
         let first = spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read first page")
             .expect("first page present");
         let final_partial = spool
-            .read_page(1)
+            .read_page_for_test(1)
             .await
             .expect("read final page")
             .expect("final page present");
-        let end = spool.read_page(2).await.expect("read end marker");
+        let end = spool.read_page_for_test(2).await.expect("read end marker");
         assert!(end.is_none());
 
         let mut read_back = Vec::new();
@@ -1834,7 +1817,7 @@ mod tests {
             .expect("complete with true size succeeds");
 
         let got = spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read final partial page")
             .expect("page present");
@@ -1937,13 +1920,13 @@ mod tests {
             .get_spool("test-key")
             .expect("published complete spool recovers");
         let recovered_page = recovered_spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("read recovered page")
             .expect("recovered page exists");
         assert_eq!(recovered_page.as_ref(), data.as_ref());
         assert!(recovered_spool
-            .read_page(1)
+            .read_page_for_test(1)
             .await
             .expect("read recovered EOF")
             .is_none());

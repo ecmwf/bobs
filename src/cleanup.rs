@@ -279,15 +279,20 @@ mod tests {
         fn sync_directory(
             path: &std::path::Path,
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::sync_directory(path)
+            let path = path.to_path_buf();
+            async move {
+                if BLOCK_NEXT_CLOSE.swap(false, Ordering::SeqCst) {
+                    CLOSE_STARTED.notify_waiters();
+                    CLOSE_RELEASE.notified().await;
+                }
+                TokioFileIO::sync_directory(&path).await
+            }
         }
 
-        async fn close(handle: Self::Handle) -> std::io::Result<()> {
-            if BLOCK_NEXT_CLOSE.swap(false, Ordering::SeqCst) {
-                CLOSE_STARTED.notify_waiters();
-                CLOSE_RELEASE.notified().await;
-            }
-            TokioFileIO::close(handle).await
+        fn close(
+            handle: Self::Handle,
+        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+            TokioFileIO::close(handle)
         }
 
         fn remove(

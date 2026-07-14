@@ -8,7 +8,7 @@ use crate::metrics::BobsMetrics;
 use bytes::BytesMut;
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -35,13 +35,94 @@ pub(crate) struct CleanupAnchors {
     pub full_object_read_at: Option<Instant>,
 }
 
+/// Weighted manager-wide admission held for the lifetime of one read response.
+///
+/// The semaphore units represent configured pages. Recovered spools with wider
+/// persisted pages acquire multiple units, so old layouts cannot bypass the current
+/// response-memory budget. Dropping the lease releases both admission, any lazily
+/// reopened terminal file handle, and metrics.
+pub struct ReadResponsePermit<F: FileIO> {
+    _permit: OwnedSemaphorePermit,
+    active_responses: Arc<AtomicUsize>,
+    active_permits: Arc<AtomicUsize>,
+    permit_units: usize,
+    metrics: Arc<BobsMetrics>,
+    file_handle: StdMutex<Option<Arc<F::Handle>>>,
+}
+
+impl<F: FileIO> ReadResponsePermit<F> {
+    fn file_handle(&self) -> Option<Arc<F::Handle>> {
+        self.file_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    fn retain_file_handle(&self, handle: Arc<F::Handle>) -> Arc<F::Handle> {
+        let mut retained = self
+            .file_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(retained.get_or_insert(handle))
+    }
+}
+
+impl<F: FileIO> Drop for ReadResponsePermit<F> {
+    fn drop(&mut self) {
+        let previous_responses = self.active_responses.fetch_sub(1, Ordering::AcqRel);
+        let previous_permits = self
+            .active_permits
+            .fetch_sub(self.permit_units, Ordering::AcqRel);
+        debug_assert!(previous_responses > 0);
+        debug_assert!(previous_permits >= self.permit_units);
+        self.metrics
+            .record_read_response_permit_released(self.permit_units);
+    }
+}
+
+#[derive(Clone)]
+struct SharedOpenError {
+    kind: std::io::ErrorKind,
+    message: Arc<str>,
+}
+
+impl SharedOpenError {
+    fn from_io(error: &std::io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: Arc::from(error.to_string()),
+        }
+    }
+
+    fn to_io(&self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message.to_string())
+    }
+}
+
+struct FileHandleSlot<H> {
+    manager_handle: Option<Arc<H>>,
+    response_handle: std::sync::Weak<H>,
+    retain_manager_handle: bool,
+    generation: u64,
+    last_open_error: Option<(u64, SharedOpenError)>,
+}
+
 pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub key: String,
     pub metadata: Arc<Mutex<SpoolMetadata>>,
     pub page_cache: Arc<Mutex<PageCache>>,
     /// Accumulates incoming bytes until a full page is ready for flush.
     pub write_buffer: Arc<Mutex<BytesMut>>,
-    pub file_handle: Arc<Mutex<Option<F::Handle>>>,
+    /// Optional manager-held positional-I/O handle. Active writers and terminal
+    /// spools whose first-read coverage is incomplete retain this handle. Once the
+    /// first full read releases spool admission, only response permits may strongly
+    /// retain a lazily reopened handle; this slot keeps at most a `Weak` reference so
+    /// concurrent admitted responses can share it without extending its lifetime.
+    file_handle: StdMutex<FileHandleSlot<F::Handle>>,
+    /// Single-flight gate for reopening only. The brief state mutex above is never
+    /// held across open or data I/O, and this permit is dropped before positional I/O.
+    file_handle_reopen: Semaphore,
     pub metadata_store: M,
     /// Writer notifies after each completed page; readers long-poll on this.
     pub notify: Arc<Notify>,
@@ -54,6 +135,12 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     /// Serializes mutation with terminal lifecycle operations and cleanup activity.
     /// Operation transactions always acquire `operation_gate` before this lock.
     pub(crate) lifecycle_lock: Mutex<()>,
+    /// Manager-wide response-buffer admission. A response acquires its weighted
+    /// share before any page read and retains it until its body/reader lease drops.
+    read_response_admission: Arc<Semaphore>,
+    read_response_active: Arc<AtomicUsize>,
+    read_response_permits_active: Arc<AtomicUsize>,
+    read_response_permits_per_reader: u32,
     pub page_size: usize,
     pub data_path: PathBuf,
     /// Number of active reader connections.
@@ -77,7 +164,7 @@ where
     F: FileIO,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
-    pub async fn new(
+    pub fn new(
         metadata: SpoolMetadata,
         file_handle: F::Handle,
         page_size: usize,
@@ -85,26 +172,35 @@ where
         metadata_store: M,
         metrics: Arc<BobsMetrics>,
     ) -> Self {
+        let read_response_admission = Arc::new(Semaphore::new(1));
         Self::new_with_admission(
             metadata,
-            file_handle,
+            Some(file_handle),
             page_size,
             page_cache,
             metadata_store,
             metrics,
             None,
+            read_response_admission,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            1,
         )
-        .await
     }
 
-    pub async fn new_with_admission(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_admission(
         metadata: SpoolMetadata,
-        file_handle: F::Handle,
+        file_handle: Option<F::Handle>,
         page_size: usize,
         page_cache: Arc<Mutex<PageCache>>,
         metadata_store: M,
         metrics: Arc<BobsMetrics>,
         admission_permit: Option<OwnedSemaphorePermit>,
+        read_response_admission: Arc<Semaphore>,
+        read_response_active: Arc<AtomicUsize>,
+        read_response_permits_active: Arc<AtomicUsize>,
+        read_response_permits_per_reader: u32,
     ) -> Self {
         let data_path = metadata.data_path.clone();
         let key = metadata.key.clone();
@@ -116,12 +212,30 @@ where
             metadata: Arc::new(Mutex::new(metadata)),
             page_cache,
             write_buffer: Arc::new(Mutex::new(BytesMut::new())),
-            file_handle: Arc::new(Mutex::new(Some(file_handle))),
+            file_handle: StdMutex::new({
+                let manager_handle = file_handle.map(Arc::new);
+                let response_handle = manager_handle
+                    .as_ref()
+                    .map(Arc::downgrade)
+                    .unwrap_or_default();
+                FileHandleSlot {
+                    manager_handle,
+                    response_handle,
+                    retain_manager_handle: true,
+                    generation: 0,
+                    last_open_error: None,
+                }
+            }),
+            file_handle_reopen: Semaphore::new(1),
             metadata_store,
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
             operation_gate: Arc::new(Semaphore::new(1)),
             lifecycle_lock: Mutex::new(()),
+            read_response_admission,
+            read_response_active,
+            read_response_permits_active,
+            read_response_permits_per_reader,
             page_size,
             data_path,
             reader_count: Arc::new(AtomicUsize::new(0)),
@@ -183,6 +297,234 @@ where
         if let Ok(mut permit) = self.admission_permit.lock() {
             permit.take();
         }
+    }
+
+    /// Acquire the manager-wide response-buffer budget without holding lifecycle,
+    /// metadata, cache, or spool-admission locks. Deletion cancels queued readers
+    /// immediately rather than leaving them behind a slow client.
+    pub async fn acquire_read_response_permit(
+        &self,
+    ) -> crate::error::Result<ReadResponsePermit<F>> {
+        if self.cancel.is_cancelled() {
+            return Err(crate::error::BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            });
+        }
+
+        let units = self.read_response_permits_per_reader;
+        let acquire = Arc::clone(&self.read_response_admission).acquire_many_owned(units);
+        let permit = tokio::select! {
+            result = acquire => result.map_err(|_| {
+                crate::error::BobsError::IoError(std::io::Error::other(
+                    "read response semaphore closed",
+                ))
+            })?,
+            _ = self.cancel.cancelled() => {
+                return Err(crate::error::BobsError::SpoolNotFound {
+                    key: self.key.clone(),
+                });
+            }
+        };
+
+        // Deletion can race the semaphore wake. Do not publish a lease after the
+        // spool has become terminal; dropping the raw permit restores capacity.
+        if self.cancel.is_cancelled() {
+            return Err(crate::error::BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            });
+        }
+
+        self.read_response_active.fetch_add(1, Ordering::AcqRel);
+        self.read_response_permits_active
+            .fetch_add(units as usize, Ordering::AcqRel);
+        self.metrics
+            .record_read_response_permit_acquired(units as usize);
+        Ok(ReadResponsePermit {
+            _permit: permit,
+            active_responses: Arc::clone(&self.read_response_active),
+            active_permits: Arc::clone(&self.read_response_permits_active),
+            permit_units: units as usize,
+            metrics: Arc::clone(&self.metrics),
+            file_handle: StdMutex::new(None),
+        })
+    }
+
+    /// Acquire a positional-I/O handle for one admitted response. Active and
+    /// pre-first-read terminal spools keep a manager reference. After the full-read
+    /// transition, reopened handles are retained only by response permits; the spool
+    /// keeps a `Weak` reference so concurrent responses can share one single-flight
+    /// reopen without leaving an FD behind after the last response body drops.
+    pub(crate) async fn acquire_file_handle(
+        &self,
+        response_permit: &ReadResponsePermit<F>,
+    ) -> crate::error::Result<Arc<F::Handle>> {
+        if self.cancel.is_cancelled() {
+            return Err(crate::error::BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            });
+        }
+
+        if let Some(handle) = response_permit.file_handle() {
+            return Ok(handle);
+        }
+
+        let observed_generation = {
+            let slot = self
+                .file_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(handle) = slot.manager_handle.as_ref() {
+                return Ok(response_permit.retain_file_handle(Arc::clone(handle)));
+            }
+            if let Some(handle) = slot.response_handle.upgrade() {
+                return Ok(response_permit.retain_file_handle(handle));
+            }
+            slot.generation
+        };
+
+        let _reopen_permit = tokio::select! {
+            permit = self.file_handle_reopen.acquire() => permit.map_err(|_| {
+                crate::error::BobsError::IoError(std::io::Error::other(
+                    "file-handle reopen semaphore closed",
+                ))
+            })?,
+            _ = self.cancel.cancelled() => {
+                return Err(crate::error::BobsError::SpoolNotFound {
+                    key: self.key.clone(),
+                });
+            }
+        };
+
+        if let Some(handle) = response_permit.file_handle() {
+            return Ok(handle);
+        }
+
+        {
+            let slot = self
+                .file_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(handle) = slot.manager_handle.as_ref() {
+                return Ok(response_permit.retain_file_handle(Arc::clone(handle)));
+            }
+            if let Some(handle) = slot.response_handle.upgrade() {
+                return Ok(response_permit.retain_file_handle(handle));
+            }
+            if slot.generation != observed_generation {
+                if let Some((generation, error)) = slot.last_open_error.as_ref() {
+                    if *generation == slot.generation {
+                        return Err(crate::error::BobsError::IoError(error.to_io()));
+                    }
+                }
+            }
+        }
+
+        let opened = F::open(&self.data_path).await;
+        if self.cancel.is_cancelled() {
+            drop(opened);
+            return Err(crate::error::BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            });
+        }
+
+        match opened {
+            Ok(opened) => {
+                let handle = Arc::new(opened);
+                {
+                    let mut slot = self
+                        .file_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if self.cancel.is_cancelled() {
+                        return Err(crate::error::BobsError::SpoolNotFound {
+                            key: self.key.clone(),
+                        });
+                    }
+                    slot.generation = slot.generation.wrapping_add(1);
+                    slot.last_open_error = None;
+                    slot.response_handle = Arc::downgrade(&handle);
+                    if slot.retain_manager_handle {
+                        slot.manager_handle = Some(Arc::clone(&handle));
+                    }
+                }
+                Ok(response_permit.retain_file_handle(handle))
+            }
+            Err(error) => {
+                let shared = SharedOpenError::from_io(&error);
+                let mut slot = self
+                    .file_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                slot.generation = slot.generation.wrapping_add(1);
+                let generation = slot.generation;
+                slot.last_open_error = Some((generation, shared));
+                Err(crate::error::BobsError::IoError(error))
+            }
+        }
+    }
+
+    /// Active writers and completion transactions are constructed with a handle and
+    /// never use the lazy reopen path.
+    pub(crate) fn active_file_handle(&self) -> crate::error::Result<Arc<F::Handle>> {
+        self.file_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .manager_handle
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                crate::error::BobsError::IoError(std::io::Error::other(
+                    "active spool unexpectedly has no data file handle",
+                ))
+            })
+    }
+
+    /// End manager ownership at the full-read transition. Existing response handles
+    /// remain shareable through the weak slot until the final admitted response drops.
+    pub(crate) fn close_file_handle(&self) {
+        let handle = {
+            let mut slot = self
+                .file_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.retain_manager_handle = false;
+            slot.manager_handle.take()
+        };
+        drop(handle);
+    }
+
+    /// End all handle publication during deletion. In-flight operations and response
+    /// permits keep their own clones alive, but no racing reader can discover them.
+    pub(crate) fn invalidate_file_handle(&self) {
+        let handle = {
+            let mut slot = self
+                .file_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.retain_manager_handle = false;
+            slot.response_handle = std::sync::Weak::new();
+            slot.manager_handle.take()
+        };
+        drop(handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_open_file_handle(&self) -> bool {
+        self.file_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .manager_handle
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_live_response_file_handle(&self) -> bool {
+        self.file_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .response_handle
+            .upgrade()
+            .is_some()
     }
 
     pub async fn persist_metadata(&self, metadata: &SpoolMetadata) -> crate::error::Result<()> {

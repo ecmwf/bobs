@@ -58,6 +58,8 @@ On Linux, the default backend is a sharded `io_uring` pool. Non-Linux builds, an
 
 Accepted write bytes are appended to `spool.dat` before `/write` returns, but they are not forced to stable storage per page. `/complete` syncs the data file before committing final complete metadata.
 
+Writing and completion retain one manager-held handle through the terminal transition. Recovered terminal spools may likewise retain a lazily reopened handle until their first-read coverage completes. At the full-read transition BOBS drops manager ownership before releasing first-read cache admission; positional I/O already in flight remains safe because its response owns a cloned handle. Later cache-miss reads reopen the canonical `spool.dat` asynchronously through a single-flight gate and retain the shared handle only in admitted response permits. The spool keeps a weak reference so concurrent terminal responses can share that handle without extending its lifetime beyond the final response body. The handle-state mutex and reopen gate are released before positional I/O, so independent reads remain concurrent. Deletion invalidates manager and weak handle publication before unlinking while existing response-owned handles remain safe.
+
 ## Paging and cache
 
 The byte stream is divided into fixed-size pages (`page_size`, default 4096 bytes).
@@ -67,15 +69,17 @@ Write path:
 1. HTTP body bytes are accepted at the required sequential offset.
 2. Bytes are written to `spool.dat` through `FileIO`.
 3. Full pages become reader-visible.
-4. Visible pages are inserted into a global FIFO page cache and waiting readers are notified.
+4. Visible pages admitted to the global FIFO cache are copied once into page-sized cache-owned allocations, then waiting readers are notified. The preceding disk append still uses the transport-backed `Bytes` directly.
 
-The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Setting `max_cache_bytes` to `0` disables caching. Pages larger than the cap bypass the cache. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
+The page cache is global across all spools. Entries are keyed by `(spool_key, page_index)` and share the single `max_cache_bytes` budget. Each entry owns an allocation bounded by its logical page length, so a small page slice cannot pin a much larger HTTP frame outside the accounting. This cache-only isolation copy is made only after admission; setting `max_cache_bytes` to `0` disables caching without a copy, and pages larger than the cap also bypass the cache. Cache hits clone the isolated `Bytes` without copying page contents. Once every byte of an object has been served at least once, that spool's cached pages are freed; later reads come from disk.
+
+Read responses use a separate manager-wide weighted semaphore derived from the same page/cache sizing: `max(1, floor(max_cache_bytes / page_size))` configured-page units. A response acquires its units before cache lookup or disk buffering and holds them until its streaming body is dropped, including while a yielded chunk is stalled at a slow client. Recovered spools with wider persisted pages acquire `ceil(persisted_page_size / configured_page_size)` units, capped at the full budget. Timeout, cancellation, and deletion release admission through the reader lease. When caching is disabled or smaller than one page, the one-unit minimum serializes page-backed responses rather than allowing unbounded cache-miss buffers.
 
 A trailing partial page may already be present in `spool.dat`, but it is not reader-visible until it becomes a full page or `/complete` publishes it as the final page.
 
 ## Read behaviour
 
-Reads first check the global page cache. Cache misses read the required page bytes from `spool.dat` using positional I/O.
+Reads acquire response admission, then check the global page cache. Cache misses read the required page bytes from `spool.dat` using positional I/O. Cache entries and response buffers remain separate allocations and separate accounting; the response permit does not alter cache ownership or zero-copy cache-hit slicing.
 
 A request without `Range`, or with `Range: bytes=X-`, enters follow mode. If the requested byte has not been written yet, BOBS parks the request until more data arrives, the spool completes, the spool is deleted, or the long-poll timeout fires.
 
@@ -105,7 +109,7 @@ Startup recovery scans `data_dir` for spool directories with `meta.json` sidecar
 
 Recovery derives the only usable payload path as `<data_dir>/<scanned-key>/spool.dat`; absolute, traversal, stale, and cross-spool `data_path` values from JSON are treated as untrusted metadata and are never statted, opened, written, or deleted. The canonical local entry must be a regular file and is opened without following a final symlink. Missing, symlink, and non-regular payload entries quarantine that key directory unchanged. If the persisted path is stale but the canonical local regular file exists, recovery atomically rewrites `meta.json` to the canonical path before admitting the spool. Corrupt-sidecar cleanup is likewise scoped to the scanned key directory.
 
-Recovery uses one top-level directory scan, reads sidecars individually, and keeps only compact key/activity indexing plus the bounded preferred candidate heap. Each sidecar is statted before allocation and is limited to 1 MiB. Oversized payloads and payloads with unknown fields are preserved unchanged as unsupported quarantine; malformed known-schema JSON is isolated to per-key corrupt cleanup. Every metadata-valid candidate is no-follow open-preflighted, while retained descriptors remain bounded by `max_live_spools`; excess candidates are closed without payload reads or sidecar rewrites. Selected candidates are reread before admission.
+Recovery uses one top-level directory scan, reads sidecars individually, and keeps only compact key/activity indexing plus the bounded preferred candidate heap. Each sidecar is statted before allocation and is limited to 1 MiB. Oversized sidecars and sidecars with unknown fields are preserved unchanged as unsupported quarantine; malformed known-schema JSON is isolated to per-key corrupt cleanup. Every metadata-valid candidate is no-follow open-preflighted without payload reads. Terminal `Complete` descriptors are closed immediately and recovered in the deliberate closed state; only bounded active candidates retain their preflight descriptor through admission. Selected candidates are reread before admission.
 
 - `Writing` and `WriteLocked` spools are rebuilt from `spool.dat`; byte-derived metadata in the sidecar is advisory.
 - Valid `Completing` markers are deterministically finalized to `Complete`; inconsistent markers and data are quarantined without mutation and are never reopened for writes.

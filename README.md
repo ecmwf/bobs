@@ -44,7 +44,7 @@ Operational requirements:
 
 - `HOSTNAME` must be set and include a pod ordinal like `bobs-0`
 - `page_size` must be greater than `0`
-- `max_cache_bytes` must be at least `page_size`
+- `max_cache_bytes` may be `0` to disable caching; read responses remain bounded to one page-buffer lease
 
 Example:
 
@@ -139,7 +139,7 @@ BOBS is configured via a YAML file passed as a CLI argument. All fields have sen
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
 | `page_size` | `4096` | Size of individual data pages in bytes. |
-| `max_cache_bytes` | `1048576` | Max in-memory cache size per spool in bytes. |
+| `max_cache_bytes` | `1048576` | Global cache budget and source for the read-response bound: `max(1, floor(max_cache_bytes / page_size))` page leases. `0` disables caching but still admits one bounded disk-backed response. |
 | `writer_inactivity_timeout_secs` | `300` | Seconds of writer silence before cleanup. |
 | `reader_done_ttl_secs` | `60` | TTL after spool completion and reader finishes. |
 | `unread_ttl_secs` | `3600` | TTL for completed spools that were never read. |

@@ -15,6 +15,7 @@ use dashmap::DashMap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -48,6 +49,25 @@ fn metric_state_label(state: &SpoolState, write_locked: bool) -> &'static str {
     }
 }
 
+/// Number of configured-page units available to in-flight read responses.
+/// Cache-disabled and sub-page cache budgets still allow exactly one response.
+fn read_response_permit_limit(page_size: usize, max_cache_bytes: usize) -> usize {
+    let max_permits = Semaphore::MAX_PERMITS.min(u32::MAX as usize);
+    (max_cache_bytes / page_size).clamp(1, max_permits)
+}
+
+/// Charge recovered layouts proportionally when their persisted page size is wider
+/// than the current configured page. One oversized response consumes the whole budget.
+fn read_response_permits_for_page(
+    configured_page_size: usize,
+    spool_page_size: usize,
+    permit_limit: usize,
+) -> u32 {
+    spool_page_size
+        .div_ceil(configured_page_size)
+        .min(permit_limit) as u32
+}
+
 pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub spools: Arc<DashMap<String, Arc<Spool<F, M>>>>,
     pub metadata_store: M,
@@ -59,6 +79,11 @@ pub struct SpoolManager<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> 
     /// Bounds live spool admission during creation and startup recovery.
     pub admission: Arc<Semaphore>,
     pub max_live_spools: usize,
+    /// Weighted configured-page admission retained for each HTTP response lifetime.
+    read_response_admission: Arc<Semaphore>,
+    read_response_active: Arc<AtomicUsize>,
+    read_response_permits_active: Arc<AtomicUsize>,
+    read_response_permit_limit: usize,
 }
 
 struct CreateTransaction<F: FileIO, M: MetadataStore> {
@@ -68,6 +93,9 @@ struct CreateTransaction<F: FileIO, M: MetadataStore> {
     page_size: usize,
     page_cache: Arc<Mutex<PageCache>>,
     metrics: Arc<BobsMetrics>,
+    read_response_admission: Arc<Semaphore>,
+    read_response_active: Arc<AtomicUsize>,
+    read_response_permits_active: Arc<AtomicUsize>,
 }
 
 impl<F, M> CreateTransaction<F, M>
@@ -154,18 +182,19 @@ where
             return Err(error);
         }
 
-        let spool = Arc::new(
-            Spool::new_with_admission(
-                metadata,
-                handle,
-                self.page_size,
-                Arc::clone(&self.page_cache),
-                self.metadata_store.clone(),
-                Arc::clone(&self.metrics),
-                Some(permit),
-            )
-            .await,
-        );
+        let spool = Arc::new(Spool::new_with_admission(
+            metadata,
+            Some(handle),
+            self.page_size,
+            Arc::clone(&self.page_cache),
+            self.metadata_store.clone(),
+            Arc::clone(&self.metrics),
+            Some(permit),
+            Arc::clone(&self.read_response_admission),
+            Arc::clone(&self.read_response_active),
+            Arc::clone(&self.read_response_permits_active),
+            1,
+        ));
         self.spools.insert(key, spool);
 
         let initial_state = if write_locked {
@@ -247,6 +276,8 @@ where
         std::fs::create_dir_all(data_dir.as_ref()).map_err(BobsError::IoError)?;
         let page_cache = Arc::new(Mutex::new(PageCache::new(max_cache_bytes)));
 
+        let read_response_permit_limit = read_response_permit_limit(page_size, max_cache_bytes);
+        let read_response_admission = Arc::new(Semaphore::new(read_response_permit_limit));
         Ok(Self {
             spools: Arc::new(DashMap::new()),
             metadata_store,
@@ -257,12 +288,33 @@ where
             metrics: Arc::new(BobsMetrics::new(false)),
             admission: Arc::new(Semaphore::new(max_live_spools)),
             max_live_spools,
+            read_response_admission,
+            read_response_active: Arc::new(AtomicUsize::new(0)),
+            read_response_permits_active: Arc::new(AtomicUsize::new(0)),
+            read_response_permit_limit,
         })
     }
 
     /// Set the metrics handle (replaces the default no-op).
     pub fn set_metrics(&mut self, metrics: Arc<BobsMetrics>) {
         self.metrics = metrics;
+    }
+
+    /// Total weighted configured-page units available to read responses.
+    pub fn read_response_permit_limit(&self) -> usize {
+        self.read_response_permit_limit
+    }
+
+    pub fn read_response_available_permits(&self) -> usize {
+        self.read_response_admission.available_permits()
+    }
+
+    pub fn active_read_responses(&self) -> usize {
+        self.read_response_active.load(Ordering::Acquire)
+    }
+
+    pub fn active_read_response_permits(&self) -> usize {
+        self.read_response_permits_active.load(Ordering::Acquire)
     }
 
     pub async fn create_spool(
@@ -299,6 +351,9 @@ where
             page_size: self.page_size,
             page_cache: Arc::clone(&self.page_cache),
             metrics: Arc::clone(&self.metrics),
+            read_response_admission: Arc::clone(&self.read_response_admission),
+            read_response_active: Arc::clone(&self.read_response_active),
+            read_response_permits_active: Arc::clone(&self.read_response_permits_active),
         };
         tokio::spawn(transaction.run(
             key,
@@ -427,18 +482,13 @@ where
         }
 
         spool.cancel.cancel();
-        let handle = spool.file_handle.lock().await.take();
-        if let Some(handle) = handle {
-            F::close(handle).await.map_err(BobsError::IoError)?;
-        }
-
-        // No durable Deleting tombstone is needed: before sidecar removal a crash
-        // safely recovers the original spool, and afterwards the orphan sweep removes
-        // any directory left behind.
+        // Stop publishing handles before unlinking. In-flight readers own cloned Arcs
+        // through their response permits and remain safe until those bodies drop.
+        spool.invalidate_file_handle();
         self.metadata_store.delete(key).await?;
         self.remove_spool_directory_durably(key).await?;
 
-        self.page_cache.lock().await.remove_spool(key);
+        self.page_cache.lock().await.free_spool(key);
         spool.release_admission();
         if self
             .spools
@@ -607,7 +657,6 @@ where
 
             let activity_at = recovery_activity_at(&meta);
             let canonical_data_path = self.data_dir.join(&name).join("spool.dat");
-
             // Incomplete transactions are metadata-only cleanup decisions. Do not
             // require their payload to exist or be openable.
             if matches!(meta.state, SpoolState::Creating | SpoolState::Deleting) {
@@ -659,9 +708,10 @@ where
                 preflight_file_size,
                 maximum_spool_bytes,
             ) {
-                RecoveryMetadataDisposition::Candidate(_) => {
-                    // Every metadata-valid candidate is open-preflighted, including
-                    // excess entries. Only admitted active tails are read.
+                RecoveryMetadataDisposition::Candidate(prepared) => {
+                    // Every metadata-valid candidate is no-follow open-preflighted, including
+                    // excess entries. Complete candidates close immediately; only bounded
+                    // active candidates retain their descriptor through admission.
                     let handle = match F::open(&canonical_data_path).await {
                         Ok(handle) => handle,
                         Err(error) => {
@@ -674,22 +724,29 @@ where
                         Ok(file_size) => file_size,
                         Err(error) => {
                             tracing::warn!(key = %name, error = %error, "recovery: opened payload metadata preflight failed; leaving spool intact and continuing scan");
-                            if let Err(close_error) = F::close(handle).await {
-                                tracing::warn!(key = %name, error = %close_error, "recovery: failed to close metadata-rejected preflight payload handle");
-                            }
+                            close_recovery_handle::<F>(
+                                &name,
+                                Some(handle),
+                                "metadata-rejected preflight",
+                            )
+                            .await;
                             rejected_count += 1;
                             continue;
                         }
                     };
                     if opened_file_size != preflight_file_size {
                         tracing::warn!(key = %name, preflight_file_size, opened_file_size, "recovery: canonical payload size changed during preflight; leaving spool intact and continuing scan");
-                        if let Err(error) = F::close(handle).await {
-                            tracing::warn!(key = %name, error = %error, "recovery: failed to close size-raced preflight payload handle");
-                        }
+                        close_recovery_handle::<F>(&name, Some(handle), "size-raced preflight")
+                            .await;
                         rejected_count += 1;
                         continue;
                     }
-
+                    let handle = if prepared.meta.state == SpoolState::Complete {
+                        close_recovery_handle::<F>(&name, Some(handle), "terminal preflight").await;
+                        None
+                    } else {
+                        Some(handle)
+                    };
                     let excess = candidates.push(RecoveryCandidateSummary {
                         key: name.clone(),
                         activity_at,
@@ -708,19 +765,20 @@ where
                                 "outside_bounded_candidate_window",
                             );
                             if excess.key == name {
-                                if let Err(error) = F::close(handle).await {
-                                    tracing::warn!(key = %name, error = %error, "recovery: failed to close excess preflight payload handle");
-                                }
+                                close_recovery_handle::<F>(&name, handle, "excess preflight").await;
                             } else {
                                 let (displaced_handle, _) = preflight_handles
                                     .remove(&excess.key)
-                                    .expect("displaced recovery candidate has a preflight handle");
+                                    .expect("displaced recovery candidate has a preflight entry");
                                 let previous =
                                     preflight_handles.insert(name, (handle, preflight_file_size));
                                 debug_assert!(previous.is_none());
-                                if let Err(error) = F::close(displaced_handle).await {
-                                    tracing::warn!(key = %excess.key, error = %error, "recovery: failed to close displaced preflight payload handle");
-                                }
+                                close_recovery_handle::<F>(
+                                    &excess.key,
+                                    displaced_handle,
+                                    "displaced preflight",
+                                )
+                                .await;
                             }
                         }
                     }
@@ -744,54 +802,67 @@ where
         let mut recovered_count = 0_usize;
         let mut capacity_blocked_candidate = None;
 
-        // The heap and preflight handle set are bounded exactly by admission
-        // capacity. Full metadata is reread only for selected keys; ordinary
-        // excess payloads are never tail-read or retained after their preflight.
+        // The heap and preflight entry set are bounded exactly by admission capacity.
+        // Full metadata is reread only for selected keys. Complete entries carry only
+        // the validated size; active entries retain their race-free preflight handle.
         while recovered_count < self.max_live_spools {
             let Some(summary) = candidates.pop() else {
                 break;
             };
             let activity_at = summary.activity_at;
             let key = summary.key;
-            let (preflight_handle, preflight_file_size) = preflight_handles
+            let (mut preflight_handle, preflight_file_size) = preflight_handles
                 .remove(&key)
-                .expect("selected recovery candidate has a preflight handle");
+                .expect("selected recovery candidate has a preflight entry");
             let meta = match self.metadata_store.read(&key).await {
                 Ok(Some(meta)) if meta.key == key => meta,
                 Ok(Some(meta)) => {
                     tracing::warn!(directory_key = %key, metadata_key = %meta.key, "recovery: selected sidecar key changed; leaving it intact and unavailable");
-                    if let Err(error) = F::close(preflight_handle).await {
-                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
-                    }
+                    close_recovery_handle::<F>(&key, preflight_handle.take(), "rejected preflight")
+                        .await;
                     rejected_count += 1;
                     continue;
                 }
                 Ok(None) => {
                     tracing::warn!(key = %key, "recovery: selected sidecar disappeared; leaving directory intact");
-                    if let Err(error) = F::close(preflight_handle).await {
-                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
-                    }
+                    close_recovery_handle::<F>(
+                        &key,
+                        preflight_handle.take(),
+                        "disappeared preflight",
+                    )
+                    .await;
                     rejected_count += 1;
                     continue;
                 }
                 Err(error) => {
                     tracing::warn!(key = %key, error = %error, "recovery: selected sidecar changed or became unreadable; leaving it intact and trying the next candidate");
-                    if let Err(error) = F::close(preflight_handle).await {
-                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
-                    }
+                    close_recovery_handle::<F>(
+                        &key,
+                        preflight_handle.take(),
+                        "unreadable preflight",
+                    )
+                    .await;
                     rejected_count += 1;
                     continue;
                 }
             };
 
             let canonical_data_path = self.data_dir.join(&key).join("spool.dat");
-            let file_size = match F::file_size(&preflight_handle).await {
+            let file_size = match recovery_file_size::<F>(
+                &canonical_data_path,
+                preflight_handle.as_ref(),
+            )
+            .await
+            {
                 Ok(file_size) => file_size,
                 Err(error) => {
                     tracing::warn!(key = %key, error = %error, "recovery: selected canonical payload metadata check failed; leaving spool intact and trying the next candidate");
-                    if let Err(close_error) = F::close(preflight_handle).await {
-                        tracing::warn!(key = %key, error = %close_error, "recovery: failed to close metadata-rejected preflight payload handle");
-                    }
+                    close_recovery_handle::<F>(
+                        &key,
+                        preflight_handle.take(),
+                        "metadata-rejected preflight",
+                    )
+                    .await;
                     rejected_count += 1;
                     continue;
                 }
@@ -806,9 +877,12 @@ where
                 RecoveryMetadataDisposition::Candidate(prepared) => *prepared,
                 RecoveryMetadataDisposition::Cleanup { reason } => {
                     tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unrecoverable; discarding it and trying the next candidate");
-                    if let Err(error) = F::close(preflight_handle).await {
-                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
-                    }
+                    close_recovery_handle::<F>(
+                        &key,
+                        preflight_handle.take(),
+                        "unrecoverable preflight",
+                    )
+                    .await;
                     self.metadata_store.delete(&key).await?;
                     self.remove_spool_directory_durably(&key).await?;
                     stale_count += 1;
@@ -818,9 +892,8 @@ where
                 }
                 RecoveryMetadataDisposition::Preserve { reason } => {
                     tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unsafe; leaving it intact and trying the next candidate");
-                    if let Err(error) = F::close(preflight_handle).await {
-                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
-                    }
+                    close_recovery_handle::<F>(&key, preflight_handle.take(), "unsafe preflight")
+                        .await;
                     rejected_count += 1;
                     continue;
                 }
@@ -839,9 +912,8 @@ where
 
             if file_size != preflight_file_size {
                 tracing::warn!(key = %key, preflight_file_size, file_size, "recovery: canonical payload size changed after preflight; leaving spool intact and trying the next candidate");
-                if let Err(error) = F::close(preflight_handle).await {
-                    tracing::warn!(key = %key, error = %error, "recovery: failed to close size-raced preflight payload handle");
-                }
+                close_recovery_handle::<F>(&key, preflight_handle.take(), "size-raced preflight")
+                    .await;
                 rejected_count += 1;
                 continue;
             }
@@ -850,23 +922,44 @@ where
                 Ok(permit) => permit,
                 Err(_) => {
                     tracing::warn!(key = %key, "recovery: admission permit unavailable before configured bound");
-                    if let Err(error) = F::close(preflight_handle).await {
-                        tracing::warn!(key = %key, error = %error, "recovery: failed to close capacity-blocked preflight payload handle");
-                    }
+                    close_recovery_handle::<F>(
+                        &key,
+                        preflight_handle.take(),
+                        "capacity-blocked preflight",
+                    )
+                    .await;
                     capacity_blocked_candidate =
                         Some(RecoveryCandidateSummary { key, activity_at });
                     break;
                 }
             };
 
-            // Use the successful preflight descriptor directly. Reopening here
-            // would let a transient or adversarial race repeatedly crowd out an
-            // older valid spool on every restart.
-            let handle = preflight_handle;
+            // Complete spools enter the map closed. Active spools retain the exact
+            // descriptor used for preflight so writes and completion never need reopen.
+            let mut handle = preflight_handle;
+            if meta.state == SpoolState::Complete {
+                close_recovery_handle::<F>(&key, handle.take(), "terminal admission").await;
+            } else if handle.is_none() {
+                match F::open(&canonical_data_path).await {
+                    Ok(reopened) => handle = Some(reopened),
+                    Err(error) => {
+                        tracing::warn!(key = %key, error = %error, "recovery: active payload changed after terminal preflight; leaving spool intact");
+                        rejected_count += 1;
+                        drop(permit);
+                        continue;
+                    }
+                }
+            }
 
             let trailing_partial = if trailing_partial_len > 0 {
+                let Some(active_handle) = handle.as_ref() else {
+                    tracing::warn!(key = %key, "recovery: active candidate lost its retained payload handle");
+                    rejected_count += 1;
+                    drop(permit);
+                    continue;
+                };
                 match read_exact_at::<F>(
-                    &handle,
+                    active_handle,
                     meta.total_bytes_written - trailing_partial_len,
                     trailing_partial_len as usize,
                     "loading trailing partial page during recovery",
@@ -876,9 +969,8 @@ where
                     Ok(partial) => Some(partial),
                     Err(error) => {
                         tracing::warn!(key = %key, error = %error, "recovery: failed to validate trailing partial page; leaving spool intact and trying the next candidate");
-                        if let Err(close_error) = F::close(handle).await {
-                            tracing::warn!(key = %key, error = %close_error, "recovery: failed to close rejected data file handle");
-                        }
+                        close_recovery_handle::<F>(&key, handle.take(), "rejected active data")
+                            .await;
                         rejected_count += 1;
                         drop(permit);
                         continue;
@@ -903,9 +995,8 @@ where
                     tracing::info!(key = %key, total_bytes = meta.total_bytes_written, total_pages = meta.total_pages, "recovery: finalizing durable Completing marker");
                 }
                 if let Err(error) = self.metadata_store.write(&meta).await {
-                    if let Err(close_error) = F::close(handle).await {
-                        tracing::warn!(key = %key, error = %close_error, "recovery: failed to close data file after metadata persistence failure");
-                    }
+                    close_recovery_handle::<F>(&key, handle.take(), "metadata persistence failure")
+                        .await;
                     return Err(error);
                 }
             }
@@ -915,18 +1006,25 @@ where
             let meta_state_for_init = meta.state.clone();
             let meta_write_locked_for_init = meta.write_locked;
             let meta_total_bytes_for_init = meta.total_bytes_written;
-            let spool = Arc::new(
-                Spool::new_with_admission(
-                    meta,
-                    handle,
-                    spool_page_size,
-                    Arc::clone(&self.page_cache),
-                    self.metadata_store.clone(),
-                    Arc::clone(&self.metrics),
-                    Some(permit),
-                )
-                .await,
+            let read_response_permits = read_response_permits_for_page(
+                self.page_size,
+                spool_page_size,
+                self.read_response_permit_limit,
             );
+
+            let spool = Arc::new(Spool::new_with_admission(
+                meta,
+                handle,
+                spool_page_size,
+                Arc::clone(&self.page_cache),
+                self.metadata_store.clone(),
+                Arc::clone(&self.metrics),
+                Some(permit),
+                Arc::clone(&self.read_response_admission),
+                Arc::clone(&self.read_response_active),
+                Arc::clone(&self.read_response_permits_active),
+                read_response_permits,
+            ));
 
             if let Some(partial) = trailing_partial {
                 spool.write_buffer.lock().await.extend_from_slice(&partial);
@@ -962,10 +1060,8 @@ where
             record_capacity_quarantine(&summary, self.max_live_spools, "admission_capacity");
             let (handle, _) = preflight_handles
                 .remove(&summary.key)
-                .expect("quarantined recovery candidate has a preflight handle");
-            if let Err(error) = F::close(handle).await {
-                tracing::warn!(key = %summary.key, error = %error, "recovery: failed to close quarantined preflight payload handle");
-            }
+                .expect("quarantined recovery candidate has a preflight entry");
+            close_recovery_handle::<F>(&summary.key, handle, "quarantined preflight").await;
         }
         debug_assert!(preflight_handles.is_empty());
 
@@ -1007,6 +1103,35 @@ where
             "recovery completed"
         );
         Ok((recovered_count, quarantined_count))
+    }
+}
+
+async fn recovery_file_size<F: FileIO>(
+    canonical_data_path: &Path,
+    retained_handle: Option<&F::Handle>,
+) -> std::io::Result<u64> {
+    if let Some(handle) = retained_handle {
+        return F::file_size(handle).await;
+    }
+
+    let metadata = F::symlink_metadata(canonical_data_path).await?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::other(
+            "canonical recovery payload is no longer a regular file",
+        ));
+    }
+    Ok(metadata.len())
+}
+
+async fn close_recovery_handle<F: FileIO>(
+    key: &str,
+    handle: Option<F::Handle>,
+    context: &'static str,
+) {
+    if let Some(handle) = handle {
+        if let Err(error) = F::close(handle).await {
+            tracing::warn!(key = %key, error = %error, context, "recovery: failed to close payload handle");
+        }
     }
 }
 
@@ -1620,32 +1745,86 @@ fn in_progress_progress_from_file(file_size: u64, page_size: usize) -> InProgres
 }
 
 #[cfg(test)]
-async fn read_exact_logical_range<F: FileIO>(
-    file_handle: &Arc<tokio::sync::Mutex<Option<F::Handle>>>,
-    offset: u64,
-    len: usize,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(len);
-    let handle_guard = file_handle.lock().await;
-    let Some(handle) = handle_guard.as_ref() else {
-        return Err(BobsError::WriterInactive);
-    };
-
-    let buf = read_exact_at::<F>(handle, offset, len, "loading trailing partial page")
-        .await
-        .map_err(BobsError::IoError)?;
-    out.extend_from_slice(&buf);
-
-    Ok(out)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::TokioFileIO;
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    use crate::io::{RingPool, RingPoolOptions, UringFileIO};
     use bytes::Bytes;
     use std::sync::{atomic::Ordering, Arc, OnceLock};
     use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct BlockingWriteFileIO;
+
+    struct BlockingWriteHandle {
+        inner: <TokioFileIO as FileIO>::Handle,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    static BLOCKING_WRITE_CONTROL: OnceLock<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)> =
+        OnceLock::new();
+
+    impl FileIO for BlockingWriteFileIO {
+        type Handle = BlockingWriteHandle;
+
+        async fn create(path: &Path) -> std::io::Result<Self::Handle> {
+            let (entered, release) = BLOCKING_WRITE_CONTROL
+                .get()
+                .expect("blocking write control initialized");
+            Ok(BlockingWriteHandle {
+                inner: TokioFileIO::create(path).await?,
+                entered: Arc::clone(entered),
+                release: Arc::clone(release),
+            })
+        }
+
+        async fn open(path: &Path) -> std::io::Result<Self::Handle> {
+            let (entered, release) = BLOCKING_WRITE_CONTROL
+                .get()
+                .expect("blocking write control initialized");
+            Ok(BlockingWriteHandle {
+                inner: TokioFileIO::open(path).await?,
+                entered: Arc::clone(entered),
+                release: Arc::clone(release),
+            })
+        }
+
+        async fn file_size(handle: &Self::Handle) -> std::io::Result<u64> {
+            TokioFileIO::file_size(&handle.inner).await
+        }
+
+        async fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: Bytes,
+        ) -> std::io::Result<usize> {
+            handle.entered.notify_one();
+            handle.release.notified().await;
+            TokioFileIO::write_at(&handle.inner, offset, data).await
+        }
+
+        async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> std::io::Result<Bytes> {
+            TokioFileIO::read_at(&handle.inner, offset, len).await
+        }
+
+        async fn sync_data(handle: &Self::Handle) -> std::io::Result<()> {
+            TokioFileIO::sync_data(&handle.inner).await
+        }
+
+        async fn sync_directory(path: &Path) -> std::io::Result<()> {
+            TokioFileIO::sync_directory(path).await
+        }
+
+        async fn close(handle: Self::Handle) -> std::io::Result<()> {
+            TokioFileIO::close(handle.inner).await
+        }
+
+        async fn remove(path: &Path) -> std::io::Result<()> {
+            TokioFileIO::remove(path).await
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum ProtocolEvent {
@@ -1860,6 +2039,218 @@ mod tests {
 
         fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
             TokioFileIO::remove(path)
+        }
+    }
+
+    static HANDLE_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static REOPEN_OPEN_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static REOPEN_ACTIVE_OPENS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static REOPEN_ACTIVE_HANDLES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static REOPEN_ACTIVE_READS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static REOPEN_MAX_ACTIVE_READS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static REOPEN_BLOCK_OPENS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static REOPEN_BLOCK_READS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static REOPEN_OPEN_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+    static REOPEN_READ_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+
+    fn reset_reopen_test_state() {
+        while let Ok(permit) = REOPEN_OPEN_GATE.try_acquire() {
+            permit.forget();
+        }
+        while let Ok(permit) = REOPEN_READ_GATE.try_acquire() {
+            permit.forget();
+        }
+        assert_eq!(REOPEN_ACTIVE_OPENS.load(Ordering::SeqCst), 0);
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert_eq!(REOPEN_ACTIVE_READS.load(Ordering::SeqCst), 0);
+        REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
+        REOPEN_MAX_ACTIVE_READS.store(0, Ordering::SeqCst);
+        REOPEN_BLOCK_OPENS.store(false, Ordering::SeqCst);
+        REOPEN_BLOCK_READS.store(false, Ordering::SeqCst);
+    }
+
+    #[derive(Clone)]
+    struct ReopenTestFileIO;
+
+    struct ReopenTestHandle {
+        inner: <TokioFileIO as FileIO>::Handle,
+    }
+
+    impl Drop for ReopenTestHandle {
+        fn drop(&mut self) {
+            REOPEN_ACTIVE_HANDLES.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn track_reopen_handle(inner: <TokioFileIO as FileIO>::Handle) -> ReopenTestHandle {
+        REOPEN_ACTIVE_HANDLES.fetch_add(1, Ordering::SeqCst);
+        ReopenTestHandle { inner }
+    }
+
+    impl FileIO for ReopenTestFileIO {
+        type Handle = ReopenTestHandle;
+
+        async fn create(path: &Path) -> std::io::Result<Self::Handle> {
+            Ok(track_reopen_handle(TokioFileIO::create(path).await?))
+        }
+
+        async fn open(path: &Path) -> std::io::Result<Self::Handle> {
+            REOPEN_OPEN_COUNT.fetch_add(1, Ordering::SeqCst);
+            if REOPEN_BLOCK_OPENS.load(Ordering::SeqCst) {
+                REOPEN_ACTIVE_OPENS.fetch_add(1, Ordering::SeqCst);
+                let permit = REOPEN_OPEN_GATE.acquire().await.map_err(|_| {
+                    std::io::Error::other("reopen test open gate unexpectedly closed")
+                })?;
+                permit.forget();
+                REOPEN_ACTIVE_OPENS.fetch_sub(1, Ordering::SeqCst);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            Ok(track_reopen_handle(TokioFileIO::open(path).await?))
+        }
+
+        async fn file_size(handle: &Self::Handle) -> std::io::Result<u64> {
+            TokioFileIO::file_size(&handle.inner).await
+        }
+
+        async fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: Bytes,
+        ) -> std::io::Result<usize> {
+            TokioFileIO::write_at(&handle.inner, offset, data).await
+        }
+
+        async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> std::io::Result<Bytes> {
+            if REOPEN_BLOCK_READS.load(Ordering::SeqCst) {
+                let active = REOPEN_ACTIVE_READS.fetch_add(1, Ordering::SeqCst) + 1;
+                REOPEN_MAX_ACTIVE_READS.fetch_max(active, Ordering::SeqCst);
+                let permit = REOPEN_READ_GATE.acquire().await.map_err(|_| {
+                    std::io::Error::other("reopen test read gate unexpectedly closed")
+                })?;
+                permit.forget();
+                let result = TokioFileIO::read_at(&handle.inner, offset, len).await;
+                REOPEN_ACTIVE_READS.fetch_sub(1, Ordering::SeqCst);
+                result
+            } else {
+                TokioFileIO::read_at(&handle.inner, offset, len).await
+            }
+        }
+
+        async fn sync_data(handle: &Self::Handle) -> std::io::Result<()> {
+            TokioFileIO::sync_data(&handle.inner).await
+        }
+
+        async fn sync_directory(path: &Path) -> std::io::Result<()> {
+            TokioFileIO::sync_directory(path).await
+        }
+
+        async fn close(handle: Self::Handle) -> std::io::Result<()> {
+            drop(handle);
+            Ok(())
+        }
+
+        async fn remove(path: &Path) -> std::io::Result<()> {
+            TokioFileIO::remove(path).await
+        }
+    }
+
+    const SYNTHETIC_FD_LIMIT: usize = 8;
+    static LIMITED_ACTIVE_HANDLES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static LIMITED_MAX_ACTIVE_HANDLES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[derive(Clone)]
+    struct LimitedRecoveryFileIO;
+
+    struct LimitedRecoveryHandle {
+        inner: <TokioFileIO as FileIO>::Handle,
+    }
+
+    impl Drop for LimitedRecoveryHandle {
+        fn drop(&mut self) {
+            LIMITED_ACTIVE_HANDLES.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn reserve_limited_handle() -> std::io::Result<()> {
+        LIMITED_ACTIVE_HANDLES
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                (active < SYNTHETIC_FD_LIMIT).then_some(active + 1)
+            })
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EMFILE))?;
+        LIMITED_MAX_ACTIVE_HANDLES.fetch_max(
+            LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        Ok(())
+    }
+
+    async fn limited_handle(path: &Path, create: bool) -> std::io::Result<LimitedRecoveryHandle> {
+        reserve_limited_handle()?;
+        let opened = if create {
+            TokioFileIO::create(path).await
+        } else {
+            TokioFileIO::open(path).await
+        };
+        match opened {
+            Ok(inner) => Ok(LimitedRecoveryHandle { inner }),
+            Err(error) => {
+                LIMITED_ACTIVE_HANDLES.fetch_sub(1, Ordering::SeqCst);
+                Err(error)
+            }
+        }
+    }
+
+    impl FileIO for LimitedRecoveryFileIO {
+        type Handle = LimitedRecoveryHandle;
+
+        async fn create(path: &Path) -> std::io::Result<Self::Handle> {
+            limited_handle(path, true).await
+        }
+
+        async fn open(path: &Path) -> std::io::Result<Self::Handle> {
+            limited_handle(path, false).await
+        }
+
+        async fn file_size(handle: &Self::Handle) -> std::io::Result<u64> {
+            TokioFileIO::file_size(&handle.inner).await
+        }
+
+        async fn write_at(
+            handle: &Self::Handle,
+            offset: u64,
+            data: Bytes,
+        ) -> std::io::Result<usize> {
+            TokioFileIO::write_at(&handle.inner, offset, data).await
+        }
+
+        async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> std::io::Result<Bytes> {
+            TokioFileIO::read_at(&handle.inner, offset, len).await
+        }
+
+        async fn sync_data(handle: &Self::Handle) -> std::io::Result<()> {
+            TokioFileIO::sync_data(&handle.inner).await
+        }
+
+        async fn sync_directory(path: &Path) -> std::io::Result<()> {
+            TokioFileIO::sync_directory(path).await
+        }
+
+        async fn close(handle: Self::Handle) -> std::io::Result<()> {
+            drop(handle);
+            Ok(())
+        }
+
+        async fn remove(path: &Path) -> std::io::Result<()> {
+            TokioFileIO::remove(path).await
         }
     }
 
@@ -2323,6 +2714,13 @@ mod tests {
         kib * 1024
     }
 
+    #[cfg(target_os = "linux")]
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read process fd directory")
+            .count()
+    }
+
     #[tokio::test]
     async fn test_new_accepts_cache_smaller_than_page_size() {
         let dir = tempdir().expect("create tempdir");
@@ -2334,6 +2732,8 @@ mod tests {
         assert_eq!(manager.page_size, 4096);
         assert_eq!(manager.max_cache_bytes, 1024);
         assert_eq!(manager.page_cache.lock().await.max_bytes(), 1024);
+        assert_eq!(manager.read_response_permit_limit(), 1);
+        assert_eq!(manager.read_response_available_permits(), 1);
     }
 
     #[tokio::test]
@@ -2346,6 +2746,23 @@ mod tests {
 
         assert_eq!(manager.max_cache_bytes, 0);
         assert_eq!(manager.page_cache.lock().await.max_bytes(), 0);
+        assert_eq!(manager.read_response_permit_limit(), 1);
+        assert_eq!(manager.read_response_available_permits(), 1);
+    }
+
+    #[test]
+    fn read_response_budget_uses_cache_page_units_and_weights_recovered_layouts() {
+        assert_eq!(
+            read_response_permit_limit(4 * 1024 * 1024, 256 * 1024 * 1024),
+            64
+        );
+        assert_eq!(read_response_permits_for_page(4, 4, 8), 1);
+        assert_eq!(read_response_permits_for_page(4, 9, 8), 3);
+        assert_eq!(
+            read_response_permits_for_page(4, usize::MAX, 8),
+            8,
+            "a page wider than the whole budget must serialize responses"
+        );
     }
 
     #[tokio::test]
@@ -2658,8 +3075,14 @@ mod tests {
             .await
             .expect("first create succeeds");
         let spool = manager.get_spool("a").expect("spool a exists");
-        spool.on_fully_read().await;
-
+        spool
+            .write(0, Bytes::from_static(b"complete"))
+            .await
+            .expect("write first spool");
+        spool.complete(Some(8)).await.expect("complete first spool");
+        assert!(spool.read_page_for_test(0).await.unwrap().is_some());
+        spool.mark_served_and_maybe_fully_read(0, 8).await;
+        assert!(!spool.has_open_file_handle());
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             manager.create_spool("b".into(), None, None, false, HashMap::new()),
@@ -2669,6 +3092,424 @@ mod tests {
         .expect("second create succeeds");
         assert!(manager.get_spool("a").is_some());
         assert!(manager.get_spool("b").is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn create_complete_full_read_then_repeated_cache_misses_beyond_rlimit_are_bounded() {
+        let _guard = HANDLE_LIFECYCLE_TEST_LOCK.lock().await;
+        const CYCLES: usize = SYNTHETIC_FD_LIMIT * 4;
+        const REPEATED_READS: usize = 3;
+        const PAGE_SIZE: usize = 64;
+
+        assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        LIMITED_MAX_ACTIVE_HANDLES.store(0, Ordering::SeqCst);
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager =
+            SpoolManager::<LimitedRecoveryFileIO>::new(&data_dir, PAGE_SIZE, 4 * PAGE_SIZE, 1)
+                .expect("manager init");
+        let fd_before = open_fd_count();
+
+        for sequence in 0..CYCLES {
+            let key = format!("fd-cycle-{sequence:024}");
+            manager
+                .create_spool(key.clone(), None, None, false, HashMap::new())
+                .await
+                .expect("create spool within released admission");
+            let spool = manager.get_spool(&key).expect("created spool");
+            let payload = Bytes::from(vec![sequence as u8; PAGE_SIZE]);
+            spool
+                .write(0, payload.clone())
+                .await
+                .expect("write one page");
+            spool
+                .complete(Some(PAGE_SIZE as u64))
+                .await
+                .expect("complete spool");
+            assert_eq!(
+                spool.read_page_for_test(0).await.unwrap(),
+                Some(payload.clone()),
+            );
+            spool
+                .mark_served_and_maybe_fully_read(0, PAGE_SIZE as u64)
+                .await;
+            assert!(!spool.has_open_file_handle());
+            assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+
+            for _ in 0..REPEATED_READS {
+                let permit = spool
+                    .acquire_read_response_permit()
+                    .await
+                    .expect("acquire repeated read response");
+                assert_eq!(
+                    spool.read_page(0, &permit).await.unwrap(),
+                    Some(payload.clone()),
+                );
+                assert!(!spool.has_open_file_handle());
+                assert!(spool.has_live_response_file_handle());
+                assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 1);
+                drop(permit);
+                assert!(!spool.has_live_response_file_handle());
+                assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        let fd_after = open_fd_count();
+        assert_eq!(manager.spools.len(), CYCLES);
+        assert_eq!(manager.admission.available_permits(), 1);
+        assert_eq!(
+            LIMITED_MAX_ACTIVE_HANDLES.load(Ordering::SeqCst),
+            1,
+            "response admission must bound cache-miss reopen handles"
+        );
+        assert!(
+            fd_after < fd_before + CYCLES / 2,
+            "terminal spool descriptors did not settle: before={fd_before}, after={fd_after}"
+        );
+    }
+
+    async fn repeated_terminal_reads_are_response_scoped_for_backend<F: FileIO>() {
+        const PAGE_SIZE: usize = 4096;
+        let dir = tempdir().expect("create backend tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<F>::new(&data_dir, PAGE_SIZE, 4 * PAGE_SIZE, 1)
+            .expect("backend manager init");
+        let key = "backend-response-scope".to_string();
+        let payload = Bytes::from(vec![0x6b; PAGE_SIZE]);
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create backend spool");
+        let spool = manager.get_spool(&key).expect("backend spool");
+        spool.write(0, payload.clone()).await.expect("write page");
+        spool
+            .complete(Some(PAGE_SIZE as u64))
+            .await
+            .expect("complete backend spool");
+        assert_eq!(
+            spool.read_page_for_test(0).await.unwrap(),
+            Some(payload.clone()),
+        );
+        spool
+            .mark_served_and_maybe_fully_read(0, PAGE_SIZE as u64)
+            .await;
+        assert!(!spool.has_open_file_handle());
+
+        for _ in 0..3 {
+            let permit = spool
+                .acquire_read_response_permit()
+                .await
+                .expect("acquire backend response");
+            assert_eq!(
+                spool.read_page(0, &permit).await.unwrap(),
+                Some(payload.clone()),
+            );
+            assert!(!spool.has_open_file_handle());
+            assert!(spool.has_live_response_file_handle());
+            drop(permit);
+            assert!(!spool.has_live_response_file_handle());
+        }
+    }
+
+    #[tokio::test]
+    async fn tokio_terminal_reopens_are_response_scoped() {
+        repeated_terminal_reads_are_response_scoped_for_backend::<TokioFileIO>().await;
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+    #[tokio::test]
+    async fn uring_terminal_reopens_are_response_scoped() {
+        let pool = Arc::new(
+            RingPool::new_for_test(RingPoolOptions {
+                shard_count: 1,
+                queue_capacity: 64,
+                driver_name_prefix: "bobs-terminal-response-scope-test".to_owned(),
+            })
+            .expect("response-scope io_uring pool should start"),
+        );
+        let _override = crate::io::ring_pool::scoped_test_ring_pool_override(Arc::clone(&pool));
+        repeated_terminal_reads_are_response_scoped_for_backend::<UringFileIO>().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reopen_reads_share_handle_and_survive_delete() {
+        let _guard = HANDLE_LIFECYCLE_TEST_LOCK.lock().await;
+        const READERS: usize = 8;
+        const PAGE_SIZE: usize = 4096;
+
+        reset_reopen_test_state();
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = Arc::new(
+            SpoolManager::<ReopenTestFileIO>::new(&data_dir, PAGE_SIZE, READERS * PAGE_SIZE, 1)
+                .expect("manager init"),
+        );
+        let key = "concurrent-reopen-delete".to_string();
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("created spool");
+        let payload = Bytes::from(vec![0x5a; PAGE_SIZE]);
+        spool.write(0, payload.clone()).await.expect("write page");
+        spool
+            .complete(Some(PAGE_SIZE as u64))
+            .await
+            .expect("complete spool");
+        assert_eq!(
+            spool.read_page_for_test(0).await.unwrap(),
+            Some(payload.clone()),
+        );
+        spool
+            .mark_served_and_maybe_fully_read(0, PAGE_SIZE as u64)
+            .await;
+        assert!(!spool.has_open_file_handle());
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        let fd_closed = open_fd_count();
+
+        REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
+        REOPEN_BLOCK_READS.store(true, Ordering::SeqCst);
+        let start = Arc::new(tokio::sync::Barrier::new(READERS));
+        let mut readers = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let spool = Arc::clone(&spool);
+            let start = Arc::clone(&start);
+            readers.push(tokio::spawn(async move {
+                start.wait().await;
+                spool.read_page_for_test(0).await
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while REOPEN_ACTIVE_READS.load(Ordering::SeqCst) < READERS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all positional reads entered without serialization");
+        assert_eq!(
+            REOPEN_OPEN_COUNT.load(Ordering::SeqCst),
+            1,
+            "concurrent cache misses must single-flight one reopen"
+        );
+        assert_eq!(
+            REOPEN_MAX_ACTIVE_READS.load(Ordering::SeqCst),
+            READERS,
+            "the reopen gate must be released before positional reads"
+        );
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 1);
+        assert!(spool.has_live_response_file_handle());
+        let fd_during_reads = open_fd_count();
+        assert!(
+            fd_during_reads <= fd_closed + READERS * 8,
+            "unexpected descriptor growth during shared reopen: closed={fd_closed}, reading={fd_during_reads}"
+        );
+
+        manager
+            .delete_spool(&key)
+            .await
+            .expect("delete while reopened reads retain cloned handles");
+        assert!(manager.get_spool(&key).is_none());
+        assert!(!spool.has_open_file_handle());
+        REOPEN_READ_GATE.add_permits(READERS);
+
+        for reader in readers {
+            assert_eq!(
+                reader
+                    .await
+                    .expect("reader task join")
+                    .expect("reader result"),
+                Some(payload.clone()),
+            );
+        }
+        REOPEN_BLOCK_READS.store(false, Ordering::SeqCst);
+        assert_eq!(REOPEN_ACTIVE_READS.load(Ordering::SeqCst), 0);
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert!(!spool.has_live_response_file_handle());
+        let fd_after_reads = open_fd_count();
+        assert!(
+            fd_after_reads <= fd_closed + READERS * 8,
+            "descriptors did not settle after delete/read completion: closed={fd_closed}, after={fd_after_reads}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_read_transition_during_reopen_never_restores_manager_handle() {
+        let _guard = HANDLE_LIFECYCLE_TEST_LOCK.lock().await;
+        reset_reopen_test_state();
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+            .expect("fixture manager");
+        let key = "coverage-reopen-race".to_string();
+        let metadata = sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, 1);
+        write_sidecar_fixture(&fixture, metadata, b"x").await;
+        drop(fixture);
+
+        let manager = SpoolManager::<ReopenTestFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+            .expect("race manager");
+        manager
+            .recover()
+            .await
+            .expect("recover closed terminal spool");
+        let spool = manager.get_spool(&key).expect("recovered race spool");
+        assert!(!spool.has_open_file_handle());
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+
+        REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
+        REOPEN_BLOCK_OPENS.store(true, Ordering::SeqCst);
+        let reader_spool = Arc::clone(&spool);
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while REOPEN_ACTIVE_OPENS.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cache-miss reopen entered gate");
+
+        spool.mark_served_and_maybe_fully_read(0, 1).await;
+        assert!(!spool.has_open_file_handle());
+        REOPEN_OPEN_GATE.add_permits(1);
+        assert_eq!(
+            reader.await.expect("reader join").expect("reader result"),
+            Some(Bytes::from_static(b"x")),
+        );
+        REOPEN_BLOCK_OPENS.store(false, Ordering::SeqCst);
+        assert_eq!(REOPEN_OPEN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert!(!spool.has_open_file_handle());
+        assert!(!spool.has_live_response_file_handle());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_during_response_scoped_reopen_leaves_no_handle() {
+        let _guard = HANDLE_LIFECYCLE_TEST_LOCK.lock().await;
+        reset_reopen_test_state();
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = Arc::new(
+            SpoolManager::<ReopenTestFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+                .expect("delete race manager"),
+        );
+        let key = "delete-reopen-race".to_string();
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create race spool");
+        let spool = manager.get_spool(&key).expect("race spool");
+        spool
+            .write(0, Bytes::from_static(b"x"))
+            .await
+            .expect("write race byte");
+        spool.complete(Some(1)).await.expect("complete race spool");
+        assert_eq!(
+            spool.read_page_for_test(0).await.unwrap(),
+            Some(Bytes::from_static(b"x")),
+        );
+        spool.mark_served_and_maybe_fully_read(0, 1).await;
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+
+        REOPEN_OPEN_COUNT.store(0, Ordering::SeqCst);
+        REOPEN_BLOCK_OPENS.store(true, Ordering::SeqCst);
+        let reader_spool = Arc::clone(&spool);
+        let reader = tokio::spawn(async move { reader_spool.read_page_for_test(0).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while REOPEN_ACTIVE_OPENS.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete-raced reopen entered gate");
+
+        manager
+            .delete_spool(&key)
+            .await
+            .expect("delete while reopen is pending");
+        REOPEN_OPEN_GATE.add_permits(1);
+        assert!(matches!(
+            reader.await.expect("reader join"),
+            Err(BobsError::SpoolNotFound { .. })
+        ));
+        REOPEN_BLOCK_OPENS.store(false, Ordering::SeqCst);
+        assert_eq!(REOPEN_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert!(!spool.has_open_file_handle());
+        assert!(!spool.has_live_response_file_handle());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn recovery_complete_candidates_beyond_synthetic_rlimit_retain_no_fds() {
+        let _guard = HANDLE_LIFECYCLE_TEST_LOCK.lock().await;
+        const CANDIDATES: usize = SYNTHETIC_FD_LIMIT * 4;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, CANDIDATES)
+            .expect("fixture manager");
+        let mut keys = Vec::with_capacity(CANDIDATES);
+        for sequence in 0..CANDIDATES {
+            let key = format!("rlimit-candidate-{sequence:015}");
+            let metadata = sidecar_fixture_metadata(&data_dir, &key, SpoolState::Complete, 1);
+            write_sidecar_fixture(&fixture, metadata, b"x").await;
+            keys.push(key);
+        }
+        drop(fixture);
+
+        LIMITED_ACTIVE_HANDLES.store(0, Ordering::SeqCst);
+        LIMITED_MAX_ACTIVE_HANDLES.store(0, Ordering::SeqCst);
+        let fd_before = open_fd_count();
+        let manager =
+            SpoolManager::<LimitedRecoveryFileIO>::new(&data_dir, 4096, 16 * 4096, CANDIDATES)
+                .expect("limited recovery manager");
+        manager
+            .recover()
+            .await
+            .expect("recover more Complete candidates than descriptor limit");
+
+        assert_eq!(manager.spools.len(), CANDIDATES);
+        assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            LIMITED_MAX_ACTIVE_HANDLES.load(Ordering::SeqCst),
+            1,
+            "Complete preflight descriptors must be closed one at a time"
+        );
+        assert!(keys.iter().all(|key| {
+            manager
+                .get_spool(key)
+                .is_some_and(|spool| !spool.has_open_file_handle())
+        }));
+        let fd_after = open_fd_count();
+        assert!(
+            fd_after < fd_before + SYNTHETIC_FD_LIMIT,
+            "recovery retained terminal descriptors: before={fd_before}, after={fd_after}"
+        );
+
+        let spool = manager.get_spool(&keys[0]).expect("recovered spool");
+        assert_eq!(
+            spool.read_page_for_test(0).await.unwrap(),
+            Some(Bytes::from_static(b"x")),
+        );
+        assert!(spool.has_open_file_handle());
+        spool.mark_served_and_maybe_fully_read(0, 1).await;
+        assert!(!spool.has_open_file_handle());
+        assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
+        manager
+            .delete_spool(&keys[0])
+            .await
+            .expect("delete lazily reopened then closed spool");
+        manager
+            .delete_spool(&keys[1])
+            .await
+            .expect("delete never-opened recovered spool");
+        assert_eq!(LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2787,7 +3628,6 @@ mod tests {
         assert_eq!(
             take_protocol_events(),
             vec![
-                ProtocolEvent::Close,
                 ProtocolEvent::MetadataDelete,
                 ProtocolEvent::ParentDirectorySync,
             ],
@@ -2864,7 +3704,6 @@ mod tests {
         assert_eq!(
             take_protocol_events(),
             vec![
-                ProtocolEvent::Close,
                 ProtocolEvent::MetadataDelete,
                 ProtocolEvent::ParentDirectorySync,
             ]
@@ -2905,6 +3744,66 @@ mod tests {
         manager.delete_spool(&key).await.expect("delete spool");
         assert!(manager.get_spool(&key).is_none());
         assert!(!spool_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_serializes_with_in_flight_and_queued_writes() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        BLOCKING_WRITE_CONTROL
+            .set((Arc::clone(&entered), Arc::clone(&release)))
+            .expect("blocking write control set once");
+
+        let dir = tempdir().expect("create tempdir");
+        let manager = Arc::new(
+            SpoolManager::<BlockingWriteFileIO>::new(dir.path(), 4096, 16 * 4096, 256)
+                .expect("manager init"),
+        );
+        let key = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create spool");
+        let spool = manager.get_spool(&key).expect("spool exists");
+
+        let first_spool = Arc::clone(&spool);
+        let first_write = tokio::spawn(async move {
+            first_spool
+                .write(0, bytes::Bytes::from(vec![1; 4096]))
+                .await
+        });
+        entered.notified().await;
+
+        let delete_manager = Arc::clone(&manager);
+        let delete_key = key.clone();
+        let delete_task =
+            tokio::spawn(async move { delete_manager.delete_spool(&delete_key).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !delete_task.is_finished(),
+            "deletion must wait for the earlier write to finish publication"
+        );
+
+        let queued_spool = Arc::clone(&spool);
+        let queued_write = tokio::spawn(async move {
+            queued_spool
+                .write(4096, bytes::Bytes::from(vec![2; 4096]))
+                .await
+        });
+        release.notify_one();
+
+        first_write
+            .await
+            .expect("first write task join")
+            .expect("write linearized before deletion succeeds");
+        delete_task
+            .await
+            .expect("delete task join")
+            .expect("delete succeeds");
+        assert!(matches!(
+            queued_write.await.expect("queued write task join"),
+            Err(BobsError::InvalidState { .. })
+        ));
     }
 
     #[tokio::test]
@@ -3482,7 +4381,7 @@ mod tests {
         assert_eq!(trailing.as_ref(), &data[page_size * 2..]);
         assert_eq!(
             spool
-                .read_page(0)
+                .read_page_for_test(0)
                 .await
                 .expect("read page 0")
                 .unwrap()
@@ -3491,7 +4390,7 @@ mod tests {
         );
         assert_eq!(
             spool
-                .read_page(1)
+                .read_page_for_test(1)
                 .await
                 .expect("read page 1")
                 .unwrap()
@@ -3550,18 +4449,37 @@ mod tests {
         assert_eq!(meta.final_page_size, Some(19));
 
         assert_eq!(
-            spool.read_page(0).await.expect("page 0").unwrap().as_ref(),
+            spool
+                .read_page_for_test(0)
+                .await
+                .expect("page 0")
+                .unwrap()
+                .as_ref(),
             &data[..page_size]
         );
         assert_eq!(
-            spool.read_page(1).await.expect("page 1").unwrap().as_ref(),
+            spool
+                .read_page_for_test(1)
+                .await
+                .expect("page 1")
+                .unwrap()
+                .as_ref(),
             &data[page_size..page_size * 2]
         );
         assert_eq!(
-            spool.read_page(2).await.expect("page 2").unwrap().as_ref(),
+            spool
+                .read_page_for_test(2)
+                .await
+                .expect("page 2")
+                .unwrap()
+                .as_ref(),
             &data[page_size * 2..]
         );
-        assert!(spool.read_page(3).await.expect("end of spool").is_none());
+        assert!(spool
+            .read_page_for_test(3)
+            .await
+            .expect("end of spool")
+            .is_none());
     }
 
     #[tokio::test]
@@ -3586,14 +4504,28 @@ mod tests {
         assert_eq!(durable.total_pages, 2);
         assert_eq!(durable.final_page_size, Some(37));
         assert_eq!(
-            spool.read_page(0).await.expect("page 0").unwrap().as_ref(),
+            spool
+                .read_page_for_test(0)
+                .await
+                .expect("page 0")
+                .unwrap()
+                .as_ref(),
             &data[..4096]
         );
         assert_eq!(
-            spool.read_page(1).await.expect("page 1").unwrap().as_ref(),
+            spool
+                .read_page_for_test(1)
+                .await
+                .expect("page 1")
+                .unwrap()
+                .as_ref(),
             &data[4096..]
         );
-        assert!(spool.read_page(2).await.expect("exact EOF").is_none());
+        assert!(spool
+            .read_page_for_test(2)
+            .await
+            .expect("exact EOF")
+            .is_none());
         assert!(matches!(
             spool
                 .write(data.len() as u64, Bytes::from_static(b"tail"))
@@ -4512,10 +5444,10 @@ mod tests {
         let spool = manager.get_spool(&key).expect("recovered spool");
         assert_eq!(spool.page_size, 8);
         assert_eq!(
-            spool.read_page(0).await.unwrap().unwrap().as_ref(),
+            spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
             b"abcdef"
         );
-        assert!(spool.read_page(1).await.unwrap().is_none());
+        assert!(spool.read_page_for_test(1).await.unwrap().is_none());
         assert_eq!(persisted_metadata(&manager, &key).await.page_size, 8);
     }
 
@@ -4563,9 +5495,9 @@ mod tests {
             "terminal resegmentation must not preload a 128 MiB page"
         );
 
-        let first = spool.read_page(0).await.unwrap().unwrap();
+        let first = spool.read_page_for_test(0).await.unwrap().unwrap();
         let last = spool
-            .read_page(recovered.total_pages - 1)
+            .read_page_for_test(recovered.total_pages - 1)
             .await
             .unwrap()
             .unwrap();
@@ -4699,10 +5631,10 @@ mod tests {
         let spool = manager.get_spool(&key).expect("spool recovered");
         assert_eq!(spool.page_size, 8192);
         assert_eq!(
-            spool.read_page(0).await.unwrap().unwrap().as_ref(),
+            spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
             b"abcdefghij"
         );
-        assert!(spool.read_page(1).await.unwrap().is_none());
+        assert!(spool.read_page_for_test(1).await.unwrap().is_none());
         assert!(data_dir.join(&key).join("spool.dat").exists());
         assert_eq!(persisted_metadata(&manager, &key).await.page_size, 8192);
     }
@@ -4724,12 +5656,17 @@ mod tests {
         let one_page = manager.get_spool(&one_page_key).expect("one-page spool");
         assert_eq!(one_page.page_size, 8192);
         assert_eq!(
-            one_page.read_page(0).await.unwrap().unwrap().as_ref(),
+            one_page
+                .read_page_for_test(0)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             b"abc"
         );
         let empty = manager.get_spool(&empty_key).expect("empty spool");
         assert_eq!(empty.page_size, 8192);
-        assert!(empty.read_page(0).await.unwrap().is_none());
+        assert!(empty.read_page_for_test(0).await.unwrap().is_none());
         assert!(data_dir.join(&one_page_key).join("spool.dat").exists());
         assert!(data_dir.join(&empty_key).join("spool.dat").exists());
     }
@@ -4777,16 +5714,29 @@ mod tests {
                 Err(BobsError::SpoolClosed)
             ));
             if expected.is_empty() {
-                assert!(spool.read_page(0).await.unwrap().is_none());
+                assert!(spool.read_page_for_test(0).await.unwrap().is_none());
             } else {
                 assert_eq!(
-                    spool.read_page(0).await.unwrap().unwrap().as_ref(),
+                    spool.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
                     expected
                 );
+                let permit = spool
+                    .acquire_read_response_permit()
+                    .await
+                    .expect("acquire salvage read response");
+                let handle = spool
+                    .acquire_file_handle(&permit)
+                    .await
+                    .expect("reopen salvaged payload");
                 assert_eq!(
-                    read_exact_logical_range::<TokioFileIO>(&spool.file_handle, 0, expected.len(),)
-                        .await
-                        .expect("read exact salvaged range"),
+                    read_exact_at::<TokioFileIO>(
+                        &handle,
+                        0,
+                        expected.len(),
+                        "reading exact salvaged range",
+                    )
+                    .await
+                    .expect("read exact salvaged range"),
                     expected
                 );
             }
@@ -4828,8 +5778,8 @@ mod tests {
         let metadata = partial.metadata.lock().await.clone();
         assert_eq!(metadata.total_pages, 2);
         assert_eq!(metadata.final_page_size, Some(1));
-        let first = partial.read_page(0).await.unwrap().unwrap();
-        let second = partial.read_page(1).await.unwrap().unwrap();
+        let first = partial.read_page_for_test(0).await.unwrap().unwrap();
+        let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), b"abc");
     }
 
@@ -4878,21 +5828,31 @@ mod tests {
             rss_growth < (PAGE_SIZE / 4) as u64,
             "sparse terminal salvage grew RSS by {rss_growth} bytes"
         );
-
+        let permit = spool
+            .acquire_read_response_permit()
+            .await
+            .expect("acquire sparse salvage response");
+        let handle = spool
+            .acquire_file_handle(&permit)
+            .await
+            .expect("reopen sparse salvage");
         assert_eq!(
-            read_exact_logical_range::<RecoveryCountingFileIO>(&spool.file_handle, 0, 4)
+            read_exact_at::<RecoveryCountingFileIO>(&handle, 0, 4, "reading sparse prefix",)
                 .await
-                .expect("read sparse prefix"),
+                .expect("read sparse prefix")
+                .as_ref(),
             b"ABCD"
         );
         assert_eq!(
-            read_exact_logical_range::<RecoveryCountingFileIO>(
-                &spool.file_handle,
+            read_exact_at::<RecoveryCountingFileIO>(
+                &handle,
                 FILE_LEN - 4,
                 4,
+                "reading sparse suffix",
             )
             .await
-            .expect("read exact cross-page suffix"),
+            .expect("read sparse suffix")
+            .as_ref(),
             b"WXYZ"
         );
         assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 8);
@@ -5084,13 +6044,22 @@ mod tests {
             .complete(Some(9))
             .await
             .expect("idempotent completion validates recovered size");
-        let first = partial.read_page(0).await.unwrap().unwrap();
-        let second = partial.read_page(1).await.unwrap().unwrap();
+        let first = partial.read_page_for_test(0).await.unwrap().unwrap();
+        let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
+        let permit = partial
+            .acquire_read_response_permit()
+            .await
+            .expect("acquire WriteLocked salvage response");
+        let handle = partial
+            .acquire_file_handle(&permit)
+            .await
+            .expect("reopen WriteLocked salvage");
         assert_eq!(
-            read_exact_logical_range::<TokioFileIO>(&partial.file_handle, 2, 6)
+            read_exact_at::<TokioFileIO>(&handle, 2, 6, "reading migrated WriteLocked range",)
                 .await
-                .expect("read range across migrated page boundary"),
+                .expect("read range across migrated page boundary")
+                .as_ref(),
             b"cdefgh"
         );
 
@@ -5107,8 +6076,8 @@ mod tests {
             .complete(Some(12))
             .await
             .expect("complete exact salvage");
-        let first = exact.read_page(0).await.unwrap().unwrap();
-        let second = exact.read_page(1).await.unwrap().unwrap();
+        let first = exact.read_page_for_test(0).await.unwrap().unwrap();
+        let second = exact.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), exact_data);
 
         let empty = manager
@@ -5124,7 +6093,7 @@ mod tests {
             .complete(Some(0))
             .await
             .expect("complete empty salvage");
-        assert!(empty.read_page(0).await.unwrap().is_none());
+        assert!(empty.read_page_for_test(0).await.unwrap().is_none());
 
         for (key, expected_bytes) in [
             (&partial_key, partial_data.as_slice()),
@@ -5162,8 +6131,8 @@ mod tests {
             partial.page_size, 7,
             "later config changes atomically resegment terminal bytes again"
         );
-        let first = partial.read_page(0).await.unwrap().unwrap();
-        let second = partial.read_page(1).await.unwrap().unwrap();
+        let first = partial.read_page_for_test(0).await.unwrap().unwrap();
+        let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
         assert_eq!(
             persisted_metadata(&restarted, &partial_key).await.page_size,
@@ -5263,13 +6232,22 @@ mod tests {
         assert_eq!(partial_meta.total_bytes_written, 9);
         assert_eq!(partial_meta.total_pages, 2);
         assert_eq!(partial_meta.final_page_size, Some(3));
-        let first = partial.read_page(0).await.unwrap().unwrap();
-        let second = partial.read_page(1).await.unwrap().unwrap();
+        let first = partial.read_page_for_test(0).await.unwrap().unwrap();
+        let second = partial.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), partial_data);
+        let permit = partial
+            .acquire_read_response_permit()
+            .await
+            .expect("acquire migrated range response");
+        let handle = partial
+            .acquire_file_handle(&permit)
+            .await
+            .expect("reopen migrated range");
         assert_eq!(
-            read_exact_logical_range::<TokioFileIO>(&partial.file_handle, 2, 6)
+            read_exact_at::<TokioFileIO>(&handle, 2, 6, "reading migrated range")
                 .await
-                .expect("read range across new page boundary"),
+                .expect("read range across new page boundary")
+                .as_ref(),
             b"cdefgh"
         );
 
@@ -5281,8 +6259,8 @@ mod tests {
         assert_eq!(exact_meta.total_bytes_written, 12);
         assert_eq!(exact_meta.total_pages, 2);
         assert_eq!(exact_meta.final_page_size, None);
-        let first = exact.read_page(0).await.unwrap().unwrap();
-        let second = exact.read_page(1).await.unwrap().unwrap();
+        let first = exact.read_page_for_test(0).await.unwrap().unwrap();
+        let second = exact.read_page_for_test(1).await.unwrap().unwrap();
         assert_eq!([first.as_ref(), second.as_ref()].concat(), exact_data);
 
         let empty = manager.get_spool(&empty_key).expect("empty Readable spool");
@@ -5291,7 +6269,7 @@ mod tests {
         assert_eq!(empty_meta.total_bytes_written, 0);
         assert_eq!(empty_meta.total_pages, 0);
         assert_eq!(empty_meta.final_page_size, None);
-        assert!(empty.read_page(0).await.unwrap().is_none());
+        assert!(empty.read_page_for_test(0).await.unwrap().is_none());
 
         for key in [&partial_key, &exact_key, &empty_key] {
             let sidecar = persisted_metadata(&manager, key).await;

@@ -16,9 +16,13 @@ Reader visibility is still page-based: a page is visible, cached, and used to no
 
 Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they also delay reader visibility until that larger page is full. They consume more of the global cache budget per cached page, so cache reach can fall unless `max_cache_bytes` is increased alongside `page_size`. Setting `max_cache_bytes` to `0` disables caching entirely; if a full page is larger than the cache cap, that page simply bypasses the cache and reads fall back to disk. Treat wider pages as a benchmarked tuning choice, not a durability or correctness requirement.
 
+Read response memory is admitted separately from live-spool admission. The manager permits `max(1, floor(max_cache_bytes / page_size))` ordinary configured-page responses at once and retains each permit until the client body is consumed or dropped. Slow clients therefore queue instead of retaining one additional page buffer each. Wider persisted pages recovered after a config change consume multiple units. With caching disabled, one response remains admitted so disk-backed reads still stream with bounded page memory.
+
 ### 2. Long-poll with Timeout
 
 When a reader requests data that has not been written yet, BOBS parks the request using a notification system. To prevent idle timeouts from network infrastructure, such as Kubernetes Ingress or load balancers, BOBS returns a `307 Temporary Redirect` if no data arrives within `long_poll_timeout_ms`. Clients like `curl -L` will automatically follow the redirect and resume the poll.
+
+The initial timeout includes time waiting for read-response admission. A timeout redirect, client cancellation, or spool deletion drops the reader lease and any permit immediately. Long-poll and response admission do not hold metadata, lifecycle, cache, or live-spool admission locks while waiting.
 
 ### 3. Follow Mode
 
