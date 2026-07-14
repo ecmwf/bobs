@@ -5,7 +5,7 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: '{{ include "bobs.fullname" . }}'
+  name: '{{ include "bobs.statefulsetName" . }}'
   labels:
     app.kubernetes.io/name: '{{ include "bobs.name" . }}'
     app.kubernetes.io/instance: '{{ .Release.Name }}'
@@ -74,7 +74,7 @@ spec:
               # {{- if .Values.internalBaseUrlTemplate }}
               value: {{ tpl .Values.internalBaseUrlTemplate . | quote }}
               # {{- else }}
-              value: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ include "bobs.headlessServiceName" . }}:{{ .Values.service.port }}/api/v1'
+              value: 'http://{{ include "bobs.statefulsetName" . }}-{ordinal}.{{ include "bobs.headlessServiceName" . }}:{{ .Values.service.port }}/api/v1'
               # {{- end }}
           command: ["bobs"]
           args: ["/etc/bobs/config.yaml"]
@@ -116,7 +116,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: '{{ include "bobs.fullname" . }}-config'
+            name: '{{ include "bobs.nameWithSuffix" (dict "base" (include "bobs.fullname" .) "suffix" "-config") }}'
       # {{- if not .Values.persistence.enabled }}
         - name: data
           emptyDir:

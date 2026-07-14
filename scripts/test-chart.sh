@@ -68,6 +68,7 @@ helm lint "$chart" --strict "${common_values[@]}" \
   --set replicaCount=1
 helm lint "$chart" --strict --values "$chart/tests/forwarded-prefix-values.yaml"
 "$chart/tests/forwarded-prefix-render.sh"
+"$chart/tests/chart-contract-render.sh"
 
 helm template bobs "$chart" "${common_values[@]}" >"$tmpdir/default.yaml"
 assert_contains 'image: "eccr.ecmwf.int/polytope/bobs:0.1.0"' "$tmpdir/default.yaml"
@@ -162,14 +163,14 @@ assert_template_rejects external-service-missing-template \
   --set headlessService.enabled=false --set-string headlessService.name=
 assert_schema_rejects governing-service-invalid --set-string headlessService.name=Bad_Name
 assert_template_rejects governing-service-invalid-template \
-  "headlessService.name must be a valid DNS-1123 Service name" \
+  "headlessService.name must be a valid DNS-1123 label" \
   --set-string headlessService.name=Bad_Name
 
 # Validate the exact final runtime bounds represented by the chart contract.
 helm template bobs "$chart" "${common_values[@]}" \
   --set config.page_size=67108864 \
   --set config.max_cache_bytes=0 \
-  --set config.max_live_spools=2305843009213693951 \
+  --set config.max_live_spools=65536 \
   --set config.max_spool_bytes=67108864 \
   --set config.io_uring_shards=256 \
   --set config.io_uring_queue_capacity=2305843009213693951 \
@@ -178,7 +179,7 @@ helm template bobs "$chart" "${common_values[@]}" \
 assert_schema_rejects page-size-high --set config.page_size=67108865
 assert_schema_rejects cache-negative --set config.max_cache_bytes=-1
 assert_schema_rejects live-spools-zero --set config.max_live_spools=0
-assert_schema_rejects live-spools-high --set config.max_live_spools=2305843009213693952
+assert_schema_rejects live-spools-high --set config.max_live_spools=65537
 assert_schema_rejects spool-size-zero --set config.max_spool_bytes=0
 assert_template_rejects page-larger-than-spool-template \
   'config.page_size must not exceed config.max_spool_bytes' \

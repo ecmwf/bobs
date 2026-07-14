@@ -6,7 +6,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: '{{ include "bobs.fullname" . }}-config'
+  name: '{{ include "bobs.nameWithSuffix" (dict "base" (include "bobs.fullname" .) "suffix" "-config") }}'
   labels:
     app.kubernetes.io/name: '{{ include "bobs.name" . }}'
     app.kubernetes.io/instance: "{{ .Release.Name }}"

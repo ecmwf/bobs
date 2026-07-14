@@ -1,5 +1,63 @@
+{{/* Validate operator-provided names before they reach Kubernetes metadata. */}}
+{{- define "bobs.validateDnsLabel" -}}
+{{- $field := index . "field" -}}
+{{- $rawName := index . "name" -}}
+{{- $name := $rawName | trim -}}
+{{- if or (ne $rawName $name) (gt (len $name) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name)) -}}
+{{- fail (printf "%s must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters)" $field) -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+
 {{- define "bobs.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $override := .Values.nameOverride | default "" -}}
+{{- if $override -}}
+{{- include "bobs.validateDnsLabel" (dict "field" "nameOverride" "name" $override) -}}
+{{- else -}}
+{{- .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Map Helm-valid dotted release names to collision-resistant DNS labels. */}}
+{{- define "bobs.releaseName" -}}
+{{- $rawName := .Release.Name -}}
+{{- if contains "." $rawName -}}
+{{- printf "%s-%s" ($rawName | replace "." "-") (sha256sum $rawName | trunc 8) -}}
+{{- else -}}
+{{- $rawName -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Shorten a DNS label without losing all entropy from the truncated tail. The
+eight-character digest helps distinguish long bases that share the retained prefix.
+Callers may then append a stable suffix within the same length budget.
+*/}}
+{{- define "bobs.boundedName" -}}
+{{- $base := index . "base" -}}
+{{- $maxLength := int (index . "maxLength") -}}
+{{- if lt $maxLength 10 -}}
+{{- fail "internal chart error: bounded DNS label length must leave room for a digest" -}}
+{{- end -}}
+{{- if gt (len $base) $maxLength -}}
+{{- $digest := sha256sum $base | trunc 8 -}}
+{{- $prefixLength := sub $maxLength 9 -}}
+{{- $prefix := $base | trunc (int $prefixLength) | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix $digest -}}
+{{- else -}}
+{{- $base -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Append a suffix while preserving it and keeping the result within 63 bytes. */}}
+{{- define "bobs.nameWithSuffix" -}}
+{{- $base := index . "base" -}}
+{{- $suffix := index . "suffix" -}}
+{{- $baseBudget := sub 63 (len $suffix) -}}
+{{- if lt $baseBudget 10 -}}
+{{- fail "internal chart error: generated Kubernetes name suffix is too long" -}}
+{{- end -}}
+{{- printf "%s%s" (include "bobs.boundedName" (dict "base" $base "maxLength" $baseBudget)) $suffix -}}
 {{- end -}}
 
 {{/*
@@ -18,16 +76,34 @@ the subchart's own `global.ingress.controller` default.
 {{- end -}}
 
 {{- define "bobs.fullname" -}}
-{{- if .Values.fullnameOverride -}}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $override := .Values.fullnameOverride | default "" -}}
+{{- if $override -}}
+{{- include "bobs.validateDnsLabel" (dict "field" "fullnameOverride" "name" $override) -}}
 {{- else -}}
 {{- $name := include "bobs.name" . -}}
-{{- if contains $name .Release.Name -}}
-{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- $releaseName := include "bobs.releaseName" . -}}
+{{- if contains $name $releaseName -}}
+{{- $releaseName | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-%s" $releaseName $name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+Reserve enough space for data-<statefulset>-<10-digit ordinal>, the longest
+controller-generated DNS label for Kubernetes' signed 32-bit replica field.
+Long names retain an eight-character digest to reduce prefix collisions.
+*/}}
+{{- define "bobs.statefulsetName" -}}
+{{- include "bobs.boundedName" (dict "base" (include "bobs.fullname" .) "maxLength" 47) -}}
+{{- end -}}
+
+{{/* The StatefulSet pod name is also the corresponding per-pod Service name. */}}
+{{- define "bobs.podName" -}}
+{{- $root := index . "root" -}}
+{{- $ordinal := index . "ordinal" -}}
+{{- include "bobs.nameWithSuffix" (dict "base" (include "bobs.statefulsetName" $root) "suffix" (printf "-%d" $ordinal)) -}}
 {{- end -}}
 
 {{/*
@@ -37,17 +113,10 @@ requires an explicit existing headless Service in the release namespace.
 */}}
 {{- define "bobs.headlessServiceName" -}}
 {{- $rawName := .Values.headlessService.name | default "" -}}
-{{- $name := $rawName | trim -}}
-{{- if ne $rawName $name -}}
-{{- fail "headlessService.name must be a valid DNS-1123 Service name (lowercase alphanumeric or '-', at most 63 characters)" -}}
-{{- end -}}
-{{- if $name -}}
-{{- if or (gt (len $name) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name)) -}}
-{{- fail "headlessService.name must be a valid DNS-1123 Service name (lowercase alphanumeric or '-', at most 63 characters)" -}}
-{{- end -}}
-{{- $name -}}
+{{- if $rawName -}}
+{{- include "bobs.validateDnsLabel" (dict "field" "headlessService.name" "name" $rawName) -}}
 {{- else if .Values.headlessService.enabled -}}
-{{- printf "%s-svc" (include "bobs.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- include "bobs.nameWithSuffix" (dict "base" (include "bobs.fullname" .) "suffix" "-svc") -}}
 {{- else -}}
 {{- fail "headlessService.name must be a non-empty external governing Service name when headlessService.enabled=false" -}}
 {{- end -}}
@@ -62,15 +131,46 @@ requires an explicit existing headless Service in the release namespace.
 
 {{/* Keep Helm's contract consistent with Config::validate. */}}
 {{- define "bobs.validateConfigBounds" -}}
+{{- $dataDir := .Values.config.data_dir | default "" -}}
+{{- if not (hasPrefix "/" $dataDir) -}}
+{{- fail "config.data_dir must be a non-empty absolute filesystem path" -}}
+{{- end -}}
 {{- if gt (int64 .Values.config.page_size) (int64 .Values.config.max_spool_bytes) -}}
 {{- fail "config.page_size must not exceed config.max_spool_bytes" -}}
+{{- end -}}
+{{- if gt (int64 .Values.config.max_live_spools) 65536 -}}
+{{- fail "config.max_live_spools must not exceed 65536" -}}
+{{- end -}}
+{{- if and .Values.config.metrics.enabled (eq (int64 .Values.config.port) (int64 .Values.config.metrics.port)) -}}
+{{- fail "config.metrics.port must differ from config.port when metrics are enabled" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Reject governing Service names that alias another Service in this release. */}}
+{{- define "bobs.validateServiceNameCollisions" -}}
+{{- $root := index . "root" -}}
+{{- $governingName := index . "governingName" -}}
+{{- $seen := dict -}}
+{{- $mainName := include "bobs.fullname" $root -}}
+{{- $_ := set $seen $mainName "main Service" -}}
+{{- range $ordinal, $_ := until (int $root.Values.replicaCount) -}}
+{{- $podName := include "bobs.podName" (dict "root" $root "ordinal" $ordinal) -}}
+{{- if hasKey $seen $podName -}}
+{{- fail (printf "generated Service name %q collides with the %s" $podName (get $seen $podName)) -}}
+{{- end -}}
+{{- $_ := set $seen $podName (printf "per-pod Service for ordinal %d" $ordinal) -}}
+{{- end -}}
+{{- if hasKey $seen $governingName -}}
+{{- fail (printf "headlessService.name resolves to %q and collides with the generated %s" $governingName (get $seen $governingName)) -}}
 {{- end -}}
 {{- end -}}
 
 {{/* Validate chart-wide invariants while resolving the StatefulSet serviceName. */}}
 {{- define "bobs.governingServiceName" -}}
 {{- include "bobs.validatePersistence" . -}}
-{{- include "bobs.headlessServiceName" . -}}
+{{- $name := include "bobs.headlessServiceName" . -}}
+{{- include "bobs.validateServiceNameCollisions" (dict "root" . "governingName" $name) -}}
+{{- $name -}}
 {{- end -}}
 
 {{/* Keep the fsGroup fallback outside YAML so an empty context still mounts writable PVCs. */}}
@@ -167,6 +267,31 @@ imagePullSecrets:
 {{- end -}}
 {{- end -}}
 
+{{/* Render one stable Service for every StatefulSet pod. */}}
+{{- define "bobs.podServices" -}}
+{{ print "\n" -}}
+{{- $port := .Values.service.port -}}
+{{- range $ordinal, $_ := until (int .Values.replicaCount) }}
+{{- if gt $ordinal 0 }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: '{{ include "bobs.podName" (dict "root" $ "ordinal" $ordinal) }}'
+  labels:
+    app.kubernetes.io/name: '{{ include "bobs.name" $ }}'
+    app.kubernetes.io/instance: '{{ $.Release.Name }}'
+spec:
+  ports:
+    - port: {{ $port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    statefulset.kubernetes.io/pod-name: '{{ include "bobs.podName" (dict "root" $ "ordinal" $ordinal) }}'
+{{- end }}
+{{- end -}}
+
 {{/* Render community ingress-nginx resources, including per-pod forwarded prefixes. */}}
 {{- define "bobs.communityIngresses" -}}
 {{- $fullName := include "bobs.fullname" . -}}
@@ -193,6 +318,7 @@ imagePullSecrets:
 # accepts short public URLs and redirected public /api/v1/read URLs.
 {{- if .Values.ingress.forwardedPrefix.enabled }}
 {{- range $index, $_ := until (int .Values.replicaCount) }}
+{{- $podName := include "bobs.podName" (dict "root" $ "ordinal" $index) -}}
 {{- $podAnnotations := deepCopy $annotations -}}
 {{- $_ := set $podAnnotations "nginx.ingress.kubernetes.io/x-forwarded-prefix" (printf "/%s-%d" $routeName $index) }}
 {{ if gt $index 0 }}
@@ -201,7 +327,7 @@ imagePullSecrets:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ (printf "%s-%d" $fullName $index) | trunc 63 | trimSuffix "-" | quote }}
+  name: {{ $podName | quote }}
   labels:
     app.kubernetes.io/name: '{{ include "bobs.name" $ }}'
     app.kubernetes.io/instance: '{{ $.Release.Name }}'
@@ -219,7 +345,7 @@ spec:
             pathType: ImplementationSpecific
             backend:
               service:
-                name: '{{ $fullName }}-{{ $index }}'
+                name: {{ $podName | quote }}
                 port:
                   number: {{ $port }}
   {{- if $.Values.ingress.tls }}
@@ -246,11 +372,12 @@ spec:
       http:
         paths:
           {{- range $index, $_ := until (int $.Values.replicaCount) }}
+          {{- $podName := include "bobs.podName" (dict "root" $ "ordinal" $index) }}
           - path: '/{{ $routeName }}-{{ $index }}/(api/v1/read/|api/v1/)?([0-9a-zA-Z-]+)$'
             pathType: ImplementationSpecific
             backend:
               service:
-                name: '{{ $fullName }}-{{ $index }}'
+                name: {{ $podName | quote }}
                 port:
                   number: {{ $port }}
           {{- end }}

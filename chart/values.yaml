@@ -81,7 +81,7 @@ probes:
 
 # Internal base URL template bobs uses to build per-ordinal pod URLs. Leave empty
 # to use StatefulSet pod DNS through the governing Service:
-#   http://<fullname>-{ordinal}.<headless-service-name>:<service.port>/api/v1
+#   http://<statefulset-name>-{ordinal}.<headless-service-name>:<service.port>/api/v1
 # Set to override (tpl-rendered; `{ordinal}` is substituted by bobs at runtime).
 # The `bobs.headlessServiceName` helper resolves either the managed Service name
 # or the required external governing Service name.
@@ -102,9 +102,9 @@ config:
   host: "0.0.0.0"
   port: 3000
   # Helm deployment profile. These intentionally override the Rust binary defaults
-  # (data_dir ./data, page_size 16 MiB, global cache 256 MiB) with the PVC path
-  # and a lower-latency 4 KiB page / 1 MiB global cache. max_cache_bytes may be
-  # smaller than page_size. It also derives the weighted response-lifetime read
+  # (data_dir ./data, page_size 16 MiB, global cache 256 MiB) with an absolute PVC
+  # path and a lower-latency 4 KiB page / 1 MiB global cache. max_cache_bytes may
+  # be smaller than page_size. It also derives the weighted response-lifetime read
   # budget as max(1, floor(max_cache_bytes / page_size)); 0 disables caching but
   # retains one bounded disk-backed response.
   data_dir: "/var/lib/bobs"
@@ -113,7 +113,7 @@ config:
   page_size: 4096
   max_cache_bytes: 1048576
   # Separate first-read/live-spool admission limit. The explicit chart default
-  # matches max_cache_bytes / page_size; operators may override it independently.
+  # matches max_cache_bytes / page_size; operators may override it in 1..=65536.
   max_live_spools: 256
   # Per-spool write limit; must be >= page_size. 8 GiB leaves headroom on the default 10 GiB PVC.
   max_spool_bytes: 8589934592
@@ -142,6 +142,7 @@ config:
   route_name: "download"
   # Kubernetes metrics profile: bind on all interfaces and allow only collection.
   # The Rust binary defaults are 127.0.0.1 and an empty list (allow all labels).
+  # When enabled, this port must differ from config.port.
   metrics:
     enabled: false
     bind_address: "0.0.0.0"

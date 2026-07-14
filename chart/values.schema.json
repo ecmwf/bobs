@@ -3,7 +3,7 @@
   "type": "object",
   "required": ["enabled", "replicaCount", "image", "rustLog", "service", "config", "persistence", "headlessService"],
   "properties": {
-    "replicaCount": { "type": "integer", "minimum": 1 },
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
     "enabled": { "type": "boolean" },
     "global": {
       "type": "object",
@@ -83,10 +83,10 @@
       "properties": {
         "host": { "type": "string", "minLength": 1 },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "data_dir": { "type": "string", "minLength": 1 },
+        "data_dir": { "type": "string", "pattern": "^/" },
         "page_size": { "type": "integer", "minimum": 1, "maximum": 67108864 },
         "max_cache_bytes": { "type": "integer", "minimum": 0 },
-        "max_live_spools": { "type": "integer", "minimum": 1, "maximum": 2305843009213693951 },
+        "max_live_spools": { "type": "integer", "minimum": 1, "maximum": 65536 },
         "max_spool_bytes": { "type": "integer", "minimum": 1 },
         "create_admission_timeout_ms": { "type": "integer", "minimum": 1 },
         "enable_pprof": { "type": "boolean" },
@@ -203,8 +203,20 @@
         }
       ]
     },
-    "nameOverride": { "type": "string" },
-    "fullnameOverride": { "type": "string" }
+    "nameOverride": {
+      "type": "string",
+      "oneOf": [
+        { "const": "" },
+        { "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+      ]
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "oneOf": [
+        { "const": "" },
+        { "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+      ]
+    }
   },
   "additionalProperties": false
 }

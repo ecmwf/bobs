@@ -32,10 +32,10 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | ------- | --------- | ------------- |
 | `host` | `0.0.0.0` | Address for the HTTP server to bind to. |
 | `port` | `3000` | Port for the HTTP server to listen on. |
-| `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. |
+| `data_dir` | binary: `./data`; chart: `/var/lib/bobs` | File system path for storing spool files. The chart requires a non-empty absolute path because it mounts this value as a directory; the binary also supports relative paths. |
 | `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of internal data pages. Valid range: `1..=67108864` (64 MiB), and it must not exceed `max_spool_bytes`. A page becomes visible only when full; `/api/v1/complete/{key}` publishes a trailing partial page. |
 | `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global budget for the logical bytes of bounded cache-owned page allocations across all spools, excluding allocator overhead. It also derives the read-response permit budget as `max(1, floor(max_cache_bytes / page_size))`; weighted permits are held until response bodies are dropped. Cache insertion may copy a page solely to avoid retaining an oversized transport-frame backing; the frame-to-disk path remains zero-copy. Set to `0` to disable caching while retaining a one-page response bound. A page rejected because it exceeds the cap likewise bypasses the cache without an isolation copy and remains readable from disk. |
-| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools in the first-read cache phase and for startup recovery. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0` and within Tokio's semaphore limit. The first proven full-object read frees that spool's cache and admission slot immediately while leaving it readable from disk. Startup admits at most this many durable spools and leaves excess entries unopened and unchanged for a later restart with more capacity. |
+| `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools in the first-read cache phase and for startup recovery. YAML omission derives it from effective page/cache settings; explicit values are preserved. Must be greater than `0`; the chart permits at most `65536`. The first proven full-object read frees that spool's cache and admission slot immediately while leaving it readable from disk. Startup admits at most this many durable spools and leaves excess entries unopened and unchanged for a later restart with more capacity. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests. Must be greater than `0` and at least `page_size`. |
 | `create_admission_timeout_ms` | `5000` | Maximum time `/api/v1/create` waits for a `max_live_spools` slot before returning `503 Service Unavailable`. Must be greater than `0`. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup timeout for an unfinished spool whose writer has stopped sending data. Must be greater than `0`. |
@@ -53,7 +53,7 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `route_name` | `""` | External download route prefix. Must be non-empty. |
 | `metrics.enabled` | `false` | Enable OpenTelemetry metrics export. Requires a build with `--features telemetry`; has no effect without that feature. |
 | `metrics.bind_address` | `127.0.0.1` | Bind address for the Prometheus `/metrics` scrape endpoint. Use `0.0.0.0` in Kubernetes so the pod is scrapable. |
-| `metrics.port` | `9464` | Port for the Prometheus `/metrics` scrape endpoint (the conventional OTel Prometheus exporter port). Runs on a separate port from the main data port. |
+| `metrics.port` | `9464` | Port for the Prometheus `/metrics` scrape endpoint (the conventional OTel Prometheus exporter port). When metrics are enabled, it must differ from the main `port`. |
 | `metrics.allowed_labels` | `[]` | Caller-provided label keys forwarded as metric attributes. Empty list means all caller labels pass through. Set to a non-empty list to restrict label cardinality. |
 | `metrics.max_label_value_length` | `128` | Maximum byte length for label values. Values exceeding this limit are truncated before recording. |
 
@@ -63,9 +63,11 @@ Persisted page layouts are also brought under the current limits before admissio
 
 ## Helm storage and StatefulSet DNS
 
-The chart mounts `config.data_dir` as a filesystem directory. `persistence.volumeMode` is therefore fixed to `Filesystem`; raw `Block` PVCs are rejected and the chart does not render `volumeDevices`.
+The chart requires `config.data_dir` to be a non-empty absolute path and mounts it as a filesystem directory. `persistence.volumeMode` is therefore fixed to `Filesystem`; raw `Block` PVCs are rejected and the chart does not render `volumeDevices`. The chart also accepts `config.max_live_spools` only in `1..=65536`. When metrics are enabled, the template rejects `config.metrics.port == config.port`. JSON Schema validates each port's range but cannot express that comparison.
 
-`headlessService` controls the StatefulSet governing Service. With `enabled: true`, an empty `name` keeps the managed `<fullname>-svc` default and a valid non-empty name overrides it. With `enabled: false`, the chart omits that Service and `name` must identify an existing headless Service in the release namespace. The resolved name drives `StatefulSet.spec.serviceName` and the chart's default pod URL, `http://<fullname>-{ordinal}.<governing-service>:<port>/api/v1`. Per-replica Services remain managed separately for ingress routing.
+`headlessService` controls the StatefulSet governing Service. With `enabled: true`, an empty `name` keeps the managed `<fullname>-svc` default and a valid non-empty name overrides it. With `enabled: false`, the chart omits that Service and `name` must identify an existing headless Service in the release namespace. The resolved name drives `StatefulSet.spec.serviceName` and the chart's default pod URL, `http://<statefulset-name>-{ordinal}.<governing-service>:<port>/api/v1`. Per-replica Services remain managed separately for ingress routing. The chart rejects governing names that collide with its main or per-pod Services.
+
+Kubernetes DNS labels generated by the chart stay within 63 characters. For a long release or `fullnameOverride`, suffixed names keep the suffix and include an eight-character digest of the unshortened base. Dots in a Helm release name are replaced with hyphens and a digest is appended to reduce collisions with literal hyphenated releases. The StatefulSet base reserves room for controller-generated pod and PVC ordinals, so multi-digit per-pod Service and Ingress names remain distinct.
 
 ## Helm ingress and shutdown settings
 

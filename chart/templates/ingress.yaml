@@ -51,11 +51,12 @@ spec:
       http:
         paths:
           {{- range $i, $e := until (int $.Values.replicaCount) }}
+          # {{- $podName := include "bobs.podName" (dict "root" $ "ordinal" $i) }}
           - path: '/{{ $routeName }}-{{ $i }}'
             pathType: Prefix
             backend:
               service:
-                name: '{{ $fullName }}-{{ $i }}'
+                name: '{{ $podName }}'
                 port:
                   number: {{ $port }}
           {{- end }}

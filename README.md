@@ -211,14 +211,22 @@ route_name: download
 `chart/` is the source of truth for the BOBS Helm chart. `polytope-chart`
 vendors a packaged copy and verifies it against a pinned commit from this repository.
 
-BOBS needs `config.data_dir` to be a directory, so the chart supports only
-`persistence.volumeMode: Filesystem`; raw `Block` PVCs are rejected and are never
-rendered as `volumeDevices`. The StatefulSet governing Service is controlled by
-`headlessService`: with `enabled: true`, an empty `name` preserves the managed
-`<fullname>-svc` default and a non-empty name overrides it. With `enabled: false`,
-`name` is required and must identify an existing headless Service in the release
-namespace. The governing name is used by the StatefulSet and its default stable pod
-DNS. Ingress still uses the chart's per-replica Services.
+The chart requires `config.data_dir` to be a non-empty absolute path mounted as
+a directory. It supports only `persistence.volumeMode: Filesystem`; raw `Block`
+PVCs are rejected and are never rendered as `volumeDevices`. Chart values also
+limit `config.max_live_spools` to `65536`. When metrics are enabled,
+`config.metrics.port` must differ from `config.port`; Helm's template validation
+enforces this cross-field rule because JSON Schema cannot compare the two ports.
+
+The StatefulSet governing Service is controlled by `headlessService`: with
+`enabled: true`, an empty `name` preserves the managed `<fullname>-svc` default
+and a non-empty name overrides it. With `enabled: false`, `name` is required and
+must identify an existing headless Service in the release namespace. The chart
+rejects governing names that collide with its main or per-replica Services.
+Generated DNS labels stay within 63 characters. Long bases retain a short digest,
+dotted release names are mapped to DNS labels, and per-replica names retain their
+ordinal suffix. Ingress still uses the chart's per-replica Services.
+
 Validate chart changes with:
 
 ```bash
