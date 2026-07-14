@@ -3473,12 +3473,13 @@ mod tests {
         const CYCLES: usize = 128;
         const PAGE_SIZE: usize = 64;
 
+        LIMITED_ACTIVE_HANDLES.store(0, Ordering::SeqCst);
+        LIMITED_MAX_ACTIVE_HANDLES.store(0, Ordering::SeqCst);
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
-        let manager = SpoolManager::<TokioFileIO>::new(&data_dir, PAGE_SIZE, 4 * PAGE_SIZE, 1)
-            .expect("manager init");
-        let fd_before = open_fd_count();
-        let mut maximum_fd_count = fd_before;
+        let manager =
+            SpoolManager::<LimitedRecoveryFileIO>::new(&data_dir, PAGE_SIZE, 4 * PAGE_SIZE, 1)
+                .expect("manager init");
 
         for sequence in 0..CYCLES {
             let key = format!("fd-cycle-{sequence:024}");
@@ -3504,15 +3505,19 @@ mod tests {
                 !spool.has_open_file_handle(),
                 "full-read terminal spool must release its manager descriptor"
             );
-            maximum_fd_count = maximum_fd_count.max(open_fd_count());
+            assert_eq!(
+                LIMITED_ACTIVE_HANDLES.load(Ordering::SeqCst),
+                0,
+                "completed cycle retained a synthetic data descriptor"
+            );
         }
 
-        let fd_after = open_fd_count();
         assert_eq!(manager.spools.len(), CYCLES);
         assert_eq!(manager.admission.available_permits(), 1);
-        assert!(
-            maximum_fd_count < fd_before + CYCLES / 2,
-            "tracked terminal spools leaked proportional descriptors: before={fd_before}, max={maximum_fd_count}, after={fd_after}"
+        assert_eq!(
+            LIMITED_MAX_ACTIVE_HANDLES.load(Ordering::SeqCst),
+            1,
+            "sequential cycles must keep at most one data descriptor active"
         );
     }
 
