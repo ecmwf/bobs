@@ -3860,6 +3860,17 @@ mod tests {
             .await
             .expect("create empty UUID dir");
 
+        let temp_only_uuid_key = uuid::Uuid::new_v4().to_string();
+        let temp_only_uuid_dir = data_dir.join(&temp_only_uuid_key);
+        tokio::fs::create_dir(&temp_only_uuid_dir)
+            .await
+            .expect("create UUID temp-only dir");
+        let private_temp =
+            temp_only_uuid_dir.join(format!("meta.json.tmp.{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&private_temp, b"interrupted metadata transaction")
+            .await
+            .expect("seed UUID metadata temp");
+
         let nonempty_uuid_key = uuid::Uuid::new_v4().to_string();
         let nonempty_uuid_dir = data_dir.join(&nonempty_uuid_key);
         tokio::fs::create_dir(&nonempty_uuid_dir)
@@ -3893,6 +3904,10 @@ mod tests {
         assert!(
             !empty_uuid_dir.exists(),
             "empty pre-marker key directory must be removed on restart"
+        );
+        assert!(
+            !temp_only_uuid_dir.exists(),
+            "UUID metadata temps must be cleaned without becoming sidecar markers"
         );
         assert!(
             nonempty_uuid_dir.join("operator-data").exists(),
