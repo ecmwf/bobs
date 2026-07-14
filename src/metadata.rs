@@ -4,6 +4,7 @@
 
 use crate::error::{BobsError, Result};
 use crate::spool::SpoolMetadata;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Read, Write};
@@ -64,6 +65,46 @@ impl MetadataDirectoryScan {
     }
 }
 
+const TEMP_CREATE_ATTEMPTS: usize = 16;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MetadataFileIdentity {
+    #[cfg(unix)]
+    pub(crate) device: u64,
+    #[cfg(unix)]
+    pub(crate) inode: u64,
+}
+
+#[derive(Debug)]
+struct CreatedMetadataTemp {
+    file: File,
+    path: PathBuf,
+    identity: MetadataFileIdentity,
+}
+
+#[derive(Debug)]
+struct MetadataTempCleanup {
+    path: Option<PathBuf>,
+}
+
+impl MetadataTempCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for MetadataTempCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = remove_file_if_present(&path);
+        }
+    }
+}
+
 /// Metadata persistence backend.
 ///
 /// All operations are asynchronous and return `Send` futures for generic
@@ -82,9 +123,9 @@ pub trait MetadataStore: Sync {
 /// Synchronous sidecar metadata backend selected for fallback benchmarking and
 /// non-Linux builds.
 ///
-/// Metadata is stored as `<data_dir>/<key>/meta.json`. Updates are committed by
-/// writing `<data_dir>/<key>/meta.json.tmp`, syncing that file's data, renaming
-/// it over the final sidecar, and syncing the spool directory.
+/// Metadata is stored as `<data_dir>/<key>/meta.json`. Updates are committed through
+/// a create-new, non-following, transaction-private temporary file, which is synced,
+/// atomically renamed over the final sidecar, and followed by a spool-directory sync.
 #[derive(Clone, Debug)]
 pub struct SyncSidecarMetadataStore {
     data_dir: PathBuf,
@@ -158,10 +199,6 @@ impl SyncSidecarMetadataStore {
         self.spool_dir(key).join(META_FILE)
     }
 
-    fn tmp_path(&self, key: &str) -> PathBuf {
-        self.spool_dir(key).join(TMP_FILE)
-    }
-
     #[cfg(test)]
     fn invoke_operation_hook(&self) {
         if let Some(hook) = self.operation_hook {
@@ -173,23 +210,27 @@ impl SyncSidecarMetadataStore {
     fn invoke_operation_hook(&self) {}
 
     fn write_sync(&self, metadata: &SpoolMetadata) -> Result<()> {
-        self.invoke_operation_hook();
         let spool_dir = self.spool_dir(&metadata.key);
         fs::create_dir_all(&spool_dir).map_err(storage_error)?;
 
         let payload = serde_json::to_vec(metadata)
             .map_err(|error| BobsError::SerializationError(error.to_string()))?;
         ensure_sidecar_size(payload.len() as u64)?;
-        let tmp_path = spool_dir.join(TMP_FILE);
+        let CreatedMetadataTemp {
+            mut file,
+            path: tmp_path,
+            identity,
+        } = create_metadata_temp(&spool_dir)?;
+        let mut tmp_cleanup = MetadataTempCleanup::new(tmp_path.clone());
         let meta_path = spool_dir.join(META_FILE);
+        self.invoke_operation_hook();
 
-        {
-            let mut tmp = File::create(&tmp_path).map_err(storage_error)?;
-            tmp.write_all(&payload).map_err(storage_error)?;
-            tmp.sync_data().map_err(storage_error)?;
-        }
+        file.write_all(&payload).map_err(storage_error)?;
+        file.sync_data().map_err(storage_error)?;
+        validate_metadata_temp_path(&tmp_path, identity).map_err(storage_error)?;
 
         fs::rename(&tmp_path, &meta_path).map_err(storage_error)?;
+        tmp_cleanup.disarm();
         (self.sync_directory)(&spool_dir).map_err(storage_error)?;
         Ok(())
     }
@@ -209,17 +250,18 @@ impl SyncSidecarMetadataStore {
 
     fn delete_sync(&self, key: &str) -> Result<()> {
         self.invoke_operation_hook();
-        let meta_path = self.meta_path(key);
-        let tmp_path = self.tmp_path(key);
-        let mut removed_any = false;
-
-        removed_any |= remove_file_if_present(&meta_path)?;
-        removed_any |= remove_file_if_present(&tmp_path)?;
+        let spool_dir = self.spool_dir(key);
+        let mut removed_any = remove_file_if_present(&self.meta_path(key))?;
+        removed_any |= remove_metadata_temp_entries(&spool_dir)?;
 
         if removed_any {
-            let spool_dir = self.spool_dir(key);
-            if spool_dir.exists() {
-                (self.sync_directory)(&spool_dir).map_err(storage_error)?;
+            match fs::symlink_metadata(&spool_dir) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    (self.sync_directory)(&spool_dir).map_err(storage_error)?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(storage_error(error)),
             }
         }
 
@@ -246,6 +288,13 @@ impl SyncSidecarMetadataStore {
                 MetadataDirectoryEntryKind::Symlink
             } else if file_type.is_dir() {
                 let path = entry.path();
+                // Recovery is the exclusive startup owner. Remove only names from
+                // the private temp protocol before classifying fixed spool markers.
+                // UUID temps are never sidecars, and symlinks are unlinked rather
+                // than followed.
+                if remove_metadata_temp_entries(&path)? {
+                    (self.sync_directory)(&path).map_err(storage_error)?;
+                }
                 MetadataDirectoryEntryKind::Directory {
                     // lstat both fixed local names. A symlink still counts as a
                     // marker and is rejected by the later trusted-path checks; it
@@ -518,6 +567,144 @@ fn remove_file_if_present(path: &Path) -> Result<bool> {
     }
 }
 
+fn create_metadata_temp(spool_dir: &Path) -> Result<CreatedMetadataTemp> {
+    // `meta.json.tmp` was the historical fixed temporary name. Unlink only that
+    // directory entry, whether it is a regular file or a symlink; never open it.
+    remove_file_if_present(&spool_dir.join(TMP_FILE))?;
+
+    for _ in 0..TEMP_CREATE_ATTEMPTS {
+        let name = format!("{TMP_FILE}.{}", uuid::Uuid::new_v4());
+        let path = spool_dir.join(name);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        configure_no_follow(&mut options);
+
+        match options.open(&path) {
+            Ok(file) => {
+                let identity = match metadata_file_identity(&file) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        let _ = remove_file_if_present(&path);
+                        return Err(storage_error(error));
+                    }
+                };
+                return Ok(CreatedMetadataTemp {
+                    file,
+                    path,
+                    identity,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // Never unlink a transaction-private collision: it may belong to a
+                // concurrent writer. A fresh random name avoids interfering with it.
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+    }
+
+    Err(storage_error(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a private metadata temporary file",
+    )))
+}
+
+fn configure_no_follow(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+fn metadata_file_identity(file: &File) -> io::Result<MetadataFileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata temporary path is not a regular file",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(MetadataFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(MetadataFileIdentity {})
+    }
+}
+
+pub(crate) fn validate_metadata_temp_path(
+    path: &Path,
+    expected: MetadataFileIdentity,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "metadata temporary path was replaced before publication",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != expected.device || metadata.ino() != expected.inode {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "metadata temporary inode was replaced before publication",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_metadata_temp_entries(spool_dir: &Path) -> Result<bool> {
+    let entries = match fs::read_dir(spool_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(storage_error(error)),
+    };
+    let mut removed_any = false;
+
+    for entry in entries {
+        let entry = entry.map_err(storage_error)?;
+        if !is_metadata_temp_name(&entry.file_name()) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(storage_error)?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            continue;
+        }
+        removed_any |= remove_file_if_present(&entry.path())?;
+    }
+
+    Ok(removed_any)
+}
+
+fn is_metadata_temp_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name == TMP_FILE
+        || name
+            .strip_prefix(TMP_FILE)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
@@ -687,6 +874,18 @@ mod tests {
         );
     }
 
+    fn metadata_temp_paths(spool_dir: &Path) -> Vec<PathBuf> {
+        let mut paths = fs::read_dir(spool_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| is_metadata_temp_name(&entry.file_name()))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
     fn metadata_with_generation(generation: u64) -> SpoolMetadata {
         SpoolMetadata {
             key: "sidecar-test-key".to_string(),
@@ -762,6 +961,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_cleans_uuid_temp_without_classifying_it_as_a_sidecar() {
+        let dir = tempdir().expect("create tempdir");
+        let store = SyncSidecarMetadataStore::new(dir.path());
+        let key = "sidecar-test-key";
+        let spool_dir = dir.path().join(key);
+        fs::create_dir_all(&spool_dir).expect("create spool directory");
+        let temp_path = spool_dir.join(format!("{TMP_FILE}.{}", uuid::Uuid::new_v4()));
+        let unrelated_path = spool_dir.join(format!("{TMP_FILE}.not-a-uuid"));
+        fs::write(&temp_path, b"stale private transaction").expect("seed private temp");
+        fs::write(&unrelated_path, b"unrelated").expect("seed unrelated entry");
+
+        let mut scan = store.scan().await.expect("scan metadata");
+        assert_eq!(
+            scan.next().await.expect("one entry").expect("valid entry"),
+            MetadataDirectoryEntry {
+                name: key.to_owned(),
+                kind: MetadataDirectoryEntryKind::Directory {
+                    has_sidecar: false,
+                    has_data: false,
+                },
+            }
+        );
+        assert!(scan.next().await.is_none());
+        assert!(fs::symlink_metadata(temp_path).is_err());
+        assert_eq!(
+            fs::read(unrelated_path).expect("read unrelated entry"),
+            b"unrelated"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn scan_unlinks_uuid_temp_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        fs::create_dir(&data_dir).expect("create data directory");
+        let store = SyncSidecarMetadataStore::new(&data_dir);
+        let key = "sidecar-test-key";
+        let spool_dir = data_dir.join(key);
+        fs::create_dir_all(&spool_dir).expect("create spool directory");
+        let target = dir.path().join("external-target");
+        fs::write(&target, b"sentinel").expect("seed target");
+        let temp_path = spool_dir.join(format!("{TMP_FILE}.{}", uuid::Uuid::new_v4()));
+        symlink(&target, &temp_path).expect("seed private temp symlink");
+
+        let mut scan = store.scan().await.expect("scan metadata");
+        let entry = scan.next().await.expect("one entry").expect("valid entry");
+        assert_eq!(
+            entry.kind,
+            MetadataDirectoryEntryKind::Directory {
+                has_sidecar: false,
+                has_data: false,
+            }
+        );
+        assert!(scan.next().await.is_none());
+        assert!(fs::symlink_metadata(temp_path).is_err());
+        assert_eq!(fs::read(target).expect("read target"), b"sentinel");
+    }
+
+    #[tokio::test]
     async fn sync_store_replacement_keeps_old_final_until_rename() {
         let dir = tempdir().expect("create tempdir");
         let store = SyncSidecarMetadataStore::new(dir.path());
@@ -812,6 +1073,192 @@ mod tests {
             .delete(&meta.key)
             .await
             .expect("delete absent metadata");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sync_store_unlinks_stale_tmp_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("create tempdir");
+        let store = SyncSidecarMetadataStore::new(dir.path());
+        let mut meta = metadata_with_generation(1);
+        meta.key = "A".to_owned();
+        let spool_dir = dir.path().join(&meta.key);
+        let target_dir = dir.path().join("B");
+        fs::create_dir_all(&spool_dir).expect("create metadata directory");
+        fs::create_dir_all(&target_dir).expect("create target directory");
+        let target = target_dir.join("spool.dat");
+        let sentinel = b"must not be truncated";
+        fs::write(&target, sentinel).expect("seed symlink target");
+        symlink(&target, spool_dir.join(TMP_FILE)).expect("craft stale temporary symlink");
+
+        store.write(&meta).await.expect("write metadata safely");
+
+        assert_eq!(fs::read(&target).expect("read target"), sentinel);
+        assert!(fs::symlink_metadata(spool_dir.join(TMP_FILE)).is_err());
+        assert!(metadata_temp_paths(&spool_dir).is_empty());
+        assert_metadata_eq(
+            store.read(&meta.key).await.expect("read metadata").unwrap(),
+            &meta,
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sync_store_read_ignores_and_delete_unlinks_tmp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("create tempdir");
+        let store = SyncSidecarMetadataStore::new(dir.path());
+        let mut meta = metadata_with_generation(1);
+        meta.key = "A".to_owned();
+        let spool_dir = dir.path().join(&meta.key);
+        let target_dir = dir.path().join("B");
+        fs::create_dir_all(&spool_dir).expect("create metadata directory");
+        fs::create_dir_all(&target_dir).expect("create target directory");
+        let target = target_dir.join("spool.dat");
+        let sentinel = b"temporary symlink target";
+        fs::write(&target, sentinel).expect("seed symlink target");
+        let tmp_path = spool_dir.join(TMP_FILE);
+        symlink(&target, &tmp_path).expect("craft temporary symlink");
+
+        assert!(store
+            .read(&meta.key)
+            .await
+            .expect("read metadata")
+            .is_none());
+        assert_eq!(
+            fs::read(&target).expect("read target after metadata read"),
+            sentinel
+        );
+        store
+            .delete(&meta.key)
+            .await
+            .expect("delete temporary symlink");
+        assert!(fs::symlink_metadata(&tmp_path).is_err());
+        assert_eq!(
+            fs::read(&target).expect("read target after metadata delete"),
+            sentinel
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_store_recovers_stale_regular_tmp() {
+        let dir = tempdir().expect("create tempdir");
+        let store = SyncSidecarMetadataStore::new(dir.path());
+        let meta = metadata_with_generation(1);
+        let spool_dir = dir.path().join(&meta.key);
+        fs::create_dir_all(&spool_dir).expect("create spool directory");
+        fs::write(spool_dir.join(TMP_FILE), b"stale partial metadata")
+            .expect("seed stale regular temporary file");
+
+        store
+            .write(&meta)
+            .await
+            .expect("recover stale temporary file");
+
+        assert!(metadata_temp_paths(&spool_dir).is_empty());
+        assert_metadata_eq(
+            store.read(&meta.key).await.expect("read metadata").unwrap(),
+            &meta,
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_store_concurrent_writes_use_independent_temps() {
+        let dir = tempdir().expect("create tempdir");
+        let store = SyncSidecarMetadataStore::new(dir.path());
+        let first = metadata_with_generation(1);
+        let second = metadata_with_generation(2);
+
+        let (first_result, second_result) = tokio::join!(store.write(&first), store.write(&second));
+        first_result.expect("first concurrent write");
+        second_result.expect("second concurrent write");
+
+        let actual = store
+            .read(&first.key)
+            .await
+            .expect("read final metadata")
+            .unwrap();
+        assert!(
+            actual.total_pages == first.total_pages || actual.total_pages == second.total_pages
+        );
+        assert!(metadata_temp_paths(&dir.path().join(&first.key)).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_sync_write_leaves_no_orphaned_temp() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        static WRITE_STARTED: AtomicBool = AtomicBool::new(false);
+
+        fn slow_write() {
+            WRITE_STARTED.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
+        WRITE_STARTED.store(false, Ordering::SeqCst);
+        let dir = tempdir().expect("create tempdir");
+        let store = SyncSidecarMetadataStore::with_operation_hook(dir.path(), slow_write);
+        let meta = metadata_with_generation(1);
+        let spool_dir = dir.path().join(&meta.key);
+        let write_store = store.clone();
+        let write_meta = meta.clone();
+        let write = tokio::spawn(async move { write_store.write(&write_meta).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !WRITE_STARTED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking write should start");
+        assert_eq!(metadata_temp_paths(&spool_dir).len(), 1);
+
+        write.abort();
+        assert!(write
+            .await
+            .expect_err("write should be cancelled")
+            .is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !metadata_temp_paths(&spool_dir).is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached blocking transaction should finish without an orphaned temp");
+        assert!(spool_dir.join(META_FILE).is_file());
+    }
+
+    #[tokio::test]
+    async fn sync_store_rejects_replaced_transaction_temp() {
+        use std::sync::OnceLock;
+
+        static SPOOL_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+        fn replace_temp() {
+            let paths = metadata_temp_paths(SPOOL_DIR.get().expect("test spool path set"));
+            assert_eq!(paths.len(), 1);
+            fs::remove_file(&paths[0]).expect("unlink opened transaction temp");
+            fs::write(&paths[0], b"attacker replacement").expect("replace transaction temp");
+        }
+
+        let dir = tempdir().expect("create tempdir");
+        let meta = metadata_with_generation(1);
+        let spool_dir = dir.path().join(&meta.key);
+        SPOOL_DIR
+            .set(spool_dir.clone())
+            .expect("set test spool path");
+        let store = SyncSidecarMetadataStore::with_operation_hook(dir.path(), replace_temp);
+
+        assert!(matches!(
+            store.write(&meta).await,
+            Err(BobsError::StorageError(_))
+        ));
+        assert!(!spool_dir.join(META_FILE).exists());
+        assert!(metadata_temp_paths(&spool_dir).is_empty());
     }
 
     #[tokio::test]
