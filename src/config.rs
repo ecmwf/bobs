@@ -26,6 +26,8 @@ fn derived_max_live_spools(page_size: usize, max_cache_bytes: usize) -> usize {
 const DEFAULT_MAX_SPOOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Tokio's bounded MPSC channel stores capacity in a semaphore.
 pub const MAX_IO_URING_QUEUE_CAPACITY: usize = tokio::sync::Semaphore::MAX_PERMITS;
+/// Operational ceiling for live-spool admission and the recovery candidate heap.
+pub const MAX_LIVE_SPOOLS: usize = 65_536;
 
 pub(crate) fn validate_page_size(page_size: usize) -> Result<()> {
     if page_size == 0 {
@@ -43,6 +45,22 @@ pub(crate) fn validate_page_size(page_size: usize) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_max_live_spools(max_live_spools: usize) -> Result<()> {
+    if max_live_spools == 0 {
+        return Err(BobsError::ConfigurationError(
+            "max_live_spools must be greater than 0".to_string(),
+        ));
+    }
+
+    if max_live_spools > MAX_LIVE_SPOOLS {
+        return Err(BobsError::ConfigurationError(format!(
+            "max_live_spools must not exceed {MAX_LIVE_SPOOLS}"
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -53,8 +71,9 @@ pub struct Config {
     pub max_cache_bytes: usize,
     /// Maximum number of spools admitted before their first complete read.
     /// Writers wait for a slot; startup leaves excess durable spools quarantined.
-    /// When omitted from YAML, this is derived from `max_cache_bytes / page_size`
-    /// (with a minimum of one). Explicit operator overrides are preserved.
+    /// Valid range: `1..=MAX_LIVE_SPOOLS`. When omitted from YAML, this is derived
+    /// from `max_cache_bytes / page_size` (with a minimum of one). Derived and
+    /// explicit values are both subject to the same upper bound.
     pub max_live_spools: usize,
     /// Maximum bytes accepted for one spool across all write requests.
     pub max_spool_bytes: u64,
@@ -95,7 +114,8 @@ pub struct MetricsConfig {
     pub enabled: bool,
     /// Bind address for the Prometheus `/metrics` scrape endpoint.
     pub bind_address: String,
-    /// Port for the Prometheus `/metrics` scrape endpoint.
+    /// Port for the Prometheus `/metrics` scrape endpoint. When telemetry is
+    /// enabled, this must differ from the main HTTP `port`.
     pub port: u16,
     /// Only these label keys are propagated as metric attributes.
     /// If empty, ALL caller-provided labels are propagated.
@@ -193,17 +213,13 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_page_size(self.page_size)?;
 
-        if self.max_live_spools == 0 {
-            return Err(BobsError::ConfigurationError(
-                "max_live_spools must be greater than 0".to_string(),
-            ));
-        }
+        validate_max_live_spools(self.max_live_spools)?;
 
-        if self.max_live_spools > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(BobsError::ConfigurationError(format!(
-                "max_live_spools must not exceed {}",
-                tokio::sync::Semaphore::MAX_PERMITS
-            )));
+        #[cfg(feature = "telemetry")]
+        if self.metrics.enabled && self.metrics.port == self.port {
+            return Err(BobsError::ConfigurationError(
+                "metrics.port must differ from port when metrics.enabled is true".to_string(),
+            ));
         }
 
         if self.max_spool_bytes == 0 {
@@ -539,18 +555,76 @@ route_name: test-route
     }
 
     #[test]
-    fn test_validate_rejects_max_live_spools_above_semaphore_limit() {
+    fn test_validate_accepts_max_live_spools_upper_bound() {
         let config = Config {
-            max_live_spools: tokio::sync::Semaphore::MAX_PERMITS + 1,
+            max_live_spools: MAX_LIVE_SPOOLS,
             host_prefix: "test".into(),
             domain: "example.com".into(),
             route_name: "bobs".into(),
             ..Config::default()
         };
 
-        let err = config.validate().expect_err("validation should fail");
+        config.validate().expect("upper bound should be valid");
+    }
+
+    #[test]
+    fn test_validate_rejects_max_live_spools_above_policy_bound() {
+        for max_live_spools in [MAX_LIVE_SPOOLS + 1, usize::MAX] {
+            let config = Config {
+                max_live_spools,
+                host_prefix: "test".into(),
+                domain: "example.com".into(),
+                route_name: "bobs".into(),
+                ..Config::default()
+            };
+
+            let err = config.validate().expect_err("validation should fail");
+            assert!(matches!(err, BobsError::ConfigurationError(_)));
+            assert!(err.to_string().contains("max_live_spools"));
+            assert!(err.to_string().contains(&MAX_LIVE_SPOOLS.to_string()));
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn test_validate_rejects_enabled_metrics_on_main_http_port() {
+        let config = Config {
+            port: 3000,
+            metrics: MetricsConfig {
+                enabled: true,
+                port: 3000,
+                ..MetricsConfig::default()
+            },
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        let err = config.validate().expect_err("port collision should fail");
         assert!(matches!(err, BobsError::ConfigurationError(_)));
-        assert!(err.to_string().contains("max_live_spools"));
+        assert!(err
+            .to_string()
+            .contains("metrics.port must differ from port"));
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn test_validate_accepts_enabled_metrics_on_different_port() {
+        let config = Config {
+            port: 3000,
+            metrics: MetricsConfig {
+                enabled: true,
+                port: 9464,
+                ..MetricsConfig::default()
+            },
+            host_prefix: "test".into(),
+            domain: "example.com".into(),
+            route_name: "bobs".into(),
+            ..Config::default()
+        };
+
+        config.validate().expect("different ports should be valid");
     }
 
     #[test]
@@ -899,26 +973,32 @@ route_name: z
     }
 
     #[test]
-    fn test_from_file_rejects_derived_admission_above_semaphore_limit() {
-        let tmp = tempdir().expect("tempdir");
-        let path = tmp.path().join("derived-too-large.yaml");
-        std::fs::write(
-            &path,
-            format!(
-                "page_size: 1\nmax_cache_bytes: {}\nhost_prefix: x\ndomain: y\nroute_name: z\n",
-                tokio::sync::Semaphore::MAX_PERMITS + 1
-            ),
-        )
-        .expect("write yaml");
+    fn test_from_file_applies_policy_bound_to_derived_admission() {
+        for (max_cache_bytes, should_pass) in [
+            (MAX_LIVE_SPOOLS, true),
+            (MAX_LIVE_SPOOLS + 1, false),
+            (usize::MAX, false),
+        ] {
+            let tmp = tempdir().expect("tempdir");
+            let path = tmp.path().join("derived-admission.yaml");
+            std::fs::write(
+                &path,
+                format!(
+                    "page_size: 1\nmax_cache_bytes: {max_cache_bytes}\nhost_prefix: x\ndomain: y\nroute_name: z\n"
+                ),
+            )
+            .expect("write yaml");
 
-        let config = Config::from_file(&path).expect("parse yaml");
-        assert_eq!(
-            config.max_live_spools,
-            tokio::sync::Semaphore::MAX_PERMITS + 1
-        );
-        let err = config
-            .validate()
-            .expect_err("derived admission above semaphore limit must fail");
-        assert!(err.to_string().contains("max_live_spools"));
+            let config = Config::from_file(&path).expect("parse yaml");
+            assert_eq!(config.max_live_spools, max_cache_bytes);
+            let result = config.validate();
+            if should_pass {
+                result.expect("derived upper bound should pass");
+            } else {
+                let err = result.expect_err("derived admission above policy bound must fail");
+                assert!(matches!(err, BobsError::ConfigurationError(_)));
+                assert!(err.to_string().contains("max_live_spools"));
+            }
+        }
     }
 }
