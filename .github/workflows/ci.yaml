@@ -39,8 +39,11 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
+      - name: Run default-feature tests
         run: cargo test
+
+      - name: Run Skaffold telemetry-feature tests
+        run: cargo test --features telemetry
 
   helm:
     runs-on: ubuntu-latest
