@@ -5,10 +5,9 @@
 use crate::config::MAX_PAGE_SIZE_BYTES;
 use crate::error::{BobsError, Result};
 use crate::io::{read_exact_at, FileIO};
-use crate::metadata::{
-    MetadataDirectoryEntryKind, MetadataStore, SyncSidecarMetadataStore,
-    METADATA_SCAN_CHANNEL_CAPACITY,
-};
+#[cfg(test)]
+use crate::metadata::METADATA_SCAN_CHANNEL_CAPACITY;
+use crate::metadata::{MetadataDirectoryEntryKind, MetadataStore, SyncSidecarMetadataStore};
 use crate::metrics::BobsMetrics;
 use crate::spool::{CleanupAnchors, PageCache, Spool, SpoolMetadata, SpoolState};
 use crate::time::now_secs;
@@ -529,8 +528,11 @@ where
         let mut orphan_deleted = 0_u64;
         let mut rejected_count = 0_usize;
         let mut quarantined_count = 0_usize;
-        let mut candidates =
-            RecoveryCandidateBuilder::new(self.max_live_spools, METADATA_SCAN_CHANNEL_CAPACITY);
+        let mut candidates = RecoveryCandidateBuilder::new(self.max_live_spools);
+        // A retained candidate keeps the handle that proved its canonical payload
+        // openable. This bounds descriptors by admission capacity and removes a
+        // preflight-to-admission reopen race without retaining full metadata.
+        let mut preflight_handles = HashMap::with_capacity(self.max_live_spools);
 
         // This is the only top-level data-directory scan. The blocking producer
         // is backpressured by a fixed-size channel; each sidecar is read and
@@ -647,17 +649,52 @@ where
             let activity_at = recovery_activity_at(&meta);
             let canonical_data_path = self.data_dir.join(&name).join("spool.dat");
             match prepare_recovery_candidate(meta, &canonical_data_path, self.page_size) {
-                RecoveryMetadataDisposition::Candidate(_) => {
-                    if let Some(excess) = candidates.push(RecoveryCandidateSummary {
-                        key: name,
+                RecoveryMetadataDisposition::Candidate(prepared) => {
+                    let preflight_file_size = prepared.file_size;
+                    // Validate payload openability before it can occupy the bounded
+                    // preferred set. Do not read active tails here: excess candidates
+                    // must cost only one streamed sidecar, one stat, and one open.
+                    let handle = match F::open(&canonical_data_path).await {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            tracing::warn!(key = %name, error = %error, "recovery: canonical payload preflight failed; leaving spool intact and continuing scan");
+                            rejected_count += 1;
+                            continue;
+                        }
+                    };
+                    let excess = candidates.push(RecoveryCandidateSummary {
+                        key: name.clone(),
                         activity_at,
-                    }) {
-                        quarantined_count += 1;
-                        record_capacity_quarantine(
-                            &excess,
-                            self.max_live_spools,
-                            "outside_bounded_candidate_window",
-                        );
+                    });
+                    match excess {
+                        None => {
+                            let previous =
+                                preflight_handles.insert(name, (handle, preflight_file_size));
+                            debug_assert!(previous.is_none());
+                        }
+                        Some(excess) => {
+                            quarantined_count += 1;
+                            record_capacity_quarantine(
+                                &excess,
+                                self.max_live_spools,
+                                "outside_bounded_candidate_window",
+                            );
+                            if excess.key == name {
+                                if let Err(error) = F::close(handle).await {
+                                    tracing::warn!(key = %name, error = %error, "recovery: failed to close excess preflight payload handle");
+                                }
+                            } else {
+                                let (displaced_handle, _) = preflight_handles
+                                    .remove(&excess.key)
+                                    .expect("displaced recovery candidate has a preflight handle");
+                                let previous =
+                                    preflight_handles.insert(name, (handle, preflight_file_size));
+                                debug_assert!(previous.is_none());
+                                if let Err(error) = F::close(displaced_handle).await {
+                                    tracing::warn!(key = %excess.key, error = %error, "recovery: failed to close displaced preflight payload handle");
+                                }
+                            }
+                        }
                     }
                 }
                 RecoveryMetadataDisposition::Cleanup { reason } => {
@@ -679,30 +716,41 @@ where
         let mut recovered_count = 0_usize;
         let mut capacity_blocked_candidate = None;
 
-        // The candidate heap is bounded by admission capacity plus a fixed refill
-        // reserve. Full metadata is reread only when a key is selected. Rejected
-        // selected candidates release their permit and the next preferred key is
-        // tried without opening data for ordinary excess entries.
+        // The heap and preflight handle set are bounded exactly by admission
+        // capacity. Full metadata is reread only for selected keys; ordinary
+        // excess payloads are never tail-read or retained after their preflight.
         while recovered_count < self.max_live_spools {
             let Some(summary) = candidates.pop() else {
                 break;
             };
             let activity_at = summary.activity_at;
             let key = summary.key;
+            let (preflight_handle, preflight_file_size) = preflight_handles
+                .remove(&key)
+                .expect("selected recovery candidate has a preflight handle");
             let meta = match self.metadata_store.read(&key).await {
                 Ok(Some(meta)) if meta.key == key => meta,
                 Ok(Some(meta)) => {
                     tracing::warn!(directory_key = %key, metadata_key = %meta.key, "recovery: selected sidecar key changed; leaving it intact and unavailable");
+                    if let Err(error) = F::close(preflight_handle).await {
+                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
+                    }
                     rejected_count += 1;
                     continue;
                 }
                 Ok(None) => {
                     tracing::warn!(key = %key, "recovery: selected sidecar disappeared; leaving directory intact");
+                    if let Err(error) = F::close(preflight_handle).await {
+                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
+                    }
                     rejected_count += 1;
                     continue;
                 }
                 Err(error) => {
                     tracing::warn!(key = %key, error = %error, "recovery: selected sidecar changed or became unreadable; leaving it intact and trying the next candidate");
+                    if let Err(error) = F::close(preflight_handle).await {
+                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
+                    }
                     rejected_count += 1;
                     continue;
                 }
@@ -717,6 +765,9 @@ where
                 RecoveryMetadataDisposition::Candidate(prepared) => *prepared,
                 RecoveryMetadataDisposition::Cleanup { reason } => {
                     tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unrecoverable; discarding it and trying the next candidate");
+                    if let Err(error) = F::close(preflight_handle).await {
+                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
+                    }
                     self.metadata_store.delete(&key).await?;
                     self.remove_spool_directory_durably(&key).await?;
                     stale_count += 1;
@@ -726,6 +777,9 @@ where
                 }
                 RecoveryMetadataDisposition::Preserve { reason } => {
                     tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unsafe; leaving it intact and trying the next candidate");
+                    if let Err(error) = F::close(preflight_handle).await {
+                        tracing::warn!(key = %key, error = %error, "recovery: failed to close rejected preflight payload handle");
+                    }
                     rejected_count += 1;
                     continue;
                 }
@@ -742,25 +796,32 @@ where
             } = prepared;
             let spool_page_size = migration.page_size;
 
+            if file_size != preflight_file_size {
+                tracing::warn!(key = %key, preflight_file_size, file_size, "recovery: canonical payload size changed after preflight; leaving spool intact and trying the next candidate");
+                if let Err(error) = F::close(preflight_handle).await {
+                    tracing::warn!(key = %key, error = %error, "recovery: failed to close size-raced preflight payload handle");
+                }
+                rejected_count += 1;
+                continue;
+            }
+
             let permit = match Arc::clone(&self.admission).try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
                     tracing::warn!(key = %key, "recovery: admission permit unavailable before configured bound");
+                    if let Err(error) = F::close(preflight_handle).await {
+                        tracing::warn!(key = %key, error = %error, "recovery: failed to close capacity-blocked preflight payload handle");
+                    }
                     capacity_blocked_candidate =
                         Some(RecoveryCandidateSummary { key, activity_at });
                     break;
                 }
             };
 
-            let handle = match F::open(&canonical_data_path).await {
-                Ok(handle) => handle,
-                Err(error) => {
-                    tracing::warn!(key = %key, error = %error, "recovery: failed to open data file; leaving spool intact and trying the next candidate");
-                    rejected_count += 1;
-                    drop(permit);
-                    continue;
-                }
-            };
+            // Use the successful preflight descriptor directly. Reopening here
+            // would let a transient or adversarial race repeatedly crowd out an
+            // older valid spool on every restart.
+            let handle = preflight_handle;
 
             let trailing_partial = if trailing_partial_len > 0 {
                 match read_exact_at::<F>(
@@ -792,6 +853,8 @@ where
                 }
                 if migration.write_locked_salvage {
                     tracing::warn!(key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating WriteLocked spool to bounded Complete salvage; further writes are rejected, reads and idempotent completion remain available");
+                } else if migration.legacy_writing_salvage {
+                    tracing::warn!(key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating zero-page legacy Writing spool to bounded Complete salvage; exact durable bytes remain readable and further writes are rejected");
                 } else if migration.persist {
                     tracing::info!(key = %key, page_size = spool_page_size, "recovery: atomically resegmenting terminal or legacy sidecar metadata");
                 }
@@ -863,7 +926,14 @@ where
         while let Some(summary) = candidates.pop() {
             quarantined_count += 1;
             record_capacity_quarantine(&summary, self.max_live_spools, "admission_capacity");
+            let (handle, _) = preflight_handles
+                .remove(&summary.key)
+                .expect("quarantined recovery candidate has a preflight handle");
+            if let Err(error) = F::close(handle).await {
+                tracing::warn!(key = %summary.key, error = %error, "recovery: failed to close quarantined preflight payload handle");
+            }
         }
+        debug_assert!(preflight_handles.is_empty());
 
         // Commit empty pre-marker removals, and retry any parent-directory
         // durability boundary left uncertain by an earlier failed recovery.
@@ -927,7 +997,7 @@ fn record_capacity_quarantine(
         configured,
         activity_at = summary.activity_at,
         reason,
-        "recovery: valid excess candidate left durable and unopened for a later restart"
+        "recovery: valid excess candidate left durable after bounded open preflight without tail reads for a later restart"
     );
 }
 
@@ -958,11 +1028,10 @@ struct RecoveryCandidateBuilder {
 }
 
 impl RecoveryCandidateBuilder {
-    fn new(admission_capacity: usize, refill_reserve: usize) -> Self {
-        let window_capacity = admission_capacity.saturating_add(refill_reserve);
+    fn new(admission_capacity: usize) -> Self {
         Self {
-            window_capacity,
-            preferred: BinaryHeap::with_capacity(window_capacity),
+            window_capacity: admission_capacity,
+            preferred: BinaryHeap::with_capacity(admission_capacity),
         }
     }
 
@@ -1154,12 +1223,15 @@ struct RecoveryMigration {
     page_size: usize,
     persist: bool,
     write_locked_salvage: bool,
+    legacy_writing_salvage: bool,
 }
 
 /// Convert every terminal byte stream to the current bounded stride. Active
-/// Writing retains a historical stride only when it is no larger than the current
-/// configured stride. Missing or oversized WriteLocked layouts are terminalized
-/// to bounded Complete salvage because their durable bytes are contiguous.
+/// Writing retains a known historical stride no larger than the current configured
+/// stride. Legacy zero-page Writing is terminalized only when all contiguous durable
+/// bytes fit in one current page; ambiguous legacy multi-page layouts are preserved.
+/// Missing or oversized WriteLocked layouts are terminalized to bounded Complete
+/// salvage because their durable bytes are contiguous.
 fn prepare_recovery_metadata(
     meta: &mut SpoolMetadata,
     file_size: u64,
@@ -1186,6 +1258,7 @@ fn prepare_recovery_metadata(
             page_size: configured_page_size,
             persist,
             write_locked_salvage: false,
+            legacy_writing_salvage: false,
         });
     }
 
@@ -1194,6 +1267,36 @@ fn prepare_recovery_metadata(
         || usize::try_from(meta.page_size)
             .ok()
             .is_none_or(|size| size > MAX_PAGE_SIZE_BYTES);
+
+    if meta.state == SpoolState::Writing && missing_page_size {
+        validate_legacy_active_layout(meta, file_size)?;
+        if meta.total_pages != 0 {
+            return Err(
+                "active legacy multi-page layout has no authoritative historical stride".into(),
+            );
+        }
+        if file_size > target_page_size {
+            return Err(format!(
+                "zero-page legacy Writing payload has {file_size} bytes, exceeding the bounded terminal salvage page size {target_page_size}"
+            ));
+        }
+
+        let write_locked = meta.write_locked;
+        resegment_complete_bytes(
+            meta,
+            file_size,
+            target_page_size,
+            write_locked,
+            "zero-page Writing salvage",
+        )?;
+        meta.page_size = target_page_size;
+        return Ok(RecoveryMigration {
+            page_size: configured_page_size,
+            persist: true,
+            write_locked_salvage: false,
+            legacy_writing_salvage: true,
+        });
+    }
 
     if meta.state == SpoolState::WriteLocked && (missing_page_size || oversized_page_size) {
         validate_legacy_active_layout(meta, file_size)?;
@@ -1212,6 +1315,7 @@ fn prepare_recovery_metadata(
             page_size: configured_page_size,
             persist: true,
             write_locked_salvage: true,
+            legacy_writing_salvage: false,
         });
     }
 
@@ -1240,6 +1344,7 @@ fn prepare_recovery_metadata(
         page_size,
         persist: missing_page_size,
         write_locked_salvage: false,
+        legacy_writing_salvage: false,
     })
 }
 
@@ -1276,24 +1381,9 @@ fn derive_legacy_page_size(
     file_size: u64,
 ) -> std::result::Result<u64, String> {
     if matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
-        validate_legacy_active_layout(meta, file_size)?;
-        if meta.total_pages == 0 {
-            // No page-1 offset exists. Keep every durable byte in the trailing
-            // buffer by choosing a stride strictly larger than a non-empty file.
-            return if file_size == 0 {
-                Ok(1)
-            } else {
-                file_size
-                    .checked_add(1)
-                    .ok_or_else(|| "durable file is too large to choose a safe stride".into())
-            };
-        }
-        if file_size == 0 || !file_size.is_multiple_of(meta.total_pages) {
-            return Err(
-                "durable file length is not exactly divisible by the active page count".into(),
-            );
-        }
-        return Ok(file_size / meta.total_pages);
+        return Err(
+            "active legacy page size is ambiguous without an authoritative durable stride".into(),
+        );
     }
 
     if meta.state != SpoolState::Complete {
@@ -1712,6 +1802,7 @@ mod tests {
     static RECOVERY_MAX_READ_LEN: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     const RECOVERY_FAIL_OPEN_KEY: &str = "ffffffff-ffff-4fff-8fff-ffffffffff05";
+    const RECOVERY_FAIL_OPEN_PREFIX: &str = "eeeeeeee-eeee-4eee-8eee-";
 
     #[derive(Clone)]
     struct RecoveryCountingFileIO;
@@ -1733,7 +1824,10 @@ mod tests {
                 if path
                     .parent()
                     .and_then(Path::file_name)
-                    .is_some_and(|key| key == RECOVERY_FAIL_OPEN_KEY)
+                    .and_then(|key| key.to_str())
+                    .is_some_and(|key| {
+                        key == RECOVERY_FAIL_OPEN_KEY || key.starts_with(RECOVERY_FAIL_OPEN_PREFIX)
+                    })
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -1932,10 +2026,10 @@ mod tests {
     }
 
     #[test]
-    fn million_key_recovery_index_is_capacity_plus_channel_bounded() {
+    fn million_key_recovery_index_is_admission_bounded() {
         const KEY_COUNT: usize = 1_000_000;
         const CAPACITY: usize = 64;
-        let mut builder = RecoveryCandidateBuilder::new(CAPACITY, METADATA_SCAN_CHANNEL_CAPACITY);
+        let mut builder = RecoveryCandidateBuilder::new(CAPACITY);
         let mut discarded = 0;
         for index in 0..KEY_COUNT {
             discarded += usize::from(
@@ -1948,9 +2042,8 @@ mod tests {
             );
         }
 
-        let retained_bound = CAPACITY + METADATA_SCAN_CHANNEL_CAPACITY;
-        assert_eq!(builder.preferred.len(), retained_bound);
-        assert_eq!(discarded, KEY_COUNT - retained_bound);
+        assert_eq!(builder.preferred.len(), CAPACITY);
+        assert_eq!(discarded, KEY_COUNT - CAPACITY);
         let mut queue = builder.finish();
         assert_eq!(
             queue.pop().expect("best candidate").activity_at,
@@ -2096,6 +2189,72 @@ mod tests {
         )
         .await
         .expect("write old-main sidecar");
+    }
+
+    async fn write_sparse_old_main_writing_fixture(
+        data_dir: &Path,
+        key: &str,
+        file_len: u64,
+        prefix: &[u8],
+        suffix: &[u8],
+    ) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let spool_dir = data_dir.join(key);
+        let data_path = spool_dir.join("spool.dat");
+        std::fs::create_dir_all(&spool_dir).expect("create sparse legacy fixture directory");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&data_path)
+            .expect("create sparse legacy payload");
+        file.set_len(file_len)
+            .expect("set sparse legacy payload length");
+        file.write_all(prefix).expect("write sparse legacy prefix");
+        if !suffix.is_empty() {
+            file.seek(SeekFrom::Start(file_len - suffix.len() as u64))
+                .expect("seek sparse legacy suffix");
+            file.write_all(suffix).expect("write sparse legacy suffix");
+        }
+        file.sync_data().expect("sync sparse legacy payload");
+
+        let sidecar = serde_json::json!({
+            "key": key,
+            "content_type": null,
+            "content_encoding": null,
+            "state": "Writing",
+            "write_locked": false,
+            "created_at": 11,
+            "last_write_at": 12,
+            "last_read_at": null,
+            "readable_at": 13,
+            "total_bytes_written": file_len,
+            "total_pages": 0,
+            "final_page_size": null,
+            "data_path": data_path,
+            "labels": {},
+        });
+        tokio::fs::write(
+            spool_dir.join("meta.json"),
+            serde_json::to_vec(&sidecar).expect("serialize sparse old-main fixture"),
+        )
+        .await
+        .expect("write sparse old-main sidecar");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_rss_bytes() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
+        let kib = status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("parse VmRSS");
+        kib * 1024
     }
 
     #[tokio::test]
@@ -2864,8 +3023,8 @@ mod tests {
         assert_eq!(actual_admitted, expected_admitted_sorted);
         assert_eq!(
             RECOVERY_OPEN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "only admitted spool data files may be opened"
+            keys.len(),
+            "every metadata-valid payload is open-preflighted, but only admitted tails are read"
         );
         assert_eq!(
             RECOVERY_READ_BYTES.load(std::sync::atomic::Ordering::SeqCst),
@@ -3180,86 +3339,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_releases_failed_permit_and_does_not_read_valid_excess_tail() {
+    async fn max_one_recovery_skips_hundreds_of_newer_open_failures_on_every_restart() {
         let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        const FAILED_COUNT: usize = 128;
+
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let page_size = 4096_usize;
-        let active_key = "ffffffff-ffff-4fff-8fff-ffffffffff06";
-        let excess_key = "ffffffff-ffff-4fff-8fff-ffffffffff07";
-        let fixture = SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 65536, 3)
-            .expect("fixture manager");
+        let valid_key = "10000000-0000-4000-8000-999999999999";
+        let fixture =
+            SpoolManager::<TokioFileIO>::new(&data_dir, page_size, 65536, FAILED_COUNT + 1)
+                .expect("fixture manager");
 
-        let mut failed =
-            sidecar_fixture_metadata(&data_dir, RECOVERY_FAIL_OPEN_KEY, SpoolState::Writing, 17);
-        failed.last_write_at = 1_000;
-        write_sidecar_fixture(&fixture, failed, b"newer-but-unopenable").await;
+        for index in 0..FAILED_COUNT {
+            let key = format!("eeeeeeee-eeee-4eee-8eee-{index:012}");
+            let mut failed = sidecar_fixture_metadata(
+                &data_dir,
+                &key,
+                SpoolState::Writing,
+                b"unopenable".len() as u64,
+            );
+            failed.last_write_at = 10_000 + index as u64;
+            write_sidecar_fixture(&fixture, failed, b"unopenable").await;
+        }
 
-        let active_data = b"older-active";
-        let mut active = sidecar_fixture_metadata(
-            &data_dir,
-            active_key,
-            SpoolState::Writing,
-            active_data.len() as u64,
-        );
-        active.last_write_at = 900;
-        write_sidecar_fixture(&fixture, active, active_data).await;
-
-        let excess_data = b"valid-excess-tail";
-        let mut excess = sidecar_fixture_metadata(
-            &data_dir,
-            excess_key,
-            SpoolState::Writing,
-            excess_data.len() as u64,
-        );
-        excess.last_write_at = 800;
-        write_sidecar_fixture(&fixture, excess, excess_data).await;
-        let excess_sidecar = tokio::fs::read(data_dir.join(excess_key).join("meta.json"))
-            .await
-            .expect("snapshot excess sidecar");
+        let mut valid = sidecar_fixture_metadata(&data_dir, valid_key, SpoolState::Complete, 4);
+        valid.last_write_at = 1;
+        write_sidecar_fixture(&fixture, valid, b"good").await;
         drop(fixture);
 
-        RECOVERY_OPEN_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
-        RECOVERY_OPEN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
-        RECOVERY_READ_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
-        let limited = SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, page_size, 65536, 1)
-            .expect("limited manager");
-        let counts = limited
-            .recover_with_counts()
-            .await
-            .expect("bounded recovery succeeds");
-
-        assert_eq!(
-            counts,
-            (1, 1),
-            "only the metadata-valid excess spool contributes to quarantine metrics"
-        );
-        assert!(limited.get_spool(active_key).is_some());
-        assert!(limited.get_spool(RECOVERY_FAIL_OPEN_KEY).is_none());
-        assert!(limited.get_spool(excess_key).is_none());
-        assert_eq!(
-            RECOVERY_OPEN_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "failed candidate releases its permit so the older candidate is attempted"
-        );
-        assert_eq!(
-            RECOVERY_OPEN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-        assert_eq!(
-            RECOVERY_READ_BYTES.load(std::sync::atomic::Ordering::SeqCst),
-            active_data.len(),
-            "the valid excess tail must remain unopened and unread"
-        );
-        assert_eq!(limited.admission.available_permits(), 0);
-        assert!(data_dir.join(RECOVERY_FAIL_OPEN_KEY).exists());
-        assert_eq!(
-            tokio::fs::read(data_dir.join(excess_key).join("meta.json"))
+        for restart in 1..=2 {
+            RECOVERY_OPEN_ATTEMPTS.store(0, Ordering::SeqCst);
+            RECOVERY_OPEN_COUNT.store(0, Ordering::SeqCst);
+            RECOVERY_READ_BYTES.store(0, Ordering::SeqCst);
+            RECOVERY_MAX_READ_LEN.store(0, Ordering::SeqCst);
+            let manager =
+                SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, page_size, 65536, 1)
+                    .expect("max-one recovery manager");
+            let counts = manager
+                .recover_with_counts()
                 .await
-                .expect("excess sidecar remains"),
-            excess_sidecar,
-            "valid excess metadata remains untouched"
-        );
+                .expect("recovery continues beyond open failures");
+
+            assert_eq!(counts, (1, 0), "restart {restart}");
+            assert_eq!(manager.spool_keys(), vec![valid_key.to_owned()]);
+            assert_eq!(
+                RECOVERY_OPEN_ATTEMPTS.load(Ordering::SeqCst),
+                FAILED_COUNT + 1,
+                "restart {restart}: all newer failures are rejected during the single streaming scan"
+            );
+            assert_eq!(
+                RECOVERY_OPEN_COUNT.load(Ordering::SeqCst),
+                1,
+                "restart {restart}: only the older valid payload remains open"
+            );
+            assert_eq!(
+                RECOVERY_READ_BYTES.load(Ordering::SeqCst),
+                0,
+                "restart {restart}: neither failed nor Complete payloads allocate tail buffers"
+            );
+            assert_eq!(RECOVERY_MAX_READ_LEN.load(Ordering::SeqCst), 0);
+            assert_eq!(manager.admission.available_permits(), 0);
+            for index in 0..FAILED_COUNT {
+                let key = format!("eeeeeeee-eeee-4eee-8eee-{index:012}");
+                assert!(
+                    data_dir.join(key).exists(),
+                    "open-failing candidate remains quarantined non-destructively"
+                );
+            }
+            drop(manager);
+        }
     }
 
     #[tokio::test]
@@ -4620,52 +4769,168 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recovery_migrates_old_main_in_progress_spool_without_config_stride() {
+    async fn recovery_terminalizes_bounded_zero_page_old_main_writing_spools() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
-        let paged_key = uuid::Uuid::new_v4().to_string();
-        let zero_page_key = uuid::Uuid::new_v4().to_string();
-        write_old_main_sidecar_fixture(&data_dir, &paged_key, "Writing", b"abcdefgh", 2, None)
+        let partial_key = uuid::Uuid::new_v4().to_string();
+        let exact_key = uuid::Uuid::new_v4().to_string();
+        let empty_key = uuid::Uuid::new_v4().to_string();
+        let ambiguous_key = uuid::Uuid::new_v4().to_string();
+        write_old_main_sidecar_fixture(&data_dir, &partial_key, "Writing", b"abc", 0, None).await;
+        write_old_main_sidecar_fixture(&data_dir, &exact_key, "Writing", b"abcd", 0, None).await;
+        write_old_main_sidecar_fixture(&data_dir, &empty_key, "Writing", b"", 0, None).await;
+        write_old_main_sidecar_fixture(&data_dir, &ambiguous_key, "Writing", b"abcdefgh", 2, None)
             .await;
-        write_old_main_sidecar_fixture(&data_dir, &zero_page_key, "Writing", b"abc", 0, None).await;
+        let ambiguous_sidecar = tokio::fs::read(data_dir.join(&ambiguous_key).join("meta.json"))
+            .await
+            .expect("snapshot ambiguous sidecar");
 
         let manager =
-            SpoolManager::<TokioFileIO>::new(&data_dir, 8192, 65536, 256).expect("restart manager");
-        manager.recover().await.expect("migrate active spools");
-
-        let paged = manager.get_spool(&paged_key).expect("paged active spool");
-        assert_eq!(paged.page_size, 4);
-        assert_eq!(paged.metadata.lock().await.state, SpoolState::Writing);
-        assert_eq!(
-            paged.read_page_for_test(0).await.unwrap().unwrap().as_ref(),
-            b"abcd"
-        );
-        assert_eq!(
-            paged.read_page_for_test(1).await.unwrap().unwrap().as_ref(),
-            b"efgh"
-        );
-        assert_eq!(persisted_metadata(&manager, &paged_key).await.page_size, 4);
-
-        let zero_page = manager
-            .get_spool(&zero_page_key)
-            .expect("zero-page active spool");
-        assert_eq!(zero_page.page_size, 4);
-        assert_eq!(zero_page.write_buffer.lock().await.as_ref(), b"abc");
-        zero_page
-            .write(3, bytes::Bytes::from_static(b"d"))
+            SpoolManager::<TokioFileIO>::new(&data_dir, 4, 65536, 256).expect("restart manager");
+        manager
+            .recover()
             .await
-            .expect("resume write at durable offset");
-        assert_eq!(
-            zero_page
-                .read_page_for_test(0)
-                .await
-                .unwrap()
-                .unwrap()
-                .as_ref(),
-            b"abcd"
+            .expect("salvage bounded zero-page writers");
+
+        for (key, expected, expected_pages, expected_final) in [
+            (&partial_key, b"abc".as_slice(), 1, Some(3)),
+            (&exact_key, b"abcd".as_slice(), 1, None),
+            (&empty_key, b"".as_slice(), 0, None),
+        ] {
+            let spool = manager.get_spool(key).expect("terminal salvage spool");
+            let metadata = spool.metadata.lock().await.clone();
+            assert_eq!(spool.page_size, 4);
+            assert_eq!(metadata.state, SpoolState::Complete);
+            assert_eq!(metadata.total_bytes_written, expected.len() as u64);
+            assert_eq!(metadata.total_pages, expected_pages);
+            assert_eq!(metadata.final_page_size, expected_final);
+            assert!(matches!(
+                spool
+                    .write(expected.len() as u64, bytes::Bytes::from_static(b"x"))
+                    .await,
+                Err(BobsError::SpoolClosed)
+            ));
+            if expected.is_empty() {
+                assert!(spool.read_page(0).await.unwrap().is_none());
+            } else {
+                assert_eq!(
+                    spool.read_page(0).await.unwrap().unwrap().as_ref(),
+                    expected
+                );
+                assert_eq!(
+                    read_exact_logical_range::<TokioFileIO>(&spool.file_handle, 0, expected.len(),)
+                        .await
+                        .expect("read exact salvaged range"),
+                    expected
+                );
+            }
+            assert_eq!(
+                tokio::fs::read(data_dir.join(key).join("spool.dat"))
+                    .await
+                    .expect("read unchanged payload"),
+                expected
+            );
+            let persisted = persisted_metadata(&manager, key).await;
+            assert_eq!(persisted.state, SpoolState::Complete);
+            assert_eq!(persisted.page_size, 4);
+        }
+
+        assert!(
+            manager.get_spool(&ambiguous_key).is_none(),
+            "legacy multi-page Writing remains quarantined without a durable stride"
         );
-        assert!(data_dir.join(&paged_key).join("spool.dat").exists());
-        assert!(data_dir.join(&zero_page_key).join("spool.dat").exists());
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&ambiguous_key).join("meta.json"))
+                .await
+                .unwrap(),
+            ambiguous_sidecar
+        );
+        assert_eq!(
+            tokio::fs::read(data_dir.join(&ambiguous_key).join("spool.dat"))
+                .await
+                .unwrap(),
+            b"abcdefgh"
+        );
+
+        drop(manager);
+        let restarted =
+            SpoolManager::<TokioFileIO>::new(&data_dir, 2, 65536, 256).expect("second restart");
+        restarted.recover().await.expect("resegment terminal bytes");
+        let partial = restarted
+            .get_spool(&partial_key)
+            .expect("persisted terminal salvage");
+        let metadata = partial.metadata.lock().await.clone();
+        assert_eq!(metadata.total_pages, 2);
+        assert_eq!(metadata.final_page_size, Some(1));
+        let first = partial.read_page(0).await.unwrap().unwrap();
+        let second = partial.read_page(1).await.unwrap().unwrap();
+        assert_eq!([first.as_ref(), second.as_ref()].concat(), b"abc");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn recovery_sparse_zero_page_64_mib_salvage_has_bounded_rss_and_no_tail_read() {
+        let _recovery_io_guard = RECOVERY_IO_TEST_LOCK.lock().await;
+        const PAGE_SIZE: usize = MAX_PAGE_SIZE_BYTES;
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = uuid::Uuid::new_v4().to_string();
+        write_sparse_old_main_writing_fixture(&data_dir, &key, PAGE_SIZE as u64, b"ABCD", b"WXYZ")
+            .await;
+
+        RECOVERY_OPEN_ATTEMPTS.store(0, Ordering::SeqCst);
+        RECOVERY_OPEN_COUNT.store(0, Ordering::SeqCst);
+        RECOVERY_READ_BYTES.store(0, Ordering::SeqCst);
+        RECOVERY_MAX_READ_LEN.store(0, Ordering::SeqCst);
+        let rss_before = current_rss_bytes();
+        let manager =
+            SpoolManager::<RecoveryCountingFileIO>::new(&data_dir, PAGE_SIZE, 16 * 1024, 1)
+                .expect("recovery manager");
+        manager
+            .recover()
+            .await
+            .expect("salvage sparse zero-page writer");
+        let rss_growth = current_rss_bytes().saturating_sub(rss_before);
+
+        let spool = manager.get_spool(&key).expect("terminal sparse salvage");
+        let metadata = spool.metadata.lock().await.clone();
+        assert_eq!(metadata.state, SpoolState::Complete);
+        assert_eq!(metadata.page_size, PAGE_SIZE as u64);
+        assert_eq!(metadata.total_bytes_written, PAGE_SIZE as u64);
+        assert_eq!(metadata.total_pages, 1);
+        assert_eq!(metadata.final_page_size, None);
+        assert_eq!(RECOVERY_OPEN_ATTEMPTS.load(Ordering::SeqCst), 1);
+        assert_eq!(RECOVERY_OPEN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            RECOVERY_READ_BYTES.load(Ordering::SeqCst),
+            0,
+            "terminal salvage must not allocate or load a 64 MiB active tail"
+        );
+        assert_eq!(RECOVERY_MAX_READ_LEN.load(Ordering::SeqCst), 0);
+        assert!(
+            rss_growth < (PAGE_SIZE / 4) as u64,
+            "sparse terminal salvage grew RSS by {rss_growth} bytes"
+        );
+
+        assert_eq!(
+            read_exact_logical_range::<RecoveryCountingFileIO>(&spool.file_handle, 0, 4)
+                .await
+                .expect("read sparse prefix"),
+            b"ABCD"
+        );
+        assert_eq!(
+            read_exact_logical_range::<RecoveryCountingFileIO>(
+                &spool.file_handle,
+                PAGE_SIZE as u64 - 4,
+                4,
+            )
+            .await
+            .expect("read sparse suffix"),
+            b"WXYZ"
+        );
+        assert_eq!(RECOVERY_READ_BYTES.load(Ordering::SeqCst), 8);
+        assert_eq!(RECOVERY_MAX_READ_LEN.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
