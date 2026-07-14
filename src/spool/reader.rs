@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -70,7 +69,7 @@ where
             };
 
             if let Some((file_offset, page_len)) = disk_read {
-                let handle = Arc::clone(&self.file_handle);
+                let handle = self.acquire_file_handle().await?;
                 let disk_buf = read_exact_at::<F>(
                     &handle,
                     file_offset,
@@ -146,6 +145,10 @@ mod tests {
             unreachable!("short-read tests construct handles directly")
         }
 
+        async fn file_size(handle: &Self::Handle) -> std::io::Result<u64> {
+            Ok(handle.data.len() as u64)
+        }
+
         async fn write_at(
             _handle: &Self::Handle,
             _offset: u64,
@@ -198,6 +201,10 @@ mod tests {
 
         async fn open(_path: &Path) -> std::io::Result<Self::Handle> {
             unreachable!("blocking-read tests construct handles directly")
+        }
+
+        async fn file_size(handle: &Self::Handle) -> std::io::Result<u64> {
+            Ok(handle.data.len() as u64)
         }
 
         async fn write_at(
@@ -401,10 +408,11 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = vec![0x7Au8; 4096];
-        TokioFileIO::write_at(&spool.file_handle, 0, Bytes::copy_from_slice(&data))
+        let handle = spool.active_file_handle().expect("active handle");
+        TokioFileIO::write_at(&handle, 0, Bytes::copy_from_slice(&data))
             .await
             .expect("failed to write test data to disk");
-        TokioFileIO::sync_data(&spool.file_handle)
+        TokioFileIO::sync_data(&handle)
             .await
             .expect("failed to sync test data");
         {
@@ -516,10 +524,11 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let data = vec![0x42u8; 4096];
-        TokioFileIO::write_at(&spool.file_handle, 0, Bytes::copy_from_slice(&data))
+        let handle = spool.active_file_handle().expect("active handle");
+        TokioFileIO::write_at(&handle, 0, Bytes::copy_from_slice(&data))
             .await
             .expect("failed to write recovered full page to disk");
-        TokioFileIO::sync_data(&spool.file_handle)
+        TokioFileIO::sync_data(&handle)
             .await
             .expect("failed to sync test data");
         {
@@ -543,10 +552,11 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let partial = vec![0x55u8; 1000];
-        TokioFileIO::write_at(&spool.file_handle, 0, Bytes::copy_from_slice(&partial))
+        let handle = spool.active_file_handle().expect("active handle");
+        TokioFileIO::write_at(&handle, 0, Bytes::copy_from_slice(&partial))
             .await
             .expect("failed to write recovered partial to disk");
-        TokioFileIO::sync_data(&spool.file_handle)
+        TokioFileIO::sync_data(&handle)
             .await
             .expect("failed to sync test data");
         {
@@ -574,10 +584,11 @@ mod tests {
         let spool = make_spool(dir.path(), 4096).await;
 
         let partial = vec![0x66u8; 1000];
-        TokioFileIO::write_at(&spool.file_handle, 0, Bytes::copy_from_slice(&partial))
+        let handle = spool.active_file_handle().expect("active handle");
+        TokioFileIO::write_at(&handle, 0, Bytes::copy_from_slice(&partial))
             .await
             .expect("failed to write recovered partial to disk");
-        TokioFileIO::sync_data(&spool.file_handle)
+        TokioFileIO::sync_data(&handle)
             .await
             .expect("failed to sync test data");
         {

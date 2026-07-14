@@ -95,6 +95,20 @@ impl FileIO for UringFileIO {
         submit_open(path, O_RDWR | libc::O_NOFOLLOW, 0).await
     }
 
+    fn file_size(handle: &Self::Handle) -> impl std::future::Future<Output = Result<u64>> + Send {
+        let fd = Arc::clone(&handle.fd);
+        async move {
+            task::spawn_blocking(move || {
+                let duplicate = fd.try_clone()?;
+                File::from(duplicate)
+                    .metadata()
+                    .map(|metadata| metadata.len())
+            })
+            .await
+            .map_err(Error::other)?
+        }
+    }
+
     async fn write_at(handle: &Self::Handle, offset: u64, data: Bytes) -> Result<usize> {
         let sqe_len = ring_pool::checked_sqe_len(data.len())?;
         let (tx, rx) = oneshot::channel();
@@ -258,14 +272,23 @@ async fn submit_open(path: &Path, flags: i32, mode: u32) -> Result<UringFileHand
     .await?;
     let fd = Arc::try_unwrap(recv_result(rx).await?)
         .map_err(|_| Error::other("newly opened data descriptor was unexpectedly shared"))?;
-    let file = File::from(fd);
-    if !file.metadata()?.file_type().is_file() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("data path is not a regular file: {}", path.display()),
-        ));
-    }
-    let fd = Arc::new(file.into());
+    let display_path = path.to_path_buf();
+    let fd = task::spawn_blocking(move || {
+        let file = File::from(fd);
+        if !file.metadata()?.file_type().is_file() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "data path is not a regular file: {}",
+                    display_path.display()
+                ),
+            ));
+        }
+        Ok::<OwnedFd, Error>(file.into())
+    })
+    .await
+    .map_err(Error::other)??;
+    let fd = Arc::new(fd);
     Ok(UringFileHandle::new(fd, pool, ring_index, routed_key))
 }
 

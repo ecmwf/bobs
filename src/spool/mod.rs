@@ -61,16 +61,46 @@ impl Drop for ReadResponsePermit {
     }
 }
 
+#[derive(Clone)]
+struct SharedOpenError {
+    kind: std::io::ErrorKind,
+    message: Arc<str>,
+}
+
+impl SharedOpenError {
+    fn from_io(error: &std::io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: Arc::from(error.to_string()),
+        }
+    }
+
+    fn to_io(&self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message.to_string())
+    }
+}
+
+struct FileHandleSlot<H> {
+    handle: Option<Arc<H>>,
+    generation: u64,
+    last_open_error: Option<(u64, SharedOpenError)>,
+}
+
 pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub key: String,
     pub metadata: Arc<Mutex<SpoolMetadata>>,
     pub page_cache: Arc<Mutex<PageCache>>,
     /// Accumulates incoming bytes until a full page is ready for flush.
     pub write_buffer: Arc<Mutex<BytesMut>>,
-    /// Shared positional-I/O handle. Cloning this `Arc` keeps the handle alive for
-    /// each in-flight operation; it closes naturally when the final spool/operation
-    /// reference is dropped.
-    pub file_handle: Arc<F::Handle>,
+    /// Manager-held positional-I/O handle. Unlike the former optional handle state,
+    /// whose empty branch was unreachable, `None` is now a deliberate terminal-closed
+    /// state: recovery starts Complete spools closed and the first full read drops the
+    /// manager's reference. In-flight operations retain cloned `Arc`s, while a later
+    /// read reopens the canonical path through `file_handle_reopen`.
+    file_handle: StdMutex<FileHandleSlot<F::Handle>>,
+    /// Single-flight gate for reopening only. The brief state mutex above is never
+    /// held across open or data I/O, and this permit is dropped before positional I/O.
+    file_handle_reopen: Semaphore,
     pub metadata_store: M,
     /// Writer notifies after each completed page; readers long-poll on this.
     pub notify: Arc<Notify>,
@@ -123,7 +153,7 @@ where
         let read_response_admission = Arc::new(Semaphore::new(1));
         Self::new_with_admission(
             metadata,
-            file_handle,
+            Some(file_handle),
             page_size,
             page_cache,
             metadata_store,
@@ -139,7 +169,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_admission(
         metadata: SpoolMetadata,
-        file_handle: F::Handle,
+        file_handle: Option<F::Handle>,
         page_size: usize,
         page_cache: Arc<Mutex<PageCache>>,
         metadata_store: M,
@@ -160,7 +190,12 @@ where
             metadata: Arc::new(Mutex::new(metadata)),
             page_cache,
             write_buffer: Arc::new(Mutex::new(BytesMut::new())),
-            file_handle: Arc::new(file_handle),
+            file_handle: StdMutex::new(FileHandleSlot {
+                handle: file_handle.map(Arc::new),
+                generation: 0,
+                last_open_error: None,
+            }),
+            file_handle_reopen: Semaphore::new(1),
             metadata_store,
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
@@ -278,6 +313,133 @@ where
             permit_units: units as usize,
             metrics: Arc::clone(&self.metrics),
         })
+    }
+
+    /// Clone the shared handle or asynchronously reopen `spool.dat`. Concurrent
+    /// reopeners share one attempt; once this returns, neither the state mutex nor
+    /// the reopen gate is retained across the caller's positional I/O.
+    pub(crate) async fn acquire_file_handle(&self) -> crate::error::Result<Arc<F::Handle>> {
+        if self.cancel.is_cancelled() {
+            return Err(crate::error::BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            });
+        }
+
+        let observed_generation = {
+            let slot = self
+                .file_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(handle) = slot.handle.as_ref() {
+                return Ok(Arc::clone(handle));
+            }
+            slot.generation
+        };
+
+        let _reopen_permit = tokio::select! {
+            permit = self.file_handle_reopen.acquire() => permit.map_err(|_| {
+                crate::error::BobsError::IoError(std::io::Error::other(
+                    "file-handle reopen semaphore closed",
+                ))
+            })?,
+            _ = self.cancel.cancelled() => {
+                return Err(crate::error::BobsError::SpoolNotFound {
+                    key: self.key.clone(),
+                });
+            }
+        };
+
+        {
+            let slot = self
+                .file_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(handle) = slot.handle.as_ref() {
+                return Ok(Arc::clone(handle));
+            }
+            if slot.generation != observed_generation {
+                if let Some((generation, error)) = slot.last_open_error.as_ref() {
+                    if *generation == slot.generation {
+                        return Err(crate::error::BobsError::IoError(error.to_io()));
+                    }
+                }
+            }
+        }
+
+        let opened = F::open(&self.data_path).await;
+        if self.cancel.is_cancelled() {
+            drop(opened);
+            return Err(crate::error::BobsError::SpoolNotFound {
+                key: self.key.clone(),
+            });
+        }
+
+        match opened {
+            Ok(opened) => {
+                let handle = Arc::new(opened);
+                let mut slot = self
+                    .file_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if self.cancel.is_cancelled() {
+                    return Err(crate::error::BobsError::SpoolNotFound {
+                        key: self.key.clone(),
+                    });
+                }
+                slot.generation = slot.generation.wrapping_add(1);
+                slot.last_open_error = None;
+                slot.handle = Some(Arc::clone(&handle));
+                Ok(handle)
+            }
+            Err(error) => {
+                let shared = SharedOpenError::from_io(&error);
+                let mut slot = self
+                    .file_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                slot.generation = slot.generation.wrapping_add(1);
+                let generation = slot.generation;
+                slot.last_open_error = Some((generation, shared));
+                Err(crate::error::BobsError::IoError(error))
+            }
+        }
+    }
+
+    /// Active writers and completion transactions are constructed with a handle and
+    /// never use the lazy reopen path.
+    pub(crate) fn active_file_handle(&self) -> crate::error::Result<Arc<F::Handle>> {
+        self.file_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handle
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                crate::error::BobsError::IoError(std::io::Error::other(
+                    "active spool unexpectedly has no data file handle",
+                ))
+            })
+    }
+
+    /// Drop only the manager-held reference. Clones owned by active positional I/O
+    /// remain valid until those operations finish.
+    pub(crate) fn close_file_handle(&self) {
+        let handle = self
+            .file_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handle
+            .take();
+        drop(handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_open_file_handle(&self) -> bool {
+        self.file_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handle
+            .is_some()
     }
 
     pub async fn persist_metadata(&self, metadata: &SpoolMetadata) -> crate::error::Result<()> {
