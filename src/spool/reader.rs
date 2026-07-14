@@ -145,6 +145,10 @@ mod tests {
             unreachable!("short-read tests construct handles directly")
         }
 
+        async fn file_size(handle: &Self::Handle) -> std::io::Result<u64> {
+            Ok(handle.data.len() as u64)
+        }
+
         async fn write_at(
             _handle: &Self::Handle,
             _offset: u64,
@@ -197,6 +201,10 @@ mod tests {
 
         async fn open(_path: &Path) -> std::io::Result<Self::Handle> {
             unreachable!("blocking-read tests construct handles directly")
+        }
+
+        async fn file_size(handle: &Self::Handle) -> std::io::Result<u64> {
+            Ok(handle.data.len() as u64)
         }
 
         async fn write_at(
