@@ -6,8 +6,20 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BobsError {
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("spool exceeds configured maximum of {max_bytes} bytes")]
+    SpoolTooLarge { max_bytes: u64 },
+
+    #[error("timed out waiting for create admission capacity")]
+    AdmissionTimeout,
+
     #[error("spool not found: {key}")]
     SpoolNotFound { key: String },
+
+    #[error("spool already exists: {key}")]
+    SpoolAlreadyExists { key: String },
 
     #[error("spool is closed")]
     SpoolClosed,
@@ -21,14 +33,14 @@ pub enum BobsError {
     #[error("size mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
 
-    #[error("writer is inactive")]
-    WriterInactive,
-
     #[error("invalid range header: {0}")]
     InvalidRange(String),
 
     #[error("range not satisfiable: {reason}")]
     RangeNotSatisfiable { total: Option<u64>, reason: String },
+
+    #[error("configuration error: {0}")]
+    ConfigurationError(String),
 
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
@@ -38,6 +50,12 @@ pub enum BobsError {
 
     #[error("serialization error: {0}")]
     SerializationError(String),
+
+    #[error("metadata sidecar is too large: {actual} bytes exceeds {maximum}-byte limit")]
+    MetadataTooLarge { actual: u64, maximum: u64 },
+
+    #[error("metadata sidecar contains unsupported field: {field}")]
+    MetadataUnknownField { field: String },
 
     #[error("invalid state transition: cannot {attempted_action} when in {current} state")]
     InvalidState {

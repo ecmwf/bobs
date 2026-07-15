@@ -2,53 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# {{- include "bobs.validateConfigBounds" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: '{{ include "bobs.fullname" . }}-config'
+  name: '{{ include "bobs.nameWithSuffix" (dict "base" (include "bobs.fullname" .) "suffix" "-config") }}'
   labels:
-    app.kubernetes.io/name: '{{ include "bobs.name" . }}'
-    app.kubernetes.io/instance: '{{ .Release.Name }}'
+    # prettier-ignore
+    app.kubernetes.io/name: {{ include "bobs.name" . | quote }}
+    # prettier-ignore
+    app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
 data:
   config.yaml: |
-    host: {{ .Values.config.host | quote }}
-    port: {{ .Values.config.port }}
-    data_dir: {{ .Values.config.data_dir | quote }}
-    page_size: {{ int .Values.config.page_size }}
-    max_cache_bytes: {{ int .Values.config.max_cache_bytes }}
-    max_live_spools: {{ int .Values.config.max_live_spools }}
-    {{- if .Values.config.io_uring_shards }}
-    io_uring_shards: {{ int .Values.config.io_uring_shards }}
-    {{- end }}
-    {{- if .Values.config.io_uring_queue_capacity }}
-    io_uring_queue_capacity: {{ int .Values.config.io_uring_queue_capacity }}
-    {{- end }}
-    writer_inactivity_timeout_secs: {{ .Values.config.writer_inactivity_timeout_secs }}
-    read_idle_ttl_secs: {{ .Values.config.read_idle_ttl_secs }}
-    full_read_complete_ttl_secs: {{ .Values.config.full_read_complete_ttl_secs }}
-    # deprecated — no longer drives cleanup; kept for backward compatibility
-    reader_done_ttl_secs: {{ .Values.config.reader_done_ttl_secs }}
-    # deprecated — no longer drives cleanup; kept for backward compatibility
-    unread_ttl_secs: {{ .Values.config.unread_ttl_secs }}
-    cleanup_sweep_interval_secs: {{ .Values.config.cleanup_sweep_interval_secs }}
-    long_poll_timeout_ms: {{ .Values.config.long_poll_timeout_ms }}
-    host_prefix: {{ required "bobs.config.host_prefix must be set" .Values.config.host_prefix | quote }}
-    domain: {{ required "bobs.config.domain must be set" .Values.config.domain | quote }}
-    route_name: {{ required "bobs.config.route_name must be set" .Values.config.route_name | quote }}
-    {{- if .Values.config.metrics }}
-    metrics:
-      enabled: {{ .Values.config.metrics.enabled }}
-      {{- if .Values.config.metrics.bind_address }}
-      bind_address: {{ .Values.config.metrics.bind_address | quote }}
-      {{- end }}
-      {{- if .Values.config.metrics.port }}
-      port: {{ .Values.config.metrics.port }}
-      {{- end }}
-      {{- if .Values.config.metrics.allowed_labels }}
-      allowed_labels:
-        {{- range .Values.config.metrics.allowed_labels }}
-        - {{ . | quote }}
-        {{- end }}
-      {{- end }}
-      max_label_value_length: {{ .Values.config.metrics.max_label_value_length | default 128 }}
-    {{- end }}
+    {{- include "bobs.configYaml" . | nindent 4 }}

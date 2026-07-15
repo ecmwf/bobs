@@ -64,13 +64,21 @@ pub fn init_meter_provider(
     (provider, registry)
 }
 
-/// Spawn a minimal HTTP server exposing `GET /metrics` for Prometheus scraping.
+/// Serve `GET /metrics` on an already-bound listener until `shutdown` resolves,
+/// then drain connections using the same deadline as the main HTTP server.
+///
+/// Binding is deliberately owned by startup so every configured listener is
+/// validated before either server begins accepting requests.
 #[cfg(feature = "telemetry")]
-pub async fn serve_metrics(
+pub async fn serve_metrics<F>(
+    listener: tokio::net::TcpListener,
     registry: prometheus::Registry,
-    bind_address: &str,
-    port: u16,
-) -> Result<(), std::io::Error> {
+    shutdown: F,
+    drain_timeout: std::time::Duration,
+) -> Result<crate::server::DrainReport, std::io::Error>
+where
+    F: std::future::Future<Output = ()>,
+{
     use axum::extract::State;
     use axum::response::IntoResponse;
     use axum::{routing::get, Router};
@@ -93,11 +101,10 @@ pub async fn serve_metrics(
     let app = Router::new()
         .route("/metrics", get(handler))
         .with_state(registry);
+    let addr = listener.local_addr()?;
 
-    let listener = tokio::net::TcpListener::bind(format!("{bind_address}:{port}")).await?;
-
-    tracing::info!(port, "prometheus /metrics endpoint listening");
-    axum::serve(listener, app).await
+    tracing::info!(addr = %addr, port = addr.port(), "prometheus /metrics endpoint listening");
+    crate::server::serve_http(listener, app, shutdown, drain_timeout).await
 }
 
 /// Deletion reason label values.
@@ -106,6 +113,7 @@ pub mod reason {
     pub const IDLE_TTL: &str = "idle_ttl";
     pub const FULL_READ_TTL: &str = "full_read_ttl";
     pub const WRITER_TIMEOUT: &str = "writer_timeout";
+    pub const DELETE_RETRY: &str = "delete_retry";
 }
 
 /// Read mode label values.
@@ -127,7 +135,6 @@ pub mod state {
     pub const WRITING: &str = "writing";
     pub const WRITE_LOCKED: &str = "write_locked";
     pub const COMPLETE: &str = "complete";
-    pub const READABLE: &str = "readable";
 }
 
 /// Central metrics handle holding all bobs instruments.
@@ -159,10 +166,13 @@ struct InnerMetrics {
     read_bytes: Counter<u64>,
     read_duration: Histogram<f64>,
     read_active: UpDownCounter<i64>,
+    read_response_buffers_active: UpDownCounter<i64>,
+    read_response_permits_active: UpDownCounter<i64>,
 
     // System-level
     spools_active: UpDownCounter<i64>,
     disk_usage: Gauge<u64>,
+    recovery_spools: Gauge<u64>,
     cache_hits: Counter<u64>,
     cache_misses: Counter<u64>,
 }
@@ -269,17 +279,33 @@ impl BobsMetrics {
                 .i64_up_down_counter("bobs.read.active")
                 .with_description("Currently active readers")
                 .build(),
+            read_response_buffers_active: meter
+                .i64_up_down_counter("bobs.read.response_buffers.active")
+                .with_description("Read responses currently holding page-buffer admission")
+                .build(),
+            read_response_permits_active: meter
+                .i64_up_down_counter("bobs.read.response_permits.active")
+                .with_description(
+                    "Weighted page-buffer permit units currently held by read responses",
+                )
+                .build(),
 
             // ── System-level ──────────────────────────────────────────────────
             spools_active: meter
                 .i64_up_down_counter("bobs.spools.active")
                 .with_description("Currently active spools by state")
                 .build(),
-            // Gauge: same rule as byte counter — keep "bytes" in name, omit
+            // Gauge: same rule as byte counter — keep "bytes" in the name, omit
             // unit annotation.
             disk_usage: meter
                 .u64_gauge("bobs.disk.usage.bytes")
                 .with_description("Disk usage of the spool data directory")
+                .build(),
+            recovery_spools: meter
+                .u64_gauge("bobs.recovery.spools")
+                .with_description(
+                    "Configured, recovered, and quarantined spool counts from startup recovery",
+                )
                 .build(),
             cache_hits: meter
                 .u64_counter("bobs.pages.cache.hits")
@@ -438,6 +464,30 @@ impl BobsMetrics {
         }
     }
 
+    pub fn record_read_response_permit_acquired(&self, permit_units: usize) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            inner.read_response_buffers_active.add(1, &[]);
+            inner
+                .read_response_permits_active
+                .add(permit_units as i64, &[]);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = permit_units;
+    }
+
+    pub fn record_read_response_permit_released(&self, permit_units: usize) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            inner.read_response_buffers_active.add(-1, &[]);
+            inner
+                .read_response_permits_active
+                .add(-(permit_units as i64), &[]);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = permit_units;
+    }
+
     // --- System-Level ---
 
     #[allow(unused_variables)]
@@ -480,6 +530,29 @@ impl BobsMetrics {
         }
     }
 
+    /// Record the bounded startup recovery result. `status` is deliberately a
+    /// fixed low-cardinality dimension rather than a spool key.
+    #[allow(unused_variables)]
+    pub fn record_recovery_snapshot(
+        &self,
+        configured: usize,
+        recovered: usize,
+        quarantined: usize,
+    ) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            for (status, value) in [
+                ("configured", configured),
+                ("recovered", recovered),
+                ("quarantined", quarantined),
+            ] {
+                inner
+                    .recovery_spools
+                    .record(value as u64, &[KeyValue::new("status", status)]);
+            }
+        }
+    }
+
     /// Record current disk usage in bytes (called once per cleanup sweep).
     #[allow(unused_variables)]
     pub fn record_disk_usage(&self, bytes: u64) {
@@ -515,6 +588,9 @@ mod tests {
         metrics.record_state_transition(Some(state::WRITING), state::COMPLETE);
         metrics.record_cache_hit();
         metrics.record_cache_miss();
+        metrics.record_read_response_permit_acquired(2);
+        metrics.record_read_response_permit_released(2);
+        metrics.record_recovery_snapshot(3, 2, 1);
     }
 
     #[test]

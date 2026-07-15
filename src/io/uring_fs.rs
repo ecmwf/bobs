@@ -8,12 +8,14 @@ compile_error!("UringFileIO is only available on Linux; use the tokio-fileio-fal
 use super::{ring_pool, FileIO};
 use bytes::Bytes;
 use std::ffi::CString;
+use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use tokio::task;
 
 const O_CREAT: i32 = 0o100;
 const O_TRUNC: i32 = 0o1000;
@@ -81,14 +83,34 @@ impl FileIO for UringFileIO {
     type Handle = UringFileHandle;
 
     async fn create(path: &Path) -> Result<Self::Handle> {
-        submit_open(path, O_RDWR | O_CREAT | O_TRUNC, CREATE_MODE).await
+        submit_open(
+            path,
+            O_RDWR | O_CREAT | O_TRUNC | libc::O_NOFOLLOW,
+            CREATE_MODE,
+        )
+        .await
     }
 
     async fn open(path: &Path) -> Result<Self::Handle> {
-        submit_open(path, O_RDWR, 0).await
+        submit_open(path, O_RDWR | libc::O_NOFOLLOW, 0).await
+    }
+
+    fn file_size(handle: &Self::Handle) -> impl std::future::Future<Output = Result<u64>> + Send {
+        let fd = Arc::clone(&handle.fd);
+        async move {
+            task::spawn_blocking(move || {
+                let duplicate = fd.try_clone()?;
+                File::from(duplicate)
+                    .metadata()
+                    .map(|metadata| metadata.len())
+            })
+            .await
+            .map_err(Error::other)?
+        }
     }
 
     async fn write_at(handle: &Self::Handle, offset: u64, data: Bytes) -> Result<usize> {
+        let sqe_len = ring_pool::checked_sqe_len(data.len())?;
         let (tx, rx) = oneshot::channel();
         let pool = Arc::clone(&handle.pool);
         #[cfg(test)]
@@ -103,6 +125,7 @@ impl FileIO for UringFileIO {
                 fd: Arc::clone(&handle.fd),
                 offset,
                 data,
+                sqe_len,
                 tx,
             },
         )
@@ -111,6 +134,7 @@ impl FileIO for UringFileIO {
     }
 
     async fn read_at(handle: &Self::Handle, offset: u64, len: usize) -> Result<Bytes> {
+        let sqe_len = ring_pool::checked_sqe_len(len)?;
         let (tx, rx) = oneshot::channel();
         let pool = Arc::clone(&handle.pool);
         #[cfg(test)]
@@ -124,7 +148,7 @@ impl FileIO for UringFileIO {
             ring_pool::Request::Read {
                 fd: Arc::clone(&handle.fd),
                 offset,
-                len,
+                sqe_len,
                 tx,
             },
         )
@@ -149,6 +173,30 @@ impl FileIO for UringFileIO {
             },
         )
         .await?;
+        recv_result(rx).await
+    }
+
+    async fn sync_directory(path: &Path) -> Result<()> {
+        let path = path.to_path_buf();
+        let routing_path = path.clone();
+        let fd: OwnedFd = task::spawn_blocking(move || File::open(path).map(Into::into))
+            .await
+            .map_err(Error::other)??;
+        let fd = Arc::new(fd);
+        let (routed_key, routing_bytes) = data_path_routing_key(&routing_path);
+        #[cfg(not(test))]
+        let _ = &routed_key;
+        let pool = ring_pool::global_or_default_ring_pool()?;
+        let ring_index = ring_pool::ring_index_for_key_bytes(&routing_bytes, pool.shard_count());
+        #[cfg(test)]
+        pool.record_routing(
+            ring_pool::RingPoolOperationKind::DirectorySync,
+            routed_key,
+            ring_index,
+        );
+        let (tx, rx) = oneshot::channel();
+        pool.submit_to_ring(ring_index, ring_pool::Request::SyncDirectory { fd, tx })
+            .await?;
         recv_result(rx).await
     }
 
@@ -222,7 +270,25 @@ async fn submit_open(path: &Path, flags: i32, mode: u32) -> Result<UringFileHand
         },
     )
     .await?;
-    let fd = recv_result(rx).await?;
+    let fd = Arc::try_unwrap(recv_result(rx).await?)
+        .map_err(|_| Error::other("newly opened data descriptor was unexpectedly shared"))?;
+    let display_path = path.to_path_buf();
+    let fd = task::spawn_blocking(move || {
+        let file = File::from(fd);
+        if !file.metadata()?.file_type().is_file() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "data path is not a regular file: {}",
+                    display_path.display()
+                ),
+            ));
+        }
+        Ok::<OwnedFd, Error>(file.into())
+    })
+    .await
+    .map_err(Error::other)??;
+    let fd = Arc::new(fd);
     Ok(UringFileHandle::new(fd, pool, ring_index, routed_key))
 }
 
@@ -395,13 +461,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn io_uring_fileio_open_rejects_symlink() {
+        Suite::open_rejects_symlink().await;
+    }
+
+    #[tokio::test]
     async fn io_uring_fileio_remove_unlinks_file() {
         Suite::remove_unlinks_file().await;
     }
 
     #[tokio::test]
+    async fn io_uring_fileio_sync_directory_succeeds() {
+        Suite::sync_directory_succeeds().await;
+    }
+
+    #[tokio::test]
     async fn io_uring_fileio_close_and_drop_are_safe() {
         Suite::close_and_drop_are_safe().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_direct_read_is_rejected_before_routing_or_submission() {
+        let Some(oversized_len) = crate::io::MAX_IO_URING_IO_LEN.checked_add(1) else {
+            return;
+        };
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("oversized-read.bin");
+        let pool = Arc::new(
+            RingPool::new_for_test(explicit_test_options(1))
+                .expect("oversized request test ring pool should start"),
+        );
+        let _override = scoped_test_ring_pool_override(Arc::clone(&pool));
+        let handle = UringFileIO::create(&path)
+            .await
+            .expect("create oversized request test file");
+        let routing_events = pool.routing_events().len();
+        let submission_events = pool.submission_events().len();
+
+        let error = UringFileIO::read_at(&handle, 0, oversized_len)
+            .await
+            .expect_err("oversized direct read must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(pool.routing_events().len(), routing_events);
+        assert_eq!(pool.submission_events().len(), submission_events);
+        assert_eq!(pool.in_flight_operations(), 0);
     }
 
     #[derive(Debug)]

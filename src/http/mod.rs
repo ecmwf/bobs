@@ -19,7 +19,6 @@ use axum::{Json, Router};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -29,7 +28,8 @@ const JOB_ID_HEADER: &str = "X-Polytope-Job-Id";
 
 fn extract_job_id(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(JOB_ID_HEADER)?.to_str().ok()?;
-    crate::manager::is_request_id_key(value).then(|| value.to_string())
+    let canonical = value.to_ascii_lowercase();
+    crate::manager::is_request_id_key(&canonical).then_some(canonical)
 }
 
 fn request_span(
@@ -38,120 +38,26 @@ fn request_span(
     offset: Option<u64>,
     range: Option<&str>,
 ) -> tracing::Span {
-    match (job_id, key, offset, range) {
-        (None, None, None, None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = tracing::field::Empty,
-            range = tracing::field::Empty,
-        ),
-        (Some(job_id), None, None, None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = tracing::field::Empty,
-            range = tracing::field::Empty,
-        ),
-        (None, Some(key), None, None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = key,
-            offset = tracing::field::Empty,
-            range = tracing::field::Empty,
-        ),
-        (Some(job_id), Some(key), None, None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = key,
-            offset = tracing::field::Empty,
-            range = tracing::field::Empty,
-        ),
-        (None, None, Some(offset), None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = offset,
-            range = tracing::field::Empty,
-        ),
-        (Some(job_id), None, Some(offset), None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = offset,
-            range = tracing::field::Empty,
-        ),
-        (None, Some(key), Some(offset), None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = key,
-            offset = offset,
-            range = tracing::field::Empty,
-        ),
-        (Some(job_id), Some(key), Some(offset), None) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = key,
-            offset = offset,
-            range = tracing::field::Empty,
-        ),
-        (None, None, None, Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = tracing::field::Empty,
-            range = range,
-        ),
-        (Some(job_id), None, None, Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = tracing::field::Empty,
-            range = range,
-        ),
-        (None, Some(key), None, Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = key,
-            offset = tracing::field::Empty,
-            range = range,
-        ),
-        (Some(job_id), Some(key), None, Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = key,
-            offset = tracing::field::Empty,
-            range = range,
-        ),
-        (None, None, Some(offset), Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = offset,
-            range = range,
-        ),
-        (Some(job_id), None, Some(offset), Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = tracing::field::Empty,
-            offset = offset,
-            range = range,
-        ),
-        (None, Some(key), Some(offset), Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = tracing::field::Empty,
-            "bobs.spool.key" = key,
-            offset = offset,
-            range = range,
-        ),
-        (Some(job_id), Some(key), Some(offset), Some(range)) => tracing::info_span!(
-            "bobs.request",
-            "request.id" = job_id,
-            "bobs.spool.key" = key,
-            offset = offset,
-            range = range,
-        ),
+    let span = tracing::info_span!(
+        "bobs.request",
+        "request.id" = tracing::field::Empty,
+        "bobs.spool.key" = tracing::field::Empty,
+        offset = tracing::field::Empty,
+        range = tracing::field::Empty,
+    );
+    if let Some(job_id) = job_id {
+        span.record("request.id", job_id);
     }
+    if let Some(key) = key {
+        span.record("bobs.spool.key", key);
+    }
+    if let Some(offset) = offset {
+        span.record("offset", offset);
+    }
+    if let Some(range) = range {
+        span.record("range", range);
+    }
+    span
 }
 
 enum ReadRequestRange {
@@ -182,7 +88,13 @@ struct PprofParams {
 /// On-demand CPU sampling profiler. `GET /debug/pprof/profile?seconds=N` runs an
 /// in-process pprof CPU profile for N seconds (default 30) and returns a
 /// flamegraph SVG. Used to find BOBS's per-pod CPU hot path under load.
-async fn pprof_profile(Query(params): Query<PprofParams>) -> Response {
+async fn pprof_profile<F: FileIO, M: MetadataStore>(
+    State(state): State<Arc<AppState<F, M>>>,
+    Query(params): Query<PprofParams>,
+) -> Response {
+    if !state.config.enable_pprof {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let seconds = params.seconds.unwrap_or(30).clamp(1, 120);
     let guard = match pprof::ProfilerGuardBuilder::default()
         .frequency(199)
@@ -223,13 +135,13 @@ where
 {
     Router::new()
         .route("/api/v1/health", get(health::<F, M>))
-        .route("/api/v1/status", get(status::<F, M>).head(status_head))
+        .route("/api/v1/status", get(health::<F, M>).head(status_head))
         .route("/api/v1/create", put(create_spool::<F, M>))
         .route("/api/v1/write/{key}/{offset}", post(write_spool::<F, M>))
         .route("/api/v1/complete/{key}", post(complete_spool::<F, M>))
         .route("/api/v1/read/{key}", get(read_spool::<F, M>))
         .route("/api/v1/delete/{key}", delete(delete_spool::<F, M>))
-        .route("/debug/pprof/profile", get(pprof_profile))
+        .route("/debug/pprof/profile", get(pprof_profile::<F, M>))
 }
 
 #[derive(Debug, Serialize)]
@@ -247,20 +159,12 @@ async fn health<F: FileIO, M: MetadataStore>(
     })
 }
 
-async fn status<F: FileIO, M: MetadataStore>(
-    State(state): State<Arc<AppState<F, M>>>,
-) -> impl IntoResponse {
-    Json(StatusResponse {
-        status: "ok",
-        hostname: state.hostname.clone(),
-    })
-}
-
 async fn status_head() -> impl IntoResponse {
     StatusCode::OK
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateRequest {
     content_type: Option<String>,
     content_encoding: Option<String>,
@@ -272,8 +176,53 @@ struct CreateRequest {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompleteRequest {
     expected_size: Option<u64>,
+}
+
+fn validate_producer_header(
+    name: &str,
+    value: &Option<String>,
+) -> std::result::Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        return Err(ApiError(BobsError::InvalidRequest(format!(
+            "{name} must not be empty"
+        ))));
+    }
+    HeaderValue::from_str(value).map_err(|error| {
+        ApiError(BobsError::InvalidRequest(format!(
+            "invalid {name}: {error}"
+        )))
+    })?;
+    Ok(())
+}
+
+fn enforce_content_length(
+    headers: &HeaderMap,
+    offset: u64,
+    max_spool_bytes: u64,
+) -> std::result::Result<(), BobsError> {
+    let Some(value) = headers.get(axum::http::header::CONTENT_LENGTH) else {
+        return Ok(());
+    };
+    let length = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| BobsError::InvalidRequest("invalid Content-Length".into()))?;
+    if offset
+        .checked_add(length)
+        .is_none_or(|total| total > max_spool_bytes)
+    {
+        return Err(BobsError::SpoolTooLarge {
+            max_bytes: max_spool_bytes,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -299,8 +248,10 @@ where
             CreateRequest::default()
         } else {
             serde_json::from_slice::<CreateRequest>(&body)
-                .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
+                .map_err(|e| ApiError(BobsError::InvalidRequest(e.to_string())))?
         };
+        validate_producer_header("content_type", &req.content_type)?;
+        validate_producer_header("content_encoding", &req.content_encoding)?;
         let labels = state.config.filter_labels(&req.labels);
         // Key the spool by the originating request ID when the caller supplies
         // one (X-Polytope-Job-Id), so spool directories, read URLs and logs all
@@ -312,7 +263,8 @@ where
         let create_start = Instant::now();
         let create_result = state
             .manager
-            .create_spool(
+            .create_spool_with_admission_timeout(
+                Duration::from_millis(state.config.create_admission_timeout_ms),
                 key.clone(),
                 req.content_type.clone(),
                 req.content_encoding.clone(),
@@ -370,30 +322,77 @@ where
         let labels = spool.metadata.lock().await.labels.clone();
         let write_start = Instant::now();
         let write_batch_size = state.config.page_size;
-        let mut pending = bytes::BytesMut::with_capacity(write_batch_size);
+        // Start empty so body size hints cannot trigger eager reservation. Full-frame
+        // pages remain zero-copy; partial staging grows only with received bytes and
+        // is bounded by the validated 64 MiB page-size ceiling.
+        let mut pending = bytes::BytesMut::new();
         let mut write_offset = offset;
+        let mut received_bytes = 0_u64;
         let write_result: std::result::Result<(), crate::error::BobsError> = async {
+            // Check a known size only after resolving the target spool so an
+            // oversized request follows the same durable cleanup path as a
+            // chunked body that crosses the limit. This still happens before
+            // polling the body.
+            enforce_content_length(&headers, offset, state.config.max_spool_bytes)?;
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| BobsError::SerializationError(e.to_string()))?;
                 if let Ok(data) = frame.into_data() {
+                    // Only non-empty payload frames are activity. Empty requests still
+                    // validate state and offset below without extending the writer TTL.
+                    if data.is_empty() {
+                        continue;
+                    }
+                    received_bytes = received_bytes
+                        .checked_add(data.len() as u64)
+                        .ok_or(BobsError::SpoolTooLarge {
+                            max_bytes: state.config.max_spool_bytes,
+                        })?;
+                    if offset
+                        .checked_add(received_bytes)
+                        .is_none_or(|total| total > state.config.max_spool_bytes)
+                    {
+                        return Err(BobsError::SpoolTooLarge {
+                            max_bytes: state.config.max_spool_bytes,
+                        });
+                    }
+                    // Refresh under the lifecycle lock before buffering an accepted
+                    // frame so cleanup cannot act on a stale inactivity snapshot.
+                    spool.refresh_write_activity(now_secs()).await?;
                     let mut cursor = 0;
-                    while cursor < data.len() {
-                        let remaining_batch_space = write_batch_size - pending.len();
-                        let take = remaining_batch_space.min(data.len() - cursor);
-                        pending.extend_from_slice(&data[cursor..cursor + take]);
-                        cursor += take;
+
+                    if !pending.is_empty() {
+                        let take = (write_batch_size - pending.len()).min(data.len());
+                        pending.extend_from_slice(&data[..take]);
+                        cursor = take;
                         if pending.len() == write_batch_size {
-                            let batch = std::mem::replace(&mut pending, bytes::BytesMut::with_capacity(write_batch_size)).freeze();
+                            let batch = pending.split().freeze();
                             let batch_len = batch.len();
                             spool.write(write_offset, batch).await?;
                             write_offset += batch_len as u64;
                         }
                     }
+
+                    // Full pages already owned by the body frame need no staging copy.
+                    while data.len() - cursor >= write_batch_size {
+                        let end = cursor + write_batch_size;
+                        let batch = data.slice(cursor..end);
+                        cursor = end;
+                        spool.write(write_offset, batch).await?;
+                        write_offset += write_batch_size as u64;
+                    }
+
+                    if cursor < data.len() {
+                        pending.extend_from_slice(&data[cursor..]);
+                    }
                 }
             }
-            if !pending.is_empty() {
+            if pending.is_empty() {
+                if received_bytes == 0 {
+                    spool.write(write_offset, Bytes::new()).await?;
+                }
+            } else {
                 let batch_len = pending.len();
-                spool.write(write_offset, std::mem::take(&mut pending).freeze()).await?;
+                spool.write(write_offset, pending.freeze()).await?;
                 write_offset += batch_len as u64;
             }
             Ok(())
@@ -409,6 +408,19 @@ where
             if write_result.is_ok() { crate::metrics::outcome::SUCCESS } else { crate::metrics::outcome::ERROR },
             write_elapsed,
         );
+        if matches!(write_result, Err(BobsError::SpoolTooLarge { .. })) {
+            // A known-length request can be rejected before polling its body,
+            // while a chunked body can cross the limit after full pages have
+            // reached disk. In either case, commit a durable deletion before
+            // reporting 413 so the object cannot reappear after restart and its
+            // admission slot is reusable. A cleanup failure is a server error,
+            // not a safe payload rejection.
+            state
+                .manager
+                .delete_oversize_spool_if_write_head(&key, write_offset, job_id.as_deref())
+                .await
+                .map_err(ApiError)?;
+        }
         write_result.map_err(ApiError)?;
         if let Some(job_id) = &job_id {
             tracing::debug!("event.name" = "bobs.spool.write.completed", "request.id" = %job_id, "bobs.spool.key" = %key, offset = offset, bytes = total_written, outcome = "success", "spool write completed");
@@ -436,7 +448,7 @@ where
             CompleteRequest::default()
         } else {
             serde_json::from_slice::<CompleteRequest>(&body)
-                .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?
+                .map_err(|e| ApiError(BobsError::InvalidRequest(e.to_string())))?
         };
         let spool = state
             .manager
@@ -476,6 +488,7 @@ where
     started_at: Instant,
     duration_recorded: bool,
     bytes_served: u64,
+    response_permit: Option<crate::spool::ReadResponsePermit<F>>,
 }
 
 fn read_page_chunk(page: &Bytes, slice_start: usize, slice_end: usize) -> Bytes {
@@ -494,6 +507,42 @@ struct ResolvedReadRange {
     start: u64,
     end: Option<u64>,
     follow: bool,
+}
+
+#[derive(Debug)]
+struct ContiguousResponseProgress {
+    start: u64,
+    next: u64,
+    contiguous: bool,
+}
+
+impl ContiguousResponseProgress {
+    fn new(start: u64) -> Self {
+        Self {
+            start,
+            next: start,
+            contiguous: true,
+        }
+    }
+
+    fn record(&mut self, start: u64, end: u64) {
+        if !self.contiguous || start != self.next || start >= end {
+            self.contiguous = false;
+            return;
+        }
+        self.next = end;
+    }
+
+    fn successful_completion(
+        &self,
+        expected_end: u64,
+        outcome: &'static str,
+    ) -> Option<(u64, u64)> {
+        (self.contiguous
+            && self.next == expected_end
+            && outcome == crate::metrics::outcome::SUCCESS)
+            .then_some((self.start, self.next))
+    }
 }
 
 fn resolve_read_range(
@@ -580,17 +629,40 @@ fn apply_read_response_headers(
     metadata: &ReadMetadata,
     range: &ResolvedReadRange,
 ) -> std::result::Result<(), ApiError> {
-    let content_type_header = HeaderValue::from_str(
-        metadata
-            .content_type
-            .as_deref()
-            .unwrap_or("application/octet-stream"),
-    )
-    .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
+    let content_type = metadata
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let content_type_header = HeaderValue::from_str(content_type)
+        .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
     response
         .headers_mut()
         .insert(axum::http::header::CONTENT_TYPE, content_type_header);
 
+    response.headers_mut().insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    // The payload and media type are producer-controlled and BOBS serves every
+    // spool from one deployment origin. Force download as the browser-level
+    // containment boundary; nosniff/CSP remain defence in depth for user agents
+    // that render despite Content-Disposition.
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
+    );
+    let base_content_type = content_type.split(';').next().unwrap_or_default().trim();
+    if ["text/html", "application/xhtml+xml", "image/svg+xml"]
+        .iter()
+        .any(|active| base_content_type.eq_ignore_ascii_case(active))
+    {
+        // Spools share a deployment origin. Sandboxing producer-controlled active
+        // documents prevents them from inheriting that origin or running script.
+        response.headers_mut().insert(
+            "Content-Security-Policy",
+            HeaderValue::from_static("sandbox; default-src 'none'; frame-ancestors 'none'"),
+        );
+    }
     if let Some(enc) = &metadata.content_encoding {
         let encoding_header = HeaderValue::from_str(enc)
             .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?;
@@ -683,10 +755,17 @@ where
             .get_spool(&key)
             .ok_or_else(|| ApiError(BobsError::SpoolNotFound { key: key.clone() }))?;
 
-        if !spool.is_readable().await {
-            return Err(ApiError(BobsError::SpoolLocked));
+        {
+            let _lifecycle_guard = spool.lifecycle_lock.lock().await;
+            let meta = spool.metadata.lock().await;
+            if meta.state == crate::spool::SpoolState::Deleting {
+                return Err(ApiError(BobsError::SpoolNotFound { key: key.clone() }));
+            }
+            if !meta.state.is_readable() || (meta.state == crate::spool::SpoolState::Writing && meta.write_locked) {
+                return Err(ApiError(BobsError::SpoolLocked));
+            }
+            spool.acquire_reader();
         }
-        spool.acquire_reader();
 
         let read_labels = spool.metadata.lock().await.labels.clone();
         let read_mode = if matches!(request_range, ReadRequestRange::Follow) {
@@ -705,15 +784,13 @@ where
             started_at: read_start,
             duration_recorded: false,
             bytes_served: 0,
+            response_permit: None,
         };
         let long_poll_timeout = Duration::from_millis(state.config.long_poll_timeout_ms);
         let page_size = spool.page_size as u64;
         let metadata = {
             let meta = spool.metadata.lock().await;
-            let is_complete = matches!(
-                meta.state,
-                crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting
-            );
+            let is_complete = meta.state == crate::spool::SpoolState::Complete;
             let complete_size = if is_complete {
                 Some(meta.total_bytes_written)
             } else {
@@ -738,14 +815,20 @@ where
         let response_range = ResolvedReadRange { start, end, follow };
         tracing::info!("event.name" = "bobs.spool.read.started", "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "success", "spool read started");
 
-    // Pre-fetch the first page before committing to a streaming response.
-    // If the timeout fires before any data arrives, return a 307 redirect
-    // so standard clients (curl -L, browsers) retry automatically.
+    // Acquire response-buffer admission and pre-fetch the first page before
+    // committing to a streaming response. The timeout covers both queueing and
+    // long-polling; every error/redirect path drops any acquired permit.
     let first_page_idx = start / page_size;
-    let first_page = match tokio::time::timeout(long_poll_timeout, spool.read_page(first_page_idx))
-        .await
-    {
-        Ok(Ok(v)) => v,
+    let first_read = async {
+        let permit = spool.acquire_read_response_permit().await?;
+        let page = spool.read_page(first_page_idx, &permit).await?;
+        Ok::<_, BobsError>((page, permit))
+    };
+    let first_page = match tokio::time::timeout(long_poll_timeout, first_read).await {
+        Ok(Ok((page, permit))) => {
+            lease.response_permit = Some(permit);
+            page
+        }
         Ok(Err(e)) => {
             lease.duration_recorded = true;
             state.metrics.record_read_duration(&read_labels, read_mode, crate::metrics::outcome::ERROR, read_start.elapsed().as_secs_f64());
@@ -771,6 +854,7 @@ where
         let mut bytes_served = 0_u64;
         let mut outcome = crate::metrics::outcome::SUCCESS;
         let mut prefetched = first_page;
+        let mut response_progress = ContiguousResponseProgress::new(start);
 
         loop {
             if let Some(end) = end {
@@ -784,15 +868,19 @@ where
             let page_start = page_idx * page_size;
             let page_end = page_start + page_size;
 
-            // First iteration uses the pre-fetched page; subsequent iterations
-            // long-poll via read_page with a timeout. Mid-stream timeouts just
-            // end the stream (the connection was recently active, not idle).
+            // First iteration uses the pre-fetched page; subsequent follow-mode
+            // reads long-poll with a timeout. Once response bytes have been sent,
+            // a timeout must abort the chunked body rather than look like clean EOF.
             let maybe_page = if let Some(page) = prefetched.take() {
                 Some(page)
             } else if follow {
+                let response_permit = lease
+                    .response_permit
+                    .as_ref()
+                    .expect("prefetched response must retain read admission");
                 match tokio::time::timeout(
                     long_poll_timeout,
-                    spool.read_page(page_idx),
+                    spool.read_page(page_idx, response_permit),
                 ).await {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
@@ -802,11 +890,23 @@ where
                     }
                     Err(_) => {
                         outcome = crate::metrics::outcome::TIMEOUT;
+                        tracing::warn!("event.name" = "bobs.spool.read.timeout", "bobs.spool.key" = %stream_key, range = %stream_range, start = start, end = ?end, follow = follow, bytes = bytes_served, outcome = "error", "spool read timed out mid-stream");
+                        lease.duration_recorded = true;
+                        stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
+                        stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
+                        yield Err::<Bytes, BobsError>(BobsError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "follow read long-poll timed out",
+                        )));
                         break;
                     }
                 }
             } else {
-                match spool.read_page(page_idx).await {
+                let response_permit = lease
+                    .response_permit
+                    .as_ref()
+                    .expect("prefetched response must retain read admission");
+                match spool.read_page(page_idx, response_permit).await {
                     Ok(v) => v,
                     Err(e) => {
                         outcome = crate::metrics::outcome::ERROR;
@@ -833,28 +933,32 @@ where
                 bytes_served += chunk_len;
                 lease.bytes_served = bytes_served;
                 let chunk_end = offset;
+                response_progress.record(chunk_start, chunk_end);
 
-                // 1. Refresh activity timestamp (atomic, lock-free).
-                let now = now_secs();
-                spool.last_read_activity_at.store(now, Ordering::Relaxed);
-
-                // 2. Record coverage and run the full-read transition when this
-                // chunk completes first coverage of the whole object.
+                // Refresh monotonic activity and coverage under the lifecycle lock so
+                // cleanup cannot act on a stale eligibility snapshot.
                 spool
-                    .mark_served_and_maybe_fully_read(chunk_start, chunk_end, now)
+                    .mark_served_and_maybe_fully_read(chunk_start, chunk_end)
                     .await;
 
-                // 3. Keep legacy last_read_at for observability (not used in new cleanup).
-                {
-                    let mut meta = spool.metadata.lock().await;
-                    meta.last_read_at = Some(now);
+                // If this chunk completes a bounded response, record its exact
+                // contiguous extent before yielding. Hyper may not poll again once
+                // Content-Length is satisfied. In fragmented fallback, only a
+                // completed full-object response can recover coverage.
+                let completed_response = end.and_then(|expected_end| {
+                    response_progress.successful_completion(expected_end, outcome)
+                });
+                if let Some((response_start, response_end)) = completed_response {
+                    spool
+                        .mark_contiguous_response_complete_and_maybe_fully_read(
+                            response_start,
+                            response_end,
+                        )
+                        .await;
                 }
 
-                // 4. If this chunk completes a bounded read, record duration
-                //    NOW before yielding. hyper drops the response body
-                //    without a final poll once Content-Length is satisfied,
-                //    so the post-loop cleanup would never execute.
-                if end.is_some_and(|e| offset >= e) && !lease.duration_recorded {
+                // Record duration before yielding for the same final-poll reason.
+                if completed_response.is_some() && !lease.duration_recorded {
                     let completion_span = request_span(
                         stream_job_id.as_deref(),
                         Some(&stream_key),
@@ -875,7 +979,7 @@ where
                 // loop back and long-poll for more data.
                 let done = {
                     let meta = spool.metadata.lock().await;
-                    matches!(meta.state, crate::spool::SpoolState::Complete | crate::spool::SpoolState::Deleting)
+                    meta.state == crate::spool::SpoolState::Complete
                         && offset >= meta.total_bytes_written
                 };
                 if done {
@@ -886,6 +990,27 @@ where
                 break;
             }
         }
+        // A chunked follow response can only provide fallback recovery after a
+        // clean end at the completed object's exact size. Error, timeout, client
+        // cancellation, partial and gapped streams never reach this transition.
+        if end.is_none() {
+            let completed_size = {
+                let meta = spool.metadata.lock().await;
+                (meta.state == crate::spool::SpoolState::Complete)
+                    .then_some(meta.total_bytes_written)
+            };
+            if let Some((response_start, response_end)) = completed_size.and_then(|size| {
+                response_progress.successful_completion(size, outcome)
+            }) {
+                spool
+                    .mark_contiguous_response_complete_and_maybe_fully_read(
+                        response_start,
+                        response_end,
+                    )
+                    .await;
+            }
+        }
+
         // Post-loop fallback for chunked responses (follow mode on
         // in-progress spools) where Content-Length is not set and hyper
         // polls the stream to completion normally.
@@ -1069,7 +1194,11 @@ struct ApiError(BobsError);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
+            BobsError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            BobsError::SpoolTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            BobsError::AdmissionTimeout => StatusCode::SERVICE_UNAVAILABLE,
             BobsError::SpoolNotFound { .. } => StatusCode::NOT_FOUND,
+            BobsError::SpoolAlreadyExists { .. } => StatusCode::CONFLICT,
             BobsError::OffsetMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::SizeMismatch { .. } => StatusCode::BAD_REQUEST,
             BobsError::InvalidRange(_) => StatusCode::BAD_REQUEST,
@@ -1107,12 +1236,13 @@ mod tests {
     use crate::cleanup::start_cleanup_task;
     use crate::config::MetricsConfig;
     use crate::error::BobsError;
-    use crate::io::DefaultFileIO;
-    use crate::metadata::DefaultMetadataStore;
+    use crate::io::{DefaultFileIO, TokioFileIO};
+    use crate::metadata::{DefaultMetadataStore, SyncSidecarMetadataStore};
     use axum::http::Request;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use serde_json::Value;
+    use std::sync::atomic::Ordering;
     use tower::ServiceExt;
 
     fn test_config(dir: &std::path::Path) -> Arc<Config> {
@@ -1123,6 +1253,9 @@ mod tests {
             page_size: 4096,
             max_cache_bytes: 65536,
             max_live_spools: 256,
+            max_spool_bytes: 1024 * 1024,
+            create_admission_timeout_ms: 100,
+            enable_pprof: false,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 600,
             full_read_complete_ttl_secs: 30,
@@ -1150,6 +1283,9 @@ mod tests {
             page_size: 4096,
             max_cache_bytes: 65536,
             max_live_spools: 256,
+            max_spool_bytes: 1024 * 1024,
+            create_admission_timeout_ms: 100,
+            enable_pprof: false,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 2,
             full_read_complete_ttl_secs: 2,
@@ -1166,42 +1302,88 @@ mod tests {
         })
     }
 
-    /// Returns both the `Router` and the shared `AppState` so tests can inspect
-    /// spool fields (e.g. `full_object_read_at`) after HTTP round-trips.
-    async fn app_with_state() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+    async fn app_with_config_and_metrics(
+        configure: impl FnOnce(&mut Config),
+        metrics: Arc<BobsMetrics>,
+    ) -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
         let data_dir = root.join("data");
-        let manager = Arc::new(
-            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-                DefaultMetadataStore::new(&data_dir),
-                &data_dir,
-                4096,
-                65536,
-                256,
-            )
-            .expect("manager init"),
-        );
+        let mut config = (*test_config(&data_dir)).clone();
+        configure(&mut config);
+        let config = Arc::new(config);
+        let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+            DefaultMetadataStore::new(&data_dir),
+            &data_dir,
+            config.page_size,
+            config.max_cache_bytes,
+            config.max_live_spools,
+        )
+        .expect("manager init");
+        manager.set_metrics(Arc::clone(&metrics));
+        let manager = Arc::new(manager);
         let state = Arc::new(AppState {
             manager,
-            config: test_config(&data_dir),
+            config,
             hostname: "bobs-0".into(),
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
-            metrics: Arc::new(BobsMetrics::new(false)),
+            metrics,
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
     }
 
-    /// Like `app_with_state` but uses `test_config_ttl` (short sweep + TTL values).
-    async fn app_with_ttl_config() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+    async fn app_with_read_budget(
+        page_size: usize,
+        max_cache_bytes: usize,
+        long_poll_timeout_ms: u64,
+        metrics: Arc<BobsMetrics>,
+    ) -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+        app_with_config_and_metrics(
+            |config| {
+                config.page_size = page_size;
+                config.max_cache_bytes = max_cache_bytes;
+                config.long_poll_timeout_ms = long_poll_timeout_ms;
+            },
+            metrics,
+        )
+        .await
+    }
+
+    async fn app_with_config(
+        configure: impl FnOnce(&mut Config),
+    ) -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+        app_with_config_and_metrics(configure, Arc::new(BobsMetrics::new(false))).await
+    }
+
+    async fn app_with_options(
+        long_poll_timeout_ms: u64,
+        metrics: Arc<BobsMetrics>,
+    ) -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+        app_with_config_and_metrics(
+            |config| config.long_poll_timeout_ms = long_poll_timeout_ms,
+            metrics,
+        )
+        .await
+    }
+
+    /// Returns both the `Router` and the shared `AppState` so tests can inspect
+    /// spool fields after HTTP round-trips.
+    async fn app_with_state() -> (Router, Arc<AppState<DefaultFileIO, DefaultMetadataStore>>) {
+        app_with_config(|_| {}).await
+    }
+
+    /// Like `app_with_state` but uses short TTLs and the synchronous sidecar
+    /// backend so paused-time tests do not depend on io_uring completion timing.
+    async fn app_with_ttl_config() -> (Router, Arc<AppState<TokioFileIO, SyncSidecarMetadataStore>>)
+    {
         let root = std::env::temp_dir().join(format!("bobs-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
         let data_dir = root.join("data");
         let manager = Arc::new(
-            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-                DefaultMetadataStore::new(&data_dir),
+            SpoolManager::<TokioFileIO, SyncSidecarMetadataStore>::with_metadata_store(
+                SyncSidecarMetadataStore::new(&data_dir),
                 &data_dir,
                 4096,
                 65536,
@@ -1217,7 +1399,7 @@ mod tests {
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
             metrics: Arc::new(BobsMetrics::new(false)),
         });
-        let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
+        let app = router::<TokioFileIO, SyncSidecarMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
     }
 
@@ -1228,6 +1410,85 @@ mod tests {
     // -----------------------------------------------------------------------
     // Shared test helpers
     // -----------------------------------------------------------------------
+
+    async fn wait_for_spool_removal<F, M>(manager: &SpoolManager<F, M>, key: &str)
+    where
+        F: FileIO,
+        M: MetadataStore + Clone + Send + Sync + 'static,
+    {
+        for _ in 0..2_000 {
+            if manager.get_spool(key).is_none() {
+                return;
+            }
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+                .await
+                .expect("removal wait task panicked");
+        }
+        panic!("spool {key} was not removed after cleanup was scheduled");
+    }
+
+    async fn complete_disk_fixture(
+        state: &Arc<AppState<DefaultFileIO, DefaultMetadataStore>>,
+        data: Bytes,
+    ) -> (
+        String,
+        Arc<crate::spool::Spool<DefaultFileIO, DefaultMetadataStore>>,
+    ) {
+        let key = uuid::Uuid::new_v4().to_string();
+        state
+            .manager
+            .create_spool(key.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create disk fixture spool");
+        let spool = state.manager.get_spool(&key).expect("fixture spool exists");
+        spool
+            .write(0, data.clone())
+            .await
+            .expect("write disk fixture");
+        spool
+            .complete(Some(data.len() as u64))
+            .await
+            .expect("complete disk fixture");
+        state.manager.page_cache.lock().await.free_spool(&key);
+        (key, spool)
+    }
+
+    fn read_request(key: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("build read request")
+    }
+
+    async fn wait_for_reader_count<F, M>(spool: &crate::spool::Spool<F, M>, expected: usize)
+    where
+        F: FileIO,
+        M: MetadataStore + Clone + Send + Sync + 'static,
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if spool.reader_count.load(Ordering::SeqCst) == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader count reached expected value");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_rss_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+        let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        Some(kib * 1024)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn current_rss_bytes() -> Option<u64> {
+        None
+    }
 
     #[test]
     fn read_page_chunk_uses_zero_copy_slice() {
@@ -1245,6 +1506,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn contiguous_response_progress_rejects_gaps_partial_errors_and_timeouts() {
+        let mut partial = ContiguousResponseProgress::new(0);
+        partial.record(0, 50);
+        assert_eq!(
+            partial.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            None
+        );
+
+        let mut gapped = ContiguousResponseProgress::new(0);
+        gapped.record(0, 50);
+        gapped.record(51, 100);
+        assert_eq!(
+            gapped.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            None
+        );
+
+        let mut full = ContiguousResponseProgress::new(0);
+        full.record(0, 50);
+        full.record(50, 100);
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::ERROR),
+            None,
+            "errored response must not recover coverage"
+        );
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::TIMEOUT),
+            None,
+            "timed-out response must not recover coverage"
+        );
+        assert_eq!(
+            full.successful_completion(100, crate::metrics::outcome::SUCCESS),
+            Some((0, 100))
+        );
+    }
+
     #[tokio::test]
     async fn read_spool_range_yields_zero_copy_cached_page_slice() {
         let (app, state) = app_with_state().await;
@@ -1252,7 +1549,7 @@ mod tests {
         let key = write_and_complete(&app, data).await;
         let spool = state.manager.get_spool(&key).expect("spool must exist");
         let page = spool
-            .read_page(0)
+            .read_page_for_test(0)
             .await
             .expect("page read should succeed")
             .expect("page should exist");
@@ -1440,6 +1737,18 @@ mod tests {
         v["key"].as_str().expect("key string").to_string()
     }
 
+    async fn write_in_progress_page(app: &Router, byte: u8) -> String {
+        let key = create_key(app).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from(vec![byte; 4096]))
+            .expect("build write request");
+        let resp = app.clone().oneshot(req).await.expect("write oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        key
+    }
+
     #[tokio::test]
     async fn create_uses_request_id_header_as_spool_key() {
         let app = app().await;
@@ -1474,6 +1783,961 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(uuid::Uuid::parse_str(v["key"].as_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_canonicalizes_uppercase_request_id() {
+        let app = app().await;
+        let request_id = "0123456789ABCDEFGHJKMNPQRS";
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, request_id)
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["key"].as_str().unwrap(),
+            request_id.to_ascii_lowercase()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_request_id_create_returns_conflict_without_truncation_or_permit_leak() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_live_spools = 2;
+        })
+        .await;
+        let request_id = "0123456789abcdefghjkmnpqrs";
+
+        let first = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, request_id)
+            .body(Body::empty())
+            .expect("first create request");
+        assert_eq!(
+            app.clone().oneshot(first).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let write = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{request_id}/0"))
+            .body(Body::from("safe"))
+            .expect("write request");
+        assert_eq!(
+            app.clone().oneshot(write).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let duplicate = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, request_id)
+            .body(Body::from(r#"{"write_locked":true}"#))
+            .expect("duplicate create request");
+        assert_eq!(
+            app.oneshot(duplicate).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+
+        assert_eq!(
+            tokio::fs::read(state.config.data_dir.join(request_id).join("spool.dat"))
+                .await
+                .expect("read original spool bytes"),
+            b"safe"
+        );
+        assert_eq!(state.manager.spools.len(), 1);
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_request_id_creates_have_one_winner_and_one_conflict() {
+        let (app, state) = app_with_config(|config| config.max_live_spools = 2).await;
+        let request_id = "0123456789abcdefghjkmnpqrs";
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+
+        for _ in 0..2 {
+            let task_app = app.clone();
+            let task_start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                let request = Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/create")
+                    .header(JOB_ID_HEADER, request_id)
+                    .body(Body::empty())
+                    .expect("create request");
+                task_start.wait().await;
+                task_app
+                    .oneshot(request)
+                    .await
+                    .expect("create response")
+                    .status()
+            }));
+        }
+        start.wait().await;
+        let first = tasks.remove(0).await.expect("first task join");
+        let second = tasks.remove(0).await.expect("second task join");
+        assert!(
+            matches!(
+                (first, second),
+                (StatusCode::CREATED, StatusCode::CONFLICT)
+                    | (StatusCode::CONFLICT, StatusCode::CREATED)
+            ),
+            "unexpected statuses: {first}, {second}"
+        );
+        assert_eq!(state.manager.spools.len(), 1);
+        assert_eq!(state.manager.admission.available_permits(), 1);
+        assert_eq!(
+            tokio::fs::metadata(state.config.data_dir.join(request_id).join("spool.dat"))
+                .await
+                .expect("created data file")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pprof_is_not_exposed_by_default() {
+        let app = app().await;
+        let req = Request::builder()
+            .uri("/debug/pprof/profile?seconds=1")
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_producer_headers() {
+        for field in ["content_type", "content_encoding"] {
+            let app = app().await;
+            let body = format!(r#"{{"{field}":"invalid\nvalue"}}"#);
+            let req = Request::builder()
+                .method("PUT")
+                .uri("/api/v1/create")
+                .body(Body::from(body))
+                .expect("request build");
+            let resp = app.oneshot(req).await.expect("oneshot");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "field={field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_and_complete_deny_unknown_fields() {
+        let app = app().await;
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .body(Body::from(r#"{"surprise":true}"#))
+            .expect("request build");
+        let resp = app.clone().oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let key = create_key(&app).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::from(r#"{"unexpected":1}"#))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_write_deletes_partial_spool_and_releases_admission() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let spool_dir = state.config.data_dir.join(&key);
+        let (first_page_written_tx, first_page_written_rx) = tokio::sync::oneshot::channel();
+        let (send_overflow_tx, send_overflow_rx) = tokio::sync::oneshot::channel();
+
+        let body_stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"1234"));
+            let _ = first_page_written_tx.send(());
+            let _ = send_overflow_rx.await;
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"567"));
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from_stream(body_stream))
+            .expect("request build");
+        let write_app = app.clone();
+        let write_task =
+            tokio::spawn(async move { write_app.oneshot(req).await.expect("oneshot") });
+
+        first_page_written_rx
+            .await
+            .expect("body polled for the overflow frame");
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
+        assert!(spool_dir.join("spool.dat").exists());
+
+        send_overflow_tx.send(()).expect("send overflow frame");
+        let resp = write_task.await.expect("write task");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(
+            !spool_dir.exists(),
+            "partial spool directory must be removed"
+        );
+
+        // max_live_spools=1: a successful create proves the rejected spool's
+        // admission permit was released before the 413 response.
+        let replacement_key = create_key(&app).await;
+        assert_ne!(replacement_key, key);
+    }
+
+    #[tokio::test]
+    async fn known_length_oversize_write_deletes_spool_without_reading_body() {
+        let (app, state) = app_with_config(|config| {
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let spool_dir = state.config.data_dir.join(&key);
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let body_stream = async_stream::stream! {
+            body_polled_in_stream.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .header(axum::http::header::CONTENT_LENGTH, "7")
+            .body(Body::from_stream(body_stream))
+            .expect("oversize request");
+
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("oversize response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(!spool_dir.exists());
+        assert!(
+            state
+                .manager
+                .metadata_store
+                .read(&key)
+                .await
+                .unwrap()
+                .is_none(),
+            "oversize cleanup must not leave recoverable metadata"
+        );
+
+        // max_live_spools=1: successful replacement proves the rejected
+        // spool's admission permit was released before the 413 response.
+        let replacement_key = create_key(&app).await;
+        assert_ne!(replacement_key, key);
+    }
+
+    #[tokio::test]
+    async fn overflow_cleanup_serializes_with_concurrent_complete() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let spool_dir = state.config.data_dir.join(&key);
+        let (first_page_tx, first_page_rx) = tokio::sync::oneshot::channel();
+        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+
+        let body_stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234"));
+            let _ = first_page_tx.send(());
+            let _ = overflow_rx.await;
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"567"));
+        };
+        let write_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from_stream(body_stream))
+            .expect("write request");
+        let write_app = app.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(write_request)
+                .await
+                .expect("write response")
+        });
+
+        first_page_rx.await.expect("first page consumed");
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+        overflow_tx.send(()).expect("send overflow frame");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let complete_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("complete request");
+        let complete_app = app.clone();
+        let complete_task = tokio::spawn(async move {
+            complete_app
+                .oneshot(complete_request)
+                .await
+                .expect("complete response")
+        });
+        drop(lifecycle_guard);
+
+        let write_response = write_task.await.expect("write task");
+        assert_eq!(write_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let complete_status = complete_task.await.expect("complete task").status();
+        assert!(
+            matches!(complete_status, StatusCode::OK | StatusCode::NOT_FOUND),
+            "unexpected completion status: {complete_status}"
+        );
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(!spool_dir.exists());
+        assert!(
+            state
+                .manager
+                .metadata_store
+                .read(&key)
+                .await
+                .unwrap()
+                .is_none(),
+            "overflow cleanup must not leave recoverable metadata"
+        );
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn known_length_oversize_cleanup_serializes_with_concurrent_complete() {
+        let (app, state) = app_with_config(|config| {
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let spool_dir = state.config.data_dir.join(&key);
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let body_stream = async_stream::stream! {
+            body_polled_in_stream.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+        };
+        let write_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .header(axum::http::header::CONTENT_LENGTH, "7")
+            .body(Body::from_stream(body_stream))
+            .expect("oversize request");
+        let write_app = app.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(write_request)
+                .await
+                .expect("write response")
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let complete_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("complete request");
+        let complete_app = app.clone();
+        let complete_task = tokio::spawn(async move {
+            complete_app
+                .oneshot(complete_request)
+                .await
+                .expect("complete response")
+        });
+        drop(lifecycle_guard);
+
+        let write_response = write_task.await.expect("write task");
+        assert_eq!(write_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        let complete_status = complete_task.await.expect("complete task").status();
+        assert!(
+            matches!(complete_status, StatusCode::OK | StatusCode::NOT_FOUND),
+            "unexpected completion status: {complete_status}"
+        );
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(!spool_dir.exists());
+        assert!(
+            state
+                .manager
+                .metadata_store
+                .read(&key)
+                .await
+                .unwrap()
+                .is_none(),
+            "oversize cleanup must not leave recoverable metadata"
+        );
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn known_length_oversize_does_not_delete_when_complete_wins_race() {
+        let (app, state) = app_with_config(|config| config.max_spool_bytes = 6).await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        let complete_app = app.clone();
+        let complete_key = key.clone();
+        let complete_task = tokio::spawn(async move {
+            complete_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/complete/{complete_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let write_app = app.clone();
+        let write_key = key.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/write/{write_key}/0"))
+                        .header(axum::http::header::CONTENT_LENGTH, "7")
+                        .body(Body::from_stream(async_stream::stream! {
+                            body_polled_in_stream.store(true, Ordering::SeqCst);
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(lifecycle_guard);
+
+        assert_eq!(complete_task.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(write_task.await.unwrap().status(), StatusCode::CONFLICT);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        let surviving = state
+            .manager
+            .get_spool(&key)
+            .expect("completed spool survives");
+        assert_eq!(
+            surviving.metadata.lock().await.state,
+            crate::spool::SpoolState::Complete
+        );
+        assert!(state.config.data_dir.join(&key).join("spool.dat").exists());
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_does_not_delete_when_complete_wins_race() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_spool_bytes = 6;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let (first_page_tx, first_page_rx) = tokio::sync::oneshot::channel();
+        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+        let write_app = app.clone();
+        let write_key = key.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/write/{write_key}/0"))
+                        .body(Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234"));
+                            let _ = first_page_tx.send(());
+                            let _ = overflow_rx.await;
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"567"));
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        first_page_rx.await.expect("first page written");
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        let complete_app = app.clone();
+        let complete_key = key.clone();
+        let complete_task = tokio::spawn(async move {
+            complete_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/complete/{complete_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        overflow_tx.send(()).expect("send overflow");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(lifecycle_guard);
+
+        assert_eq!(complete_task.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(write_task.await.unwrap().status(), StatusCode::CONFLICT);
+        let surviving = state
+            .manager
+            .get_spool(&key)
+            .expect("completed spool survives");
+        assert_eq!(
+            surviving.metadata.lock().await.state,
+            crate::spool::SpoolState::Complete
+        );
+        assert_eq!(
+            tokio::fs::read(state.config.data_dir.join(&key).join("spool.dat"))
+                .await
+                .unwrap(),
+            b"1234"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_length_oversize_returns_not_found_when_delete_wins_race() {
+        let (app, state) = app_with_config(|config| {
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        let delete_app = app.clone();
+        let delete_key = key.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_app
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/v1/delete/{delete_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let write_app = app.clone();
+        let write_key = key.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/write/{write_key}/0"))
+                        .header(axum::http::header::CONTENT_LENGTH, "7")
+                        .body(Body::from_stream(async_stream::stream! {
+                            body_polled_in_stream.store(true, Ordering::SeqCst);
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(lifecycle_guard);
+
+        assert_eq!(delete_task.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(write_task.await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        assert!(state.manager.get_spool(&key).is_none());
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_returns_not_found_when_delete_wins_race() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let (first_page_tx, first_page_rx) = tokio::sync::oneshot::channel();
+        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+        let write_app = app.clone();
+        let write_key = key.clone();
+        let write_task = tokio::spawn(async move {
+            write_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/write/{write_key}/0"))
+                        .body(Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234"));
+                            let _ = first_page_tx.send(());
+                            let _ = overflow_rx.await;
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"567"));
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        first_page_rx.await.expect("first page written");
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let lifecycle_guard = spool.lifecycle_lock.lock().await;
+
+        let delete_app = app.clone();
+        let delete_key = key.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_app
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/v1/delete/{delete_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        overflow_tx.send(()).expect("send overflow");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(lifecycle_guard);
+
+        assert_eq!(delete_task.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(write_task.await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert!(state.manager.get_spool(&key).is_none());
+        assert!(!state.config.data_dir.join(&key).exists());
+        assert_eq!(state.manager.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn known_length_oversize_cleanup_failure_keeps_duplicate_create_conflicting() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4;
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = "0123456789abcdefghjkmnpqrs".to_string();
+        let create = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, &key)
+            .body(Body::empty())
+            .expect("create request");
+        assert_eq!(
+            app.clone().oneshot(create).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let initial_write = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from("1234"))
+            .expect("initial write request");
+        assert_eq!(
+            app.clone().oneshot(initial_write).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let meta_path = state.config.data_dir.join(&key).join("meta.json");
+        tokio::fs::remove_file(&meta_path)
+            .await
+            .expect("remove metadata file");
+        tokio::fs::create_dir(&meta_path)
+            .await
+            .expect("replace metadata with directory");
+
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let overflow_body = async_stream::stream! {
+            body_polled_in_stream.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"567"));
+        };
+        let overflow_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/4"))
+            .header(axum::http::header::CONTENT_LENGTH, "3")
+            .body(Body::from_stream(overflow_body))
+            .expect("overflow request");
+        let response = app
+            .clone()
+            .oneshot(overflow_request)
+            .await
+            .expect("overflow response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body_polled.load(Ordering::SeqCst));
+        let duplicate = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .header(JOB_ID_HEADER, &key)
+            .body(Body::empty())
+            .expect("duplicate create request");
+        let duplicate_response = app
+            .oneshot(duplicate)
+            .await
+            .expect("duplicate create response");
+        assert_eq!(duplicate_response.status(), StatusCode::CONFLICT);
+
+        let spool = state
+            .manager
+            .get_spool(&key)
+            .expect("failed cleanup must remain tracked");
+        assert_eq!(
+            spool.metadata.lock().await.state,
+            crate::spool::SpoolState::Deleting
+        );
+        assert!(state.config.data_dir.join(&key).exists());
+        assert_eq!(state.manager.admission.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_body_write_validates_offset_and_state_without_keepalive() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        let activity_before = spool.cleanup_anchors().last_write_at;
+
+        let wrong_offset = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/1"))
+            .body(Body::empty())
+            .expect("wrong-offset request");
+        assert_eq!(
+            app.clone().oneshot(wrong_offset).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(spool.cleanup_anchors().last_write_at, activity_before);
+
+        let valid_empty = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::empty())
+            .expect("empty request");
+        assert_eq!(
+            app.clone().oneshot(valid_empty).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(spool.cleanup_anchors().last_write_at, activity_before);
+
+        let complete = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("complete request");
+        assert_eq!(
+            app.clone().oneshot(complete).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let activity_after_complete = spool.cleanup_anchors().last_write_at;
+        let closed_empty = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::empty())
+            .expect("closed write request");
+        assert_eq!(
+            app.oneshot(closed_empty).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            spool.cleanup_anchors().last_write_at,
+            activity_after_complete
+        );
+    }
+
+    #[tokio::test]
+    async fn known_length_oversize_wrong_offset_returns_400_without_deleting_or_polling() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 8;
+            config.max_spool_bytes = 8;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let body_stream = async_stream::stream! {
+            body_polled_in_stream.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"oversize"));
+        };
+
+        let hinted_oversize = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/1"))
+            .header(axum::http::header::CONTENT_LENGTH, u64::MAX.to_string())
+            .body(Body::from_stream(body_stream))
+            .expect("hinted request");
+        assert_eq!(
+            app.clone().oneshot(hinted_oversize).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!body_polled.load(Ordering::SeqCst));
+        assert!(state.manager.get_spool(&key).is_some());
+
+        let small_write = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from("tiny"))
+            .expect("small write request");
+        assert_eq!(
+            app.oneshot(small_write).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let spool = state
+            .manager
+            .get_spool(&key)
+            .expect("original spool remains");
+        assert_eq!(spool.write_buffer.lock().await.as_ref(), b"tiny");
+        assert_eq!(spool.metadata.lock().await.total_bytes_written, 4);
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_wrong_offset_returns_400_without_deleting() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 8;
+            config.max_spool_bytes = 6;
+            config.max_live_spools = 1;
+        })
+        .await;
+        let key = create_key(&app).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/1"))
+            .body(Body::from_stream(async_stream::stream! {
+                yield Ok::<_, std::io::Error>(Bytes::from_static(b"1234567"));
+            }))
+            .expect("chunked oversize request");
+
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.manager.get_spool(&key).is_some());
+        assert_eq!(
+            tokio::fs::metadata(state.config.data_dir.join(&key).join("spool.dat"))
+                .await
+                .expect("original data file")
+                .len(),
+            0
+        );
+        assert_eq!(state.manager.admission.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_admission_timeout_returns_service_unavailable() {
+        let (app, _) = app_with_config(|config| {
+            config.max_live_spools = 1;
+            config.create_admission_timeout_ms = 10;
+        })
+        .await;
+        create_key(&app).await;
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn active_content_reads_are_forced_downloads_nosniff_and_sandboxed() {
+        let app = app().await;
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .body(Body::from(r#"{"content_type":"text/html; charset=utf-8"}"#))
+            .expect("request build");
+        let resp = app.clone().oneshot(req).await.expect("oneshot");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let key = value["key"].as_str().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from("<script>alert(1)</script>"))
+            .expect("request build");
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let req = Request::builder()
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_DISPOSITION],
+            HeaderValue::from_static("attachment")
+        );
+        assert_eq!(
+            resp.headers()["X-Content-Type-Options"],
+            HeaderValue::from_static("nosniff")
+        );
+        assert_eq!(
+            resp.headers()["Content-Security-Policy"],
+            HeaderValue::from_static("sandbox; default-src 'none'; frame-ancestors 'none'")
+        );
     }
 
     #[test]
@@ -1539,13 +2803,6 @@ mod tests {
     #[test]
     fn test_api_error_serialization_error() {
         let err = ApiError(BobsError::SerializationError("bad json".to_string()));
-        let resp = err.into_response();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn test_api_error_writer_inactive() {
-        let err = ApiError(BobsError::WriterInactive);
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -1619,6 +2876,22 @@ mod tests {
             .expect("request build");
         let resp = app.oneshot(req).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_read_deleting_spool_returns_not_found() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        spool.metadata.lock().await.state = crate::spool::SpoolState::Deleting;
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1811,6 +3084,143 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn first_page_long_poll_timeout_still_redirects() {
+        let (app, state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
+        let key = create_key(&app).await;
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("build follow request");
+
+        let response = app.oneshot(req).await.expect("follow read oneshot");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("/api/v1/read/{key}").as_str())
+        );
+        let spool = state.manager.get_spool(&key).expect("spool remains");
+        assert_eq!(spool.reader_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(
+            state.manager.read_response_available_permits(),
+            state.manager.read_response_permit_limit()
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_ingress_long_poll_redirect_stays_on_public_pod_path() {
+        let (app, _state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
+        let key = create_key(&app).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header("X-Forwarded-Prefix", "/download-0")
+            .body(Body::empty())
+            .expect("build ingress follow request");
+
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("ingress follow read oneshot");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("/download-0/api/v1/read/{key}").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_follow_timeout_aborts_chunked_body() {
+        let (app, state) = app_with_options(10, Arc::new(BobsMetrics::new(false))).await;
+        let key = write_in_progress_page(&app, 0x5a).await;
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("build follow request");
+        let response = app.oneshot(req).await.expect("follow read oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .is_none(),
+            "in-progress follow response must be chunked"
+        );
+
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("first body frame")
+            .expect("first frame succeeds")
+            .into_data()
+            .expect("first frame contains data");
+        assert_eq!(first, Bytes::from(vec![0x5a; 4096]));
+        let timeout_frame = body.frame().await.expect("timeout error frame");
+        assert!(
+            timeout_frame.is_err(),
+            "mid-stream timeout must abort the transfer, not return clean EOF"
+        );
+        drop(body);
+
+        let spool = state.manager.get_spool(&key).expect("spool remains");
+        assert_eq!(spool.reader_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn mid_stream_follow_timeout_records_timeout_metrics_once() {
+        use prometheus::Encoder;
+
+        let (_provider, registry) = crate::metrics::init_meter_provider("timeout-test");
+        let metrics = Arc::new(BobsMetrics::new(true));
+        let (app, _state) = app_with_options(10, metrics).await;
+        let key = write_in_progress_page(&app, 0x33).await;
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("build follow request");
+        let response = app.oneshot(req).await.expect("follow read oneshot");
+        assert!(response.into_body().collect().await.is_err());
+
+        let mut encoded = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&registry.gather(), &mut encoded)
+            .expect("encode metrics");
+        let scrape = String::from_utf8(encoded).expect("metrics are UTF-8");
+        let count_lines: Vec<_> = scrape
+            .lines()
+            .filter(|line| line.starts_with("bobs_read_duration_seconds_count"))
+            .collect();
+        assert!(
+            count_lines
+                .iter()
+                .any(|line| line.contains("mode=\"follow\"")
+                    && line.contains("outcome=\"timeout\"")
+                    && line.ends_with(" 1")),
+            "missing timeout metric: {scrape}"
+        );
+        assert!(
+            count_lines
+                .iter()
+                .all(|line| !line.contains("outcome=\"success\"")
+                    && !line.contains("outcome=\"client_gone\"")),
+            "timeout must not also record success/client_gone: {scrape}"
+        );
     }
 
     #[tokio::test]
@@ -2201,12 +3611,120 @@ mod tests {
         assert_eq!(meta.total_bytes_written, 8192);
     }
 
+    #[tokio::test]
+    async fn test_slow_body_frame_refreshes_monotonic_writer_activity_before_batch_flush() {
+        let (app, state) = app_with_state().await;
+        let key = create_key(&app).await;
+        let spool = state.manager.get_spool(&key).expect("spool exists");
+        spool.metadata.lock().await.last_write_at = 1;
+        let stale_anchor = Instant::now() - Duration::from_secs(60);
+        spool
+            .cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_write_at = stale_anchor;
+
+        let (frame_processed_tx, frame_processed_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let body_stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"));
+            let _ = frame_processed_tx.send(());
+            let _ = finish_rx.await;
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from_stream(body_stream))
+            .expect("request build");
+        let write_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.oneshot(request).await.expect("write oneshot") }
+        });
+
+        frame_processed_rx
+            .await
+            .expect("handler should process the first frame before waiting");
+        let metadata = spool.metadata.lock().await;
+        assert!(
+            metadata.last_write_at > 1,
+            "every received frame must refresh wall-clock activity before a batch is flushed"
+        );
+        assert_eq!(
+            metadata.total_bytes_written, 0,
+            "sub-page frame remains pending"
+        );
+        drop(metadata);
+        assert!(
+            spool.cleanup_anchors().last_write_at > stale_anchor,
+            "every received frame must refresh the monotonic cleanup anchor before a batch is flushed"
+        );
+
+        finish_tx.send(()).expect("write task still waiting");
+        assert_eq!(
+            write_task.await.expect("write task join").status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_refresh_rejection_surfaces_completion_and_delete_states() {
+        for delete_before_frame in [false, true] {
+            let (app, state) = app_with_state().await;
+            let key = create_key(&app).await;
+            let spool = state.manager.get_spool(&key).expect("spool exists");
+            let (body_polled_tx, body_polled_rx) = tokio::sync::oneshot::channel();
+            let (release_frame_tx, release_frame_rx) = tokio::sync::oneshot::channel();
+            let body_stream = async_stream::stream! {
+                let _ = body_polled_tx.send(());
+                let _ = release_frame_rx.await;
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"));
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/write/{key}/0"))
+                .body(Body::from_stream(body_stream))
+                .expect("request build");
+            let task = tokio::spawn({
+                let app = app.clone();
+                async move { app.oneshot(request).await.expect("write oneshot") }
+            });
+            body_polled_rx
+                .await
+                .expect("handler captured the spool before lifecycle transition");
+
+            let expected = if delete_before_frame {
+                state
+                    .manager
+                    .delete_spool(&key)
+                    .await
+                    .expect("delete before frame");
+                StatusCode::NOT_FOUND
+            } else {
+                spool.complete(None).await.expect("complete before frame");
+                StatusCode::CONFLICT
+            };
+            release_frame_tx
+                .send(())
+                .expect("handler still polling body");
+            assert_eq!(
+                task.await.expect("write task join").status(),
+                expected,
+                "HTTP must return the lifecycle refresh rejection"
+            );
+            assert_eq!(
+                spool.metadata.lock().await.total_bytes_written,
+                0,
+                "rejected frame must never reach the pending buffer or data file"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Read-coverage tracking — full_object_read_at and last_read_activity_at
     // -----------------------------------------------------------------------
 
     /// A single Range request that covers the entire 8 KiB object must set
-    /// `full_object_read_at` after the response body is fully drained.
+    /// the full-object cleanup anchor after the response body is fully drained.
     #[tokio::test]
     async fn test_full_range_sets_full_object_read_at() {
         let (app, state) = app_with_state().await;
@@ -2217,7 +3735,7 @@ mod tests {
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "full-range read must set full_object_read_at"
         );
         let cache = spool.page_cache.lock().await;
@@ -2227,8 +3745,8 @@ mod tests {
         );
     }
 
-    /// A partial Range request leaves bytes un-served; `full_object_read_at`
-    /// must remain 0.
+    /// A partial Range request leaves bytes un-served; the full-object cleanup
+    /// anchor must remain unset.
     #[tokio::test]
     async fn test_partial_range_does_not_set_full_object_read_at() {
         let (app, state) = app_with_state().await;
@@ -2238,10 +3756,9 @@ mod tests {
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.full_object_read_at.load(Ordering::Relaxed),
-            0,
-            "partial range must not set full_object_read_at"
+        assert!(
+            spool.cleanup_anchors().full_object_read_at.is_none(),
+            "partial range must not set the full-object cleanup anchor"
         );
         let cache = spool.page_cache.lock().await;
         assert!(
@@ -2250,8 +3767,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fragmented_fallback_requires_one_completed_full_range() {
+        let (app, state) = app_with_state().await;
+        let key = write_and_complete(&app, vec![7u8; 8192]).await;
+        let spool = state.manager.get_spool(&key).expect("spool must exist");
+
+        {
+            let mut missing = spool.missing_ranges.lock().await;
+            for fragment in 0u64..1025 {
+                let start = fragment * 2;
+                missing.mark_served(start, start + 1);
+            }
+            assert!(
+                missing.is_capped(),
+                ">1024 disjoint fragments must cap tracking"
+            );
+            assert!(
+                !missing.is_complete(),
+                "overflow must not claim full coverage"
+            );
+        }
+        assert!(spool.cleanup_anchors().full_object_read_at.is_none());
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // A completed partial response is insufficient exact evidence.
+        assert_eq!(
+            range_read_drain(&app, &key, "bytes=0-4095").await,
+            StatusCode::PARTIAL_CONTENT
+        );
+        assert!(spool.cleanup_anchors().full_object_read_at.is_none());
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // Dropping a full-range body after its first page must not commit the
+        // response-level fallback, even though per-page activity was recorded.
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/read/{key}"))
+            .header(axum::http::header::RANGE, "bytes=0-8191")
+            .body(Body::empty())
+            .expect("build range request");
+        let response = app.clone().oneshot(request).await.expect("range oneshot");
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("first frame")
+            .expect("first frame succeeds")
+            .into_data()
+            .expect("data frame");
+        assert_eq!(first.len(), 4096);
+        drop(body);
+        tokio::task::yield_now().await;
+        assert!(spool.cleanup_anchors().full_object_read_at.is_none());
+        assert_eq!(state.manager.admission.available_permits(), 255);
+
+        // A subsequent successfully drained contiguous full range re-establishes
+        // exact coverage and releases this spool's admission permit.
+        assert_eq!(
+            range_read_drain(&app, &key, "bytes=0-8191").await,
+            StatusCode::PARTIAL_CONTENT
+        );
+        assert!(spool.cleanup_anchors().full_object_read_at.is_some());
+        assert_eq!(state.manager.admission.available_permits(), 256);
+        assert!(!spool.missing_ranges.lock().await.is_capped());
+    }
+
     /// Two non-overlapping ranges that together cover the full 8 KiB object
-    /// must set `full_object_read_at` after the second request completes.
+    /// must set the full-object cleanup anchor after the second request.
     #[tokio::test]
     async fn test_two_ranges_covering_full_object_sets_flag() {
         let (app, state) = app_with_state().await;
@@ -2260,23 +3843,21 @@ mod tests {
         // First half — coverage incomplete.
         range_read_drain(&app, &key, "bytes=0-4095").await;
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.full_object_read_at.load(Ordering::Relaxed),
-            0,
-            "after first half: full_object_read_at must still be 0"
+        assert!(
+            spool.cleanup_anchors().full_object_read_at.is_none(),
+            "after first half: full-object cleanup anchor must still be unset"
         );
 
         // Second half — now fully covered.
         range_read_drain(&app, &key, "bytes=4096-8191").await;
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "after second half: full_object_read_at must be set"
         );
     }
 
-    /// Out-of-order ranges: serve the second half first, then the first half.
-    /// `full_object_read_at` must be 0 after the first request and > 0 only
-    /// after the second.
+    /// Out-of-order ranges set the full-object cleanup anchor only once all bytes
+    /// have been covered.
     #[tokio::test]
     async fn test_out_of_order_ranges_set_flag_on_completion() {
         let (app, state) = app_with_state().await;
@@ -2285,22 +3866,21 @@ mod tests {
         // Second half first.
         range_read_drain(&app, &key, "bytes=4096-8191").await;
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.full_object_read_at.load(Ordering::Relaxed),
-            0,
-            "only second half served: full_object_read_at must be 0"
+        assert!(
+            spool.cleanup_anchors().full_object_read_at.is_none(),
+            "only second half served: full-object cleanup anchor must be unset"
         );
 
         // First half — completes coverage.
         range_read_drain(&app, &key, "bytes=0-4095").await;
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "after first half served: full_object_read_at must be set"
         );
     }
 
     /// Overlapping ranges must not double-count bytes. Two overlapping requests
-    /// that together cover a 4 KiB object must set `full_object_read_at`.
+    /// that together cover a 4 KiB object must set the full-object cleanup anchor.
     #[tokio::test]
     async fn test_overlapping_ranges_do_not_double_count() {
         let (app, state) = app_with_state().await;
@@ -2310,22 +3890,21 @@ mod tests {
         // bytes 0-3000 (first request).
         range_read_drain(&app, &key, "bytes=0-3000").await;
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.full_object_read_at.load(Ordering::Relaxed),
-            0,
-            "bytes 3001-4095 still missing: flag must be 0"
+        assert!(
+            spool.cleanup_anchors().full_object_read_at.is_none(),
+            "bytes 3001-4095 still missing: cleanup anchor must be unset"
         );
 
         // bytes 2000-4095 — overlaps [0,3001) and covers [3001,4096).
         range_read_drain(&app, &key, "bytes=2000-4095").await;
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "overlapping second range completes coverage: flag must be set"
         );
     }
 
     /// A follow-GET (no Range header) that consumes the entire body must set
-    /// `full_object_read_at`.
+    /// the full-object cleanup anchor.
     #[tokio::test]
     async fn test_follow_read_sets_full_object_read_at() {
         let (app, state) = app_with_state().await;
@@ -2336,7 +3915,7 @@ mod tests {
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "follow-GET must set full_object_read_at after all bytes are served"
         );
     }
@@ -2372,37 +3951,28 @@ mod tests {
         assert_eq!(body, data);
     }
 
-    /// Any read that yields at least one chunk must update `last_read_activity_at`.
+    /// Any read that yields at least one chunk must update the read-activity anchor.
     #[tokio::test]
     async fn test_last_read_activity_updated_on_chunk_yield() {
         let (app, state) = app_with_state().await;
         let key = write_and_complete(&app, vec![1u8; 4096]).await;
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        assert_eq!(
-            spool.last_read_activity_at.load(Ordering::Relaxed),
-            0,
-            "no reads yet: last_read_activity_at must be 0"
+        assert!(
+            spool.cleanup_anchors().last_read_activity_at.is_none(),
+            "no reads yet: read-activity anchor must be unset"
         );
 
         range_read_drain(&app, &key, "bytes=0-4095").await;
 
         assert!(
-            spool.last_read_activity_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().last_read_activity_at.is_some(),
             "after range read: last_read_activity_at must be updated"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Cleanup TTL integration — HTTP read → cleanup deletion
-    //
-    // NOTE on wall-clock vs tokio time:
-    // `crate::time::now_secs()` uses `SystemTime::now()` (wall clock).
-    // `tokio::time::advance()` only advances
-    // the tokio virtual clock, which controls `tokio::time::interval` sweeps.
-    // To make a TTL condition fire we set the stored timestamp to `1` (a value
-    // in 1970 that is always >> any TTL seconds behind the current wall clock).
-    // `tokio::time::advance()` is used solely to trigger the cleanup sweep.
+    // Cleanup TTL integration — HTTP read → monotonic cleanup deletion
     // -----------------------------------------------------------------------
 
     /// Full-range HTTP read sets `full_object_read_at`; cleanup deletes the
@@ -2419,20 +3989,25 @@ mod tests {
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
         assert!(
-            spool.full_object_read_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().full_object_read_at.is_some(),
             "HTTP read path must set full_object_read_at after full coverage"
         );
 
-        // Simulate that full-read and the latest byte-serving activity happened
-        // long ago so the short-TTL comparison fires. Wall clock can't be
-        // advanced by tokio::time, so use an old epoch value.
-        spool.full_object_read_at.store(1, Ordering::SeqCst);
-        spool.last_read_activity_at.store(1, Ordering::SeqCst);
+        // Age both monotonic anchors beyond the short TTL.
+        {
+            let mut anchors = spool
+                .cleanup_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let old = Instant::now() - Duration::from_secs(10);
+            anchors.full_object_read_at = Some(old);
+            anchors.last_read_activity_at = Some(old);
+        }
 
         let task = start_cleanup_task(state.manager.clone(), state.config.clone());
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::task::yield_now().await;
+        wait_for_spool_removal(&state.manager, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),
@@ -2450,21 +4025,20 @@ mod tests {
         let key = write_and_complete(&app, vec![5u8; 4096]).await;
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
-        // No reads: last_read_activity_at must be 0.
-        assert_eq!(spool.last_read_activity_at.load(Ordering::Relaxed), 0);
+        assert!(spool.cleanup_anchors().last_read_activity_at.is_none());
 
-        // Set readable_at to an old epoch value so the idle TTL fires.
-        // (complete() sets readable_at = now_secs(); we override to simulate an
-        // old spool whose idle TTL has clearly expired.)
         {
-            let mut meta = spool.metadata.lock().await;
-            meta.readable_at = Some(1);
+            let mut anchors = spool
+                .cleanup_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            anchors.readable_at = Some(Instant::now() - Duration::from_secs(10));
         }
 
         let task = start_cleanup_task(state.manager.clone(), state.config.clone());
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::task::yield_now().await;
+        wait_for_spool_removal(&state.manager, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),
@@ -2483,23 +4057,24 @@ mod tests {
 
         let spool = state.manager.get_spool(&key).expect("spool must exist");
 
-        // Make readable_at old so that, without activity, idle TTL would fire.
+        // Make the readable anchor old so that, without activity, idle TTL would fire.
         {
-            let mut meta = spool.metadata.lock().await;
-            meta.readable_at = Some(1);
+            let mut anchors = spool
+                .cleanup_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            anchors.readable_at = Some(Instant::now() - Duration::from_secs(10));
         }
 
-        // Perform a range read — this stores last_read_activity_at = now_secs().
+        // Perform a range read, which refreshes the monotonic activity anchor.
         let status = range_read_drain(&app, &key, "bytes=0-4095").await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         assert!(
-            spool.last_read_activity_at.load(Ordering::Relaxed) > 0,
+            spool.cleanup_anchors().last_read_activity_at.is_some(),
             "range read must update last_read_activity_at"
         );
 
-        // Advance tokio time to trigger several cleanup sweeps. Because
-        // last_read_activity_at ≈ now_secs(), the idle check
-        // (now - last_activity ≈ 0 < 2) must NOT delete the spool.
+        // Trigger several cleanup sweeps; recent monotonic activity protects the spool.
         let task = start_cleanup_task(state.manager.clone(), state.config.clone());
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
@@ -2510,20 +4085,255 @@ mod tests {
             "spool with recent read activity must NOT be deleted"
         );
 
-        // Simulate that activity has now stopped (reset to old epoch value).
-        // idle_anchor = last_read_activity_at = 1 → now - 1 >> 2 → idle fires.
-        spool.last_read_activity_at.store(1, Ordering::SeqCst);
+        // Age the activity anchor beyond the idle TTL.
+        spool
+            .cleanup_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_read_activity_at = Some(Instant::now() - Duration::from_secs(10));
 
         tokio::time::advance(Duration::from_secs(3)).await;
-        // measure_disk_usage is now spawned fire-and-forget, so the cleanup
-        // loop returns to interval.tick() without blocking on spawn_blocking
-        // I/O.  A single yield is enough for the deletion sweep to run.
+        // Deletion stays visible until metadata and directory removal finish.
         tokio::task::yield_now().await;
+        wait_for_spool_removal(&state.manager, &key).await;
 
         assert!(
             state.manager.get_spool(&key).is_none(),
             "spool must be deleted once activity stops and idle TTL expires"
         );
         task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_unconsumed_parallel_readers_are_page_budget_bounded() {
+        const PAGE_SIZE: usize = 4 * 1024 * 1024;
+        const PERMIT_LIMIT: usize = 4;
+        const CLIENTS: usize = 64;
+
+        let (app, state) = app_with_read_budget(
+            PAGE_SIZE,
+            PAGE_SIZE * PERMIT_LIMIT,
+            60_000,
+            Arc::new(BobsMetrics::new(false)),
+        )
+        .await;
+        let (key, spool) = complete_disk_fixture(&state, Bytes::from(vec![0xA5; PAGE_SIZE])).await;
+        assert_eq!(state.manager.read_response_permit_limit(), PERMIT_LIMIT);
+        let rss_before = current_rss_bytes();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(CLIENTS);
+        let mut tasks = Vec::with_capacity(CLIENTS);
+        for id in 0..CLIENTS {
+            let app = app.clone();
+            let request = read_request(&key);
+            let sender = sender.clone();
+            tasks.push(tokio::spawn(async move {
+                let response = app.oneshot(request).await.expect("parallel read response");
+                let _ = sender.send((id, response)).await;
+            }));
+        }
+        drop(sender);
+
+        let mut held_responses = Vec::with_capacity(PERMIT_LIMIT);
+        for _ in 0..PERMIT_LIMIT {
+            let (_, response) = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
+                .await
+                .expect("admitted reader returned")
+                .expect("reader channel remains open");
+            assert_eq!(response.status(), StatusCode::OK);
+            held_responses.push(response);
+        }
+        wait_for_reader_count(&spool, CLIENTS).await;
+
+        assert_eq!(state.manager.active_read_responses(), PERMIT_LIMIT);
+        assert_eq!(state.manager.active_read_response_permits(), PERMIT_LIMIT);
+        assert_eq!(state.manager.read_response_available_permits(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+                .await
+                .is_err(),
+            "an unconsumed response must retain its page-buffer permit"
+        );
+
+        let rss_after = current_rss_bytes();
+        if let (Some(before), Some(after)) = (rss_before, rss_after) {
+            eprintln!(
+                "slow-reader instrumentation: clients={CLIENTS} page_bytes={PAGE_SIZE} permit_limit={PERMIT_LIMIT} active={} permit_units={} rss_before={} rss_after={} rss_delta={}",
+                state.manager.active_read_responses(),
+                state.manager.active_read_response_permits(),
+                before,
+                after,
+                after.saturating_sub(before),
+            );
+        }
+
+        drop(held_responses.pop());
+        let (_, replacement) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("one queued reader admitted after release")
+            .expect("reader channel remains open");
+        assert_eq!(replacement.status(), StatusCode::OK);
+        held_responses.push(replacement);
+        assert_eq!(state.manager.active_read_responses(), PERMIT_LIMIT);
+
+        for task in &tasks {
+            task.abort();
+        }
+        drop(held_responses);
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.active_read_response_permits(), 0);
+        assert_eq!(
+            state.manager.read_response_available_permits(),
+            PERMIT_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_reader_waiting_for_response_permit_cleans_up_activity() {
+        let (app, state) =
+            app_with_read_budget(4096, 0, 60_000, Arc::new(BobsMetrics::new(false))).await;
+        let (key, spool) = complete_disk_fixture(&state, Bytes::from_static(b"page")).await;
+
+        let held = app
+            .clone()
+            .oneshot(read_request(&key))
+            .await
+            .expect("first response");
+        assert_eq!(state.manager.active_read_responses(), 1);
+
+        let waiting_app = app.clone();
+        let waiting_request = read_request(&key);
+        let waiting = tokio::spawn(async move { waiting_app.oneshot(waiting_request).await });
+        wait_for_reader_count(&spool, 2).await;
+        waiting.abort();
+        assert!(waiting
+            .await
+            .expect_err("waiting request must be cancelled")
+            .is_cancelled());
+        wait_for_reader_count(&spool, 1).await;
+        assert_eq!(state.manager.active_read_responses(), 1);
+
+        drop(held);
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.read_response_available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn permit_queue_timeout_redirect_does_not_leak_or_steal_capacity() {
+        let (app, state) =
+            app_with_read_budget(4096, 0, 25, Arc::new(BobsMetrics::new(false))).await;
+        let (key, spool) = complete_disk_fixture(&state, Bytes::from_static(b"page")).await;
+
+        let held = app
+            .clone()
+            .oneshot(read_request(&key))
+            .await
+            .expect("first response");
+        let redirect = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.clone().oneshot(read_request(&key)),
+        )
+        .await
+        .expect("queued read observes initial timeout")
+        .expect("redirect response");
+
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(state.manager.active_read_responses(), 1);
+        assert_eq!(state.manager.active_read_response_permits(), 1);
+        assert_eq!(state.manager.read_response_available_permits(), 0);
+        wait_for_reader_count(&spool, 1).await;
+
+        drop(redirect);
+        drop(held);
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.read_response_available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_cancels_permit_waiter_without_waiting_for_slow_response() {
+        let (app, state) =
+            app_with_read_budget(4096, 0, 60_000, Arc::new(BobsMetrics::new(false))).await;
+        let (key, spool) = complete_disk_fixture(&state, Bytes::from_static(b"page")).await;
+
+        let held = app
+            .clone()
+            .oneshot(read_request(&key))
+            .await
+            .expect("first response");
+        let waiting_app = app.clone();
+        let waiting_request = read_request(&key);
+        let waiting = tokio::spawn(async move { waiting_app.oneshot(waiting_request).await });
+        wait_for_reader_count(&spool, 2).await;
+
+        tokio::time::timeout(Duration::from_secs(5), state.manager.delete_spool(&key))
+            .await
+            .expect("delete must not wait for response admission")
+            .expect("delete succeeds");
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("permit waiter wakes on delete")
+            .expect("waiting task joins")
+            .expect("router returns not-found response");
+        assert_eq!(cancelled.status(), StatusCode::NOT_FOUND);
+        wait_for_reader_count(&spool, 1).await;
+        assert_eq!(state.manager.active_read_responses(), 1);
+
+        drop(cancelled);
+        drop(held);
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.read_response_available_permits(), 1);
+        assert!(state.manager.get_spool(&key).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admitted_parallel_readers_drain_normally_at_full_throughput() {
+        const PAGE_SIZE: usize = 64 * 1024;
+        const READERS: usize = 16;
+        let (app, state) = app_with_read_budget(
+            PAGE_SIZE,
+            PAGE_SIZE * 2,
+            5_000,
+            Arc::new(BobsMetrics::new(false)),
+        )
+        .await;
+        let expected = Bytes::from(
+            (0..PAGE_SIZE * 4)
+                .map(|offset| (offset % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (key, spool) = complete_disk_fixture(&state, expected.clone()).await;
+
+        let mut tasks = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let app = app.clone();
+            let request = read_request(&key);
+            let expected = expected.clone();
+            tasks.push(tokio::spawn(async move {
+                let response = app.oneshot(request).await.expect("read response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("collect admitted response")
+                    .to_bytes();
+                assert_eq!(body, expected);
+            }));
+        }
+
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(15), task)
+                .await
+                .expect("reader drains without admission deadlock")
+                .expect("reader task joins");
+        }
+        wait_for_reader_count(&spool, 0).await;
+        assert_eq!(state.manager.active_read_responses(), 0);
+        assert_eq!(state.manager.active_read_response_permits(), 0);
+        assert_eq!(state.manager.read_response_available_permits(), 2);
     }
 }

@@ -9,16 +9,15 @@ use bobs::io::DefaultFileIO;
 use bobs::manager::SpoolManager;
 use bobs::metadata::DefaultMetadataStore;
 use bobs::metrics::BobsMetrics;
+use bobs::server::{serve_http, SHUTDOWN_DRAIN_TIMEOUT};
 use bobs::shutdown;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::task::JoinSet;
-use tower::ServiceExt;
 
 #[cfg(feature = "telemetry")]
 use bobs::metrics::{init_meter_provider, serve_metrics};
+#[cfg(feature = "telemetry")]
+use tokio_util::sync::CancellationToken;
 
 fn parse_ordinal(hostname: &str) -> std::io::Result<String> {
     let (_, ordinal) = hostname.rsplit_once('-').ok_or_else(|| {
@@ -96,38 +95,55 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
     {
-        let ring_pool = bobs::io::initialize_production_ring_pool(
-            config.io_uring_shards,
-            config.io_uring_queue_capacity,
-        )?;
+        let queue_capacity = config.resolved_io_uring_queue_capacity()?;
+        let ring_pool =
+            bobs::io::initialize_production_ring_pool(config.io_uring_shards, queue_capacity)?;
         tracing::debug!(
             configured_shards = ?ring_pool.configured_shards,
             resolved_shards = ring_pool.resolved_shards,
             cpu_pinning_enabled = ring_pool.cpu_pinning_enabled,
-            queue_capacity = config.io_uring_queue_capacity,
+            queue_capacity,
             "io_uring production ring pool initialized",
         );
     }
 
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = TcpListener::bind(&addr).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to bind main HTTP listener at {addr}: {error}"),
+        )
+    })?;
+
     #[cfg(feature = "telemetry")]
-    let _meter_provider = if config.metrics.enabled {
+    let metrics_listener = if config.metrics.enabled {
+        let metrics_addr = format!("{}:{}", config.metrics.bind_address, config.metrics.port);
+        let listener = TcpListener::bind(&metrics_addr).await.map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to bind metrics HTTP listener at {metrics_addr}: {error}"),
+            )
+        })?;
+        Some((listener, metrics_addr))
+    } else {
+        None
+    };
+
+    #[cfg(feature = "telemetry")]
+    let (_meter_provider, metrics_server) = if let Some((listener, metrics_addr)) = metrics_listener
+    {
         let (provider, registry) = init_meter_provider(&hostname);
-        let metrics_bind_address = config.metrics.bind_address.clone();
-        let metrics_port = config.metrics.port;
-        tokio::spawn(async move {
-            if let Err(e) = serve_metrics(registry, &metrics_bind_address, metrics_port).await {
-                tracing::error!(port = metrics_port, error = %e, "metrics server failed");
-            }
-        });
         tracing::info!(
             "event.name" = "startup.metrics.enabled",
             outcome = "success",
-            port = metrics_port,
+            addr = %metrics_addr,
+            host = %config.metrics.bind_address,
+            port = config.metrics.port,
             "prometheus /metrics scrape endpoint enabled"
         );
-        Some(provider)
+        (Some(provider), Some((listener, registry)))
     } else {
-        None
+        (None, None)
     };
 
     let metrics = Arc::new(BobsMetrics::new(config.metrics.enabled));
@@ -142,7 +158,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     manager.set_metrics(Arc::clone(&metrics));
     let manager = Arc::new(manager);
 
-    manager.recover().await?;
+    manager
+        .recover_with_max_spool_bytes(config.max_spool_bytes)
+        .await?;
     let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
     let state = Arc::new(AppState {
@@ -154,60 +172,116 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metrics,
     });
     let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(state);
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
     tracing::info!("event.name" = "startup.server.listening", outcome = "success", addr = %addr, host = %config.host, port = config.port, "server listening");
 
-    // 16 MiB h2 windows — one body fits in a single window with no flow-control pauses.
-    const H2_WINDOW: u32 = 16 * 1024 * 1024;
-    // Largest HTTP/2 frame we let peers send us (spec ceiling 2^24-1). The default is
-    // 16 KiB, which shreds a 16 MiB write body into ~1024 DATA frames; at the ceiling a
-    // 16 MiB body is ~1-2 frames. After CRC removal the per-frame h2 codec/flow-control
-    // work was ~37% of BOBS CPU on the worker->BOBS write path — this collapses it.
-    const H2_MAX_FRAME: u32 = 16 * 1024 * 1024 - 1;
+    #[cfg(feature = "telemetry")]
+    let (drain, metrics_drain) = if let Some((metrics_listener, registry)) = metrics_server {
+        let cancellation = CancellationToken::new();
+        let main_cancellation = cancellation.clone();
+        let metrics_cancellation = cancellation.clone();
+        let main_server = serve_http(
+            listener,
+            app,
+            async move { main_cancellation.cancelled().await },
+            SHUTDOWN_DRAIN_TIMEOUT,
+        );
+        let metrics_server = serve_metrics(
+            metrics_listener,
+            registry,
+            async move { metrics_cancellation.cancelled().await },
+            SHUTDOWN_DRAIN_TIMEOUT,
+        );
+        tokio::pin!(main_server);
+        tokio::pin!(metrics_server);
 
-    let mut shutdown = std::pin::pin!(shutdown::shutdown_signal());
-    let mut tasks: JoinSet<()> = JoinSet::new();
-
-    loop {
         tokio::select! {
-            result = listener.accept() => {
-                let (stream, _) = result?;
-                let io = TokioIo::new(stream);
-                let app = app.clone();
-                tasks.spawn(async move {
-                    let mut builder = Builder::new(TokioExecutor::new());
-                    builder
-                        .http2()
-                        .initial_stream_window_size(H2_WINDOW)
-                        .initial_connection_window_size(H2_WINDOW)
-                        .max_frame_size(H2_MAX_FRAME);
-                    let svc = hyper::service::service_fn(move |req| {
-                        let app = app.clone();
-                        async move { app.oneshot(req).await }
-                    });
-                    if let Err(err) = builder.serve_connection_with_upgrades(io, svc).await {
-                        tracing::warn!(error = %err, "connection error");
-                    }
-                });
+            _ = shutdown::shutdown_signal() => {
+                tracing::info!(
+                    "event.name" = "startup.shutdown.received",
+                    outcome = "success",
+                    drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                    "shutdown signal received; stopping accepts and draining connections"
+                );
+                cancellation.cancel();
+                let (main_result, metrics_result) =
+                    tokio::join!(main_server.as_mut(), metrics_server.as_mut());
+                (main_result?, Some(metrics_result?))
             }
-            _ = &mut shutdown => {
-                tracing::info!("event.name" = "startup.shutdown.received", outcome = "success", "shutdown signal received");
-                break;
+            main_result = main_server.as_mut() => {
+                cancellation.cancel();
+                let metrics_result = metrics_server.as_mut().await;
+                (main_result?, Some(metrics_result?))
             }
-            // Reap finished connection tasks to avoid unbounded JoinSet growth.
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            metrics_result = metrics_server.as_mut() => {
+                cancellation.cancel();
+                let main_result = main_server.as_mut().await;
+                (main_result?, Some(metrics_result?))
+            }
         }
+    } else {
+        let drain = serve_http(
+            listener,
+            app,
+            async {
+                shutdown::shutdown_signal().await;
+                tracing::info!(
+                    "event.name" = "startup.shutdown.received",
+                    outcome = "success",
+                    drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                    "shutdown signal received; stopping accepts and draining connections"
+                );
+            },
+            SHUTDOWN_DRAIN_TIMEOUT,
+        )
+        .await?;
+        (drain, None)
+    };
+
+    #[cfg(not(feature = "telemetry"))]
+    let drain = serve_http(
+        listener,
+        app,
+        async {
+            shutdown::shutdown_signal().await;
+            tracing::info!(
+                "event.name" = "startup.shutdown.received",
+                outcome = "success",
+                drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                "shutdown signal received; stopping accepts and draining connections"
+            );
+        },
+        SHUTDOWN_DRAIN_TIMEOUT,
+    )
+    .await?;
+
+    if drain.timed_out {
+        tracing::warn!(
+            "event.name" = "startup.shutdown.drain_timeout",
+            outcome = "timeout",
+            listener = "main",
+            drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+            aborted_connections = drain.aborted_connections,
+            "HTTP drain deadline reached; aborted remaining connections"
+        );
     }
 
-    // Drain in-flight connections before exiting.
-    while tasks.join_next().await.is_some() {}
+    #[cfg(feature = "telemetry")]
+    if let Some(metrics_drain) = metrics_drain {
+        if metrics_drain.timed_out {
+            tracing::warn!(
+                "event.name" = "startup.shutdown.drain_timeout",
+                outcome = "timeout",
+                listener = "metrics",
+                drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                aborted_connections = metrics_drain.aborted_connections,
+                "HTTP drain deadline reached; aborted remaining connections"
+            );
+        }
+    }
 
     // Drop HTTP entrypoints and background manager users before tearing down
     // the global io_uring pool; otherwise lingering Arc<SpoolManager> handles
     // can keep pool clones alive and prevent driver shutdown from joining.
-    drop(listener);
-    drop(app);
     cleanup_task.abort();
     match cleanup_task.await {
         Ok(()) => tracing::debug!("cleanup task exited before shutdown"),

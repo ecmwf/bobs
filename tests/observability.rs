@@ -51,7 +51,9 @@ fn test_config(dir: &std::path::Path) -> Arc<Config> {
         reader_done_ttl_secs: 60,
         unread_ttl_secs: 3600,
         cleanup_sweep_interval_secs: 30,
-        long_poll_timeout_ms: 25,
+        // This suite tests logging, not timeout scheduling. Leave enough room for a
+        // completed-spool cache miss to reopen its response-scoped handle under CI load.
+        long_poll_timeout_ms: 1000,
         io_uring_shards: None,
         io_uring_queue_capacity: 1024,
         host_prefix: "test".into(),

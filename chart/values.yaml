@@ -3,18 +3,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 replicaCount: 1
+# Dependency condition consumed by parent charts such as polytope-chart.
+enabled: true
 
-# Default fallback for standalone bobs renders. When deployed as a subchart of
-# polytope-chart, the parent's `global.ingress.controller` propagates here.
+# Defaults for standalone BOBS renders. Values under `global` can be supplied by
+# a parent chart and propagate here through Helm's standard global mechanism.
 global:
+  imageRegistry: ""
   ingress:
     controller: nginx-inc
 
 imagePullSecrets: []
 
 image:
-  repository: bobs
-  tag: latest
+  registry: eccr.ecmwf.int
+  repository: polytope/bobs
+  tag: "0.1.0"
+  digest: ""
   pullPolicy: IfNotPresent
 
 service:
@@ -75,12 +80,15 @@ probes:
   enabled: false
 
 # Internal base URL template bobs uses to build per-ordinal pod URLs. Leave empty
-# to use the default derived from the release fullname and service port:
-#   http://<fullname>-{ordinal}:<service.port>/api/v1
-# Set to override (tpl-rendered; `{ordinal}` is substituted by bobs at runtime),
-# e.g. to route via the headless service:
-#   internalBaseUrlTemplate: 'http://{{ include "bobs.fullname" . }}-{ordinal}.{{ .Values.headlessService.name }}:{{ .Values.service.port }}/api/v1'
+# to use StatefulSet pod DNS through the governing Service:
+#   http://<statefulset-name>-{ordinal}.<headless-service-name>:<service.port>/api/v1
+# Set to override (tpl-rendered; `{ordinal}` is substituted by bobs at runtime).
+# The `bobs.headlessServiceName` helper resolves either the managed Service name
+# or the required external governing Service name.
 internalBaseUrlTemplate: ""
+
+# tracing-subscriber filter used by the BOBS process.
+rustLog: info
 
 observability:
   # deployment.environment OTel resource attribute.
@@ -93,32 +101,56 @@ observability:
 config:
   host: "0.0.0.0"
   port: 3000
+  # Helm deployment profile. These intentionally override the Rust binary defaults
+  # (data_dir ./data, page_size 16 MiB, global cache 256 MiB) with a lower-latency
+  # 4 KiB page / 1 MiB global cache. The chart mounts its data volume only at the
+  # normalized /var/lib/bobs path or a descendant so it cannot hide image or system
+  # paths. The standalone binary still accepts other runtime data_dir locations.
+  # max_cache_bytes may be smaller than page_size. It also derives the weighted
+  # response-lifetime read budget as max(1, floor(max_cache_bytes / page_size)); 0
+  # disables caching but retains one bounded disk-backed response.
   data_dir: "/var/lib/bobs"
-  # Spool write page size. BOBS fsyncs a metadata commit per page on write, so
-  # larger pages amortise fsync cost over more data. max_cache_bytes must be >= page_size.
+  # Valid page sizes are 1..=67108864 bytes (64 MiB) and must not exceed
+  # max_spool_bytes. Pages larger than the cache bypass it.
   page_size: 4096
   max_cache_bytes: 1048576
-  # Admission limit: max spools concurrently holding an in-memory page cache
-  # (created but not yet fully read). create blocks until a slot frees, applying
-  # backpressure to writers instead of growing memory without bound.
-  max_live_spools: 4096
+  # Separate first-read and recovery admission limit. The explicit chart default
+  # matches max_cache_bytes / page_size; operators may override it within 1..=65536.
+  max_live_spools: 256
+  # Per-spool write limit; must be >= page_size. 8 GiB leaves headroom on the default 10 GiB PVC.
+  max_spool_bytes: 8589934592
+  # Bound create admission waits; exhausted capacity returns HTTP 503.
+  create_admission_timeout_ms: 5000
+  # Exposes an unauthenticated, CPU-intensive profiler on the main listener.
+  enable_pprof: false
   # io_uring tuning. When unset, BOBS auto-resolves shards = (num_cpus/4).max(1)
-  # and a queue capacity of 1024. Override for higher per-volume write parallelism.
+  # and a queue capacity of 1024. Explicit shard counts must be in 1..=256.
+  # Queue capacity must be 1..=Tokio's Semaphore::MAX_PERMITS
+  # (usize::MAX >> 3; 2305843009213693951 on 64-bit).
   # io_uring_shards: 8
   # io_uring_queue_capacity: 4096
   writer_inactivity_timeout_secs: 300
   read_idle_ttl_secs: 600
   full_read_complete_ttl_secs: 30
+  # Deprecated compatibility fields: parsed by BOBS but ignored by cleanup.
   reader_done_ttl_secs: 60
   unread_ttl_secs: 3600
   cleanup_sweep_interval_secs: 30
   long_poll_timeout_ms: 25000
+  # Required deployment routing values. host_prefix and domain are supplied by
+  # the parent chart or operator; route_name intentionally defaults to download.
+  # route_name is one 1-63 character path segment: ASCII letters, digits, '_' and
+  # '-' only, starting and ending with an alphanumeric character.
   host_prefix: ""
   domain: ""
   route_name: "download"
+  # Kubernetes metrics profile: bind on all interfaces and allow only collection.
+  # The Rust binary defaults are 127.0.0.1 and an empty list (allow all labels).
+  # When enabled, this port must differ from config.port.
   metrics:
     enabled: false
     bind_address: "0.0.0.0"
+    # Must differ from config.port when enabled in a telemetry build.
     port: 9464
     allowed_labels:
       - collection
@@ -128,23 +160,42 @@ config:
       interval: 30s
       labels: {}
 
+# The chart mounts BOBS data only at /var/lib/bobs or a normalized descendant.
+# Raw Block PVCs are unsupported; persistence.volumeMode is fixed to Filesystem.
+
 persistence:
   enabled: true
   size: 10Gi
   storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  annotations: {}
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete
+  emptyDir:
+    medium: ""
+    sizeLimit: 10Gi
 
 ingress:
   enabled: false
   className: nginx
   annotations: {}
   tls: []
-  # X-Forwarded-Prefix location snippet for the nginx-inc ingress. Off by default
-  # (parity with the deployed/vendored chart). When enabled, the ingress preserves
-  # the external route prefix (/{route_name}-N) for BOBS long-poll redirects and
-  # re-asserts the standard forwarded headers explicitly.
+  # Preserve the exact external /{route_name}-N pod prefix in BOBS long-poll
+  # redirects whenever ingress is enabled. NGINX Inc uses a location snippet;
+  # community ingress-nginx renders one Ingress per replica with its native
+  # x-forwarded-prefix annotation. Existing user annotations are retained.
+  # Explicit false is rejected with ingress.enabled=true because it would emit
+  # unroutable redirect Location paths.
   forwardedPrefix:
-    enabled: false
+    enabled: true
 
+# StatefulSet governing Service and stable pod DNS. When enabled, the chart creates
+# a headless Service. An empty name preserves the <fullname>-svc default; set a
+# valid Service name to override it. When disabled, name is required and must name
+# an existing external headless Service in this release namespace.
 headlessService:
   enabled: true
-  name: bobs-svc
+  name: ""

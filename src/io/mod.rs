@@ -2,6 +2,19 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+/// Maximum explicit number of `io_uring` rings and driver threads.
+///
+/// The automatic default remains `(num_cpus / 4).max(1)`. This limit prevents a
+/// malformed or hostile configuration from attempting pathological allocation and
+/// thread creation.
+pub const MAX_IO_URING_SHARDS: usize = 256;
+
+/// Maximum byte length representable by one `io_uring` read or write SQE.
+///
+/// Callers that configure backend I/O sizes may use this limit, but higher-level
+/// protocols remain responsible for choosing their own request or page policies.
+pub const MAX_IO_URING_IO_LEN: usize = u32::MAX as usize;
+
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 pub mod ring_pool;
 pub mod tokio_fs;
@@ -38,7 +51,23 @@ pub async fn read_exact_at<F: FileIO>(
     len: usize,
     context: &str,
 ) -> io::Result<Bytes> {
+    if len == 0 {
+        return Ok(Bytes::new());
+    }
+
+    let first = F::read_at(handle, offset, len).await?;
+    if first.len() == len {
+        return Ok(first);
+    }
+    if first.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("expected {len} bytes while {context}, got 0"),
+        ));
+    }
+
     let mut out = BytesMut::with_capacity(len);
+    out.extend_from_slice(&first);
 
     while out.len() < len {
         let read_offset = offset + out.len() as u64;
@@ -60,11 +89,27 @@ pub trait FileIO: Send + Sync + Clone + 'static {
     /// Associated type for file handles. Must be Send + Sync.
     type Handle: Send + Sync + 'static;
 
-    /// Create a new file at the given path.
+    /// Create a new regular file at the given path without following a final symlink.
     fn create(path: &Path) -> impl Future<Output = std::io::Result<Self::Handle>> + Send;
 
-    /// Open an existing file at the given path.
+    /// Inspect a canonical path without following its final symlink or blocking a Tokio worker.
+    fn symlink_metadata(
+        path: &Path,
+    ) -> impl Future<Output = std::io::Result<std::fs::Metadata>> + Send {
+        let path = path.to_path_buf();
+        async move {
+            tokio::task::spawn_blocking(move || std::fs::symlink_metadata(path))
+                .await
+                .map_err(std::io::Error::other)?
+        }
+    }
+
+    /// Open an existing regular file at the given path without following a final symlink.
     fn open(path: &Path) -> impl Future<Output = std::io::Result<Self::Handle>> + Send;
+
+    /// Return the current length of an opened regular file without blocking a Tokio worker.
+    /// Implementations must inspect the open descriptor rather than resolving the path again.
+    fn file_size(handle: &Self::Handle) -> impl Future<Output = std::io::Result<u64>> + Send;
 
     /// Write owned data at a specific byte offset in the file.
     fn write_at(
@@ -82,6 +127,9 @@ pub trait FileIO: Send + Sync + Clone + 'static {
 
     /// Sync file data to disk.
     fn sync_data(handle: &Self::Handle) -> impl Future<Output = std::io::Result<()>> + Send;
+
+    /// Sync a directory so entry creation, rename, and removal are durable.
+    fn sync_directory(path: &Path) -> impl Future<Output = std::io::Result<()>> + Send;
 
     /// Close the file handle.
     fn close(handle: Self::Handle) -> impl Future<Output = std::io::Result<()>> + Send;
@@ -314,6 +362,30 @@ pub(crate) mod fileio_test_cases {
             I::close(handle).await.expect("failed to close");
         }
 
+        pub(crate) async fn open_rejects_symlink() {
+            let dir = tempdir().expect("failed to create temp dir");
+            let target_path = dir.path().join("target.bin");
+            let symlink_path = dir.path().join("spool.dat");
+            std::fs::write(&target_path, b"external sentinel").expect("write symlink target");
+            std::os::unix::fs::symlink(&target_path, &symlink_path).expect("create data symlink");
+
+            let error = I::open(&symlink_path)
+                .await
+                .err()
+                .expect("opening a symlink must fail");
+            assert!(
+                matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ELOOP
+                ) || error.kind() == std::io::ErrorKind::InvalidData,
+                "unexpected symlink rejection: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&target_path).expect("read symlink target"),
+                b"external sentinel"
+            );
+        }
+
         pub(crate) async fn remove_unlinks_file() {
             let dir = tempdir().expect("failed to create temp dir");
             let file_path = dir.path().join("test_remove.bin");
@@ -325,6 +397,17 @@ pub(crate) mod fileio_test_cases {
             assert!(file_path.exists(), "file should exist after creation");
             I::remove(&file_path).await.expect("failed to remove file");
             assert!(!file_path.exists(), "file should not exist after removal");
+        }
+
+        pub(crate) async fn sync_directory_succeeds() {
+            let dir = tempdir().expect("failed to create temp dir");
+            let file_path = dir.path().join("directory-entry");
+            let handle = I::create(&file_path).await.expect("failed to create file");
+            I::sync_data(&handle).await.expect("failed to sync file");
+            I::close(handle).await.expect("failed to close");
+            I::sync_directory(dir.path())
+                .await
+                .expect("failed to sync directory");
         }
 
         pub(crate) async fn close_and_drop_are_safe() {
