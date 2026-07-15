@@ -309,8 +309,8 @@ app.kubernetes.io/instance: {{ .Release.Name | toString | quote }}
 
 {{/*
 Build the BOBS image reference. global.imageRegistry overrides image.registry.
-A qualified repository is split before applying the global override, avoiding
-references such as registry.example/eccr.example/project/bobs.
+An already-qualified repository beneath the global registry is preserved rather
+than receiving the registry project path twice.
 */}}
 {{- define "bobs.image" -}}
 {{- $globalRegistry := "" -}}
@@ -337,7 +337,9 @@ references such as registry.example/eccr.example/project/bobs.
   {{- $registry = $globalRegistry -}}
 {{- end -}}
 {{- $image := $repositoryPath -}}
-{{- if $registry -}}
+{{- if and $globalRegistry (hasPrefix (printf "%s/" $globalRegistry) $repository) -}}
+  {{- $image = $repository -}}
+{{- else if $registry -}}
   {{- $image = printf "%s/%s" $registry $repositoryPath -}}
 {{- end -}}
 {{- $digest := .Values.image.digest | default "" -}}
