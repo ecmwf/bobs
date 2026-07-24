@@ -59,3 +59,12 @@ jobs:
 
       - name: Test forwarded-prefix ingress rendering
         run: chart/tests/forwarded-prefix-render.sh
+
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Check version consistency
+        run: bash scripts/check-versions.sh

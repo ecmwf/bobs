@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Publish chart
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - chart/**
+
+permissions:
+  contents: write  # to create release tags
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.20.0
+
+      - name: Get chart version
+        id: version
+        run: |
+          VERSION=$(awk '/^version:/{print $2; exit}' chart/Chart.yaml | tr -d "'\"")
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Guard — ensure this chart version has not been published before
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git ls-remote --tags origin "refs/tags/chart/${VERSION}" | grep -q .; then
+            echo "::error::Tag 'chart/${VERSION}' already exists. Bump chart/Chart.yaml version before merging chart changes."
+            exit 1
+          fi
+
+      - name: Package chart
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: helm package chart/ --version "${VERSION}"
+
+      - name: Login to registry
+        run: |
+          echo '${{ secrets.ECMWF_DOCKER_REGISTRY_ACCESS_TOKEN }}' | \
+          helm registry login eccr.ecmwf.int \
+            --username '${{ secrets.ECMWF_DOCKER_REGISTRY_USERNAME }}' \
+            --password-stdin
+
+      - name: Push chart
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: helm push "bobs-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: chart/${{ steps.version.outputs.version }}
+          name: "bobs chart v${{ steps.version.outputs.version }}"
+          generate_release_notes: true
+
+      - name: Summary
+        run: |
+          echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs:${{ steps.version.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Release**: chart/${{ steps.version.outputs.version }}" >> "${GITHUB_STEP_SUMMARY}"
