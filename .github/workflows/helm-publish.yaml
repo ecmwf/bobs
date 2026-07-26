@@ -77,6 +77,15 @@ jobs:
           VERSION: ${{ needs.detect.outputs.version }}
         run: helm push "bobs-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
 
+      - name: Create and push release tag
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "chart/${VERSION}"
+          git push origin "chart/${VERSION}"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
