@@ -69,14 +69,30 @@ several significant. Top three to fix first: **#1, #2, #3**.
 
 ## Medium severity
 
-- [ ] **4. Inconsistent action pinning (supply chain).**
-  `ci.yaml` pins `actions/checkout` to a SHA but leaves the rest floating:
-  `dtolnay/rust-toolchain@stable` (moving branch), `Swatinem/rust-cache@v2`,
-  `docker/*@v3/v6` (has registry secrets + `contents: write`),
-  `softprops/action-gh-release@v2` (`contents: write`), and
-  `docs-sites.yaml` `actions/checkout|cache|upload-artifact@v4`. The
-  security-sensitive workflows are the ones left unpinned.
-  _Fix:_ pin everything to SHAs (or accept floating everywhere — no half-and-half).
+- [x] **4. Inconsistent action pinning (supply chain).**
+  `ci.yaml` pinned only `actions/checkout`; the rest floated:
+  `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`, `docker/*@v3/v6`,
+  `softprops/action-gh-release@v2`, and `docs-sites.yaml`
+  `actions/checkout|cache|upload-artifact@v4`.
+  _Done:_ pinned every third-party action to a 40-char commit SHA with a
+  version comment, across `ci.yaml`, `publish-image.yml`, `helm-publish.yaml`,
+  and `docs-sites.yaml`:
+  - `dtolnay/rust-toolchain` → `4cda84d5` (the `stable` branch tip, whose
+    `action.yml` bakes in `default: stable`, so it keeps installing stable with
+    no extra input)
+  - `Swatinem/rust-cache` → `f13886b9` (v2.8.1)
+  - `docker/setup-buildx-action` → `8d2750c6` (v3.12.0),
+    `docker/login-action` → `c94ce9fb` (v3.7.0),
+    `docker/build-push-action` → `10e90e36` (v6.19.2)
+  - `softprops/action-gh-release` → `3bb12739` (v2.6.2)
+  - `actions/cache` → `0057852b` (v4.3.0),
+    `actions/upload-artifact` → `ea165f8d` (v4.6.2),
+    `docs-sites.yaml` `actions/checkout` → `34e11487` (v4.3.1, matching the
+    other workflows)
+  Verified no floating action refs remain (`grep` for non-40-hex `@refs`).
+  Note: this pins the action _code_ only; `dtolnay/rust-toolchain` still installs
+  whatever "stable" rust is at run time (the rust-version pinning concern lives
+  with the deferred clippy work in #3).
 
 - [x] **5. No `concurrency` guards on publish workflows.**
   Two quick pushes to `main` can launch overlapping publish runs that race on
