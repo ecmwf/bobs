@@ -101,19 +101,30 @@ several significant. Top three to fix first: **#1, #2, #3**.
   to `publish-image.yml` and `helm-publish.yaml` so publishes serialize instead
   of racing.
 
-- [ ] **6. Mutable image tag as the published artifact.**
-  Image published only as `eccr.ecmwf.int/polytope/bobs:<ver>`. Workspace
-  `AGENTS.md` mandates digest pinning (mn5 mirror has served stale manifests).
-  Digest is captured to the job summary but never propagated to anything
-  consumable.
-  _Fix:_ also push an immutable `sha-<commit>` tag and/or wire digest into
-  `chart/values.yaml image.digest`.
+- [x] **6. Mutable image tag as the published artifact.**
+  Image was published only as `eccr.ecmwf.int/polytope/bobs:<ver>`. Workspace
+  `AGENTS.md` mandates digest pinning (the mn5 mirror has served stale manifests
+  for a reused tag).
+  _Done:_ the build now also pushes an immutable, per-commit
+  `eccr.ecmwf.int/polytope/bobs:sha-<github.sha>` tag alongside the version tag,
+  and the job summary prints the version tag, the immutable sha tag, and the
+  digest. A per-commit tag is content-addressable in practice (a given commit
+  is never re-pushed with different content), giving deployments a stable
+  reference.
+  _Remaining (follow-up):_ wire the resulting digest into
+  `chart/values.yaml image.digest` so the chart deploys by digest by default —
+  left out here because it needs a commit-back / cross-artifact step.
 
-- [ ] **7. TOCTOU / non-atomic publish.**
+- [x] **7. TOCTOU / non-atomic publish.**
   `detect` decides, `publish` builds+pushes, then creates the tag last. If the
   push succeeds but tag creation fails, the image is out but untagged, so the
-  next push overwrites the same registry tag. The "released" source of truth is
-  written last.
+  next push overwrites the same registry tag.
+  _Reviewed — no code change beyond item 6:_ the build→tag order is actually
+  correct (you must not create the `v<ver>` release tag before the image push
+  succeeds). The residual risk is a mutable version tag being overwritten on a
+  retry, which the immutable `sha-<commit>` tag from item 6 now mitigates:
+  every published build keeps a durable, content-addressable reference
+  regardless of version-tag state.
 
 ## Low severity / polish
 
@@ -141,6 +152,17 @@ several significant. Top three to fix first: **#1, #2, #3**.
 
 - [ ] **14. No `CODEOWNERS`.** Nothing enforces review ownership on workflow
   files that hold the release keys.
+
+- [ ] **15. REUSE job depends on Docker Hub at runtime (flaky).**
+  `fsfe/reuse-action` is a Docker action that pulls `docker.io/fsfe/reuse:6`
+  from Docker Hub on every run; Docker Hub rate-limiting/timeouts on GitHub
+  runners make the job intermittently fail (observed 2026-07-26: the PR run
+  failed with `registry-1.docker.io ... i/o timeout` while the push run 13s
+  earlier passed; a plain re-run then passed in 18s). Not a compliance issue.
+  _Options:_ run REUSE via the pip package (`pipx run reuse==<pinned> lint`) to
+  avoid Docker Hub entirely, or add a retry. Deferred — ECMWF repos use
+  `fsfe/reuse-action` consistently, so changing it is a cross-repo convention
+  decision, not a bobs-local one.
 
 ## Deferred to follow-up PR
 

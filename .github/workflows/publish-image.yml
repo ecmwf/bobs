@@ -111,7 +111,9 @@ jobs:
           push: true
           target: release
           build-args: FEATURES=telemetry
-          tags: eccr.ecmwf.int/polytope/bobs:${{ needs.detect.outputs.version }}
+          tags: |
+            eccr.ecmwf.int/polytope/bobs:${{ needs.detect.outputs.version }}
+            eccr.ecmwf.int/polytope/bobs:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -128,4 +130,5 @@ jobs:
         run: |
           echo "## Image published" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Tag**: \`eccr.ecmwf.int/polytope/bobs:${{ needs.detect.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Immutable tag**: \`eccr.ecmwf.int/polytope/bobs:sha-${{ github.sha }}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Digest**: \`${{ steps.build.outputs.digest }}\`" >> "${GITHUB_STEP_SUMMARY}"
