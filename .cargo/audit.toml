@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# cargo-audit configuration (read by `cargo audit`).
+#
+# Every ignored advisory below is a *transitive* dependency of `pprof`, which is
+# pulled in only for the optional pprof CPU-profiling endpoint. `pprof` 0.14.1 is
+# the latest release and still pins these versions, so they cannot be resolved by
+# `cargo update`. Re-evaluate whenever `pprof` is upgraded.
+[advisories]
+ignore = [
+    # quick-xml 0.26 DoS advisories (pprof -> inferno -> quick-xml). quick-xml is
+    # used by inferno solely to *generate* flamegraph SVGs during profiling; bobs
+    # never parses untrusted XML, so the memory-exhaustion / quadratic-parse
+    # vectors are unreachable here.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

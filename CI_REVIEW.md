@@ -128,41 +128,54 @@ several significant. Top three to fix first: **#1, #2, #3**.
 
 ## Low severity / polish
 
-- [ ] **8. Untested feature.** `tokio-fileio-fallback` is declared but never
-  built/tested in CI (only `default` and `telemetry` are).
+- [x] **8. Untested feature.** `Cargo.toml` declared three features; CI tested
+  `default` and `telemetry` but never `tokio-fileio-fallback`.
+  _Done:_ added `cargo test --locked --features tokio-fileio-fallback` to the
+  `build-and-test` job (verified locally: builds clean, 12 tests pass).
 
-- [ ] **9. Chart registry namespace inconsistency.** Image →
-  `eccr.ecmwf.int/polytope/bobs`; chart → `oci://eccr.ecmwf.int/bobs` (no
-  `polytope/`). Confirm deliberate — `AGENTS.md` says everything lives under
-  `polytope/`.
+- [x] **9. Chart registry namespace — accepted as-is.** Image publishes to
+  `eccr.ecmwf.int/polytope/bobs`; the chart publishes to
+  `oci://eccr.ecmwf.int/bobs`. Confirmed intentional — the chart lives under the
+  top-level `bobs` OCI namespace, separate from the `polytope/` image project.
+  No change.
 
-- [ ] **10. Hardcoded versions in `test-chart.sh`.** `bobs:0.1.0`, byte-exact
-  bounds, etc. are pinned literals; every appVersion bump needs hand-editing.
-  _Fix:_ derive expected version from `Cargo.toml`.
+- [x] **10. Hardcoded versions in `test-chart.sh`.** The two `bobs:0.1.0` image
+  assertions were pinned literals needing hand-editing on every version bump.
+  _Done:_ derive `app_version` from `chart/Chart.yaml::appVersion` (awk) and use
+  it in both assertions. Verified end-to-end: full chart contract test passes
+  (`BOBS chart contract tests passed`, kubeconform 35/35 valid).
 
-- [ ] **11. No dependency vulnerability scanning.** No `cargo audit`/`cargo-deny`,
-  no `deny.toml`. Cheap, high-value addition given the supply-chain effort.
+- [x] **11. No dependency vulnerability scanning.**
+  _Done:_ added an `audit` job to `ci.yaml` that installs `cargo-audit` (via
+  SHA-pinned `taiki-e/install-action` v2.85.2) and runs `cargo audit`. Two
+  pre-existing high-severity advisories in transitive `quick-xml 0.26`
+  (`pprof -> inferno -> quick-xml`) block a naive gate; they are documented and
+  ignored in `.cargo/audit.toml` with justification (quick-xml is used only to
+  *generate* flamegraph SVGs — bobs never parses untrusted XML — and `pprof`
+  0.14.1 pins the version so `cargo update` can't fix it). Yanked `spin` remains
+  a non-failing warning. Verified `cargo audit` exits 0 with the config.
+  _Tradeoff:_ audit runs on every PR/push, so a newly published advisory can
+  block an unrelated PR (intended — surfaces vulns promptly); move to a cron
+  schedule if that friction is unwanted.
 
-- [ ] **12. `docs-sites.yaml` publishes on every push to `main`** (no path filter
-  on the push trigger), republishing `latest` docs for unrelated changes.
+- [~] **12. `docs-sites.yaml` publishes on every push to `main`** — _skipped
+  (won't fix)._ Republishing `latest` docs for unrelated changes is minor waste
+  and acceptable.
 
 - [x] **13. No `concurrency` on `ci.yaml`.** Rapid PR pushes run redundant full
   CI. _Done:_ added `concurrency` keyed on workflow+ref with
   `cancel-in-progress: true`.
 
-- [ ] **14. No `CODEOWNERS`.** Nothing enforces review ownership on workflow
-  files that hold the release keys.
+- [~] **14. No `CODEOWNERS`.** — _skipped (won't fix)._ Its enforcement depends
+  on a branch-protection setting only a repo admin can toggle; the team opted
+  not to add one.
 
-- [ ] **15. REUSE job depends on Docker Hub at runtime (flaky).**
-  `fsfe/reuse-action` is a Docker action that pulls `docker.io/fsfe/reuse:6`
-  from Docker Hub on every run; Docker Hub rate-limiting/timeouts on GitHub
-  runners make the job intermittently fail (observed 2026-07-26: the PR run
-  failed with `registry-1.docker.io ... i/o timeout` while the push run 13s
-  earlier passed; a plain re-run then passed in 18s). Not a compliance issue.
-  _Options:_ run REUSE via the pip package (`pipx run reuse==<pinned> lint`) to
-  avoid Docker Hub entirely, or add a retry. Deferred — ECMWF repos use
-  `fsfe/reuse-action` consistently, so changing it is a cross-repo convention
-  decision, not a bobs-local one.
+- [~] **15. REUSE job depends on Docker Hub at runtime (flaky).** — _skipped
+  (won't fix)._ Observed 2026-07-26: the PR run failed with
+  `registry-1.docker.io ... i/o timeout` while the push run passed; a plain
+  re-run then passed in 18s. Transient Docker Hub rate-limiting, not a
+  compliance issue. Left on `fsfe/reuse-action` for cross-repo consistency;
+  handle with a re-run when it flakes.
 
 ## Deferred to follow-up PR
 

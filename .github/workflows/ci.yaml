@@ -54,6 +54,9 @@ jobs:
       - name: Run telemetry-feature tests
         run: cargo test --locked --features telemetry
 
+      - name: Run tokio-fileio-fallback tests
+        run: cargo test --locked --features tokio-fileio-fallback
+
   version-check:
     runs-on: ubuntu-latest
     steps:
@@ -64,3 +67,19 @@ jobs:
 
       - name: Check version consistency
         run: bash scripts/check-versions.sh
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies for known vulnerabilities
+        run: cargo audit

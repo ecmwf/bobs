@@ -7,6 +7,10 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 chart="$repo_root/chart"
+# Image tag the chart renders by default; kept in sync with Cargo.toml and
+# CITATION.cff by scripts/check-versions.sh. Derive it so these assertions do not
+# need hand-editing on every version bump.
+app_version=$(awk '/^appVersion:/{print $2; exit}' "$chart/Chart.yaml" | tr -d "'\"")
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -71,7 +75,7 @@ helm lint "$chart" --strict --values "$chart/tests/forwarded-prefix-values.yaml"
 "$chart/tests/chart-contract-render.sh"
 
 helm template bobs "$chart" "${common_values[@]}" >"$tmpdir/default.yaml"
-assert_contains 'image: "eccr.ecmwf.int/polytope/bobs:0.1.0"' "$tmpdir/default.yaml"
+assert_contains "image: \"eccr.ecmwf.int/polytope/bobs:${app_version}\"" "$tmpdir/default.yaml"
 assert_contains 'value: "info"' "$tmpdir/default.yaml"
 assert_contains 'max_live_spools: 256' "$tmpdir/default.yaml"
 assert_contains 'max_spool_bytes: 8589934592' "$tmpdir/default.yaml"
@@ -101,7 +105,7 @@ helm template bobs "$chart" "${common_values[@]}" \
   --set global.imageRegistry=eccr.ecmwf.int/polytope \
   --set image.repository=eccr.ecmwf.int/polytope/bobs \
   >"$tmpdir/qualified-repository.yaml"
-assert_contains 'image: "eccr.ecmwf.int/polytope/bobs:0.1.0"' "$tmpdir/qualified-repository.yaml"
+assert_contains "image: \"eccr.ecmwf.int/polytope/bobs:${app_version}\"" "$tmpdir/qualified-repository.yaml"
 
 helm template bobs "$chart" "${common_values[@]}" \
   --set persistence.accessModes[0]=ReadWriteMany \
