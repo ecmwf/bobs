@@ -13,17 +13,16 @@ on:
   push:
     branches:
       - main
-    paths:
-      - chart/**
-      - scripts/test-chart.sh
-      - .github/workflows/chart.yaml
+    # Chart releases are published by manually pushing a chart/{VERSION} tag.
+    tags:
+      - chart/*
 
 permissions:
   contents: read
 
 concurrency:
   group: chart-${{ github.ref }}
-  # Never cancel an in-flight publish on main; do cancel superseded PR runs.
+  # Never cancel an in-flight publish (tag push); do cancel superseded PR runs.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -58,52 +57,31 @@ jobs:
       - name: Lint and test standalone chart
         run: ./scripts/test-chart.sh
 
-  # ── Chart publish (main only) ──────────────────────────────────────────────
-  # Runs after the lint/template gate above. Idempotent: skips when
-  # chart/{VERSION} is already tagged, so only a chart version bump publishes.
-  detect:
+  # ── Chart publish (chart/{VERSION} tag only) ───────────────────────────────
+  # A maintainer publishes by pushing a chart/{VERSION} tag (org tag rules
+  # forbid CI from creating tags). Runs after the lint/template gate above and
+  # refuses to publish if the tag disagrees with chart/Chart.yaml.
+  publish:
     needs: [lint-and-template]
-    if: github.event_name == 'push'
+    if: startsWith(github.ref, 'refs/tags/chart/')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      should_publish: ${{ steps.gate.outputs.should_publish }}
+      contents: write # to create the GitHub Release for the existing tag
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Get chart version
+      - name: Resolve and verify version
         id: version
         run: |
           VERSION=$(awk '/^version:/{print $2; exit}' chart/Chart.yaml | tr -d "'\"")
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-
-      - name: Check if version was already released
-        id: gate
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          if git ls-remote --tags origin "refs/tags/chart/${VERSION}" | grep -q .; then
-            echo "should_publish=false" >> "${GITHUB_OUTPUT}"
-            echo "Chart version ${VERSION} is already tagged — skipping publish"
-          else
-            echo "should_publish=true" >> "${GITHUB_OUTPUT}"
-            echo "New chart version ${VERSION} — will publish"
+          if [ "chart/${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match chart/Chart.yaml version chart/${VERSION}" >&2
+            exit 1
           fi
-
-  publish:
-    needs: [detect]
-    if: github.event_name == 'push' && needs.detect.outputs.should_publish == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # to create the release tag via softprops/action-gh-release
-    steps:
-      - name: Check out code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify version consistency
         run: bash scripts/check-versions.sh
@@ -128,27 +106,18 @@ jobs:
 
       - name: Push chart
         env:
-          VERSION: ${{ needs.detect.outputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: helm push "bobs-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
-
-      - name: Create and push release tag
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "chart/${VERSION}"
-          git push origin "chart/${VERSION}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
         with:
-          tag_name: chart/${{ needs.detect.outputs.version }}
-          name: "bobs chart v${{ needs.detect.outputs.version }}"
+          tag_name: chart/${{ steps.version.outputs.version }}
+          name: "bobs chart v${{ steps.version.outputs.version }}"
           generate_release_notes: true
 
       - name: Summary
         run: |
           echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs:${{ needs.detect.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Release**: chart/${{ needs.detect.outputs.version }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs:${{ steps.version.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Release**: chart/${{ steps.version.outputs.version }}" >> "${GITHUB_STEP_SUMMARY}"
