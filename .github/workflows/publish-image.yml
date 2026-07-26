@@ -46,12 +46,8 @@ with open('Cargo.toml', 'rb') as f:
             echo "Version ${VERSION} is already tagged — skipping publish"
           else
             echo "should_publish=true" >> "${GITHUB_OUTPUT}"
-            echo "New version ${VERSION} — will publish after consistency check"
+            echo "New version ${VERSION} — will publish"
           fi
-
-      - name: Verify version consistency
-        if: steps.gate.outputs.should_publish == 'true'
-        run: bash scripts/check-versions.sh
 
   publish:
     needs: detect
@@ -62,6 +58,9 @@ with open('Cargo.toml', 'rb') as f:
     steps:
       - name: Check out code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Verify version consistency
+        run: bash scripts/check-versions.sh
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

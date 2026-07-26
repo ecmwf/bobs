@@ -39,12 +39,8 @@ jobs:
             echo "Chart version ${VERSION} is already tagged — skipping publish"
           else
             echo "should_publish=true" >> "${GITHUB_OUTPUT}"
-            echo "New chart version ${VERSION} — will publish after consistency check"
+            echo "New chart version ${VERSION} — will publish"
           fi
-
-      - name: Verify version consistency
-        if: steps.gate.outputs.should_publish == 'true'
-        run: bash scripts/check-versions.sh
 
   publish:
     needs: detect
@@ -55,6 +51,9 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Verify version consistency
+        run: bash scripts/check-versions.sh
 
       - name: Install Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
