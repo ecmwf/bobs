@@ -22,7 +22,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  fmt:
+  # ── Lightweight checks (one job to avoid paying a rounded-up billed minute
+  #    per trivial check) ──────────────────────────────────────────────────────
+  checks:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -35,11 +37,27 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-audit
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check version consistency
+        run: bash scripts/check-versions.sh
+
+      - name: Audit dependencies for known vulnerabilities
+        run: cargo audit
+
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      # Cheaper compiles: skip incremental (useless on fresh runners) and drop
+      # debuginfo from the test profile to cut codegen + link time.
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,48 +70,21 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
 
-      - name: Run default-feature tests
-        run: cargo test --locked
-
-      - name: Run telemetry-feature tests
+      # Two runs cover every cfg branch: telemetry ⇒ io_uring backend +
+      # telemetry-on code (the config prod ships); tokio-fileio-fallback ⇒ tokio
+      # backend + telemetry-off code. No code is gated on both features at once.
+      - name: Run telemetry-feature tests (io_uring backend)
         run: cargo test --locked --features telemetry
 
-      - name: Run tokio-fileio-fallback tests
+      - name: Run tokio-fileio-fallback tests (tokio backend)
         run: cargo test --locked --features tokio-fileio-fallback
-
-  version-check:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Check version consistency
-        run: bash scripts/check-versions.sh
-
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
-        with:
-          tool: cargo-audit
-
-      - name: Audit dependencies for known vulnerabilities
-        run: cargo audit
 
   # ── Image publish (v{VERSION} tag only) ────────────────────────────────────
   # A maintainer publishes by pushing a v{VERSION} tag (org tag rules forbid CI
   # from creating tags). Runs after the full test gate above and refuses to
   # publish if the tag disagrees with Cargo.toml.
   publish:
-    needs: [fmt, build-and-test, version-check, audit]
+    needs: [checks, build-and-test]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
