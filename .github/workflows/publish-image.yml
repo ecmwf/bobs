@@ -51,8 +51,37 @@ jobs:
             echo "New version ${VERSION} — will publish"
           fi
 
-  publish:
+  test:
     needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run default-feature tests
+        run: cargo test --locked
+
+      - name: Run telemetry-feature tests
+        run: cargo test --locked --features telemetry
+
+  publish:
+    needs: [detect, test]
     if: needs.detect.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:

@@ -35,14 +35,24 @@ several significant. Top three to fix first: **#1, #2, #3**.
   invocation. All six workflows now pass `yaml.safe_load`; extractor verified to
   return `0.1.0`.
 
-- [ ] **1. Publishing is not gated on tests passing.**
-  `publish-image.yml` and `helm-publish.yaml` trigger on push to `main` and run
+- [x] **1. Publishing is not gated on tests passing.**
+  `publish-image.yml` and `helm-publish.yaml` triggered on push to `main` and ran
   completely independently of `ci.yaml` (no `needs`/`workflow_run` link). The
-  Docker build compiles but never runs `cargo test`/`cargo fmt`. A commit that
-  lands on `main` with failing tests still builds+publishes an image and creates
-  a `v<ver>` release tag. Relying solely on PR branch protection; the merge
-  result on `main` is not the tree that was tested.
-  _Fix:_ gate publish on green CI (`workflow_run`) or run tests inside publish.
+  Docker build compiled but never ran `cargo test`/`cargo fmt`; the chart publish
+  never ran the chart contract test. A commit that landed on `main` with failing
+  tests still built+published.
+  _Done (approach b — inline gate):_ added a `test` job to each publish workflow,
+  gated on `should_publish == 'true'` and required by `publish`
+  (`needs: [detect, test]`):
+  - image: `cargo fmt --all -- --check` + `cargo test --locked` (default) +
+    `cargo test --locked --features telemetry` (matches the image's telemetry build).
+  - chart: installs Helm + SHA-verified kubeconform and runs `scripts/test-chart.sh`
+    (same gate as `chart.yaml`).
+  Skip semantics verified: when `should_publish=false`, `test` is skipped and
+  `publish`'s own `if` is also false, so nothing runs; when true, a failing
+  `test` blocks `publish`. Chose (b) over `workflow_run` for determinism and
+  self-containment (accepts a duplicate build only when actually publishing a new
+  version).
 
 - [x] **2. `cargo test` runs without `--locked`; the release build uses `--locked`.**
   CI regenerated a stale `Cargo.lock` and stayed green, but `Dockerfile` builds
