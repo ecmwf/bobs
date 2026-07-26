@@ -13,7 +13,14 @@ on:
   push:
     branches:
       - main
+    paths:
+      - chart/**
+      - scripts/test-chart.sh
+      - scripts/check-versions.sh
+      - .github/workflows/chart.yaml
     # Chart releases are published by manually pushing a chart/{VERSION} tag.
+    # (Release commits always bump chart/Chart.yaml, so they satisfy the paths
+    # filter above; the tag itself is what the publish job gates on.)
     tags:
       - chart/*
 

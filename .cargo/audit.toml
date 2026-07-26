@@ -4,10 +4,13 @@
 
 # cargo-audit configuration (read by `cargo audit`).
 #
-# Every ignored advisory below is a *transitive* dependency of `pprof`, which is
-# pulled in only for the optional pprof CPU-profiling endpoint. `pprof` 0.14.1 is
-# the latest release and still pins these versions, so they cannot be resolved by
-# `cargo update`. Re-evaluate whenever `pprof` is upgraded.
+# Every ignored advisory below comes from a *transitive* dependency of `pprof`.
+# `pprof` is an unconditional dependency, so it is always compiled into bobs;
+# only the `/debug/pprof/profile` HTTP endpoint is runtime-gated via the
+# `enable_pprof` config flag. `pprof` 0.14.1 is the latest release and still
+# pins these versions, so they cannot be resolved by `cargo update`. Re-evaluate
+# whenever `pprof` is upgraded (or if `pprof` is made an optional, feature-gated
+# dependency, which would let these advisories be dropped rather than ignored).
 [advisories]
 ignore = [
     # quick-xml 0.26 DoS advisories (pprof -> inferno -> quick-xml). quick-xml is
