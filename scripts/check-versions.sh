@@ -61,13 +61,13 @@ check() {
     fi
 }
 
-check 'Cargo.toml::version'       "${CARGO_VERSION}" \
+check 'Cargo.toml::package.version' "${CARGO_VERSION}" \
       'chart/Chart.yaml::appVersion'  "${CHART_APP_VERSION}"
 
-check 'Cargo.toml::version'       "${CARGO_VERSION}" \
+check 'Cargo.toml::package.version' "${CARGO_VERSION}" \
       'chart/values.yaml::image.tag'  "${VALUES_IMAGE_TAG}"
 
-check 'Cargo.toml::version'       "${CARGO_VERSION}" \
+check 'Cargo.toml::package.version' "${CARGO_VERSION}" \
       'CITATION.cff::version'         "${CITATION_VERSION}"
 
 if [ "${FAIL}" -ne 0 ]; then

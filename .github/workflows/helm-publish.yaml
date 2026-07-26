@@ -63,8 +63,6 @@ jobs:
           version: v3.20.0
 
       - name: Package chart
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
         run: helm package chart/
 
       - name: Login to registry
