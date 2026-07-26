@@ -14,12 +14,14 @@ on:
       - Cargo.lock
       - Dockerfile
 
-permissions:
-  contents: write  # to create the release tag
-
 jobs:
-  publish:
+  detect:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_publish: ${{ steps.gate.outputs.should_publish }}
     steps:
       - name: Check out code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -34,14 +36,32 @@ with open('Cargo.toml', 'rb') as f:
 ")
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: Guard — ensure this image version has not been published before
+      - name: Check if version was already released
+        id: gate
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           if git ls-remote --tags origin "refs/tags/v${VERSION}" | grep -q .; then
-            echo "::error::Tag 'v${VERSION}' already exists. Bump Cargo.toml version before merging source changes."
-            exit 1
+            echo "should_publish=false" >> "${GITHUB_OUTPUT}"
+            echo "Version ${VERSION} is already tagged — skipping publish"
+          else
+            echo "should_publish=true" >> "${GITHUB_OUTPUT}"
+            echo "New version ${VERSION} — will publish after consistency check"
           fi
+
+      - name: Verify version consistency
+        if: steps.gate.outputs.should_publish == 'true'
+        run: bash scripts/check-versions.sh
+
+  publish:
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # to create the release tag
+    steps:
+      - name: Check out code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -61,13 +81,13 @@ with open('Cargo.toml', 'rb') as f:
           push: true
           target: release
           build-args: FEATURES=telemetry
-          tags: eccr.ecmwf.int/polytope/bobs:${{ steps.version.outputs.version }}
+          tags: eccr.ecmwf.int/polytope/bobs:${{ needs.detect.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Create and push release tag
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.detect.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -77,5 +97,5 @@ with open('Cargo.toml', 'rb') as f:
       - name: Summary
         run: |
           echo "## Image published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Tag**: \`eccr.ecmwf.int/polytope/bobs:${{ steps.version.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Tag**: \`eccr.ecmwf.int/polytope/bobs:${{ needs.detect.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Digest**: \`${{ steps.build.outputs.digest }}\`" >> "${GITHUB_STEP_SUMMARY}"

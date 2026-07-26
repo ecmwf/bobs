@@ -11,12 +11,47 @@ on:
     paths:
       - chart/**
 
-permissions:
-  contents: write  # to create release tags
-
 jobs:
-  publish:
+  detect:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_publish: ${{ steps.gate.outputs.should_publish }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Get chart version
+        id: version
+        run: |
+          VERSION=$(awk '/^version:/{print $2; exit}' chart/Chart.yaml | tr -d "'\"")
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check if version was already released
+        id: gate
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git ls-remote --tags origin "refs/tags/chart/${VERSION}" | grep -q .; then
+            echo "should_publish=false" >> "${GITHUB_OUTPUT}"
+            echo "Chart version ${VERSION} is already tagged — skipping publish"
+          else
+            echo "should_publish=true" >> "${GITHUB_OUTPUT}"
+            echo "New chart version ${VERSION} — will publish after consistency check"
+          fi
+
+      - name: Verify version consistency
+        if: steps.gate.outputs.should_publish == 'true'
+        run: bash scripts/check-versions.sh
+
+  publish:
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # to create the release tag via softprops/action-gh-release
     steps:
       - name: Check out code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -26,24 +61,9 @@ jobs:
         with:
           version: v3.20.0
 
-      - name: Get chart version
-        id: version
-        run: |
-          VERSION=$(awk '/^version:/{print $2; exit}' chart/Chart.yaml | tr -d "'\"")
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-
-      - name: Guard — ensure this chart version has not been published before
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          if git ls-remote --tags origin "refs/tags/chart/${VERSION}" | grep -q .; then
-            echo "::error::Tag 'chart/${VERSION}' already exists. Bump chart/Chart.yaml version before merging chart changes."
-            exit 1
-          fi
-
       - name: Package chart
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.detect.outputs.version }}
         run: helm package chart/ --version "${VERSION}"
 
       - name: Login to registry
@@ -55,18 +75,18 @@ jobs:
 
       - name: Push chart
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.detect.outputs.version }}
         run: helm push "bobs-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: chart/${{ steps.version.outputs.version }}
-          name: "bobs chart v${{ steps.version.outputs.version }}"
+          tag_name: chart/${{ needs.detect.outputs.version }}
+          name: "bobs chart v${{ needs.detect.outputs.version }}"
           generate_release_notes: true
 
       - name: Summary
         run: |
           echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs:${{ steps.version.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Release**: chart/${{ steps.version.outputs.version }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs:${{ needs.detect.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Release**: chart/${{ needs.detect.outputs.version }}" >> "${GITHUB_STEP_SUMMARY}"
