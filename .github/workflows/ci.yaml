@@ -9,16 +9,14 @@ on:
   push:
     branches:
       - main
-    # Image releases are published by manually pushing a v{VERSION} tag.
-    tags:
-      - v*
 
 permissions:
   contents: read
 
 concurrency:
+  # Serialise main so two quick merges can't double-publish the same version;
+  # cancel superseded PR runs only.
   group: ci-${{ github.ref }}
-  # Never cancel an in-flight publish (tag push); do cancel superseded PR runs.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -79,34 +77,49 @@ jobs:
       - name: Run tokio-fileio-fallback tests (tokio backend)
         run: cargo test --locked --features tokio-fileio-fallback
 
-  # ── Image publish (v{VERSION} tag only) ────────────────────────────────────
-  # A maintainer publishes by pushing a v{VERSION} tag (org tag rules forbid CI
-  # from creating tags). Runs after the full test gate above and refuses to
-  # publish if the tag disagrees with Cargo.toml.
-  publish:
-    needs: [checks, build-and-test]
-    if: startsWith(github.ref, 'refs/tags/v')
+  # ── Publish gate ───────────────────────────────────────────────────────────
+  # On push to main, decide whether this version still needs publishing. A
+  # released version is recorded by an immutable {VERSION}.dev<run> marker tag
+  # (the only tag shape the org ruleset lets CI create). If a marker already
+  # exists the version was published on an earlier merge, so we skip.
+  gate:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    outputs:
+      publish: ${{ steps.gate.outputs.publish }}
+      version: ${{ steps.gate.outputs.version }}
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Resolve and verify version
-        id: version
+      - name: Decide whether to publish
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${VERSION}" >&2
-            exit 1
-          fi
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${VERSION}.dev" --jq 'length')
+          if [ "${existing}" -gt 0 ]; then
+            echo "Version ${VERSION} already published (${existing} marker tag(s)); skipping."
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Version ${VERSION} not yet published; will publish image + chart."
+            echo "publish=true" >> "${GITHUB_OUTPUT}"
+          fi
 
-      - name: Verify version consistency
-        run: bash scripts/check-versions.sh
+  # ── Image publish (only when the version was bumped) ───────────────────────
+  publish-image:
+    needs: [checks, build-and-test, gate]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -127,7 +140,7 @@ jobs:
           target: release
           build-args: FEATURES=telemetry
           tags: |
-            eccr.ecmwf.int/bobs:${{ steps.version.outputs.version }}
+            eccr.ecmwf.int/bobs:${{ needs.gate.outputs.version }}
             eccr.ecmwf.int/bobs:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -135,6 +148,71 @@ jobs:
       - name: Summary
         run: |
           echo "## Image published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Tag**: \`eccr.ecmwf.int/bobs:${{ steps.version.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Tag**: \`eccr.ecmwf.int/bobs:${{ needs.gate.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Immutable tag**: \`eccr.ecmwf.int/bobs:sha-${{ github.sha }}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Digest**: \`${{ steps.build.outputs.digest }}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+  # ── Chart publish (only when the version was bumped) ───────────────────────
+  publish-chart:
+    needs: [checks, build-and-test, gate]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.20.0
+
+      - name: Lint and test chart
+        run: ./scripts/test-chart.sh
+
+      - name: Package chart
+        run: helm package chart/
+
+      - name: Login to registry
+        env:
+          HELM_REGISTRY_USERNAME: ${{ secrets.ECMWF_DOCKER_REGISTRY_USERNAME }}
+          HELM_REGISTRY_PASSWORD: ${{ secrets.ECMWF_DOCKER_REGISTRY_ACCESS_TOKEN }}
+        run: |
+          printf '%s' "${HELM_REGISTRY_PASSWORD}" | \
+          helm registry login eccr.ecmwf.int \
+            --username "${HELM_REGISTRY_USERNAME}" \
+            --password-stdin
+
+      - name: Push chart
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: helm push "bobs-chart-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
+
+      - name: Summary
+        run: |
+          echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs/bobs-chart:${{ needs.gate.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+  # ── Release marker (records that this version is published) ────────────────
+  # Created only after both artifacts push, so a partial failure retries next
+  # merge. Uses the {VERSION}.dev<run> shape the tag ruleset permits CI to make.
+  release-tag:
+    needs: [gate, publish-image, publish-chart]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create immutable release marker tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          TAG="${VERSION}.dev${GITHUB_RUN_NUMBER}"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${TAG}" \
+            -f sha="${GITHUB_SHA}"
+          echo "## Release marker" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Version**: ${VERSION}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Marker tag**: ${TAG}" >> "${GITHUB_STEP_SUMMARY}"

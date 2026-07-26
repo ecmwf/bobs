@@ -24,7 +24,7 @@ imagePullSecrets: []
 image:
   registry: eccr.ecmwf.int
   repository: bobs
-  tag: "0.1.0"
+  tag: "0.1.3"
   digest: ""
   pullPolicy: IfNotPresent
 

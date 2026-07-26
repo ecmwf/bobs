@@ -18,18 +18,12 @@ on:
       - scripts/test-chart.sh
       - scripts/check-versions.sh
       - .github/workflows/chart.yaml
-    # Chart releases are published by manually pushing a chart/{VERSION} tag.
-    # (Release commits always bump chart/Chart.yaml, so they satisfy the paths
-    # filter above; the tag itself is what the publish job gates on.)
-    tags:
-      - chart/*
 
 permissions:
   contents: read
 
 concurrency:
   group: chart-${{ github.ref }}
-  # Never cancel an in-flight publish (tag push); do cancel superseded PR runs.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -64,67 +58,6 @@ jobs:
       - name: Lint and test standalone chart
         run: ./scripts/test-chart.sh
 
-  # ── Chart publish (chart/{VERSION} tag only) ───────────────────────────────
-  # A maintainer publishes by pushing a chart/{VERSION} tag (org tag rules
-  # forbid CI from creating tags). Runs after the lint/template gate above and
-  # refuses to publish if the tag disagrees with chart/Chart.yaml.
-  publish:
-    needs: [lint-and-template]
-    if: startsWith(github.ref, 'refs/tags/chart/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # to create the GitHub Release for the existing tag
-    steps:
-      - name: Check out code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Resolve and verify version
-        id: version
-        run: |
-          VERSION=$(awk '/^version:/{print $2; exit}' chart/Chart.yaml | tr -d "'\"")
-          if [ "chart/${VERSION}" != "${GITHUB_REF_NAME}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match chart/Chart.yaml version chart/${VERSION}" >&2
-            exit 1
-          fi
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-
-      - name: Verify version consistency
-        run: bash scripts/check-versions.sh
-
-      - name: Install Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
-        with:
-          version: v3.20.0
-
-      - name: Package chart
-        run: helm package chart/
-
-      - name: Login to registry
-        env:
-          HELM_REGISTRY_USERNAME: ${{ secrets.ECMWF_DOCKER_REGISTRY_USERNAME }}
-          HELM_REGISTRY_PASSWORD: ${{ secrets.ECMWF_DOCKER_REGISTRY_ACCESS_TOKEN }}
-        run: |
-          printf '%s' "${HELM_REGISTRY_PASSWORD}" | \
-          helm registry login eccr.ecmwf.int \
-            --username "${HELM_REGISTRY_USERNAME}" \
-            --password-stdin
-
-      - name: Push chart
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: helm push "bobs-chart-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
-        with:
-          tag_name: chart/${{ steps.version.outputs.version }}
-          name: "bobs chart v${{ steps.version.outputs.version }}"
-          generate_release_notes: true
-
-      - name: Summary
-        run: |
-          echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs/bobs-chart:${{ steps.version.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Release**: chart/${{ steps.version.outputs.version }}" >> "${GITHUB_STEP_SUMMARY}"
+# Chart publishing lives in ci.yaml: on push to main, the `gate` job publishes
+# image + chart together (single shared version) and stamps a {VERSION}.dev<run>
+# marker tag. This workflow only lints/templates the chart on PRs and main.
