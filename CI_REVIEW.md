@@ -177,6 +177,18 @@ several significant. Top three to fix first: **#1, #2, #3**.
   compliance issue. Left on `fsfe/reuse-action` for cross-repo consistency;
   handle with a re-run when it flakes.
 
+- [x] **16. Node 20 action deprecation.** GitHub was force-running several
+  Node-20 actions on Node 24 (annotation observed on the CI run). Bumped every
+  Node-based action to its latest Node-24 release: `actions/checkout` v7.0.1,
+  `actions/cache` v6.1.0, `actions/upload-artifact` v7.0.1,
+  `Swatinem/rust-cache` v2.9.1, `azure/setup-helm` v5.0.1,
+  `docker/setup-buildx-action` v4.2.0, `docker/login-action` v4.5.1,
+  `docker/build-push-action` v7.3.0, `softprops/action-gh-release` v3.0.2.
+  Composite/Docker actions (`dtolnay/rust-toolchain`, `taiki-e/install-action`,
+  `fsfe/reuse-action`) don't use Node and were left as-is. Caveat: the
+  `docker/*` and `gh-release` bumps live in main-only publish workflows, so they
+  are first exercised on merge, not on this PR branch.
+
 ## Deferred to follow-up PR
 
 - [ ] **3. Enable a clippy gate — deferred.**
