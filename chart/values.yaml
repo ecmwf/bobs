@@ -6,6 +6,12 @@ replicaCount: 1
 # Dependency condition consumed by parent charts such as polytope-chart.
 enabled: true
 
+# The chart is packaged/published as `bobs-chart` (OCI artifact
+# eccr.ecmwf.int/bobs/bobs-chart), but Kubernetes resource names, selectors and
+# the app.kubernetes.io/name label must stay `bobs` so upgrades don't orphan
+# existing StatefulSets. Keep this in sync with the intended workload identity.
+nameOverride: bobs
+
 # Defaults for standalone BOBS renders. Values under `global` can be supplied by
 # a parent chart and propagate here through Helm's standard global mechanism.
 global:

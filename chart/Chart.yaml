@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 apiVersion: v2
-name: bobs
+name: bobs-chart
 description: BOBS temporary spool storage service
 type: application
 version: 0.1.3

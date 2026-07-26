@@ -82,7 +82,7 @@ assert_label_strings() {
 	local file=$1 release_name=$2 app_name=$3
 	assert_contains "app.kubernetes.io/instance: \"$release_name\"" "$file"
 	assert_contains "app.kubernetes.io/name: \"$app_name\"" "$file"
-	assert_contains 'helm.sh/chart: "bobs-0.1.3"' "$file"
+	assert_contains 'helm.sh/chart: "bobs-chart-0.1.3"' "$file"
 	assert_contains 'app.kubernetes.io/version: "0.1.0"' "$file"
 	assert_contains 'app.kubernetes.io/managed-by: "Helm"' "$file"
 	assert_contains 'boolean-like: "true"' "$file"

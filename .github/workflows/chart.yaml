@@ -114,7 +114,7 @@ jobs:
       - name: Push chart
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: helm push "bobs-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
+        run: helm push "bobs-chart-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
@@ -126,5 +126,5 @@ jobs:
       - name: Summary
         run: |
           echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs:${{ steps.version.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs/bobs-chart:${{ steps.version.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Release**: chart/${{ steps.version.outputs.version }}" >> "${GITHUB_STEP_SUMMARY}"
