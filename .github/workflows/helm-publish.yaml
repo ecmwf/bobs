@@ -11,6 +11,10 @@ on:
     paths:
       - chart/**
 
+concurrency:
+  group: publish-chart
+  cancel-in-progress: false
+
 jobs:
   detect:
     runs-on: ubuntu-latest

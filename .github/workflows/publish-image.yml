@@ -14,6 +14,10 @@ on:
       - Cargo.lock
       - Dockerfile
 
+concurrency:
+  group: publish-image
+  cancel-in-progress: false
+
 jobs:
   detect:
     runs-on: ubuntu-latest
@@ -31,11 +35,7 @@ jobs:
       - name: Get image version
         id: version
         run: |
-          VERSION=$(python3 -c "
-import tomllib
-with open('Cargo.toml', 'rb') as f:
-    print(tomllib.load(f)['package']['version'])
-")
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Check if version was already released
