@@ -5,9 +5,10 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches:
-      - "**"
+      - main
 
 permissions:
   contents: read
@@ -17,7 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -31,7 +34,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -42,29 +47,16 @@ jobs:
       - name: Run default-feature tests
         run: cargo test
 
-      - name: Run Skaffold telemetry-feature tests
+      - name: Run telemetry-feature tests
         run: cargo test --features telemetry
-
-  helm:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v4
-
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-
-      - name: Lint chart
-        run: helm lint chart --values chart/tests/forwarded-prefix-values.yaml
-
-      - name: Test forwarded-prefix ingress rendering
-        run: chart/tests/forwarded-prefix-render.sh
 
   version-check:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Check version consistency
         run: bash scripts/check-versions.sh

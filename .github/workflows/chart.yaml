@@ -5,14 +5,14 @@
 name: Helm chart
 
 on:
-  push:
-    branches:
-      - "**"
+  pull_request:
     paths:
       - chart/**
       - scripts/test-chart.sh
       - .github/workflows/chart.yaml
-  pull_request:
+  push:
+    branches:
+      - main
     paths:
       - chart/**
       - scripts/test-chart.sh

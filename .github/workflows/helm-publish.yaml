@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Get chart version
         id: version
@@ -63,13 +65,16 @@ jobs:
       - name: Package chart
         env:
           VERSION: ${{ needs.detect.outputs.version }}
-        run: helm package chart/ --version "${VERSION}"
+        run: helm package chart/
 
       - name: Login to registry
+        env:
+          HELM_REGISTRY_USERNAME: ${{ secrets.ECMWF_DOCKER_REGISTRY_USERNAME }}
+          HELM_REGISTRY_PASSWORD: ${{ secrets.ECMWF_DOCKER_REGISTRY_ACCESS_TOKEN }}
         run: |
-          echo '${{ secrets.ECMWF_DOCKER_REGISTRY_ACCESS_TOKEN }}' | \
+          printf '%s' "${HELM_REGISTRY_PASSWORD}" | \
           helm registry login eccr.ecmwf.int \
-            --username '${{ secrets.ECMWF_DOCKER_REGISTRY_USERNAME }}' \
+            --username "${HELM_REGISTRY_USERNAME}" \
             --password-stdin
 
       - name: Push chart
