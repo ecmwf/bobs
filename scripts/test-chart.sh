@@ -75,7 +75,7 @@ helm lint "$chart" --strict --values "$chart/tests/forwarded-prefix-values.yaml"
 "$chart/tests/chart-contract-render.sh"
 
 helm template bobs "$chart" "${common_values[@]}" >"$tmpdir/default.yaml"
-assert_contains "image: \"eccr.ecmwf.int/polytope/bobs:${app_version}\"" "$tmpdir/default.yaml"
+assert_contains "image: \"eccr.ecmwf.int/bobs:${app_version}\"" "$tmpdir/default.yaml"
 assert_contains 'value: "info"' "$tmpdir/default.yaml"
 assert_contains 'max_live_spools: 256' "$tmpdir/default.yaml"
 assert_contains 'max_spool_bytes: 8589934592' "$tmpdir/default.yaml"
@@ -89,23 +89,23 @@ assert_not_contains 'volumeDevices:' "$tmpdir/default.yaml"
 
 helm template bobs "$chart" "${common_values[@]}" \
   --set global.imageRegistry=registry.example.com/team \
-  --set image.repository=eccr.ecmwf.int/polytope/bobs \
+  --set image.repository=registry.internal/nested/bobs \
   --set-string image.tag= \
   --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --set-string rustLog=bobs=debug \
   --set persistence.enabled=false \
   >"$tmpdir/overrides.yaml"
-assert_contains 'image: "registry.example.com/team/polytope/bobs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$tmpdir/overrides.yaml"
+assert_contains 'image: "registry.example.com/team/nested/bobs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$tmpdir/overrides.yaml"
 assert_contains 'value: "bobs=debug"' "$tmpdir/overrides.yaml"
 assert_contains 'sizeLimit: "10Gi"' "$tmpdir/overrides.yaml"
 
 # A fully-qualified repository already under global.imageRegistry must not
 # receive the registry project path a second time.
 helm template bobs "$chart" "${common_values[@]}" \
-  --set global.imageRegistry=eccr.ecmwf.int/polytope \
-  --set image.repository=eccr.ecmwf.int/polytope/bobs \
+  --set global.imageRegistry=eccr.ecmwf.int \
+  --set image.repository=eccr.ecmwf.int/bobs \
   >"$tmpdir/qualified-repository.yaml"
-assert_contains "image: \"eccr.ecmwf.int/polytope/bobs:${app_version}\"" "$tmpdir/qualified-repository.yaml"
+assert_contains "image: \"eccr.ecmwf.int/bobs:${app_version}\"" "$tmpdir/qualified-repository.yaml"
 
 helm template bobs "$chart" "${common_values[@]}" \
   --set persistence.accessModes[0]=ReadWriteMany \

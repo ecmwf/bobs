@@ -9,7 +9,7 @@ metadata:
 
 build:
   artifacts:
-    - image: eccr.ecmwf.int/polytope/bobs
+    - image: eccr.ecmwf.int/bobs
       context: .
       docker:
         dockerfile: ./Dockerfile
