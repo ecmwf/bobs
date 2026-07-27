@@ -58,6 +58,7 @@ jobs:
       - name: Lint and test standalone chart
         run: ./scripts/test-chart.sh
 
-# Chart publishing lives in ci.yaml: on push to main, the `gate` job publishes
-# image + chart together (single shared version) and stamps a {VERSION}.dev<run>
-# marker tag. This workflow only lints/templates the chart on PRs and main.
+# Chart publishing lives in ci.yaml: on push to main, the `gate` job decides
+# what to publish (image+chart on a code bump, chart only on a chart-only bump)
+# and creates a bare {CHART_VERSION} release tag.  This workflow only
+# lints/templates the chart on PRs and main.

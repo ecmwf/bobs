@@ -5,12 +5,14 @@
 #
 # check-versions.sh — verify that all version fields that must agree actually do.
 #
-# Single-version policy: the image (Cargo.toml) and the chart ship together, so
-# every version field below must equal Cargo.toml::package.version:
-#   chart/Chart.yaml::version        (chart package version)
+# App-version invariants: these fields must always equal Cargo.toml::package.version:
 #   chart/Chart.yaml::appVersion
 #   chart/values.yaml::image.tag
 #   CITATION.cff::version
+#
+# chart/Chart.yaml::version (chart package version) may be >= Cargo version
+# (chart-only releases bump it independently).  The CI gate enforces that it
+# equals the Cargo version on full code+chart releases.
 
 set -euo pipefail
 
@@ -41,7 +43,7 @@ done
 
 echo "Versions found:"
 printf '  %-40s %s\n' 'Cargo.toml::package.version'       "${CARGO_VERSION}"
-printf '  %-40s %s\n' 'chart/Chart.yaml::version'          "${CHART_VERSION}"
+printf '  %-40s %s\n' 'chart/Chart.yaml::version'          "${CHART_VERSION}  (not checked here; gate enforces == Cargo on code releases)"
 printf '  %-40s %s\n' 'chart/Chart.yaml::appVersion'       "${CHART_APP_VERSION}"
 printf '  %-40s %s\n' 'chart/values.yaml::image.tag'       "${VALUES_IMAGE_TAG}"
 printf '  %-40s %s\n' 'CITATION.cff::version'              "${CITATION_VERSION}"
@@ -62,9 +64,6 @@ check() {
 }
 
 check 'Cargo.toml::package.version' "${CARGO_VERSION}" \
-      'chart/Chart.yaml::version'      "${CHART_VERSION}"
-
-check 'Cargo.toml::package.version' "${CARGO_VERSION}" \
       'chart/Chart.yaml::appVersion'  "${CHART_APP_VERSION}"
 
 check 'Cargo.toml::package.version' "${CARGO_VERSION}" \
@@ -75,9 +74,9 @@ check 'Cargo.toml::package.version' "${CARGO_VERSION}" \
 
 if [ "${FAIL}" -ne 0 ]; then
     echo
-    echo "Version mismatch(es) detected. All five fields must agree before merging."
+    echo "Version mismatch(es) detected. All four fields must agree before merging."
     exit 1
 fi
 
 echo
-echo "All version fields match: ${CARGO_VERSION}"
+echo "All app-version fields match: ${CARGO_VERSION}"

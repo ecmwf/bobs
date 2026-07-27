@@ -78,42 +78,67 @@ jobs:
         run: cargo test --locked --features tokio-fileio-fallback
 
   # ── Publish gate ───────────────────────────────────────────────────────────
-  # On push to main, decide whether this version still needs publishing. A
-  # released version is recorded by an immutable {VERSION}.dev<run> marker tag
-  # (the only tag shape the org ruleset lets CI create). If a marker already
-  # exists the version was published on an earlier merge, so we skip.
+  # On push to main, decide what (if anything) needs publishing.
+  #
+  # Releases are recorded by a bare {CHART_VERSION} git tag.  Four cases:
+  #   - both tags exist                       → nothing to do, skip
+  #   - cargo tag missing, chart tag present  → code bumped without chart bump → ERROR
+  #   - both tags missing                     → code+chart release (versions must match)
+  #   - cargo tag present, chart tag missing  → chart-only release
   gate:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
-      publish: ${{ steps.gate.outputs.publish }}
-      version: ${{ steps.gate.outputs.version }}
+      publish_image: ${{ steps.gate.outputs.publish_image }}
+      publish_chart: ${{ steps.gate.outputs.publish_chart }}
+      cargo_version: ${{ steps.gate.outputs.cargo_version }}
+      chart_version: ${{ steps.gate.outputs.chart_version }}
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Decide whether to publish
+      - name: Decide what to publish
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          existing=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${VERSION}.dev" --jq 'length')
-          if [ "${existing}" -gt 0 ]; then
-            echo "Version ${VERSION} already published (${existing} marker tag(s)); skipping."
-            echo "publish=false" >> "${GITHUB_OUTPUT}"
+          CARGO_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          CHART_VERSION=$(awk '/^version:/{print $2; exit}' chart/Chart.yaml | tr -d "'\"")
+          echo "cargo_version=${CARGO_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "chart_version=${CHART_VERSION}" >> "${GITHUB_OUTPUT}"
+
+          cargo_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CARGO_VERSION}" --jq 'length')
+          chart_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CHART_VERSION}" --jq 'length')
+
+          if [ "${cargo_released}" -gt 0 ] && [ "${chart_released}" -gt 0 ]; then
+            echo "Nothing to publish: cargo ${CARGO_VERSION} and chart ${CHART_VERSION} are both already tagged."
+            echo "publish_image=false" >> "${GITHUB_OUTPUT}"
+            echo "publish_chart=false" >> "${GITHUB_OUTPUT}"
+          elif [ "${cargo_released}" -eq 0 ] && [ "${chart_released}" -gt 0 ]; then
+            echo "ERROR: Cargo version ${CARGO_VERSION} was bumped but chart version ${CHART_VERSION} already has a release tag." >&2
+            echo "Bump chart/Chart.yaml version alongside the code." >&2
+            exit 1
+          elif [ "${cargo_released}" -eq 0 ] && [ "${chart_released}" -eq 0 ]; then
+            if [ "${CHART_VERSION}" != "${CARGO_VERSION}" ]; then
+              echo "ERROR: Both code and chart were bumped, but versions differ: Cargo=${CARGO_VERSION}, chart=${CHART_VERSION}." >&2
+              echo "They must match on a full code+chart release." >&2
+              exit 1
+            fi
+            echo "Code+chart release at ${CARGO_VERSION}: publishing image and chart."
+            echo "publish_image=true" >> "${GITHUB_OUTPUT}"
+            echo "publish_chart=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "Version ${VERSION} not yet published; will publish image + chart."
-            echo "publish=true" >> "${GITHUB_OUTPUT}"
+            echo "Chart-only release: publishing chart at ${CHART_VERSION} (image stays at ${CARGO_VERSION})."
+            echo "publish_image=false" >> "${GITHUB_OUTPUT}"
+            echo "publish_chart=true" >> "${GITHUB_OUTPUT}"
           fi
 
-  # ── Image publish (only when the version was bumped) ───────────────────────
+  # ── Image publish (code+chart releases only) ──────────────────────────────
   publish-image:
     needs: [checks, build-and-test, gate]
-    if: needs.gate.outputs.publish == 'true'
+    if: needs.gate.outputs.publish_image == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -140,7 +165,7 @@ jobs:
           target: release
           build-args: FEATURES=telemetry
           tags: |
-            eccr.ecmwf.int/bobs:${{ needs.gate.outputs.version }}
+            eccr.ecmwf.int/bobs:${{ needs.gate.outputs.cargo_version }}
             eccr.ecmwf.int/bobs:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -148,14 +173,14 @@ jobs:
       - name: Summary
         run: |
           echo "## Image published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Tag**: \`eccr.ecmwf.int/bobs:${{ needs.gate.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Tag**: \`eccr.ecmwf.int/bobs:${{ needs.gate.outputs.cargo_version }}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Immutable tag**: \`eccr.ecmwf.int/bobs:sha-${{ github.sha }}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Digest**: \`${{ steps.build.outputs.digest }}\`" >> "${GITHUB_STEP_SUMMARY}"
 
-  # ── Chart publish (only when the version was bumped) ───────────────────────
+  # ── Chart publish (code+chart and chart-only releases) ────────────────────
   publish-chart:
     needs: [checks, build-and-test, gate]
-    if: needs.gate.outputs.publish == 'true'
+    if: needs.gate.outputs.publish_chart == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -186,33 +211,38 @@ jobs:
 
       - name: Push chart
         env:
-          VERSION: ${{ needs.gate.outputs.version }}
+          VERSION: ${{ needs.gate.outputs.chart_version }}
         run: helm push "bobs-chart-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
 
       - name: Summary
         run: |
           echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs/bobs-chart:${{ needs.gate.outputs.version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs/bobs-chart:${{ needs.gate.outputs.chart_version }}\`" >> "${GITHUB_STEP_SUMMARY}"
 
-  # ── Release marker (records that this version is published) ────────────────
-  # Created only after both artifacts push, so a partial failure retries next
-  # merge. Uses the {VERSION}.dev<run> shape the tag ruleset permits CI to make.
+  # ── Release tag ────────────────────────────────────────────────────────────
+  # Created after all publish jobs succeed or are intentionally skipped.
+  # Uses the bare chart version (X.X.X) as the shared release tag; on a
+  # code+chart release this equals the Cargo version (enforced by the gate).
   release-tag:
     needs: [gate, publish-image, publish-chart]
-    if: needs.gate.outputs.publish == 'true'
+    if: >-
+      always() &&
+      needs.gate.result == 'success' &&
+      (needs.publish-image.result == 'success' || needs.publish-image.result == 'skipped') &&
+      (needs.publish-chart.result == 'success' || needs.publish-chart.result == 'skipped') &&
+      (needs.gate.outputs.publish_image == 'true' || needs.gate.outputs.publish_chart == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Create immutable release marker tag
+      - name: Create release tag
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.gate.outputs.version }}
+          CHART_VERSION: ${{ needs.gate.outputs.chart_version }}
         run: |
-          TAG="${VERSION}.dev${GITHUB_RUN_NUMBER}"
           gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/tags/${TAG}" \
+            -f ref="refs/tags/${CHART_VERSION}" \
             -f sha="${GITHUB_SHA}"
-          echo "## Release marker" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Version**: ${VERSION}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Marker tag**: ${TAG}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "## Release tagged" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Tag**: \`${CHART_VERSION}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **SHA**: \`${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
