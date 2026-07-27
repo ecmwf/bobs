@@ -185,10 +185,8 @@ jobs:
           echo "- **SHA tag**: \`eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Digest**: \`${DIGEST}\`" >> "${GITHUB_STEP_SUMMARY}"
 
-  # ── Chart publish (code+chart and chart-only releases) ────────────────────
-  publish-chart:
-    needs: [checks, build-and-test, gate]
-    if: needs.gate.outputs.publish_chart == 'true'
+  # ── Chart lint (every PR and push to main) ────────────────────────────────
+  lint-chart:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -201,8 +199,39 @@ jobs:
         with:
           version: v3.20.0
 
+      - name: Install kubeconform
+        env:
+          KUBECONFORM_VERSION: v0.8.0
+          KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+        run: |
+          archive="$RUNNER_TEMP/kubeconform.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$KUBECONFORM_SHA256" "$archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" kubeconform
+          mkdir --parents "$HOME/.local/bin"
+          install "$RUNNER_TEMP/kubeconform" "$HOME/.local/bin/kubeconform"
+          printf '%s\n' "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Lint and test chart
         run: ./scripts/test-chart.sh
+
+  # ── Chart publish (code+chart and chart-only releases) ────────────────────
+  publish-chart:
+    needs: [checks, build-and-test, gate, lint-chart]
+    if: needs.gate.outputs.publish_chart == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.20.0
 
       - name: Package chart
         run: helm package chart/
