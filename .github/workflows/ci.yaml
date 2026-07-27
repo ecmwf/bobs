@@ -171,18 +171,18 @@ jobs:
         env:
           VERSION: ${{ needs.gate.outputs.cargo_version }}
         run: |
-          docker tag "eccr.ecmwf.int/bobs/bobs:${VERSION}" "eccr.ecmwf.int/bobs/bobs:sha-${GITHUB_SHA}"
-          docker push "eccr.ecmwf.int/bobs/bobs:sha-${GITHUB_SHA}"
+          docker tag "eccr.ecmwf.int/polytope/bobs:${VERSION}" "eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}"
+          docker push "eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}"
 
       - name: Summary
         env:
           VERSION: ${{ needs.gate.outputs.cargo_version }}
         run: |
-          DIGEST=$(docker inspect "eccr.ecmwf.int/bobs/bobs:${VERSION}" \
+          DIGEST=$(docker inspect "eccr.ecmwf.int/polytope/bobs:${VERSION}" \
             --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2 || echo 'unavailable')
           echo "## Image published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Tag**: \`eccr.ecmwf.int/bobs/bobs:${VERSION}\`" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **SHA tag**: \`eccr.ecmwf.int/bobs/bobs:sha-${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Tag**: \`eccr.ecmwf.int/polytope/bobs:${VERSION}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **SHA tag**: \`eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Digest**: \`${DIGEST}\`" >> "${GITHUB_STEP_SUMMARY}"
 
   # ── Chart publish (code+chart and chart-only releases) ────────────────────
