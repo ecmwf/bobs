@@ -9,8 +9,8 @@ chart_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
-chart_version=$(awk '/^version:/{print $2; exit}' "$chart_dir/Chart.yaml" | tr -d "'"")
-app_version=$(awk '/^appVersion:/{print $2; exit}' "$chart_dir/Chart.yaml" | tr -d "'"")
+chart_version=$(awk '/^version:/{print $2; exit}' "$chart_dir/Chart.yaml" | tr -d "'\"")
+app_version=$(awk '/^appVersion:/{print $2; exit}' "$chart_dir/Chart.yaml" | tr -d "'\"")
 
 common_values=(--set config.host_prefix=bobs --set config.domain=example.test)
 
