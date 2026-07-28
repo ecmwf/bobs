@@ -55,6 +55,8 @@ EOF
 #!/usr/bin/env bash
 url="\$2"
 version="\${url##*/tags/}"
+# The gate queries the .dev0-suffixed tag (see release-tag job); strip it.
+version="\${version%.dev0}"
 if   [ "\${version}" = "${cargo_version}" ]; then echo "${cargo_released}"
 elif [ "\${version}" = "${chart_version}" ]; then echo "${chart_released}"
 else echo "0"
@@ -83,8 +85,8 @@ EOF
           echo "cargo_version=${CARGO_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "chart_version=${CHART_VERSION}" >> "${GITHUB_OUTPUT}"
 
-          cargo_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CARGO_VERSION}" --jq 'length')
-          chart_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CHART_VERSION}" --jq 'length')
+          cargo_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CARGO_VERSION}.dev0" --jq 'length')
+          chart_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CHART_VERSION}.dev0" --jq 'length')
 
           if [ "${cargo_released}" -gt 0 ] && [ "${chart_released}" -gt 0 ]; then
             echo "Nothing to publish: cargo ${CARGO_VERSION} and chart ${CHART_VERSION} are both already tagged."

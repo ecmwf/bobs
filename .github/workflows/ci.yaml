@@ -21,6 +21,48 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ── Change detection ─────────────────────────────────────────────────────
+  # Determines which areas of the repo were touched so downstream jobs can
+  # be skipped when their inputs haven't changed.
+  #
+  # INVARIANT (why the publish jobs below can safely trust these outputs):
+  # a release is driven by the version-tag gate, but the gate's rules force a
+  # matching source change, so the path filters always agree with it:
+  #   - a code+image release requires a Cargo.toml bump  ⇒ `code`  == true
+  #   - any chart release requires a chart/Chart.yaml bump ⇒ `chart` == true
+  #   - a code bump without a chart bump is a hard gate error
+  # So whenever the gate says publish_image/publish_chart == true, the
+  # corresponding build-and-test / lint-chart job is guaranteed to have run.
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      chart: ${{ steps.filter.outputs.chart }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Dockerfile'
+              - 'skaffold.yaml'
+              - '.cargo/**'
+              - '.github/workflows/ci.yaml'
+            chart:
+              - 'chart/**'
+              - 'scripts/test-chart.sh'
+              - '.github/workflows/ci.yaml'
+
   # ── Lightweight checks (one job to avoid paying a rounded-up billed minute
   #    per trivial check) ──────────────────────────────────────────────────────
   checks:
@@ -51,6 +93,8 @@ jobs:
         run: cargo audit
 
   build-and-test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
       # Cheaper compiles: skip incremental (useless on fresh runners) and drop
@@ -81,7 +125,9 @@ jobs:
   # ── Publish gate ───────────────────────────────────────────────────────────
   # On push to main, decide what (if anything) needs publishing.
   #
-  # Releases are recorded by a bare {CHART_VERSION} git tag.  Four cases:
+  # Releases are recorded by a {CHART_VERSION}.dev0 git tag (the ".dev0"
+  # suffix keeps the tag inside the org tag-protection ruleset's *.devN
+  # exemption — see the release-tag job).  Four cases:
   #   - both tags exist                       → nothing to do, skip
   #   - cargo tag missing, chart tag present  → code bumped without chart bump → ERROR
   #   - both tags missing                     → code+chart release (versions must match)
@@ -110,8 +156,8 @@ jobs:
           echo "cargo_version=${CARGO_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "chart_version=${CHART_VERSION}" >> "${GITHUB_OUTPUT}"
 
-          cargo_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CARGO_VERSION}" --jq 'length')
-          chart_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CHART_VERSION}" --jq 'length')
+          cargo_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CARGO_VERSION}.dev0" --jq 'length')
+          chart_released=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${CHART_VERSION}.dev0" --jq 'length')
 
           if [ "${cargo_released}" -gt 0 ] && [ "${chart_released}" -gt 0 ]; then
             echo "Nothing to publish: cargo ${CARGO_VERSION} and chart ${CHART_VERSION} are both already tagged."
@@ -139,6 +185,9 @@ jobs:
   # ── Image publish (code+chart releases only) ──────────────────────────────
   publish-image:
     needs: [checks, build-and-test, gate]
+    # No always(): if build-and-test is skipped this job skips too. That is
+    # safe because publish_image == true implies a Cargo.toml bump, which the
+    # `code` path filter always catches, so build-and-test always runs here.
     if: needs.gate.outputs.publish_image == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -185,8 +234,10 @@ jobs:
           echo "- **SHA tag**: \`eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Digest**: \`${DIGEST}\`" >> "${GITHUB_STEP_SUMMARY}"
 
-  # ── Chart lint (every PR and push to main) ────────────────────────────────
+  # ── Chart lint ────────────────────────────────────────────────────────────
   lint-chart:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.chart == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -219,8 +270,16 @@ jobs:
 
   # ── Chart publish (code+chart and chart-only releases) ────────────────────
   publish-chart:
-    needs: [checks, build-and-test, gate, lint-chart]
-    if: needs.gate.outputs.publish_chart == 'true'
+    needs: [checks, build-and-test, gate, lint-chart, publish-image]
+    if: >-
+      always() &&
+      needs.gate.outputs.publish_chart == 'true' &&
+      needs.checks.result == 'success' &&
+      # Require success (not skipped): a chart release always bumps
+      # chart/Chart.yaml, so the `chart` filter always runs lint-chart here.
+      needs.lint-chart.result == 'success' &&
+      (needs.build-and-test.result == 'success' || needs.build-and-test.result == 'skipped') &&
+      (needs.publish-image.result == 'success' || needs.publish-image.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -258,15 +317,18 @@ jobs:
 
   # ── Release tag ────────────────────────────────────────────────────────────
   # Created after all publish jobs succeed or are intentionally skipped.
-  # Uses the bare chart version (X.X.X) as the shared release tag; on a
-  # code+chart release this equals the Cargo version (enforced by the gate).
+  # Uses the chart version with a ".dev0" suffix (X.X.X.dev0) as the shared
+  # release tag; on a code+chart release the X.X.X part equals the Cargo
+  # version (enforced by the gate).  The suffix is required because the org
+  # tag-protection ruleset only exempts *.devN tags from its creation block —
+  # a bare X.X.X tag would be rejected for the Actions token.
   release-tag:
     needs: [gate, publish-image, publish-chart]
     if: >-
       always() &&
       needs.gate.result == 'success' &&
-      (needs.publish-image.result == 'success' || needs.publish-image.result == 'skipped') &&
-      (needs.publish-chart.result == 'success' || needs.publish-chart.result == 'skipped') &&
+      (needs.gate.outputs.publish_image != 'true' || needs.publish-image.result == 'success') &&
+      (needs.gate.outputs.publish_chart != 'true' || needs.publish-chart.result == 'success') &&
       (needs.gate.outputs.publish_image == 'true' || needs.gate.outputs.publish_chart == 'true')
     runs-on: ubuntu-latest
     permissions:
@@ -278,8 +340,8 @@ jobs:
           CHART_VERSION: ${{ needs.gate.outputs.chart_version }}
         run: |
           gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/tags/${CHART_VERSION}" \
+            -f ref="refs/tags/${CHART_VERSION}.dev0" \
             -f sha="${GITHUB_SHA}"
           echo "## Release tagged" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Tag**: \`${CHART_VERSION}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Tag**: \`${CHART_VERSION}.dev0\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **SHA**: \`${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
