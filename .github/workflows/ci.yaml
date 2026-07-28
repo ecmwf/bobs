@@ -219,13 +219,6 @@ jobs:
           FIXED_TAG: ${{ needs.gate.outputs.cargo_version }}
         run: skaffold build --push
 
-      - name: Tag with commit SHA and push
-        env:
-          VERSION: ${{ needs.gate.outputs.cargo_version }}
-        run: |
-          docker tag "eccr.ecmwf.int/polytope/bobs:${VERSION}" "eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}"
-          docker push "eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}"
-
       - name: Summary
         env:
           VERSION: ${{ needs.gate.outputs.cargo_version }}
@@ -235,7 +228,6 @@ jobs:
           {
             echo "## Image published"
             echo "- **Tag**: \`eccr.ecmwf.int/polytope/bobs:${VERSION}\`"
-            echo "- **SHA tag**: \`eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}\`"
             echo "- **Digest**: \`${DIGEST}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
