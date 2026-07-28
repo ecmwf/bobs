@@ -229,10 +229,12 @@ jobs:
         run: |
           DIGEST=$(docker inspect "eccr.ecmwf.int/polytope/bobs:${VERSION}" \
             --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2 || echo 'unavailable')
-          echo "## Image published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Tag**: \`eccr.ecmwf.int/polytope/bobs:${VERSION}\`" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **SHA tag**: \`eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Digest**: \`${DIGEST}\`" >> "${GITHUB_STEP_SUMMARY}"
+          {
+            echo "## Image published"
+            echo "- **Tag**: \`eccr.ecmwf.int/polytope/bobs:${VERSION}\`"
+            echo "- **SHA tag**: \`eccr.ecmwf.int/polytope/bobs:sha-${GITHUB_SHA}\`"
+            echo "- **Digest**: \`${DIGEST}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   # ── Chart lint ────────────────────────────────────────────────────────────
   lint-chart:
@@ -269,14 +271,14 @@ jobs:
         run: ./scripts/test-chart.sh
 
   # ── Chart publish (code+chart and chart-only releases) ────────────────────
+  # lint-chart requires 'success' (not 'skipped'): a chart release always
+  # bumps chart/Chart.yaml so the `chart` path filter always runs lint-chart.
   publish-chart:
     needs: [checks, build-and-test, gate, lint-chart, publish-image]
     if: >-
       always() &&
       needs.gate.outputs.publish_chart == 'true' &&
       needs.checks.result == 'success' &&
-      # Require success (not skipped): a chart release always bumps
-      # chart/Chart.yaml, so the `chart` filter always runs lint-chart here.
       needs.lint-chart.result == 'success' &&
       (needs.build-and-test.result == 'success' || needs.build-and-test.result == 'skipped') &&
       (needs.publish-image.result == 'success' || needs.publish-image.result == 'skipped')
@@ -342,6 +344,8 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
             -f ref="refs/tags/${CHART_VERSION}.dev0" \
             -f sha="${GITHUB_SHA}"
-          echo "## Release tagged" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Tag**: \`${CHART_VERSION}.dev0\`" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **SHA**: \`${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
+          {
+            echo "## Release tagged"
+            echo "- **Tag**: \`${CHART_VERSION}.dev0\`"
+            echo "- **SHA**: \`${GITHUB_SHA}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
