@@ -311,12 +311,12 @@ jobs:
       - name: Push chart
         env:
           VERSION: ${{ needs.gate.outputs.chart_version }}
-        run: helm push "bobs-chart-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
+        run: helm push "bobs-chart-${VERSION}.tgz" oci://eccr.ecmwf.int/polytope
 
       - name: Summary
         run: |
           echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs/bobs-chart:${{ needs.gate.outputs.chart_version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Chart**: \`oci://eccr.ecmwf.int/polytope/bobs-chart:${{ needs.gate.outputs.chart_version }}\`" >> "${GITHUB_STEP_SUMMARY}"
 
   # ── Release tag ────────────────────────────────────────────────────────────
   # Created after all publish jobs succeed or are intentionally skipped.
