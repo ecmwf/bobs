@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
 //
 // SPDX-License-Identifier: Apache-2.0
+// trivial comment to exercise path-based CI skip
 
 use bobs::cleanup;
 use bobs::config::Config;
