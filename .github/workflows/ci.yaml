@@ -41,8 +41,9 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+        # persist-credentials must be true (the default) here: dorny/paths-filter
+        # fetches origin/main to find the merge-base on push events, and needs
+        # the token left in the git config to do so.
 
       - name: Detect changed paths
         id: filter
