@@ -24,7 +24,7 @@ imagePullSecrets: []
 image:
   registry: eccr.ecmwf.int
   repository: polytope/bobs
-  tag: "0.1.5"
+  tag: "0.1.3"
   digest: ""
   pullPolicy: IfNotPresent
 
