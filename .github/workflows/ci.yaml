@@ -35,6 +35,9 @@ jobs:
   # corresponding build-and-test / lint-chart job is guaranteed to have run.
   detect-changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read        # for git fetch (push events)
+      pull-requests: read   # for GitHub API file listing (PR events)
     outputs:
       code: ${{ steps.filter.outputs.code }}
       chart: ${{ steps.filter.outputs.chart }}
