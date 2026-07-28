@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - main
+      - feat/ci-publish-workflows
 
 permissions:
   contents: read
@@ -136,7 +137,7 @@ jobs:
   #   - both tags missing                     → code+chart release (versions must match)
   #   - cargo tag present, chart tag missing  → chart-only release
   gate:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/ci-publish-workflows')
     runs-on: ubuntu-latest
     outputs:
       publish_image: ${{ steps.gate.outputs.publish_image }}
