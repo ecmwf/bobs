@@ -624,10 +624,38 @@ fn validate_resolved_range(
     Ok(())
 }
 
+/// Map a (base, parameter-free) content type to a download file extension
+/// (without the dot). Mirrored in polytope-server's frontend direct-stream path
+/// and its S3 delivery sink so every download route names files identically;
+/// keep the three in sync when adding new media types.
+fn download_extension(base_content_type: &str) -> &'static str {
+    match base_content_type {
+        "application/x-grib" => "grib",
+        "application/prs.coverage+json" => "covjson",
+        _ => "bin",
+    }
+}
+
+/// Restrict the filename stem (the spool key, which for polytope downloads is
+/// the request id) to a safe, header-injection-proof character set. Falls back
+/// to `data` if nothing usable remains.
+fn sanitise_filename_stem(key: &str) -> String {
+    let stem: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if stem.is_empty() {
+        "data".to_string()
+    } else {
+        stem
+    }
+}
+
 fn apply_read_response_headers(
     response: &mut Response,
     metadata: &ReadMetadata,
     range: &ResolvedReadRange,
+    key: &str,
 ) -> std::result::Result<(), ApiError> {
     let content_type = metadata
         .content_type
@@ -647,11 +675,23 @@ fn apply_read_response_headers(
     // spool from one deployment origin. Force download as the browser-level
     // containment boundary; nosniff/CSP remain defence in depth for user agents
     // that render despite Content-Disposition.
+    //
+    // The filename is the spool key (the polytope request id for downloads)
+    // plus an extension derived from the content type (e.g. `<id>.grib`,
+    // `<id>.covjson`), giving clients a traceable, correctly-typed name. The
+    // extension map is mirrored in polytope-server (frontend direct-stream path
+    // and the S3 delivery sink); keep the three in sync.
+    let base_content_type = content_type.split(';').next().unwrap_or_default().trim();
+    let disposition = format!(
+        "attachment; filename=\"{}.{}\"",
+        sanitise_filename_stem(key),
+        download_extension(base_content_type)
+    );
     response.headers_mut().insert(
         axum::http::header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment"),
+        HeaderValue::from_str(&disposition)
+            .map_err(|e| ApiError(BobsError::SerializationError(e.to_string())))?,
     );
-    let base_content_type = content_type.split(';').next().unwrap_or_default().trim();
     if ["text/html", "application/xhtml+xml", "image/svg+xml"]
         .iter()
         .any(|active| base_content_type.eq_ignore_ascii_case(active))
@@ -1036,7 +1076,7 @@ where
         StatusCode::PARTIAL_CONTENT
     };
 
-    apply_read_response_headers(&mut response, &metadata, &response_range)?;
+    apply_read_response_headers(&mut response, &metadata, &response_range, &key)?;
 
     Ok(response)
     }
@@ -2728,7 +2768,7 @@ mod tests {
         let resp = app.oneshot(req).await.expect("oneshot");
         assert_eq!(
             resp.headers()[axum::http::header::CONTENT_DISPOSITION],
-            HeaderValue::from_static("attachment")
+            HeaderValue::from_str(&format!("attachment; filename=\"{key}.bin\"")).unwrap()
         );
         assert_eq!(
             resp.headers()["X-Content-Type-Options"],
@@ -2737,6 +2777,67 @@ mod tests {
         assert_eq!(
             resp.headers()["Content-Security-Policy"],
             HeaderValue::from_static("sandbox; default-src 'none'; frame-ancestors 'none'")
+        );
+    }
+
+    #[test]
+    fn download_extension_maps_known_content_types() {
+        assert_eq!(download_extension("application/x-grib"), "grib");
+        assert_eq!(
+            download_extension("application/prs.coverage+json"),
+            "covjson"
+        );
+        assert_eq!(download_extension("application/octet-stream"), "bin");
+        assert_eq!(download_extension("text/html"), "bin");
+    }
+
+    #[test]
+    fn sanitise_filename_stem_strips_unsafe_chars() {
+        assert_eq!(sanitise_filename_stem("abc-123_x"), "abc-123_x");
+        assert_eq!(sanitise_filename_stem("a\"b/c"), "abc");
+        assert_eq!(sanitise_filename_stem("///"), "data");
+    }
+
+    #[tokio::test]
+    async fn grib_read_names_download_by_key() {
+        let app = app().await;
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/create")
+            .body(Body::from(r#"{"content_type":"application/x-grib"}"#))
+            .expect("request build");
+        let resp = app.clone().oneshot(req).await.expect("oneshot");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let key = value["key"].as_str().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/write/{key}/0"))
+            .body(Body::from("GRIB...."))
+            .expect("request build");
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/complete/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let req = Request::builder()
+            .uri(format!("/api/v1/read/{key}"))
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_DISPOSITION],
+            HeaderValue::from_str(&format!("attachment; filename=\"{key}.grib\"")).unwrap()
         );
     }
 
