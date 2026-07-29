@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - main
+      - feat/ci-publish-workflows
 
 permissions:
   contents: read
@@ -136,7 +137,7 @@ jobs:
   #   - both tags missing                     → code+chart release (versions must match)
   #   - cargo tag present, chart tag missing  → chart-only release
   gate:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/ci-publish-workflows')
     runs-on: ubuntu-latest
     outputs:
       publish_image: ${{ steps.gate.outputs.publish_image }}
@@ -193,11 +194,11 @@ jobs:
         env:
           VERSION: ${{ needs.gate.outputs.cargo_version }}
         run: |
-          DIGEST=$(docker inspect "eccr.ecmwf.int/polytope/bobs:${VERSION}" \
+          DIGEST=$(docker inspect "eccr.ecmwf.int/bobs/bobs:${VERSION}" \
             --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2 || echo 'unavailable')
           {
             echo "## Image published"
-            echo "- **Tag**: \`eccr.ecmwf.int/polytope/bobs:${VERSION}\`"
+            echo "- **Tag**: \`eccr.ecmwf.int/bobs/bobs:${VERSION}\`"
             echo "- **Digest**: \`${DIGEST}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
@@ -275,12 +276,12 @@ jobs:
       - name: Push chart
         env:
           VERSION: ${{ needs.gate.outputs.chart_version }}
-        run: helm push "bobs-chart-${VERSION}.tgz" oci://eccr.ecmwf.int/polytope
+        run: helm push "bobs-chart-${VERSION}.tgz" oci://eccr.ecmwf.int/bobs
 
       - name: Summary
         run: |
           echo "## Chart published" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Chart**: \`oci://eccr.ecmwf.int/polytope/bobs-chart:${{ needs.gate.outputs.chart_version }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs/bobs-chart:${{ needs.gate.outputs.chart_version }}\`" >> "${GITHUB_STEP_SUMMARY}"
 
   # ── Release tag ────────────────────────────────────────────────────────────
   # Created after all publish jobs succeed or are intentionally skipped.
