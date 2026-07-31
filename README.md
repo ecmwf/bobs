@@ -209,8 +209,8 @@ route_name: download
 
 ## Helm chart
 
-`chart/` is the source of truth for the BOBS Helm chart. `polytope-chart`
-vendors a packaged copy and verifies it against a pinned commit from this repository.
+`chart/` is the source of truth for the BOBS Helm chart, published to
+`oci://eccr.ecmwf.int/bobs/bobs-chart` on every release.
 
 The chart restricts `config.data_dir` to `/var/lib/bobs` or a normalized
 descendant and mounts the managed PVC or `emptyDir` there. `.` and `..` segments,

@@ -9,6 +9,9 @@ chart_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+chart_version=$(awk '/^version:/{print $2; exit}' "$chart_dir/Chart.yaml" | tr -d "'\"")
+app_version=$(awk '/^appVersion:/{print $2; exit}' "$chart_dir/Chart.yaml" | tr -d "'\"")
+
 common_values=(--set config.host_prefix=bobs --set config.domain=example.test)
 
 assert_contains() {
@@ -82,8 +85,8 @@ assert_label_strings() {
 	local file=$1 release_name=$2 app_name=$3
 	assert_contains "app.kubernetes.io/instance: \"$release_name\"" "$file"
 	assert_contains "app.kubernetes.io/name: \"$app_name\"" "$file"
-	assert_contains 'helm.sh/chart: "bobs-0.1.3"' "$file"
-	assert_contains 'app.kubernetes.io/version: "0.1.0"' "$file"
+	assert_contains "helm.sh/chart: \"bobs-chart-${chart_version}\"" "$file"
+	assert_contains "app.kubernetes.io/version: \"${app_version}\"" "$file"
 	assert_contains 'app.kubernetes.io/managed-by: "Helm"' "$file"
 	assert_contains 'boolean-like: "true"' "$file"
 	assert_contains 'false-like: "false"' "$file"
