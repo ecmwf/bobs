@@ -147,8 +147,8 @@ config:
   # the parent chart or operator; route_name intentionally defaults to download.
   # route_name is one 1-63 character path segment: ASCII letters, digits, '_' and
   # '-' only, starting and ending with an alphanumeric character.
-  host_prefix: ""
-  domain: ""
+  host_prefix: bobs
+  domain: chart.example.local
   route_name: "download"
   # Kubernetes metrics profile: bind on all interfaces and allow only collection.
   # The Rust binary defaults are 127.0.0.1 and an empty list (allow all labels).
