@@ -366,6 +366,9 @@ than receiving the registry project path twice.
 {{- range .Values.imagePullSecrets | default list -}}
   {{- $secrets = append $secrets . -}}
 {{- end -}}
+{{- if .Values.imageCredentials -}}
+  {{- $secrets = append $secrets (dict "name" (printf "%s-bobs-registry-cred" .Release.Name)) -}}
+{{- end -}}
 {{- if $secrets }}
 imagePullSecrets:
   {{- toYaml $secrets | nindent 2 }}
