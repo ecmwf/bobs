@@ -332,8 +332,7 @@ than receiving the registry project path twice.
 {{- $registry := $imageRegistry -}}
 {{- if $repositoryRegistry -}}
   {{- $registry = $repositoryRegistry -}}
-{{- end -}}
-{{- if $globalRegistry -}}
+{{- else if not $imageRegistry -}}
   {{- $registry = $globalRegistry -}}
 {{- end -}}
 {{- $image := $repositoryPath -}}
