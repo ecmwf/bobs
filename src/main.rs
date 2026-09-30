@@ -87,6 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         page_size = config.page_size,
         max_cache_bytes = config.max_cache_bytes,
         max_live_spools = config.max_live_spools,
+        fsync_enabled = config.fsync_enabled,
         route_name = %config.route_name,
         public_base = %format!("https://{}.{}/{}-{}/api/v1", config.host_prefix, config.domain, config.route_name, ordinal),
         internal_base_url = %internal_base_url,
@@ -149,7 +150,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(BobsMetrics::new(config.metrics.enabled));
 
     let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-        DefaultMetadataStore::new(&config.data_dir),
+        DefaultMetadataStore::new_with_fsync(&config.data_dir, config.fsync_enabled),
         &config.data_dir,
         config.page_size,
         config.max_cache_bytes,

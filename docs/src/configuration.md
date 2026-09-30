@@ -38,6 +38,7 @@ The table distinguishes Rust defaults from chart overrides where they differ.
 | `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for spools in the first-read cache phase and for startup recovery. Valid range: `1..=65536`; the bound applies to explicit and derived values. YAML omission derives it from effective page/cache settings. The first proven full-object read frees that spool's cache and admission slot while leaving it readable from disk. Startup uses a preferred candidate and handle set whose capacity is exactly this limit, and leaves excess entries unchanged for a later restart with more capacity. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum bytes accepted for one spool across write requests and maximum canonical payload length admitted during startup recovery. An over-limit recovered payload is quarantined unchanged before open or metadata migration. Must be greater than `0` and at least `page_size`. |
 | `create_admission_timeout_ms` | `5000` | Maximum time `/api/v1/create` waits for a `max_live_spools` slot before returning `503 Service Unavailable`. Must be greater than `0`. |
+| `fsync_enabled` | `true` | Flush spool data, metadata, and directory updates across crash-durability boundaries. Set `false` only for explicitly ephemeral deployments that accept losing in-flight and retained spools on restart. |
 | `writer_inactivity_timeout_secs` | `300` | Cleanup timeout for an unfinished spool whose writer has stopped sending data. Must be greater than `0`. |
 | `enable_pprof` | `false` | Exposes unauthenticated `/debug/pprof/profile` on the main listener. Enable only for controlled profiling. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools with no served bytes, anchored when they become readable and refreshed on read progress. Must be greater than `0`. |
@@ -90,6 +91,7 @@ max_cache_bytes: 268435456      # cache and slow-reader response budget; 0 disab
 # max_live_spools omitted: derives 16; valid range 1..=65536 and bounds recovery
 max_spool_bytes: 8589934592       # 8 GiB per spool
 create_admission_timeout_ms: 5000 # return 503 rather than waiting indefinitely
+fsync_enabled: true             # safe default; false is for ephemeral spools only
 writer_inactivity_timeout_secs: 300
 enable_pprof: false            # only enable for controlled, trusted profiling
 read_idle_ttl_secs: 600

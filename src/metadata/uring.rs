@@ -108,8 +108,13 @@ struct PreparedMetadataCommit {
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 impl UringSidecarMetadataStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self::new_with_fsync(data_dir, true)
+    }
+
+    pub fn new_with_fsync(data_dir: impl Into<PathBuf>, fsync_enabled: bool) -> Self {
         Self {
             data_dir: data_dir.into(),
+            fsync_enabled,
             #[cfg(test)]
             operation_hook: None,
         }
@@ -119,6 +124,7 @@ impl UringSidecarMetadataStore {
     fn with_operation_hook(data_dir: impl Into<PathBuf>, operation_hook: fn()) -> Self {
         Self {
             data_dir: data_dir.into(),
+            fsync_enabled: true,
             operation_hook: Some(operation_hook),
         }
     }
@@ -128,7 +134,7 @@ impl UringSidecarMetadataStore {
     }
 
     fn sync_store(&self) -> SyncSidecarMetadataStore {
-        SyncSidecarMetadataStore::new(&self.data_dir)
+        SyncSidecarMetadataStore::new_with_fsync(&self.data_dir, self.fsync_enabled)
     }
 
     fn spool_dir(&self, key: &str) -> PathBuf {
@@ -223,7 +229,11 @@ impl UringSidecarMetadataStore {
 #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
 impl MetadataStore for UringSidecarMetadataStore {
     async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
-        self.write_uring(metadata).await
+        if self.fsync_enabled {
+            self.write_uring(metadata).await
+        } else {
+            self.sync_store().write(metadata).await
+        }
     }
 
     async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
@@ -239,6 +249,10 @@ impl MetadataStore for UringSidecarMetadataStore {
     async fn scan(&self) -> Result<MetadataDirectoryScan> {
         let store = self.sync_store();
         store.scan().await
+    }
+
+    fn fsync_enabled(&self) -> bool {
+        self.fsync_enabled
     }
 }
 

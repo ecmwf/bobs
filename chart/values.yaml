@@ -24,7 +24,7 @@ imagePullSecrets: []
 image:
   registry: eccr.ecmwf.int
   repository: bobs/bobs
-  tag: "0.1.4"
+  tag: "0.1.11"
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -127,6 +127,8 @@ config:
   max_spool_bytes: 8589934592
   # Bound create admission waits; exhausted capacity returns HTTP 503.
   create_admission_timeout_ms: 5000
+  # Keep crash durability by default. Set false only for explicitly ephemeral spools.
+  fsync_enabled: true
   # Exposes an unauthenticated, CPU-intensive profiler on the main listener.
   enable_pprof: false
   # io_uring tuning. When unset, BOBS auto-resolves shards = (num_cpus/4).max(1)

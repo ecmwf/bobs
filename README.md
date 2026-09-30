@@ -163,6 +163,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for the first-read cache phase and startup recovery. Valid range: `1..=65536`. Omitted values derive from effective page/cache settings; explicit values are preserved. Recovery no-follow open-preflights candidate payloads, uses a preferred summary and handle set whose capacity is exactly this limit, and closes displaced or excess handles without payload reads or sidecar rewrites. Failed preflights leave the spool intact and the scan continues. Proven full-object coverage frees a live spool's cache and admission slot while leaving it readable from disk. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool; must be at least `page_size`. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
 | `create_admission_timeout_ms` | `5000` | Maximum `/api/v1/create` admission wait before `503 Service Unavailable`. |
+| `fsync_enabled` | `true` | Flush data, metadata, and directory updates across crash-durability boundaries. Set `false` only for explicitly ephemeral spools where restart loss is acceptable; live read and TTL semantics are unchanged. |
 | `writer_inactivity_timeout_secs` | `300` | Writer-silence interval after which an unfinished spool is eligible for cleanup. Must be greater than `0`. |
 | `enable_pprof` | `false` | Enables unauthenticated `/debug/pprof/profile` on the main listener; use only in a controlled environment. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools, anchored when the spool becomes readable and refreshed whenever bytes are served. Must be greater than `0`. |
@@ -195,6 +196,7 @@ max_cache_bytes: 268435456
 # max_live_spools omitted: derives 16 from this page/cache combination
 max_spool_bytes: 8589934592
 create_admission_timeout_ms: 5000
+fsync_enabled: true
 writer_inactivity_timeout_secs: 300
 enable_pprof: false
 read_idle_ttl_secs: 600

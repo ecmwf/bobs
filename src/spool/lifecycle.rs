@@ -121,13 +121,15 @@ where
             )
         };
 
-        let handle = self.active_file_handle()?;
-        F::sync_data(&handle).await.map_err(BobsError::IoError)?;
+        if self.metadata_store.fsync_enabled() {
+            let handle = self.active_file_handle()?;
+            F::sync_data(&handle).await.map_err(BobsError::IoError)?;
 
-        // A durable marker certifies that spool.dat was synced and records the
-        // complete candidate layout. Recovery either commits this exact candidate
-        // or quarantines it; it never turns Completing back into a writable state.
-        self.persist_metadata(&marker).await?;
+            // A durable marker certifies that spool.dat was synced and records the
+            // complete candidate layout. Recovery either commits this exact candidate
+            // or quarantines it; it never turns Completing back into a writable state.
+            self.persist_metadata(&marker).await?;
+        }
         self.persist_metadata(&candidate).await?;
 
         {

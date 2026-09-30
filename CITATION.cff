@@ -6,8 +6,8 @@ abstract: "A streaming spool service that buffers large single-writer byte strea
 authors:
   - name: "European Centre for Medium-Range Weather Forecasts (ECMWF)"
     website: "https://www.ecmwf.int"
-version: "0.1.4"
-date-released: "2026-07-09"
+version: "0.1.11"
+date-released: "2026-09-30"
 repository-code: "https://github.com/ecmwf/bobs"
 url: "https://github.com/ecmwf/bobs"
 license: Apache-2.0

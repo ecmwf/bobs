@@ -118,6 +118,10 @@ pub trait MetadataStore: Sync {
     fn delete(&self, key: &str) -> impl Future<Output = Result<()>> + Send;
     /// Start one bounded top-level data-directory scan without reading sidecar payloads.
     fn scan(&self) -> impl Future<Output = Result<MetadataDirectoryScan>> + Send;
+    /// Whether crash-durability sync boundaries are enabled for this store.
+    fn fsync_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// Synchronous sidecar metadata backend selected for fallback benchmarking and
@@ -129,6 +133,7 @@ pub trait MetadataStore: Sync {
 #[derive(Clone, Debug)]
 pub struct SyncSidecarMetadataStore {
     data_dir: PathBuf,
+    fsync_enabled: bool,
     sync_directory: fn(&Path) -> io::Result<()>,
     #[cfg(test)]
     operation_hook: Option<fn()>,
@@ -144,8 +149,13 @@ impl Default for SyncSidecarMetadataStore {
 
 impl SyncSidecarMetadataStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self::new_with_fsync(data_dir, true)
+    }
+
+    pub fn new_with_fsync(data_dir: impl Into<PathBuf>, fsync_enabled: bool) -> Self {
         Self {
             data_dir: data_dir.into(),
+            fsync_enabled,
             sync_directory,
             #[cfg(test)]
             operation_hook: None,
@@ -162,6 +172,7 @@ impl SyncSidecarMetadataStore {
     fn with_directory_sync_error(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            fsync_enabled: true,
             sync_directory: |_| Err(io::Error::other("injected directory fsync failure")),
             operation_hook: None,
             read_stats: None,
@@ -172,6 +183,7 @@ impl SyncSidecarMetadataStore {
     fn with_operation_hook(data_dir: impl Into<PathBuf>, operation_hook: fn()) -> Self {
         Self {
             data_dir: data_dir.into(),
+            fsync_enabled: true,
             sync_directory,
             operation_hook: Some(operation_hook),
             read_stats: None,
@@ -185,6 +197,7 @@ impl SyncSidecarMetadataStore {
     ) -> Self {
         Self {
             data_dir: data_dir.into(),
+            fsync_enabled: true,
             sync_directory,
             operation_hook: None,
             read_stats: Some(read_stats),
@@ -226,12 +239,16 @@ impl SyncSidecarMetadataStore {
         self.invoke_operation_hook();
 
         file.write_all(&payload).map_err(storage_error)?;
-        file.sync_data().map_err(storage_error)?;
+        if self.fsync_enabled {
+            file.sync_data().map_err(storage_error)?;
+        }
         validate_metadata_temp_path(&tmp_path, identity).map_err(storage_error)?;
 
         fs::rename(&tmp_path, &meta_path).map_err(storage_error)?;
         tmp_cleanup.disarm();
-        (self.sync_directory)(&spool_dir).map_err(storage_error)?;
+        if self.fsync_enabled {
+            (self.sync_directory)(&spool_dir).map_err(storage_error)?;
+        }
         Ok(())
     }
 
@@ -256,7 +273,7 @@ impl SyncSidecarMetadataStore {
 
         if removed_any {
             match fs::symlink_metadata(&spool_dir) {
-                Ok(metadata) if metadata.file_type().is_dir() => {
+                Ok(metadata) if metadata.file_type().is_dir() && self.fsync_enabled => {
                     (self.sync_directory)(&spool_dir).map_err(storage_error)?;
                 }
                 Ok(_) => {}
@@ -292,7 +309,7 @@ impl SyncSidecarMetadataStore {
                 // the private temp protocol before classifying fixed spool markers.
                 // UUID temps are never sidecars, and symlinks are unlinked rather
                 // than followed.
-                if remove_metadata_temp_entries(&path)? {
+                if remove_metadata_temp_entries(&path)? && self.fsync_enabled {
                     (self.sync_directory)(&path).map_err(storage_error)?;
                 }
                 MetadataDirectoryEntryKind::Directory {
@@ -365,6 +382,10 @@ impl MetadataStore for SyncSidecarMetadataStore {
                 .await;
         });
         Ok(MetadataDirectoryScan { receiver })
+    }
+
+    fn fsync_enabled(&self) -> bool {
+        self.fsync_enabled
     }
 }
 
@@ -722,6 +743,7 @@ fn storage_error(error: io::Error) -> BobsError {
 #[derive(Clone, Debug)]
 pub struct UringSidecarMetadataStore {
     data_dir: PathBuf,
+    fsync_enabled: bool,
     #[cfg(test)]
     operation_hook: Option<fn()>,
 }
@@ -755,6 +777,7 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[allow(clippy::large_enum_variant)]
     enum RecoveredMetadata {
         Missing,
         Complete(SpoolMetadata),
@@ -1297,6 +1320,27 @@ mod tests {
             store.write(&meta).await,
             Err(BobsError::StorageError(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn sync_store_can_explicitly_skip_fsync_boundaries() {
+        let dir = tempdir().expect("create tempdir");
+        let mut store = SyncSidecarMetadataStore::with_directory_sync_error(dir.path());
+        store.fsync_enabled = false;
+        let meta = metadata_with_generation(1);
+
+        store
+            .write(&meta)
+            .await
+            .expect("non-durable metadata write");
+        let loaded = store
+            .read(&meta.key)
+            .await
+            .expect("read metadata")
+            .expect("metadata present");
+        assert_eq!(loaded.key, meta.key);
+        assert_eq!(loaded.state, meta.state);
+        assert!(!store.fsync_enabled());
     }
 
     #[tokio::test]

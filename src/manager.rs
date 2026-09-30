@@ -123,6 +123,7 @@ where
     F: FileIO,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         self,
         key: String,
@@ -205,17 +206,21 @@ where
         };
 
         let durability_result = async {
-            F::sync_data(&handle).await.map_err(BobsError::IoError)?;
-            F::sync_directory(&spool_dir)
-                .await
-                .map_err(BobsError::IoError)?;
+            if self.metadata_store.fsync_enabled() {
+                F::sync_data(&handle).await.map_err(BobsError::IoError)?;
+                F::sync_directory(&spool_dir)
+                    .await
+                    .map_err(BobsError::IoError)?;
+            }
 
             let mut creating = metadata.clone();
             creating.state = SpoolState::Creating;
             self.metadata_store.write(&creating).await?;
-            F::sync_directory(&self.data_dir)
-                .await
-                .map_err(BobsError::IoError)?;
+            if self.metadata_store.fsync_enabled() {
+                F::sync_directory(&self.data_dir)
+                    .await
+                    .map_err(BobsError::IoError)?;
+            }
 
             self.metadata_store.write(&metadata).await
         }
@@ -270,8 +275,10 @@ where
             }
         }
 
-        if let Err(error) = F::sync_directory(&self.data_dir).await {
-            tracing::warn!(key = %key, error = %error, "failed to sync data directory while rolling back spool creation");
+        if self.metadata_store.fsync_enabled() {
+            if let Err(error) = F::sync_directory(&self.data_dir).await {
+                tracing::warn!(key = %key, error = %error, "failed to sync data directory while rolling back spool creation");
+            }
         }
     }
 }
@@ -726,10 +733,13 @@ where
             Err(error) => return Err(BobsError::IoError(error)),
         }
 
-        // Deletion is acknowledged only after the key-directory unlink is durable.
-        F::sync_directory(&self.data_dir)
-            .await
-            .map_err(BobsError::IoError)
+        if self.metadata_store.fsync_enabled() {
+            // Deletion is acknowledged only after the key-directory unlink is durable.
+            F::sync_directory(&self.data_dir)
+                .await
+                .map_err(BobsError::IoError)?;
+        }
+        Ok(())
     }
 
     pub async fn recover(&self) -> Result<()> {
@@ -1281,11 +1291,13 @@ where
         }
         debug_assert!(preflight_handles.is_empty());
 
-        // Commit empty pre-marker removals, and retry any parent-directory
-        // durability boundary left uncertain by an earlier failed recovery.
-        F::sync_directory(&self.data_dir)
-            .await
-            .map_err(BobsError::IoError)?;
+        if self.metadata_store.fsync_enabled() {
+            // Commit empty pre-marker removals, and retry any parent-directory
+            // durability boundary left uncertain by an earlier failed recovery.
+            F::sync_directory(&self.data_dir)
+                .await
+                .map_err(BobsError::IoError)?;
+        }
 
         self.metrics.record_recovery_snapshot(
             self.max_live_spools,
@@ -2187,6 +2199,7 @@ mod tests {
             TokioFileIO::create(path)
         }
 
+        #[allow(clippy::manual_async_fn)]
         fn open(
             path: &Path,
         ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
