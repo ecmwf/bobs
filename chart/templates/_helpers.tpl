@@ -174,6 +174,7 @@ max_cache_bytes: {{ int .Values.config.max_cache_bytes }}
 max_live_spools: {{ int .Values.config.max_live_spools }}
 max_spool_bytes: {{ int .Values.config.max_spool_bytes }}
 create_admission_timeout_ms: {{ int .Values.config.create_admission_timeout_ms }}
+fsync_enabled: {{ .Values.config.fsync_enabled }}
 enable_pprof: {{ .Values.config.enable_pprof }}
 {{- if .Values.config.io_uring_shards }}
 io_uring_shards: {{ int .Values.config.io_uring_shards }}
