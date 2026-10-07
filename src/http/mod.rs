@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::async_sync::AsyncSyncCoordinator;
 use crate::config::Config;
 use crate::error::BobsError;
 use crate::io::FileIO;
@@ -78,6 +79,7 @@ pub struct AppState<F: FileIO, M: MetadataStore> {
     pub ordinal: String,
     pub internal_base_url: String,
     pub metrics: Arc<BobsMetrics>,
+    pub async_sync: Option<Arc<AsyncSyncCoordinator>>,
 }
 
 #[derive(Deserialize)]
@@ -464,20 +466,8 @@ where
         );
         complete_result.map_err(ApiError)?;
         state.metrics.record_spool_completed(&labels);
-        if !state.config.fsync_enabled && state.config.async_sync_delay_ms > 0 {
-            let sync_spool = Arc::clone(&spool);
-            let delay = Duration::from_millis(state.config.async_sync_delay_ms);
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                if let Err(error) = sync_spool.sync_completed().await {
-                    tracing::warn!(
-                        "event.name" = "bobs.spool.async_sync_failed",
-                        "bobs.spool.key" = %sync_spool.key,
-                        error = %error,
-                        "best-effort delayed spool sync failed"
-                    );
-                }
-            });
+        if let Some(async_sync) = &state.async_sync {
+            async_sync.schedule();
         }
         let meta = spool.metadata.lock().await;
         if let Some(job_id) = &job_id {
@@ -1517,7 +1507,7 @@ mod tests {
         configure(&mut config);
         let config = Arc::new(config);
         let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-            DefaultMetadataStore::new(&data_dir),
+            DefaultMetadataStore::new_with_fsync(&data_dir, config.fsync_enabled),
             &data_dir,
             config.page_size,
             config.max_cache_bytes,
@@ -1526,6 +1516,12 @@ mod tests {
         .expect("manager init");
         manager.set_metrics(Arc::clone(&metrics));
         let manager = Arc::new(manager);
+        let async_sync = (!config.fsync_enabled && config.async_sync_delay_ms > 0).then(|| {
+            AsyncSyncCoordinator::start(
+                data_dir.clone(),
+                Duration::from_millis(config.async_sync_delay_ms),
+            )
+        });
         let state = Arc::new(AppState {
             manager,
             config,
@@ -1533,6 +1529,7 @@ mod tests {
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
             metrics,
+            async_sync,
         });
         let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
@@ -1602,6 +1599,7 @@ mod tests {
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
             metrics: Arc::new(BobsMetrics::new(false)),
+            async_sync: None,
         });
         let app = router::<TokioFileIO, SyncSidecarMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
@@ -4692,16 +4690,58 @@ mod tests {
             config.async_sync_delay_ms = 1;
         })
         .await;
-        let key = write_and_complete(&app, b"sync me".to_vec()).await;
-        let spool = state.manager.get_spool(&key).expect("completed spool");
+        write_and_complete(&app, b"sync me".to_vec()).await;
+        let async_sync = state.async_sync.as_ref().expect("sync coordinator");
         tokio::time::timeout(Duration::from_secs(5), async {
-            while spool.async_sync_count.load(Ordering::Acquire) == 0 {
+            while async_sync.completed_batch_count() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("delayed sync should run");
-        assert_eq!(spool.async_sync_count.load(Ordering::Acquire), 1);
+        assert_eq!(async_sync.scheduled_count(), 1);
+        assert_eq!(async_sync.completed_batch_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_sync_is_not_awaited_by_complete_response() {
+        let (app, state) = app_with_config(|config| {
+            config.fsync_enabled = false;
+            config.async_sync_delay_ms = 60_000;
+        })
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            write_and_complete(&app, b"return before sync".to_vec()),
+        )
+        .await
+        .expect("completion response must not await delayed sync");
+        let async_sync = state.async_sync.as_ref().expect("sync coordinator");
+        assert_eq!(async_sync.scheduled_count(), 1);
+        assert_eq!(async_sync.completed_batch_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delayed_sync_coalesces_a_completion_burst() {
+        let (_app, state) = app_with_config(|config| {
+            config.fsync_enabled = false;
+            config.async_sync_delay_ms = 10;
+        })
+        .await;
+        let async_sync = state.async_sync.as_ref().expect("sync coordinator");
+        for _ in 0..32 {
+            async_sync.schedule();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while async_sync.completed_batch_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("coalesced sync should run");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(async_sync.scheduled_count(), 32);
+        assert_eq!(async_sync.completed_batch_count(), 1);
     }
 
     #[tokio::test]
@@ -4711,10 +4751,8 @@ mod tests {
             config.async_sync_delay_ms = 0;
         })
         .await;
-        let key = write_and_complete(&app, b"do not sync".to_vec()).await;
-        let spool = state.manager.get_spool(&key).expect("completed spool");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(spool.async_sync_count.load(Ordering::Acquire), 0);
+        write_and_complete(&app, b"do not sync".to_vec()).await;
+        assert!(state.async_sync.is_none());
     }
 
     #[tokio::test]
@@ -4815,6 +4853,7 @@ mod tests {
                 ordinal: "0".into(),
                 internal_base_url: "http://bobs-0:3000/api/v1".into(),
                 metrics,
+                async_sync: None,
             });
             let restarted_app =
                 router::<DefaultFileIO, DefaultMetadataStore>().with_state(restarted);

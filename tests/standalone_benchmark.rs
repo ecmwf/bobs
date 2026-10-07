@@ -118,6 +118,7 @@ where
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
         metrics: Arc::new(BobsMetrics::new(false)),
+        async_sync: None,
     });
     let app: Router = router::<F, M>().with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

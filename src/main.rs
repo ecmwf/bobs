@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use bobs::async_sync::AsyncSyncCoordinator;
 use bobs::cleanup;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
@@ -164,6 +165,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
+    let async_sync = (!config.fsync_enabled && config.async_sync_delay_ms > 0).then(|| {
+        AsyncSyncCoordinator::start(
+            config.data_dir.clone(),
+            std::time::Duration::from_millis(config.async_sync_delay_ms),
+        )
+    });
     let state = Arc::new(AppState {
         manager,
         config: config.clone(),
@@ -171,6 +178,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ordinal: ordinal.clone(),
         internal_base_url,
         metrics,
+        async_sync,
     });
     let app = router::<DefaultFileIO, DefaultMetadataStore>().with_state(state);
     tracing::info!("event.name" = "startup.server.listening", outcome = "success", addr = %addr, host = %config.host, port = config.port, "server listening");

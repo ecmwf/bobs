@@ -156,6 +156,7 @@ async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
         metrics: Arc::new(BobsMetrics::new(false)),
+        async_sync: None,
     });
     let app: Router =
         router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));
