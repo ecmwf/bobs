@@ -1368,6 +1368,8 @@ struct ErrorResponse {
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 struct ApiError(BobsError);
@@ -1391,15 +1393,27 @@ impl IntoResponse for ApiError {
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        let (error, reason, key) = match &self.0 {
+        let (error, reason, message, key) = match &self.0 {
             BobsError::ResultLost { key } => (
                 "result_lost".to_string(),
                 Some("integrity check failed after storage failure".to_string()),
+                Some(
+                    "result lost due to a storage failure; please resubmit the request".to_string(),
+                ),
                 Some(key.clone()),
             ),
-            error => (error.to_string(), None, None),
+            error => (error.to_string(), None, None, None),
         };
-        let mut response = (status, Json(ErrorResponse { error, reason, key })).into_response();
+        let mut response = (
+            status,
+            Json(ErrorResponse {
+                error,
+                reason,
+                message,
+                key,
+            }),
+        )
+            .into_response();
         if let BobsError::RangeNotSatisfiable { total, .. } = &self.0 {
             let value = total
                 .map(|total| format!("bytes */{total}"))
