@@ -79,13 +79,8 @@ pub struct Config {
     pub max_spool_bytes: u64,
     /// Maximum time create waits for a live-spool admission slot.
     pub create_admission_timeout_ms: u64,
-    /// Flush spool data and metadata across crash-durability boundaries.
-    /// Disable only for explicitly ephemeral deployments where restart data loss is acceptable.
-    pub fsync_enabled: bool,
-    /// Completed objects no larger than this are verified before response headers.
-    pub verify_before_send_bytes: u64,
-    /// Delay before best-effort background sync when foreground fsync is disabled.
-    /// Zero disables background sync.
+    /// Delay before the always-on best-effort background filesystem sync.
+    /// Zero flushes immediately after a completion is scheduled.
     pub async_sync_delay_ms: u64,
     pub writer_inactivity_timeout_secs: u64,
     /// Expose the CPU profiler on the main HTTP listener. Disabled by default.
@@ -158,8 +153,6 @@ impl Default for Config {
             max_live_spools: derived_max_live_spools(DEFAULT_PAGE_SIZE, DEFAULT_MAX_CACHE_BYTES),
             max_spool_bytes: DEFAULT_MAX_SPOOL_BYTES,
             create_admission_timeout_ms: 5000,
-            fsync_enabled: true,
-            verify_before_send_bytes: 4 * 1024 * 1024,
             async_sync_delay_ms: 500,
             writer_inactivity_timeout_secs: 300,
             enable_pprof: false,
@@ -370,7 +363,6 @@ mod tests {
         assert_eq!(config.max_live_spools, 16);
         assert_eq!(config.max_spool_bytes, DEFAULT_MAX_SPOOL_BYTES);
         assert_eq!(config.create_admission_timeout_ms, 5000);
-        assert!(config.fsync_enabled);
         assert_eq!(config.writer_inactivity_timeout_secs, 300);
         assert!(!config.enable_pprof);
         assert_eq!(config.read_idle_ttl_secs, 600);
@@ -397,7 +389,6 @@ max_cache_bytes: 131072
 max_live_spools: 123
 max_spool_bytes: 987654321
 create_admission_timeout_ms: 777
-fsync_enabled: false
 enable_pprof: true
 writer_inactivity_timeout_secs: 11
 read_idle_ttl_secs: 120
@@ -424,7 +415,6 @@ route_name: test-route
         assert_eq!(cfg.max_live_spools, 123);
         assert_eq!(cfg.max_spool_bytes, 987654321);
         assert_eq!(cfg.create_admission_timeout_ms, 777);
-        assert!(!cfg.fsync_enabled);
         assert!(cfg.enable_pprof);
         assert_eq!(cfg.writer_inactivity_timeout_secs, 11);
         assert_eq!(cfg.read_idle_ttl_secs, 120);

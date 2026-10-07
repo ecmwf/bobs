@@ -11,10 +11,7 @@ pub enum SpoolState {
     Creating,
     Writing,
     WriteLocked, // write-lock mode: writes OK, reads blocked until Complete
-    /// Completion has started but its metadata commit is not known to be durable.
-    /// Writes are fail-stop; completion remains retryable.
-    Completing,
-    Complete, // writer finished, all data readable
+    Complete,    // writer finished, all data readable
     Deleting,
 }
 
@@ -112,7 +109,7 @@ impl<'de> Deserialize<'de> for SpoolMetadata {
             PersistedSpoolState::Creating => SpoolState::Creating,
             PersistedSpoolState::Writing => SpoolState::Writing,
             PersistedSpoolState::WriteLocked => SpoolState::WriteLocked,
-            PersistedSpoolState::Completing => SpoolState::Completing,
+            PersistedSpoolState::Completing => SpoolState::Complete,
             PersistedSpoolState::Readable | PersistedSpoolState::Complete => SpoolState::Complete,
             PersistedSpoolState::Deleting => SpoolState::Deleting,
         };
@@ -153,7 +150,6 @@ mod tests {
         assert!(!SpoolState::Creating.is_readable());
         assert!(SpoolState::Writing.is_readable());
         assert!(!SpoolState::WriteLocked.is_readable());
-        assert!(!SpoolState::Completing.is_readable());
         assert!(SpoolState::Complete.is_readable());
         assert!(!SpoolState::Deleting.is_readable());
     }

@@ -365,6 +365,7 @@ impl RingPool {
                 .sum::<usize>()
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn submit_metadata_commit(
         &self,
         request: MetadataCommitRequest,
@@ -426,6 +427,7 @@ impl RingPool {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn metadata_commit_routing_event_for_key_for_test(
         key: &str,
         shard_count: usize,
@@ -465,6 +467,7 @@ impl RingPool {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn clear_routing_events(&self) {
         self.instrumentation
             .routing_events

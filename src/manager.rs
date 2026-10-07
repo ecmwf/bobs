@@ -41,12 +41,10 @@ impl DeleteReason {
     }
 }
 
-fn metric_state_label(state: &SpoolState, write_locked: bool) -> &'static str {
+fn metric_state_label(state: &SpoolState, _write_locked: bool) -> &'static str {
     match state {
         SpoolState::Creating | SpoolState::Writing => crate::metrics::state::WRITING,
         SpoolState::WriteLocked => crate::metrics::state::WRITE_LOCKED,
-        SpoolState::Completing if write_locked => crate::metrics::state::WRITE_LOCKED,
-        SpoolState::Completing => crate::metrics::state::WRITING,
         SpoolState::Complete | SpoolState::Deleting => crate::metrics::state::COMPLETE,
     }
 }
@@ -207,28 +205,15 @@ where
             integrity_failure: None,
         };
 
-        let durability_result = async {
-            if self.metadata_store.fsync_enabled() {
-                F::sync_data(&handle).await.map_err(BobsError::IoError)?;
-                F::sync_directory(&spool_dir)
-                    .await
-                    .map_err(BobsError::IoError)?;
-            }
-
+        let persistence_result = async {
             let mut creating = metadata.clone();
             creating.state = SpoolState::Creating;
             self.metadata_store.write(&creating).await?;
-            if self.metadata_store.fsync_enabled() {
-                F::sync_directory(&self.data_dir)
-                    .await
-                    .map_err(BobsError::IoError)?;
-            }
-
             self.metadata_store.write(&metadata).await
         }
         .await;
 
-        if let Err(error) = durability_result {
+        if let Err(error) = persistence_result {
             self.cleanup_failed_creation(&key, Some(handle)).await;
             return Err(error);
         }
@@ -274,12 +259,6 @@ where
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 tracing::warn!(key = %key, error = %error, "failed to remove spool directory while rolling back creation");
-            }
-        }
-
-        if self.metadata_store.fsync_enabled() {
-            if let Err(error) = F::sync_directory(&self.data_dir).await {
-                tracing::warn!(key = %key, error = %error, "failed to sync data directory while rolling back spool creation");
             }
         }
     }
@@ -734,13 +713,6 @@ where
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(BobsError::IoError(error)),
         }
-
-        if self.metadata_store.fsync_enabled() {
-            // Deletion is acknowledged only after the key-directory unlink is durable.
-            F::sync_directory(&self.data_dir)
-                .await
-                .map_err(BobsError::IoError)?;
-        }
         Ok(())
     }
 
@@ -907,7 +879,7 @@ where
             let file_metadata = match F::symlink_metadata(&canonical_data_path).await {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if meta.state == SpoolState::Complete && meta.integrity.is_some() {
+                    if meta.state == SpoolState::Complete {
                         meta.integrity_failure =
                             Some("integrity check failed after storage failure".to_string());
                         self.metadata_store.write(&meta).await?;
@@ -1147,7 +1119,6 @@ where
                 data_path_migrated,
                 metadata_needs_persist,
                 trailing_partial_len,
-                finalized_completing,
             } = prepared;
             let spool_page_size = migration.page_size;
 
@@ -1232,9 +1203,6 @@ where
                 } else if migration.persist {
                     tracing::info!(key = %key, page_size = spool_page_size, "recovery: atomically resegmenting terminal or legacy sidecar metadata");
                 }
-                if finalized_completing {
-                    tracing::info!(key = %key, total_bytes = meta.total_bytes_written, total_pages = meta.total_pages, "recovery: finalizing durable Completing marker");
-                }
                 if let Err(error) = self.metadata_store.write(&meta).await {
                     close_recovery_handle::<F>(&key, handle.take(), "metadata persistence failure")
                         .await;
@@ -1305,14 +1273,6 @@ where
             close_recovery_handle::<F>(&summary.key, handle, "quarantined preflight").await;
         }
         debug_assert!(preflight_handles.is_empty());
-
-        if self.metadata_store.fsync_enabled() {
-            // Commit empty pre-marker removals, and retry any parent-directory
-            // durability boundary left uncertain by an earlier failed recovery.
-            F::sync_directory(&self.data_dir)
-                .await
-                .map_err(BobsError::IoError)?;
-        }
 
         self.metrics.record_recovery_snapshot(
             self.max_live_spools,
@@ -1475,7 +1435,6 @@ struct PreparedRecoveryCandidate {
     data_path_migrated: bool,
     metadata_needs_persist: bool,
     trailing_partial_len: u64,
-    finalized_completing: bool,
 }
 
 enum RecoveryMetadataDisposition {
@@ -1502,10 +1461,7 @@ fn prepare_recovery_candidate(
                 reason: "incomplete Deleting transition".to_owned(),
             };
         }
-        SpoolState::Writing
-        | SpoolState::WriteLocked
-        | SpoolState::Completing
-        | SpoolState::Complete => {}
+        SpoolState::Writing | SpoolState::WriteLocked | SpoolState::Complete => {}
     }
 
     let configured_page_size_u64 = match u64::try_from(configured_page_size) {
@@ -1544,17 +1500,11 @@ fn prepare_recovery_candidate(
         };
     }
 
-    let finalized_completing = meta.state == SpoolState::Completing;
-    if finalized_completing {
-        if let Err(reason) = validate_completing_marker(&meta, file_size) {
-            return RecoveryMetadataDisposition::Preserve {
-                reason: format!("inconsistent Completing marker: {reason}"),
-            };
-        }
-        meta.state = SpoolState::Complete;
-        meta.readable_at.get_or_insert_with(now_secs);
+    let missing_integrity = meta.state == SpoolState::Complete && meta.integrity.is_none();
+    if missing_integrity {
+        meta.integrity_failure
+            .get_or_insert_with(|| "completed spool has no integrity metadata".to_string());
     }
-
     let migration = match prepare_recovery_metadata(&mut meta, file_size, configured_page_size) {
         Ok(migration) => migration,
         Err(reason) => {
@@ -1563,8 +1513,7 @@ fn prepare_recovery_candidate(
             };
         }
     };
-    let mut metadata_needs_persist =
-        finalized_completing || migration.persist || data_path_migrated;
+    let mut metadata_needs_persist = migration.persist || data_path_migrated || missing_integrity;
     let mut trailing_partial_len = 0;
 
     if meta.state == SpoolState::Complete && meta.readable_at.is_none() {
@@ -1588,7 +1537,7 @@ fn prepare_recovery_candidate(
             }
         };
         if file_size < expected_bytes {
-            if meta.integrity.is_some() {
+            if meta.integrity.is_some() || meta.integrity_failure.is_some() {
                 meta.integrity_failure =
                     Some("integrity check failed after storage failure".to_string());
                 metadata_needs_persist = true;
@@ -1609,7 +1558,6 @@ fn prepare_recovery_candidate(
         data_path_migrated,
         metadata_needs_persist,
         trailing_partial_len,
-        finalized_completing,
     }))
 }
 
@@ -1936,28 +1884,6 @@ fn complete_layout_bytes(meta: &SpoolMetadata, page_size: u64) -> std::result::R
     }
 }
 
-fn validate_completing_marker(
-    meta: &SpoolMetadata,
-    file_size: u64,
-) -> std::result::Result<(), String> {
-    if meta.state != SpoolState::Completing {
-        return Err("metadata is not a Completing marker".into());
-    }
-    let candidate_bytes = complete_layout_bytes(meta, meta.page_size)?;
-    if candidate_bytes != meta.total_bytes_written {
-        return Err(format!(
-            "candidate layout describes {candidate_bytes} bytes but marker records {}",
-            meta.total_bytes_written
-        ));
-    }
-    if file_size != candidate_bytes {
-        return Err(format!(
-            "data file has {file_size} bytes but candidate layout requires exactly {candidate_bytes}"
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InProgressProgress {
     total_bytes_written: u64,
@@ -2095,8 +2021,6 @@ mod tests {
     static PROTOCOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static PROTOCOL_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<ProtocolEvent>>> =
         std::sync::OnceLock::new();
-    static FAIL_NEXT_PARENT_SYNC: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
     static FAIL_NEXT_LIVE_METADATA_WRITE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -2159,30 +2083,25 @@ mod tests {
         }
 
         fn sync_data(
-            handle: &Self::Handle,
+            _handle: &Self::Handle,
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
             record_protocol_event(ProtocolEvent::DataSync);
-            TokioFileIO::sync_data(handle)
+            async { Err(std::io::Error::other("unexpected request-path data sync")) }
         }
 
         fn sync_directory(
             path: &Path,
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            let path = path.to_path_buf();
-            async move {
-                let parent = path.ends_with("data");
-                record_protocol_event(if parent {
-                    ProtocolEvent::ParentDirectorySync
-                } else {
-                    ProtocolEvent::SpoolDirectorySync
-                });
-                if parent && FAIL_NEXT_PARENT_SYNC.swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
-                    return Err(std::io::Error::other(
-                        "injected parent directory fsync failure",
-                    ));
-                }
-                TokioFileIO::sync_directory(&path).await
+            let parent = path.ends_with("data");
+            record_protocol_event(if parent {
+                ProtocolEvent::ParentDirectorySync
+            } else {
+                ProtocolEvent::SpoolDirectorySync
+            });
+            async {
+                Err(std::io::Error::other(
+                    "unexpected request-path directory sync",
+                ))
             }
         }
 
@@ -2590,7 +2509,6 @@ mod tests {
     }
 
     const CREATE_GATE_OPEN: usize = 1;
-    const CREATE_GATE_SYNC: usize = 2;
     static CREATE_GATE_STAGE: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     static CREATE_GATE_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
@@ -2659,11 +2577,7 @@ mod tests {
         fn sync_data(
             handle: &Self::Handle,
         ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            let handle = Arc::clone(handle);
-            async move {
-                wait_at_create_gate(CREATE_GATE_SYNC).await;
-                TokioFileIO::sync_data(&handle).await
-            }
+            TokioFileIO::sync_data(handle)
         }
 
         fn sync_directory(
@@ -2737,7 +2651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_directory_durability_ordering_failures_and_retry_release() {
+    async fn request_paths_never_call_file_sync() {
         let _protocol_guard = PROTOCOL_TEST_LOCK.lock().await;
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
@@ -2751,135 +2665,36 @@ mod tests {
         .expect("manager init");
 
         take_protocol_events();
-        let first_key = uuid::Uuid::new_v4().to_string();
+        let key = uuid::Uuid::new_v4().to_string();
         manager
-            .create_spool(first_key.clone(), None, None, false, HashMap::new())
+            .create_spool(key.clone(), None, None, false, HashMap::new())
             .await
-            .expect("durable create succeeds");
+            .expect("create succeeds without sync");
+        let spool = manager.get_spool(&key).expect("created spool");
+        spool
+            .write(0, Bytes::from_static(b"data"))
+            .await
+            .expect("write succeeds without sync");
+        spool
+            .complete(Some(4))
+            .await
+            .expect("complete succeeds without sync");
+        manager
+            .delete_spool(&key)
+            .await
+            .expect("delete succeeds without sync");
+
+        let events = take_protocol_events();
         assert_eq!(
-            take_protocol_events(),
+            events,
             vec![
                 ProtocolEvent::DataCreate,
-                ProtocolEvent::DataSync,
-                ProtocolEvent::SpoolDirectorySync,
                 ProtocolEvent::MetadataWrite(SpoolState::Creating),
-                ProtocolEvent::ParentDirectorySync,
                 ProtocolEvent::MetadataWrite(SpoolState::Writing),
-            ],
-            "create must durably publish Creating before the live sidecar"
-        );
-        assert_eq!(
-            manager
-                .get_spool(&first_key)
-                .expect("created spool is published")
-                .metadata
-                .lock()
-                .await
-                .state,
-            SpoolState::Writing,
-            "Creating must never be exposed through the production spool map"
-        );
-
-        manager
-            .delete_spool(&first_key)
-            .await
-            .expect("durable delete succeeds");
-        assert_eq!(
-            take_protocol_events(),
-            vec![
+                ProtocolEvent::MetadataWrite(SpoolState::Complete),
                 ProtocolEvent::MetadataDelete,
-                ProtocolEvent::ParentDirectorySync,
-            ],
-            "delete acknowledgement must follow the parent-directory fsync"
-        );
-
-        let failed_create_key = uuid::Uuid::new_v4().to_string();
-        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
-        let error = manager
-            .create_spool(failed_create_key.clone(), None, None, false, HashMap::new())
-            .await
-            .expect_err("parent fsync failure must not acknowledge create");
-        assert!(matches!(error, BobsError::IoError(_)));
-        let failed_create_events = take_protocol_events();
-        assert!(failed_create_events.contains(&ProtocolEvent::MetadataWrite(SpoolState::Creating)));
-        assert!(
-            !failed_create_events.contains(&ProtocolEvent::MetadataWrite(SpoolState::Writing)),
-            "a failed parent fsync must not publish live metadata"
-        );
-        assert!(failed_create_events.contains(&ProtocolEvent::MetadataDelete));
-        assert!(manager.get_spool(&failed_create_key).is_none());
-        assert!(!data_dir.join(&failed_create_key).exists());
-        assert_eq!(manager.admission.available_permits(), 1);
-
-        let failed_live_key = uuid::Uuid::new_v4().to_string();
-        FAIL_NEXT_LIVE_METADATA_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
-        let error = manager
-            .create_spool(failed_live_key.clone(), None, None, false, HashMap::new())
-            .await
-            .expect_err("final metadata failure must not acknowledge create");
-        assert!(matches!(error, BobsError::StorageError(_)));
-        let failed_live_events = take_protocol_events();
-        assert_eq!(
-            &failed_live_events[..5],
-            &[
-                ProtocolEvent::DataCreate,
-                ProtocolEvent::DataSync,
-                ProtocolEvent::SpoolDirectorySync,
-                ProtocolEvent::MetadataWrite(SpoolState::Creating),
-                ProtocolEvent::ParentDirectorySync,
-            ],
-            "Creating and the parent link must precede the live commit"
-        );
-        assert!(failed_live_events.contains(&ProtocolEvent::MetadataDelete));
-        assert!(manager.get_spool(&failed_live_key).is_none());
-        assert!(!data_dir.join(&failed_live_key).exists());
-        assert_eq!(manager.admission.available_permits(), 1);
-
-        let retry_key = uuid::Uuid::new_v4().to_string();
-        manager
-            .create_spool(retry_key.clone(), None, None, false, HashMap::new())
-            .await
-            .expect("create retry fixture");
-        take_protocol_events();
-        manager
-            .page_cache
-            .lock()
-            .await
-            .insert(&retry_key, 0, bytes::Bytes::from_static(b"data"));
-
-        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            manager.delete_spool(&retry_key).await.is_err(),
-            "parent fsync failure must not acknowledge deletion"
-        );
-        let deleting = manager
-            .get_spool(&retry_key)
-            .expect("failed deletion remains tracked");
-        assert_eq!(deleting.metadata.lock().await.state, SpoolState::Deleting);
-        assert_eq!(manager.admission.available_permits(), 0);
-        assert!(manager.page_cache.lock().await.contains(&retry_key, 0));
-        assert_eq!(
-            take_protocol_events(),
-            vec![
-                ProtocolEvent::MetadataDelete,
-                ProtocolEvent::ParentDirectorySync,
             ]
         );
-
-        manager
-            .delete_spool(&retry_key)
-            .await
-            .expect("retry syncs parent even when the key directory is absent");
-        assert_eq!(
-            take_protocol_events(),
-            vec![
-                ProtocolEvent::MetadataDelete,
-                ProtocolEvent::ParentDirectorySync,
-            ]
-        );
-        assert!(manager.get_spool(&retry_key).is_none());
-        assert!(!manager.page_cache.lock().await.contains(&retry_key, 0));
-        assert_eq!(manager.admission.available_permits(), 1);
     }
 
     #[test]
@@ -2957,9 +2772,16 @@ mod tests {
 
     async fn write_sidecar_fixture(
         manager: &SpoolManager<TokioFileIO>,
-        metadata: SpoolMetadata,
+        mut metadata: SpoolMetadata,
         data: &[u8],
     ) {
+        if metadata.state == SpoolState::Complete && metadata.integrity.is_none() {
+            metadata.integrity = Some(crate::spool::IntegrityMetadata {
+                algorithm: "xxh3-64".to_string(),
+                length: data.len() as u64,
+                checksum: xxhash_rust::xxh3::xxh3_64(data),
+            });
+        }
         let spool_dir = manager.data_dir.join(&metadata.key);
         tokio::fs::create_dir_all(&spool_dir)
             .await
@@ -2976,11 +2798,18 @@ mod tests {
 
     async fn write_sparse_sidecar_fixture(
         manager: &SpoolManager<TokioFileIO>,
-        metadata: SpoolMetadata,
+        mut metadata: SpoolMetadata,
         file_len: u64,
         prefix: &[u8],
         suffix: &[u8],
     ) {
+        if metadata.state == SpoolState::Complete && metadata.integrity.is_none() {
+            metadata.integrity = Some(crate::spool::IntegrityMetadata {
+                algorithm: "xxh3-64".to_string(),
+                length: file_len,
+                checksum: 0,
+            });
+        }
         use std::io::{Seek, SeekFrom, Write};
 
         let spool_dir = manager.data_dir.join(&metadata.key);
@@ -3026,6 +2855,13 @@ mod tests {
         tokio::fs::write(&data_path, data)
             .await
             .expect("write legacy fixture data");
+        let integrity = matches!(state, "Complete" | "Readable").then(|| {
+            serde_json::json!({
+                "algorithm": "xxh3-64",
+                "length": data.len() as u64,
+                "checksum": xxhash_rust::xxh3::xxh3_64(data),
+            })
+        });
         let sidecar = serde_json::json!({
             "key": key,
             "content_type": null,
@@ -3041,6 +2877,7 @@ mod tests {
             "final_page_size": final_page_size,
             "data_path": data_path,
             "labels": {},
+            "integrity": integrity,
         });
         tokio::fs::write(
             spool_dir.join("meta.json"),
@@ -3429,87 +3266,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_after_reservation_finishes_durable_transaction_at_open_and_sync() {
-        for (index, stage) in [CREATE_GATE_OPEN, CREATE_GATE_SYNC].into_iter().enumerate() {
-            let dir = tempdir().expect("create tempdir");
-            let data_dir = dir.path().join("data");
-            let key = format!("cancelled-stage-{index}");
-            let manager = Arc::new(
-                SpoolManager::<CancellationFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
-                    .expect("manager init"),
-            );
+    async fn cancellation_after_reservation_finishes_transaction_at_open() {
+        let index = 0;
+        let stage = CREATE_GATE_OPEN;
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let key = format!("cancelled-stage-{index}");
+        let manager = Arc::new(
+            SpoolManager::<CancellationFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+                .expect("manager init"),
+        );
 
-            let started = CREATE_GATE_STARTED.notified();
-            CREATE_GATE_STAGE.store(stage, std::sync::atomic::Ordering::SeqCst);
-            let caller_manager = Arc::clone(&manager);
-            let caller_key = key.clone();
-            let caller = tokio::spawn(async move {
-                caller_manager
-                    .create_spool(caller_key, None, None, false, HashMap::new())
-                    .await
-            });
-            started.await;
-            assert!(
-                data_dir.join(&key).exists(),
-                "reservation must exist at gate"
-            );
-            caller.abort();
-            assert!(caller
+        let started = CREATE_GATE_STARTED.notified();
+        CREATE_GATE_STAGE.store(stage, std::sync::atomic::Ordering::SeqCst);
+        let caller_manager = Arc::clone(&manager);
+        let caller_key = key.clone();
+        let caller = tokio::spawn(async move {
+            caller_manager
+                .create_spool(caller_key, None, None, false, HashMap::new())
                 .await
-                .expect_err("caller task cancelled")
-                .is_cancelled());
-            CREATE_GATE_RELEASE.notify_one();
-
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while manager.get_spool(&key).is_none() {
-                    tokio::task::yield_now().await;
-                }
-            })
+        });
+        started.await;
+        assert!(
+            data_dir.join(&key).exists(),
+            "reservation must exist at gate"
+        );
+        caller.abort();
+        assert!(caller
             .await
-            .expect("detached create transaction finishes");
-            let durable = manager
-                .metadata_store
-                .read(&key)
-                .await
-                .expect("read metadata")
-                .expect("metadata exists");
-            assert_eq!(durable.state, SpoolState::Writing);
-            assert_eq!(manager.admission.available_permits(), 0);
+            .expect_err("caller task cancelled")
+            .is_cancelled());
+        CREATE_GATE_RELEASE.notify_one();
 
-            let retry = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                manager.create_spool(key.clone(), None, None, false, HashMap::new()),
-            )
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while manager.get_spool(&key).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached create transaction finishes");
+        let durable = manager
+            .metadata_store
+            .read(&key)
             .await
-            .expect("retry must report existing instead of waiting for admission");
-            assert!(matches!(retry, Err(BobsError::SpoolAlreadyExists { .. })));
+            .expect("read metadata")
+            .expect("metadata exists");
+        assert_eq!(durable.state, SpoolState::Writing);
+        assert_eq!(manager.admission.available_permits(), 0);
 
-            drop(manager);
-            let restarted = SpoolManager::<CancellationFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
-                .expect("restart manager init");
-            restarted.recover().await.expect("restart recovery");
-            assert_eq!(
-                restarted
-                    .get_spool(&key)
-                    .expect("durable spool recovers")
-                    .metadata
-                    .lock()
-                    .await
-                    .state,
-                SpoolState::Writing
-            );
-            assert!(matches!(
-                restarted
-                    .create_spool(key.clone(), None, None, false, HashMap::new())
-                    .await,
-                Err(BobsError::SpoolAlreadyExists { .. })
-            ));
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.create_spool(key.clone(), None, None, false, HashMap::new()),
+        )
+        .await
+        .expect("retry must report existing instead of waiting for admission");
+        assert!(matches!(retry, Err(BobsError::SpoolAlreadyExists { .. })));
+
+        drop(manager);
+        let restarted = SpoolManager::<CancellationFileIO>::new(&data_dir, 4096, 16 * 4096, 1)
+            .expect("restart manager init");
+        restarted.recover().await.expect("restart recovery");
+        assert_eq!(
             restarted
-                .delete_spool(&key)
+                .get_spool(&key)
+                .expect("durable spool recovers")
+                .metadata
+                .lock()
                 .await
-                .expect("delete recovered spool");
-            assert_eq!(restarted.admission.available_permits(), 1);
-        }
+                .state,
+            SpoolState::Writing
+        );
+        assert!(matches!(
+            restarted
+                .create_spool(key.clone(), None, None, false, HashMap::new())
+                .await,
+            Err(BobsError::SpoolAlreadyExists { .. })
+        ));
+        restarted
+            .delete_spool(&key)
+            .await
+            .expect("delete recovered spool");
+        assert_eq!(restarted.admission.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -4597,6 +4434,7 @@ mod tests {
 
         let mut corrupt = sidecar_fixture_metadata(&data_dir, corrupt_key, SpoolState::Complete, 8);
         corrupt.last_write_at = 800;
+        corrupt.total_pages = 0;
         write_sidecar_fixture(&fixture, corrupt, b"bad").await;
 
         let mut ambiguous =
@@ -4645,7 +4483,7 @@ mod tests {
         );
         assert!(!data_dir.join(creating_key).exists());
         assert!(!data_dir.join(deleting_key).exists());
-        assert!(!data_dir.join(corrupt_key).exists());
+        assert!(data_dir.join(corrupt_key).exists());
         assert_eq!(
             tokio::fs::read(data_dir.join(ambiguous_key).join("meta.json"))
                 .await
@@ -4909,102 +4747,6 @@ mod tests {
             .await
             .expect("end of spool")
             .is_none());
-    }
-
-    #[tokio::test]
-    async fn crash_restart_at_completing_marker_finalizes_exact_candidate() {
-        let dir = tempdir().expect("create tempdir");
-        let data_dir = dir.path().join("data");
-        let manager =
-            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 16).expect("manager init");
-        let key = uuid::Uuid::new_v4().to_string();
-        let data = vec![0xD4u8; 4096 + 37];
-        let marker =
-            sidecar_fixture_metadata(&data_dir, &key, SpoolState::Completing, data.len() as u64);
-        write_sidecar_fixture(&manager, marker, &data).await;
-
-        manager.recover().await.expect("recover marker");
-        let spool = manager
-            .get_spool(&key)
-            .expect("valid marker must finalize and recover");
-        let durable = persisted_metadata(&manager, &key).await;
-        assert_eq!(durable.state, SpoolState::Complete);
-        assert_eq!(durable.total_bytes_written, data.len() as u64);
-        assert_eq!(durable.total_pages, 2);
-        assert_eq!(durable.final_page_size, Some(37));
-        assert_eq!(
-            spool
-                .read_page_for_test(0)
-                .await
-                .expect("page 0")
-                .unwrap()
-                .as_ref(),
-            &data[..4096]
-        );
-        assert_eq!(
-            spool
-                .read_page_for_test(1)
-                .await
-                .expect("page 1")
-                .unwrap()
-                .as_ref(),
-            &data[4096..]
-        );
-        assert!(spool
-            .read_page_for_test(2)
-            .await
-            .expect("exact EOF")
-            .is_none());
-        assert!(matches!(
-            spool
-                .write(data.len() as u64, Bytes::from_static(b"tail"))
-                .await,
-            Err(BobsError::SpoolClosed)
-        ));
-        spool
-            .complete(Some(data.len() as u64))
-            .await
-            .expect("idempotent completion after recovery");
-    }
-
-    #[tokio::test]
-    async fn inconsistent_completing_markers_are_quarantined_without_mutation() {
-        let dir = tempdir().expect("create tempdir");
-        let data_dir = dir.path().join("data");
-        let manager =
-            SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 16).expect("manager init");
-
-        let short_key = uuid::Uuid::new_v4().to_string();
-        let short_data = vec![0x51u8; 200];
-        let short_marker =
-            sidecar_fixture_metadata(&data_dir, &short_key, SpoolState::Completing, 300);
-        write_sidecar_fixture(&manager, short_marker, &short_data).await;
-
-        let extra_key = uuid::Uuid::new_v4().to_string();
-        let extra_data = vec![0xA7u8; 301];
-        let extra_marker =
-            sidecar_fixture_metadata(&data_dir, &extra_key, SpoolState::Completing, 300);
-        write_sidecar_fixture(&manager, extra_marker, &extra_data).await;
-
-        manager
-            .recover()
-            .await
-            .expect("quarantine is a successful recovery outcome");
-
-        for (key, original) in [(&short_key, &short_data), (&extra_key, &extra_data)] {
-            assert!(
-                manager.get_spool(key).is_none(),
-                "quarantined marker must not expose a writable spool"
-            );
-            let durable = persisted_metadata(&manager, key).await;
-            assert_eq!(durable.state, SpoolState::Completing);
-            assert_eq!(
-                tokio::fs::read(data_dir.join(key).join("spool.dat"))
-                    .await
-                    .expect("quarantined data remains"),
-                *original
-            );
-        }
     }
 
     #[tokio::test]
@@ -5299,58 +5041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_pre_marker_parent_sync_failure_is_retryable() {
-        let _protocol_guard = PROTOCOL_TEST_LOCK.lock().await;
-        let dir = tempdir().expect("create tempdir");
-        let data_dir = dir.path().join("data");
-        tokio::fs::create_dir_all(&data_dir)
-            .await
-            .expect("create data dir");
-        let key = uuid::Uuid::new_v4().to_string();
-        tokio::fs::create_dir(data_dir.join(&key))
-            .await
-            .expect("create empty pre-marker key dir");
-        let manager = SpoolManager::<ProtocolFileIO, ProtocolMetadataStore>::with_metadata_store(
-            ProtocolMetadataStore::new(&data_dir),
-            &data_dir,
-            4096,
-            16 * 4096,
-            256,
-        )
-        .expect("manager init");
-
-        take_protocol_events();
-        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(matches!(
-            manager.recover().await,
-            Err(BobsError::IoError(_))
-        ));
-        assert!(
-            !data_dir.join(&key).exists(),
-            "the atomic empty-dir removal may precede an uncertain parent sync"
-        );
-        assert_eq!(
-            take_protocol_events(),
-            vec![ProtocolEvent::ParentDirectorySync]
-        );
-
-        manager
-            .recover()
-            .await
-            .expect("retry re-syncs the parent even though the empty directory is gone");
-        assert_eq!(
-            take_protocol_events(),
-            vec![ProtocolEvent::ParentDirectorySync]
-        );
-        manager
-            .create_spool(key.clone(), None, None, false, HashMap::new())
-            .await
-            .expect("create succeeds after the recovery durability retry");
-        assert!(manager.get_spool(&key).is_some());
-    }
-
-    #[tokio::test]
-    async fn test_recovery_discards_complete_sidecar_when_data_file_too_short() {
+    async fn recovery_quarantines_complete_spool_when_data_file_is_too_short() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
         let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
@@ -5367,14 +5058,17 @@ mod tests {
             .expect("manager2 init");
         manager2.recover().await.expect("recover succeeds");
 
-        assert!(manager2.get_spool(&key).is_none());
-        assert!(!data_dir.join(&key).exists());
+        let recovered = manager2
+            .get_spool(&key)
+            .expect("damaged completed spool remains addressable");
+        assert!(recovered.metadata.lock().await.integrity_failure.is_some());
+        assert!(data_dir.join(&key).exists());
         assert!(manager2
             .metadata_store
             .read(&key)
             .await
             .expect("read sidecar")
-            .is_none());
+            .is_some());
     }
 
     #[tokio::test]
@@ -5659,25 +5353,19 @@ mod tests {
             .write(&metadata)
             .await
             .expect("write sidecar");
-        let sidecar_before = tokio::fs::read(spool_dir.join("meta.json"))
-            .await
-            .expect("snapshot sidecar");
 
         manager
             .recover()
             .await
             .expect("quarantine missing canonical payload");
 
-        assert!(manager.get_spool(&key).is_none());
+        let recovered = manager
+            .get_spool(&key)
+            .expect("missing completed spool remains addressable as lost");
+        assert!(recovered.metadata.lock().await.integrity_failure.is_some());
         assert!(
             spool_dir.exists(),
             "local quarantine must be non-destructive"
-        );
-        assert_eq!(
-            tokio::fs::read(spool_dir.join("meta.json"))
-                .await
-                .expect("read quarantined sidecar"),
-            sidecar_before
         );
         assert_eq!(
             tokio::fs::read(&external_path)

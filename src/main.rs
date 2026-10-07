@@ -88,7 +88,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         page_size = config.page_size,
         max_cache_bytes = config.max_cache_bytes,
         max_live_spools = config.max_live_spools,
-        fsync_enabled = config.fsync_enabled,
         route_name = %config.route_name,
         public_base = %format!("https://{}.{}/{}-{}/api/v1", config.host_prefix, config.domain, config.route_name, ordinal),
         internal_base_url = %internal_base_url,
@@ -151,7 +150,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(BobsMetrics::new(config.metrics.enabled));
 
     let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-        DefaultMetadataStore::new_with_fsync(&config.data_dir, config.fsync_enabled),
+        DefaultMetadataStore::new(&config.data_dir),
         &config.data_dir,
         config.page_size,
         config.max_cache_bytes,
@@ -165,12 +164,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let cleanup_task = cleanup::start_cleanup_task(manager.clone(), config.clone());
 
-    let async_sync = (!config.fsync_enabled && config.async_sync_delay_ms > 0).then(|| {
-        AsyncSyncCoordinator::start(
-            config.data_dir.clone(),
-            std::time::Duration::from_millis(config.async_sync_delay_ms),
-        )
-    });
+    let async_sync = AsyncSyncCoordinator::start(
+        config.data_dir.clone(),
+        std::time::Duration::from_millis(config.async_sync_delay_ms),
+    );
     let state = Arc::new(AppState {
         manager,
         config: config.clone(),

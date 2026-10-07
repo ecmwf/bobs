@@ -97,9 +97,9 @@ For a valid write head, both known-length rejection and a chunked upload crossin
 
 ### POST /api/v1/complete/{key}
 
-Idempotently finalizes the spool. A supplied `expected_size` is checked on initial and repeated requests. Completion runs as an owned transaction: if the client disconnects after finalization starts, BOBS continues syncing `spool.dat`, committing the durable `Completing` recovery marker, and committing `Complete`. A missing response is therefore an unknown outcome; retry completion with the same `expected_size`.
+Idempotently finalizes the spool. A supplied `expected_size` is checked on initial and repeated requests. Completion runs as an owned transaction: if the client disconnects after finalization starts, BOBS continues the atomic `Complete` metadata update, including exact length and XXH3-64 checksum. A missing response is therefore an unknown outcome; retry completion with the same `expected_size`.
 
-Once completion starts, BOBS rejects further writes. Before the marker is durable, an internal failure leaves completion retryable. A valid marker found during startup is finalized to `Complete`; marker/data disagreement quarantines the key unchanged and never reopens it for writing. The internal `Completing` state is not an API choice.
+Request handling performs no filesystem sync. A failed metadata update leaves completion retryable.
 
 **Request Body (Optional)**:
 

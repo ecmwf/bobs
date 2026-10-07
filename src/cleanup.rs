@@ -226,82 +226,6 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
 
-    static BLOCK_NEXT_CLOSE: AtomicBool = AtomicBool::new(false);
-    static CLOSE_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
-    static CLOSE_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
-    #[derive(Clone)]
-    struct BlockingCloseFileIO;
-
-    impl FileIO for BlockingCloseFileIO {
-        type Handle = <TokioFileIO as FileIO>::Handle;
-
-        fn create(
-            path: &std::path::Path,
-        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
-            TokioFileIO::create(path)
-        }
-
-        fn open(
-            path: &std::path::Path,
-        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
-            TokioFileIO::open(path)
-        }
-
-        fn file_size(
-            handle: &Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
-            TokioFileIO::file_size(handle)
-        }
-
-        fn write_at(
-            handle: &Self::Handle,
-            offset: u64,
-            data: bytes::Bytes,
-        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
-            TokioFileIO::write_at(handle, offset, data)
-        }
-
-        fn read_at(
-            handle: &Self::Handle,
-            offset: u64,
-            len: usize,
-        ) -> impl std::future::Future<Output = std::io::Result<bytes::Bytes>> + Send {
-            TokioFileIO::read_at(handle, offset, len)
-        }
-
-        fn sync_data(
-            handle: &Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::sync_data(handle)
-        }
-
-        fn sync_directory(
-            path: &std::path::Path,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            let path = path.to_path_buf();
-            async move {
-                if BLOCK_NEXT_CLOSE.swap(false, Ordering::SeqCst) {
-                    CLOSE_STARTED.notify_waiters();
-                    CLOSE_RELEASE.notified().await;
-                }
-                TokioFileIO::sync_directory(&path).await
-            }
-        }
-
-        fn close(
-            handle: Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::close(handle)
-        }
-
-        fn remove(
-            path: &std::path::Path,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::remove(path)
-        }
-    }
-
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
             host: "127.0.0.1".into(),
@@ -899,8 +823,7 @@ mod tests {
             let dir = tempdir().expect("create tempdir");
             let data_dir = dir.path().join("data");
             let manager = Arc::new(
-                SpoolManager::<BlockingCloseFileIO>::new(&data_dir, 4096, 65536, 8)
-                    .expect("manager init"),
+                SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 65536, 8).expect("manager init"),
             );
             for key in ["a-first-delete", "b-stale-candidate"] {
                 manager
@@ -940,12 +863,9 @@ mod tests {
             config.data_dir = data_dir.clone();
             config.cleanup_sweep_interval_secs = 3600;
             let config = Arc::new(config);
-            let close_started = CLOSE_STARTED.notified();
-            BLOCK_NEXT_CLOSE.store(true, Ordering::SeqCst);
+            let first_guard = first.lifecycle_lock.lock().await;
             let task = start_cleanup_task(Arc::clone(&manager), config);
-            tokio::time::timeout(Duration::from_secs(5), close_started)
-                .await
-                .expect("first sorted delete reaches blocked close");
+            tokio::task::yield_now().await;
 
             match refresh {
                 SnapshotRefresh::Complete => {
@@ -970,7 +890,7 @@ mod tests {
                     second.mark_served_and_maybe_fully_read(0, 6).await;
                 }
             }
-            CLOSE_RELEASE.notify_one();
+            drop(first_guard);
 
             tokio::time::timeout(Duration::from_secs(5), async {
                 while manager.get_spool("a-first-delete").is_some() {

@@ -79,7 +79,7 @@ pub struct AppState<F: FileIO, M: MetadataStore> {
     pub ordinal: String,
     pub internal_base_url: String,
     pub metrics: Arc<BobsMetrics>,
-    pub async_sync: Option<Arc<AsyncSyncCoordinator>>,
+    pub async_sync: Arc<AsyncSyncCoordinator>,
 }
 
 #[derive(Deserialize)]
@@ -466,9 +466,7 @@ where
         );
         complete_result.map_err(ApiError)?;
         state.metrics.record_spool_completed(&labels);
-        if let Some(async_sync) = &state.async_sync {
-            async_sync.schedule();
-        }
+        state.async_sync.schedule();
         let meta = spool.metadata.lock().await;
         if let Some(job_id) = &job_id {
             tracing::info!("event.name" = "bobs.spool.completed", "request.id" = %job_id, "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
@@ -865,117 +863,32 @@ where
         let response_range = ResolvedReadRange { start, end, follow };
         tracing::info!("event.name" = "bobs.spool.read.started", "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "success", "spool read started");
 
-        // Follow-mode reads that began while a live writer was active intentionally
-        // bypass verification: they consume bytes from the running process before a
-        // crash boundary exists. Completed objects with integrity metadata are checked.
+        // Live follow-mode reads intentionally bypass verification. Every completed
+        // object is fully verified before response headers or body bytes are sent.
         let mut verified_permit = None;
-        if let Some(integrity) = metadata.integrity.clone() {
+        if metadata.complete_size.is_some() {
+            let Some(integrity) = metadata.integrity.clone() else {
+                spool
+                    .quarantine_integrity_failure("missing integrity metadata")
+                    .await
+                    .map_err(ApiError)?;
+                unreachable!("quarantine always returns result_lost");
+            };
             if integrity.length != metadata.total_bytes_written {
                 spool
                     .quarantine_integrity_failure("metadata length mismatch")
                     .await
                     .map_err(ApiError)?;
             }
-            let is_full_object = start == 0 && end == Some(integrity.length);
-            if integrity.length <= state.config.verify_before_send_bytes || !is_full_object {
-                let verification = async {
-                    let permit = spool.acquire_read_response_permit().await?;
-                    spool.verify_integrity(&permit).await?;
-                    Ok::<_, BobsError>(permit)
-                };
-                match tokio::time::timeout(long_poll_timeout, verification).await {
-                    Ok(Ok(permit)) => verified_permit = Some(permit),
-                    Ok(Err(error)) => return Err(ApiError(error)),
-                    Err(_) => return Ok(long_poll_redirect(&key, &headers)),
-                }
-            } else {
-                let permit = spool
-                    .acquire_read_response_permit()
-                    .await
-                    .map_err(ApiError)?;
-                let first_len = integrity.length.min(page_size) as usize;
-                let first_chunk = match spool
-                    .read_integrity_chunk(0, first_len, &permit)
-                    .await
-                {
-                    Ok(chunk) => chunk,
-                    Err(_) => {
-                        spool
-                            .quarantine_integrity_failure("missing or short data file")
-                            .await
-                            .map_err(ApiError)?;
-                        unreachable!("quarantine always returns result_lost")
-                    }
-                };
-                lease.response_permit = Some(permit);
-                let stream_spool = Arc::clone(&spool);
-                let stream_metrics = Arc::clone(&state.metrics);
-                let stream_labels = read_labels.clone();
-                let stream = stream! {
-                    let mut lease = lease;
-                    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-                    hasher.update(&first_chunk);
-                    let mut offset = first_chunk.len() as u64;
-                    let mut pending = first_chunk;
-                    while offset < integrity.length {
-                        let len = (integrity.length - offset).min(page_size) as usize;
-                        let response_permit = lease
-                            .response_permit
-                            .as_ref()
-                            .expect("verified stream retains read admission");
-                        let next = match stream_spool
-                            .read_integrity_chunk(offset, len, response_permit)
-                            .await
-                        {
-                            Ok(chunk) => chunk,
-                            Err(_) => {
-                                let error = stream_spool
-                                    .quarantine_integrity_failure("missing or short data file")
-                                    .await
-                                    .expect_err("quarantine returns result_lost");
-                                yield Err::<Bytes, BobsError>(error);
-                                return;
-                            }
-                        };
-                        hasher.update(&next);
-                        offset += next.len() as u64;
-                        lease.bytes_served += pending.len() as u64;
-                        yield Ok::<Bytes, BobsError>(pending);
-                        pending = next;
-                    }
-                    if offset != integrity.length || hasher.digest() != integrity.checksum {
-                        let error = stream_spool
-                            .quarantine_integrity_failure("checksum or length mismatch")
-                            .await
-                            .expect_err("quarantine returns result_lost");
-                        // The final buffered chunk is deliberately withheld, leaving
-                        // Content-Length unfulfilled so the client observes truncation.
-                        yield Err::<Bytes, BobsError>(error);
-                        return;
-                    }
-                    stream_spool.mark_integrity_verified();
-                    stream_spool
-                        .mark_contiguous_response_complete_and_maybe_fully_read(0, integrity.length)
-                        .await;
-                    lease.bytes_served += pending.len() as u64;
-                    lease.duration_recorded = true;
-                    stream_metrics.record_read_bytes(&stream_labels, read_mode, integrity.length);
-                    stream_metrics.record_read_duration(
-                        &stream_labels,
-                        read_mode,
-                        crate::metrics::outcome::SUCCESS,
-                        read_start.elapsed().as_secs_f64(),
-                    );
-                    yield Ok::<Bytes, BobsError>(pending);
-                };
-                let mut response = Body::from_stream(stream).into_response();
-                *response.status_mut() = if follow {
-                    StatusCode::OK
-                } else {
-                    StatusCode::PARTIAL_CONTENT
-                };
-                apply_read_response_headers(&mut response, &metadata, &response_range, &key)?;
-                return Ok(response);
+            let verification = async {
+                let permit = spool.acquire_read_response_permit().await?;
+                spool.verify_integrity(&permit).await?;
+                Ok::<_, BobsError>(permit)
+            };
+            match tokio::time::timeout(long_poll_timeout, verification).await {
+                Ok(Ok(permit)) => verified_permit = Some(permit),
+                Ok(Err(error)) => return Err(ApiError(error)),
+                Err(_) => return Ok(long_poll_redirect(&key, &headers)),
             }
         }
 
@@ -1443,8 +1356,6 @@ mod tests {
             max_live_spools: 256,
             max_spool_bytes: 1024 * 1024,
             create_admission_timeout_ms: 100,
-            fsync_enabled: true,
-            verify_before_send_bytes: 4 * 1024 * 1024,
             async_sync_delay_ms: 500,
             enable_pprof: false,
             writer_inactivity_timeout_secs: 300,
@@ -1476,8 +1387,6 @@ mod tests {
             max_live_spools: 256,
             max_spool_bytes: 1024 * 1024,
             create_admission_timeout_ms: 100,
-            fsync_enabled: true,
-            verify_before_send_bytes: 4 * 1024 * 1024,
             async_sync_delay_ms: 500,
             enable_pprof: false,
             writer_inactivity_timeout_secs: 300,
@@ -1507,7 +1416,7 @@ mod tests {
         configure(&mut config);
         let config = Arc::new(config);
         let mut manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
-            DefaultMetadataStore::new_with_fsync(&data_dir, config.fsync_enabled),
+            DefaultMetadataStore::new(&data_dir),
             &data_dir,
             config.page_size,
             config.max_cache_bytes,
@@ -1516,12 +1425,10 @@ mod tests {
         .expect("manager init");
         manager.set_metrics(Arc::clone(&metrics));
         let manager = Arc::new(manager);
-        let async_sync = (!config.fsync_enabled && config.async_sync_delay_ms > 0).then(|| {
-            AsyncSyncCoordinator::start(
-                data_dir.clone(),
-                Duration::from_millis(config.async_sync_delay_ms),
-            )
-        });
+        let async_sync = AsyncSyncCoordinator::start(
+            data_dir.clone(),
+            Duration::from_millis(config.async_sync_delay_ms),
+        );
         let state = Arc::new(AppState {
             manager,
             config,
@@ -1599,7 +1506,7 @@ mod tests {
             ordinal: "0".into(),
             internal_base_url: "http://bobs-0:3000/api/v1".into(),
             metrics: Arc::new(BobsMetrics::new(false)),
-            async_sync: None,
+            async_sync: AsyncSyncCoordinator::start(data_dir, Duration::from_millis(500)),
         });
         let app = router::<TokioFileIO, SyncSidecarMetadataStore>().with_state(Arc::clone(&state));
         (app, state)
@@ -1660,6 +1567,14 @@ mod tests {
             .uri(format!("/api/v1/read/{key}"))
             .body(Body::empty())
             .expect("build read request")
+    }
+
+    fn range_read_request(key: &str, range: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!("/api/v1/read/{key}"))
+            .header(axum::http::header::RANGE, range)
+            .body(Body::empty())
+            .expect("build range read request")
     }
 
     async fn wait_for_reader_count<F, M>(spool: &crate::spool::Spool<F, M>, expected: usize)
@@ -4608,9 +4523,9 @@ mod tests {
         Missing,
     }
 
-    async fn assert_small_crash_damage_is_gone(damage: CrashDamage) {
+    async fn assert_crash_damage_is_gone(damage: CrashDamage, size: usize, range: bool) {
         let (app, state) = app_with_state().await;
-        let original = Bytes::from(vec![0x5a; 1024]);
+        let original = Bytes::from(vec![0x5a; size]);
         let (key, spool) = complete_disk_fixture(&state, original).await;
         spool.close_file_handle();
         match damage {
@@ -4620,15 +4535,17 @@ mod tests {
                     .open(&spool.data_path)
                     .await
                     .expect("open data for truncation");
-                file.set_len(511).await.expect("truncate data");
+                file.set_len((size / 2) as u64)
+                    .await
+                    .expect("truncate data");
             }
             CrashDamage::ZeroFill => {
-                tokio::fs::write(&spool.data_path, vec![0_u8; 1024])
+                tokio::fs::write(&spool.data_path, vec![0_u8; size])
                     .await
                     .expect("zero data");
             }
             CrashDamage::StaleSameLength => {
-                tokio::fs::write(&spool.data_path, vec![0xa5_u8; 1024])
+                tokio::fs::write(&spool.data_path, vec![0xa5_u8; size])
                     .await
                     .expect("replace data with stale bytes");
             }
@@ -4639,11 +4556,12 @@ mod tests {
             }
         }
 
-        let response = app
-            .clone()
-            .oneshot(read_request(&key))
-            .await
-            .expect("read response");
+        let request = if range {
+            range_read_request(&key, "bytes=1-16")
+        } else {
+            read_request(&key)
+        };
+        let response = app.clone().oneshot(request).await.expect("read response");
         assert_eq!(response.status(), StatusCode::GONE);
         let body: Value = serde_json::from_slice(
             &response
@@ -4672,26 +4590,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_small_spools_detect_post_crash_damage_and_persist_quarantine() {
-        for damage in [
-            CrashDamage::Truncate,
-            CrashDamage::ZeroFill,
-            CrashDamage::StaleSameLength,
-            CrashDamage::Missing,
-        ] {
-            assert_small_crash_damage_is_gone(damage).await;
+    async fn completed_spools_detect_damage_before_any_body_for_all_sizes() {
+        for size in [1024, 5 * 1024 * 1024 + 13] {
+            for damage in [
+                CrashDamage::Truncate,
+                CrashDamage::ZeroFill,
+                CrashDamage::StaleSameLength,
+                CrashDamage::Missing,
+            ] {
+                assert_crash_damage_is_gone(damage, size, false).await;
+            }
         }
     }
 
     #[tokio::test]
-    async fn fsync_disabled_schedules_delayed_best_effort_sync() {
+    async fn completed_range_read_verifies_full_spool_before_any_body() {
+        assert_crash_damage_is_gone(CrashDamage::StaleSameLength, 5 * 1024 * 1024 + 13, true).await;
+    }
+
+    #[tokio::test]
+    async fn completion_schedules_delayed_best_effort_sync() {
         let (app, state) = app_with_config(|config| {
-            config.fsync_enabled = false;
             config.async_sync_delay_ms = 1;
         })
         .await;
         write_and_complete(&app, b"sync me".to_vec()).await;
-        let async_sync = state.async_sync.as_ref().expect("sync coordinator");
+        let async_sync = &state.async_sync;
         tokio::time::timeout(Duration::from_secs(5), async {
             while async_sync.completed_batch_count() == 0 {
                 tokio::task::yield_now().await;
@@ -4706,7 +4630,6 @@ mod tests {
     #[tokio::test]
     async fn delayed_sync_is_not_awaited_by_complete_response() {
         let (app, state) = app_with_config(|config| {
-            config.fsync_enabled = false;
             config.async_sync_delay_ms = 60_000;
         })
         .await;
@@ -4716,7 +4639,7 @@ mod tests {
         )
         .await
         .expect("completion response must not await delayed sync");
-        let async_sync = state.async_sync.as_ref().expect("sync coordinator");
+        let async_sync = &state.async_sync;
         assert_eq!(async_sync.scheduled_count(), 1);
         assert_eq!(async_sync.completed_batch_count(), 0);
     }
@@ -4724,11 +4647,10 @@ mod tests {
     #[tokio::test]
     async fn delayed_sync_coalesces_a_completion_burst() {
         let (_app, state) = app_with_config(|config| {
-            config.fsync_enabled = false;
             config.async_sync_delay_ms = 10;
         })
         .await;
-        let async_sync = state.async_sync.as_ref().expect("sync coordinator");
+        let async_sync = &state.async_sync;
         for _ in 0..32 {
             async_sync.schedule();
         }
@@ -4745,51 +4667,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_async_sync_delay_disables_background_sync() {
+    async fn zero_async_sync_delay_flushes_in_background() {
         let (app, state) = app_with_config(|config| {
-            config.fsync_enabled = false;
             config.async_sync_delay_ms = 0;
         })
         .await;
-        write_and_complete(&app, b"do not sync".to_vec()).await;
-        assert!(state.async_sync.is_none());
-    }
-
-    #[tokio::test]
-    async fn corrupted_large_spool_aborts_without_completing_content_length() {
-        let (app, state) = app_with_config(|config| {
-            config.page_size = 4096;
-            config.verify_before_send_bytes = 1;
+        write_and_complete(&app, b"sync immediately".to_vec()).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.async_sync.completed_batch_count() == 0 {
+                tokio::task::yield_now().await;
+            }
         })
-        .await;
-        let original = Bytes::from(vec![0x37; 8192]);
-        let (key, spool) = complete_disk_fixture(&state, original).await;
-        spool.close_file_handle();
-        let mut damaged = vec![0x37; 8192];
-        damaged[5000] ^= 0xff;
-        tokio::fs::write(&spool.data_path, damaged)
-            .await
-            .expect("write stale large data");
-
-        let response = app
-            .clone()
-            .oneshot(read_request(&key))
-            .await
-            .expect("large read response");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[axum::http::header::CONTENT_LENGTH],
-            "8192"
-        );
-        assert!(
-            response.into_body().collect().await.is_err(),
-            "corrupted large transfer must abort before its final buffered chunk"
-        );
-        let second = app
-            .oneshot(read_request(&key))
-            .await
-            .expect("quarantined read response");
-        assert_eq!(second.status(), StatusCode::GONE);
+        .await
+        .expect("zero-delay background sync should run");
+        assert_eq!(state.async_sync.scheduled_count(), 1);
     }
 
     #[tokio::test]
@@ -4848,12 +4739,15 @@ mod tests {
             manager.recover().await.expect("restart recovery");
             let restarted = Arc::new(AppState {
                 manager: Arc::new(manager),
-                config,
+                config: Arc::clone(&config),
                 hostname: "bobs-0".into(),
                 ordinal: "0".into(),
                 internal_base_url: "http://bobs-0:3000/api/v1".into(),
                 metrics,
-                async_sync: None,
+                async_sync: AsyncSyncCoordinator::start(
+                    config.data_dir.clone(),
+                    Duration::from_millis(config.async_sync_delay_ms),
+                ),
             });
             let restarted_app =
                 router::<DefaultFileIO, DefaultMetadataStore>().with_state(restarted);
@@ -4866,10 +4760,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_complete_spool_without_integrity_metadata_is_still_served() {
+    async fn recovery_quarantines_legacy_complete_spool_without_integrity_metadata() {
         let (app, state) = app_with_state().await;
-        let expected = Bytes::from_static(b"legacy payload");
-        let (key, spool) = complete_disk_fixture(&state, expected.clone()).await;
+        let (key, spool) =
+            complete_disk_fixture(&state, Bytes::from_static(b"legacy payload")).await;
         let snapshot = {
             let mut metadata = spool.metadata.lock().await;
             metadata.integrity = None;
@@ -4879,18 +4773,54 @@ mod tests {
             .persist_metadata(&snapshot)
             .await
             .expect("persist legacy sidecar");
+        let config = Arc::clone(&state.config);
+        spool.close_file_handle();
+        drop(spool);
+        drop(app);
+        drop(state);
 
-        let response = app
+        let manager = Arc::new(
+            SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+                DefaultMetadataStore::new(&config.data_dir),
+                &config.data_dir,
+                config.page_size,
+                config.max_cache_bytes,
+                config.max_live_spools,
+            )
+            .expect("restart manager"),
+        );
+        manager.recover().await.expect("recover legacy spool");
+        let recovered = manager
+            .get_spool(&key)
+            .expect("legacy spool remains addressable");
+        assert!(recovered.metadata.lock().await.integrity_failure.is_some());
+        let restarted = Arc::new(AppState {
+            manager,
+            config: Arc::clone(&config),
+            hostname: "bobs-0".into(),
+            ordinal: "0".into(),
+            internal_base_url: "http://bobs-0:3000/api/v1".into(),
+            metrics: Arc::new(BobsMetrics::new(false)),
+            async_sync: AsyncSyncCoordinator::start(
+                config.data_dir.clone(),
+                Duration::from_millis(config.async_sync_delay_ms),
+            ),
+        });
+        let response = router::<DefaultFileIO, DefaultMetadataStore>()
+            .with_state(restarted)
             .oneshot(read_request(&key))
             .await
             .expect("legacy read response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("collect legacy body")
-            .to_bytes();
-        assert_eq!(body, expected);
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect 410")
+                .to_bytes(),
+        )
+        .expect("410 JSON");
+        assert_eq!(body["error"], "result_lost");
     }
 }

@@ -73,7 +73,7 @@ curl -X PUT http://localhost:3000/api/v1/create -d '{"content_type": "applicatio
 # Response: {"key":"550e8400-e29b-41d4-a716-446655440000","read_url":"https://bobs.example.com/download-0/550e8400-e29b-41d4-a716-446655440000","write_url":"http://localhost:3000/api/v1"}
 ```
 
-A `201 Created` response means the empty data file and key-directory link have crossed their fsync boundaries and live `Writing` or `WriteLocked` metadata is durable. The intermediate `Creating` marker is internal to crash recovery and is never exposed as an active spool. Interrupted creates are removed safely on restart; duplicate or concurrent creates for the same request ID return `409 Conflict` without truncating the existing spool.
+A `201 Created` response means the empty data file and live `Writing` or `WriteLocked` metadata have been published. The intermediate `Creating` marker is internal to restart cleanup and is never exposed as an active spool. Interrupted creates are removed safely on restart; duplicate or concurrent creates for the same request ID return `409 Conflict` without truncating the existing spool.
 
 ### 2. Write data
 
@@ -85,7 +85,7 @@ curl -X POST http://localhost:3000/api/v1/write/unique-spool-key/0 --data-binary
 
 ### 3. Complete the spool
 
-Finalize the spool to signal readers that no more data is coming. Optional `expected_size` verification ensures integrity. Completion is idempotent, but a repeated request still rejects an `expected_size` that differs from the completed size.
+Finalize the spool to signal readers that no more data is coming. BOBS atomically records the exact length and XXH3-64 checksum with `Complete`. Completion is idempotent, but a repeated request still rejects an `expected_size` that differs from the completed size.
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/complete/unique-spool-key -d '{"expected_size": 1048576}'
@@ -111,6 +111,8 @@ curl http://localhost:3000/api/v1/read/unique-spool-key
 
 If a follow read waits `long_poll_timeout_ms` before its first page, BOBS returns a `307 Temporary Redirect` for clients such as `curl -L` to retry. If that timeout occurs after bytes have started streaming, BOBS aborts the transfer with a response-body error rather than treating it as a successful end of stream.
 
+Every read of a completed spool, including a range read, verifies the full payload before sending response headers or body bytes. A checksum mismatch, short read, or missing file persistently quarantines the result and returns `410 Gone` with `error: result_lost`. Live follow-mode reads remain unverified.
+
 ### 5. Parallel reads
 
 Multiple readers can consume different ranges simultaneously.
@@ -131,7 +133,7 @@ Manually remove a spool when finished.
 curl -X DELETE http://localhost:3000/api/v1/delete/unique-spool-key
 ```
 
-A successful delete is acknowledged only after `meta.json` and the key directory are removed and the parent `data_dir` is fsynced. The manager retains cache, admission, and tracked deletion state until that durability boundary succeeds, allowing a failed delete to be retried.
+A successful delete means the metadata and key directory were removed from the live filesystem namespace. Request handling does not wait for filesystem sync.
 
 ## Health endpoint
 
@@ -163,7 +165,7 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for the first-read cache phase and startup recovery. Valid range: `1..=65536`. Omitted values derive from effective page/cache settings; explicit values are preserved. Recovery no-follow open-preflights candidate payloads, uses a preferred summary and handle set whose capacity is exactly this limit, and closes displaced or excess handles without payload reads or sidecar rewrites. Failed preflights leave the spool intact and the scan continues. Proven full-object coverage frees a live spool's cache and admission slot while leaving it readable from disk. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool; must be at least `page_size`. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
 | `create_admission_timeout_ms` | `5000` | Maximum `/api/v1/create` admission wait before `503 Service Unavailable`. |
-| `fsync_enabled` | `true` | Flush data, metadata, and directory updates across crash-durability boundaries. Set `false` only for explicitly ephemeral spools where restart loss is acceptable; live read and TTL semantics are unchanged. |
+| `async_sync_delay_ms` | `500` | Delay before the always-on coalesced background filesystem flush. `0` flushes immediately in the background; completion never waits for it. |
 | `writer_inactivity_timeout_secs` | `300` | Writer-silence interval after which an unfinished spool is eligible for cleanup. Must be greater than `0`. |
 | `enable_pprof` | `false` | Enables unauthenticated `/debug/pprof/profile` on the main listener; use only in a controlled environment. |
 | `read_idle_ttl_secs` | `600` | TTL for readable spools, anchored when the spool becomes readable and refreshed whenever bytes are served. Must be greater than `0`. |
@@ -196,7 +198,7 @@ max_cache_bytes: 268435456
 # max_live_spools omitted: derives 16 from this page/cache combination
 max_spool_bytes: 8589934592
 create_admission_timeout_ms: 5000
-fsync_enabled: true
+async_sync_delay_ms: 500
 writer_inactivity_timeout_secs: 300
 enable_pprof: false
 read_idle_ttl_secs: 600

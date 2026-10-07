@@ -107,9 +107,7 @@ impl Drop for MetadataTempCleanup {
 
 /// Metadata persistence backend.
 ///
-/// All operations are asynchronous and return `Send` futures for generic
-/// Axum/Tokio callers. Implementations must keep blocking filesystem work off
-/// Tokio worker threads while preserving the sidecar durability protocol.
+/// Tokio worker threads while preserving atomic sidecar replacement.
 pub trait MetadataStore: Sync {
     // Native `async fn` cannot express the `Send` guarantee required by generic
     // Tokio/Axum callers; RPITIT is its allocation-free, stable equivalent.
@@ -118,28 +116,17 @@ pub trait MetadataStore: Sync {
     fn delete(&self, key: &str) -> impl Future<Output = Result<()>> + Send;
     /// Start one bounded top-level data-directory scan without reading sidecar payloads.
     fn scan(&self) -> impl Future<Output = Result<MetadataDirectoryScan>> + Send;
-    /// Force the already-committed sidecar and containing directories to stable storage.
-    /// Used by delayed best-effort sync when foreground fsync is disabled.
-    fn sync(&self, _key: &str) -> impl Future<Output = Result<()>> + Send {
-        async { Ok(()) }
-    }
-    /// Whether crash-durability sync boundaries are enabled for this store.
-    fn fsync_enabled(&self) -> bool {
-        true
-    }
 }
 
 /// Synchronous sidecar metadata backend selected for fallback benchmarking and
 /// non-Linux builds.
 ///
 /// Metadata is stored as `<data_dir>/<key>/meta.json`. Updates are committed through
-/// a create-new, non-following, transaction-private temporary file, which is synced,
-/// atomically renamed over the final sidecar, and followed by a spool-directory sync.
+/// a create-new, non-following, transaction-private temporary file atomically renamed
+/// over the final sidecar.
 #[derive(Clone, Debug)]
 pub struct SyncSidecarMetadataStore {
     data_dir: PathBuf,
-    fsync_enabled: bool,
-    sync_directory: fn(&Path) -> io::Result<()>,
     #[cfg(test)]
     operation_hook: Option<fn()>,
     #[cfg(test)]
@@ -154,14 +141,8 @@ impl Default for SyncSidecarMetadataStore {
 
 impl SyncSidecarMetadataStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
-        Self::new_with_fsync(data_dir, true)
-    }
-
-    pub fn new_with_fsync(data_dir: impl Into<PathBuf>, fsync_enabled: bool) -> Self {
         Self {
             data_dir: data_dir.into(),
-            fsync_enabled,
-            sync_directory,
             #[cfg(test)]
             operation_hook: None,
             #[cfg(test)]
@@ -174,22 +155,9 @@ impl SyncSidecarMetadataStore {
     }
 
     #[cfg(test)]
-    fn with_directory_sync_error(data_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            data_dir: data_dir.into(),
-            fsync_enabled: true,
-            sync_directory: |_| Err(io::Error::other("injected directory fsync failure")),
-            operation_hook: None,
-            read_stats: None,
-        }
-    }
-
-    #[cfg(test)]
     fn with_operation_hook(data_dir: impl Into<PathBuf>, operation_hook: fn()) -> Self {
         Self {
             data_dir: data_dir.into(),
-            fsync_enabled: true,
-            sync_directory,
             operation_hook: Some(operation_hook),
             read_stats: None,
         }
@@ -202,8 +170,6 @@ impl SyncSidecarMetadataStore {
     ) -> Self {
         Self {
             data_dir: data_dir.into(),
-            fsync_enabled: true,
-            sync_directory,
             operation_hook: None,
             read_stats: Some(read_stats),
         }
@@ -244,16 +210,10 @@ impl SyncSidecarMetadataStore {
         self.invoke_operation_hook();
 
         file.write_all(&payload).map_err(storage_error)?;
-        if self.fsync_enabled {
-            file.sync_data().map_err(storage_error)?;
-        }
         validate_metadata_temp_path(&tmp_path, identity).map_err(storage_error)?;
 
         fs::rename(&tmp_path, &meta_path).map_err(storage_error)?;
         tmp_cleanup.disarm();
-        if self.fsync_enabled {
-            (self.sync_directory)(&spool_dir).map_err(storage_error)?;
-        }
         Ok(())
     }
 
@@ -273,20 +233,8 @@ impl SyncSidecarMetadataStore {
     fn delete_sync(&self, key: &str) -> Result<()> {
         self.invoke_operation_hook();
         let spool_dir = self.spool_dir(key);
-        let mut removed_any = remove_file_if_present(&self.meta_path(key))?;
-        removed_any |= remove_metadata_temp_entries(&spool_dir)?;
-
-        if removed_any {
-            match fs::symlink_metadata(&spool_dir) {
-                Ok(metadata) if metadata.file_type().is_dir() && self.fsync_enabled => {
-                    (self.sync_directory)(&spool_dir).map_err(storage_error)?;
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(storage_error(error)),
-            }
-        }
-
+        remove_file_if_present(&self.meta_path(key))?;
+        remove_metadata_temp_entries(&spool_dir)?;
         Ok(())
     }
 
@@ -314,9 +262,7 @@ impl SyncSidecarMetadataStore {
                 // the private temp protocol before classifying fixed spool markers.
                 // UUID temps are never sidecars, and symlinks are unlinked rather
                 // than followed.
-                if remove_metadata_temp_entries(&path)? && self.fsync_enabled {
-                    (self.sync_directory)(&path).map_err(storage_error)?;
-                }
+                remove_metadata_temp_entries(&path)?;
                 MetadataDirectoryEntryKind::Directory {
                     // lstat both fixed local names. A symlink still counts as a
                     // marker and is rejected by the later trusted-path checks; it
@@ -346,15 +292,6 @@ impl SyncSidecarMetadataStore {
 
         Ok(())
     }
-    fn sync_entry_sync(&self, key: &str) -> Result<()> {
-        let spool_dir = self.spool_dir(key);
-        File::open(self.meta_path(key))
-            .and_then(|file| file.sync_all())
-            .map_err(storage_error)?;
-        (self.sync_directory)(&spool_dir).map_err(storage_error)?;
-        (self.sync_directory)(&self.data_dir).map_err(storage_error)?;
-        Ok(())
-    }
 }
 
 impl MetadataStore for SyncSidecarMetadataStore {
@@ -374,12 +311,6 @@ impl MetadataStore for SyncSidecarMetadataStore {
         let store = self.clone();
         let key = key.to_owned();
         run_blocking(move || store.delete_sync(&key)).await
-    }
-
-    async fn sync(&self, key: &str) -> Result<()> {
-        let store = self.clone();
-        let key = key.to_owned();
-        run_blocking(move || store.sync_entry_sync(&key)).await
     }
 
     async fn scan(&self) -> Result<MetadataDirectoryScan> {
@@ -402,10 +333,6 @@ impl MetadataStore for SyncSidecarMetadataStore {
                 .await;
         });
         Ok(MetadataDirectoryScan { receiver })
-    }
-
-    fn fsync_enabled(&self) -> bool {
-        self.fsync_enabled
     }
 }
 
@@ -746,37 +673,14 @@ fn is_metadata_temp_name(name: &OsStr) -> bool {
             .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
 fn storage_error(error: io::Error) -> BobsError {
     BobsError::StorageError(Box::new(error))
 }
 
-/// Linux default sidecar metadata backend selected for the io_uring filesystem
-/// path.
-///
-/// Its commit path is designed around linked write, fdatasync, rename, and
-/// directory fsync operations using the low-level `io-uring` crate.
-#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-#[derive(Clone, Debug)]
-pub struct UringSidecarMetadataStore {
-    data_dir: PathBuf,
-    fsync_enabled: bool,
-    #[cfg(test)]
-    operation_hook: Option<fn()>,
-}
-
-#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-pub type DefaultMetadataStore = UringSidecarMetadataStore;
-
-#[cfg(any(not(target_os = "linux"), feature = "tokio-fileio-fallback"))]
+/// Default atomic sidecar metadata backend.
 pub type DefaultMetadataStore = SyncSidecarMetadataStore;
-
-#[cfg(any(test, all(target_os = "linux", not(feature = "tokio-fileio-fallback"))))]
-#[path = "metadata/uring.rs"]
-mod uring;
+#[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
+pub type UringSidecarMetadataStore = SyncSidecarMetadataStore;
 
 #[cfg(test)]
 mod tests {
@@ -1330,39 +1234,6 @@ mod tests {
             }
         );
         assert!(scan.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn sync_store_directory_fsync_errors_are_storage_errors() {
-        let dir = tempdir().expect("create tempdir");
-        let store = SyncSidecarMetadataStore::with_directory_sync_error(dir.path());
-        let meta = metadata_with_generation(1);
-
-        assert!(matches!(
-            store.write(&meta).await,
-            Err(BobsError::StorageError(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn sync_store_can_explicitly_skip_fsync_boundaries() {
-        let dir = tempdir().expect("create tempdir");
-        let mut store = SyncSidecarMetadataStore::with_directory_sync_error(dir.path());
-        store.fsync_enabled = false;
-        let meta = metadata_with_generation(1);
-
-        store
-            .write(&meta)
-            .await
-            .expect("non-durable metadata write");
-        let loaded = store
-            .read(&meta.key)
-            .await
-            .expect("read metadata")
-            .expect("metadata present");
-        assert_eq!(loaded.key, meta.key);
-        assert_eq!(loaded.state, meta.state);
-        assert!(!store.fsync_enabled());
     }
 
     #[tokio::test]

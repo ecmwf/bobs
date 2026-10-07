@@ -159,8 +159,6 @@ pub struct Spool<F: FileIO, M: MetadataStore = SyncSidecarMetadataStore> {
     pub(crate) integrity_hasher: StdMutex<(Xxh3, u64)>,
     /// Successful lazy verification is cached for this immutable completed spool.
     pub(crate) integrity_verified: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    pub(crate) async_sync_count: AtomicUsize,
     /// Admission permit held while this spool can retain first-read cache memory.
     /// Released at the full-read transition, or on deletion/drop if that happens first.
     admission_permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
@@ -257,8 +255,6 @@ where
             metrics,
             integrity_hasher: StdMutex::new((Xxh3::new(), 0)),
             integrity_verified: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            async_sync_count: AtomicUsize::new(0),
             admission_permit: std::sync::Mutex::new(admission_permit),
             _phantom: PhantomData,
         }
@@ -537,25 +533,6 @@ where
             .response_handle
             .upgrade()
             .is_some()
-    }
-
-    /// Best-effort delayed durability for deployments that skip foreground fsync.
-    pub async fn sync_completed(&self) -> crate::error::Result<()> {
-        let handle = F::open(&self.data_path)
-            .await
-            .map_err(crate::error::BobsError::IoError)?;
-        let sync_result = F::sync_data(&handle)
-            .await
-            .map_err(crate::error::BobsError::IoError);
-        let close_result = F::close(handle)
-            .await
-            .map_err(crate::error::BobsError::IoError);
-        sync_result?;
-        close_result?;
-        self.metadata_store.sync(&self.key).await?;
-        #[cfg(test)]
-        self.async_sync_count.fetch_add(1, Ordering::AcqRel);
-        Ok(())
     }
 
     pub async fn persist_metadata(&self, metadata: &SpoolMetadata) -> crate::error::Result<()> {

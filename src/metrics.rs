@@ -212,7 +212,7 @@ impl BobsMetrics {
 
         // Bucket boundaries (seconds) for write and read duration histograms.
         // Chosen to give useful percentile resolution across the observed range:
-        // fast cache-hit reads (~5 ms) through slow fsync-bound completes (~5 s).
+        // fast cache-hit reads (~5 ms) through larger checksum-verifying reads.
         let duration_boundaries = vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 
         InnerMetrics {
@@ -244,9 +244,7 @@ impl BobsMetrics {
                 .build(),
             complete_duration: meter
                 .f64_histogram("bobs.complete.duration")
-                .with_description(
-                    "Duration of spool completion (fdatasync + durable metadata commit)",
-                )
+                .with_description("Duration of atomic spool completion")
                 .with_unit("s")
                 .with_boundaries(vec![
                     0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0,

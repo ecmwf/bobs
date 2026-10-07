@@ -4,6 +4,7 @@
 
 use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode};
+use bobs::async_sync::AsyncSyncCoordinator;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
 use bobs::io::DefaultFileIO;
@@ -83,7 +84,7 @@ async fn app() -> axum::Router {
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
         metrics: Arc::new(BobsMetrics::new(false)),
-        async_sync: None,
+        async_sync: AsyncSyncCoordinator::start(data_dir, std::time::Duration::from_millis(500)),
     });
     router::<DefaultFileIO, DefaultMetadataStore>().with_state(state)
 }

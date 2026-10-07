@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use axum::Router;
+use bobs::async_sync::AsyncSyncCoordinator;
 use bobs::cleanup::start_cleanup_task;
 use bobs::config::Config;
 use bobs::http::{router, AppState};
@@ -156,7 +157,10 @@ async fn start_server_with_storage_root(config: Arc<Config>, storage_root: &Path
         ordinal: "0".into(),
         internal_base_url: "http://bobs-0:3000/api/v1".into(),
         metrics: Arc::new(BobsMetrics::new(false)),
-        async_sync: None,
+        async_sync: AsyncSyncCoordinator::start(
+            data_dir,
+            std::time::Duration::from_millis(config.async_sync_delay_ms),
+        ),
     });
     let app: Router =
         router::<DefaultFileIO, DefaultMetadataStore>().with_state(Arc::clone(&state));

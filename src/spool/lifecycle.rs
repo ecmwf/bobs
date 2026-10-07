@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::{BobsError, Result};
-use crate::io::FileIO;
+use crate::io::{read_exact_at, FileIO};
 use crate::metrics;
 use crate::spool::types::{IntegrityMetadata, SpoolState};
 use crate::time::now_secs;
@@ -40,9 +40,7 @@ where
             .map_err(|error| BobsError::StorageError(Box::new(error)))?
     }
 
-    /// Durability order: data fdatasync -> Completing marker -> Complete commit ->
-    /// in-memory Complete -> optional cache/buffer housekeeping. The marker carries
-    /// the final page layout, so recovery never needs the volatile write buffer.
+    /// Atomically commit complete metadata, then publish the terminal state in memory.
     async fn complete_transaction(
         &self,
         expected_size: Option<u64>,
@@ -83,49 +81,29 @@ where
         }
 
         // Spool::write has already appended the final bytes to spool.dat. Retain
-        // this copy until Complete is both durable and reflected in memory; it is
-        // useful for retry but is never the recovery source of truth.
+        // this copy until Complete is committed and reflected in memory so a failed
+        // metadata update remains retryable.
         let partial_page = (!buf.is_empty()).then(|| buf.clone().freeze());
-        let (marker, candidate, total_size, partial_page_idx, previous_state_label) = {
-            let mut meta = self.metadata.lock().await;
-            if !matches!(
-                meta.state,
-                SpoolState::Writing | SpoolState::WriteLocked | SpoolState::Completing
-            ) {
+        let (mut candidate, total_size, partial_page_idx, previous_state_label) = {
+            let meta = self.metadata.lock().await;
+            if !matches!(meta.state, SpoolState::Writing | SpoolState::WriteLocked) {
                 return Err(BobsError::InvalidState {
                     current: format!("{:?}", meta.state),
                     attempted_action: "complete".to_string(),
                 });
             }
 
-            // This in-memory fail-stop boundary precedes I/O. Cancellation cannot
-            // roll it back because this owned transaction outlives its caller.
-            meta.state = SpoolState::Completing;
             let partial_page_idx = meta.total_pages;
             let previous_state_label = active_state_label(meta.write_locked);
-            let mut marker = meta.clone();
+            let mut candidate = meta.clone();
             if let Some(page_data) = partial_page.as_ref() {
-                marker.total_pages += 1;
-                marker.final_page_size = Some(page_data.len() as u64);
+                candidate.total_pages += 1;
+                candidate.final_page_size = Some(page_data.len() as u64);
             }
-            marker.readable_at.get_or_insert_with(now_secs);
-            let integrity = {
-                let checksum = self
-                    .integrity_hasher
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                (checksum.1 == marker.total_bytes_written).then(|| IntegrityMetadata {
-                    algorithm: "xxh3-64".to_string(),
-                    length: checksum.1,
-                    checksum: checksum.0.digest(),
-                })
-            };
-            marker.integrity = integrity;
-            let mut candidate = marker.clone();
+            candidate.readable_at.get_or_insert_with(now_secs);
             candidate.state = SpoolState::Complete;
             let total_size = candidate.total_bytes_written;
             (
-                marker,
                 candidate,
                 total_size,
                 partial_page_idx,
@@ -133,15 +111,22 @@ where
             )
         };
 
-        if self.metadata_store.fsync_enabled() {
-            let handle = self.active_file_handle()?;
-            F::sync_data(&handle).await.map_err(BobsError::IoError)?;
-
-            // A durable marker certifies that spool.dat was synced and records the
-            // complete candidate layout. Recovery either commits this exact candidate
-            // or quarantines it; it never turns Completing back into a writable state.
-            self.persist_metadata(&marker).await?;
-        }
+        let incremental_checksum = {
+            let checksum = self
+                .integrity_hasher
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (checksum.1 == candidate.total_bytes_written).then(|| checksum.0.digest())
+        };
+        let checksum = match incremental_checksum {
+            Some(checksum) => checksum,
+            None => self.hash_data_file(candidate.total_bytes_written).await?,
+        };
+        candidate.integrity = Some(IntegrityMetadata {
+            algorithm: "xxh3-64".to_string(),
+            length: candidate.total_bytes_written,
+            checksum,
+        });
         self.persist_metadata(&candidate).await?;
 
         {
@@ -178,6 +163,26 @@ where
         self.notify.notify_waiters();
 
         Ok(())
+    }
+
+    async fn hash_data_file(&self, length: u64) -> Result<u64> {
+        let handle = self.active_file_handle()?;
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        let mut offset = 0_u64;
+        while offset < length {
+            let len = (length - offset).min(self.page_size as u64) as usize;
+            let bytes = read_exact_at::<F>(
+                &handle,
+                offset,
+                len,
+                "hashing recovered spool at completion",
+            )
+            .await
+            .map_err(BobsError::IoError)?;
+            hasher.update(&bytes);
+            offset += bytes.len() as u64;
+        }
+        Ok(hasher.digest())
     }
 
     /// Record byte-serving activity and coverage under the lifecycle lock used
@@ -254,66 +259,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-    use crate::io::{
-        ring_pool::{
-            scoped_test_ring_pool_override, RingPool, RingPoolOperationKind, RingPoolOptions,
-        },
-        UringFileIO,
-    };
     use crate::io::{FileIO, TokioFileIO};
     use crate::manager::SpoolManager;
-    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-    use crate::metadata::UringSidecarMetadataStore;
     use crate::metadata::{MetadataStore, SyncSidecarMetadataStore};
     use crate::spool::types::SpoolMetadata;
     use bytes::Bytes;
     use std::collections::HashMap;
-    use std::fs::{self, File};
-    use std::io::{self, Write};
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[derive(Clone)]
     struct CountingFileIO;
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    enum CompletionEvent {
-        DataFileSyncData,
-        MetadataWrite,
-        MetadataTmpFdatasync,
-        MetadataRename,
-        MetadataDirectoryFsync,
-    }
-
-    type CompletionEventLog = Arc<StdMutex<Vec<CompletionEvent>>>;
-
     static COUNTING_WRITE_AT_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static COMPLETION_EVENT_LOG: OnceLock<StdMutex<Option<CompletionEventLog>>> = OnceLock::new();
-
-    fn completion_event_slot() -> &'static StdMutex<Option<CompletionEventLog>> {
-        COMPLETION_EVENT_LOG.get_or_init(|| StdMutex::new(None))
-    }
-
-    fn set_completion_event_log(log: Option<CompletionEventLog>) {
-        *completion_event_slot()
-            .lock()
-            .expect("completion event log mutex poisoned") = log;
-    }
-
-    fn record_completion_event(event: CompletionEvent) {
-        let log = completion_event_slot()
-            .lock()
-            .expect("completion event log mutex poisoned")
-            .clone();
-        if let Some(log) = log {
-            log.lock()
-                .expect("completion event log mutex poisoned")
-                .push(event);
-        }
-    }
 
     impl FileIO for CountingFileIO {
         type Handle = <TokioFileIO as FileIO>::Handle;
@@ -376,186 +336,9 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct CompletionCountingFileIO;
-
-    impl FileIO for CompletionCountingFileIO {
-        type Handle = <TokioFileIO as FileIO>::Handle;
-
-        fn create(
-            path: &Path,
-        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
-            TokioFileIO::create(path)
-        }
-
-        fn open(
-            path: &Path,
-        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
-            TokioFileIO::open(path)
-        }
-
-        fn file_size(
-            handle: &Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
-            TokioFileIO::file_size(handle)
-        }
-
-        fn write_at(
-            handle: &Self::Handle,
-            offset: u64,
-            data: Bytes,
-        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
-            TokioFileIO::write_at(handle, offset, data)
-        }
-
-        fn read_at(
-            handle: &Self::Handle,
-            offset: u64,
-            len: usize,
-        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
-            TokioFileIO::read_at(handle, offset, len)
-        }
-
-        fn sync_data(
-            handle: &Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            record_completion_event(CompletionEvent::DataFileSyncData);
-            TokioFileIO::sync_data(handle)
-        }
-
-        fn sync_directory(
-            path: &Path,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::sync_directory(path)
-        }
-
-        fn close(
-            handle: Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::close(handle)
-        }
-
-        fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::remove(path)
-        }
-    }
-
-    #[derive(Clone)]
-    struct CountingMetadataStore {
-        data_dir: PathBuf,
-        events: CompletionEventLog,
-    }
-
-    impl CountingMetadataStore {
-        fn new(data_dir: impl Into<PathBuf>, events: CompletionEventLog) -> Self {
-            Self {
-                data_dir: data_dir.into(),
-                events,
-            }
-        }
-
-        fn spool_dir(&self, key: &str) -> PathBuf {
-            self.data_dir.join(key)
-        }
-
-        fn meta_path(&self, key: &str) -> PathBuf {
-            self.spool_dir(key).join("meta.json")
-        }
-
-        fn tmp_path(&self, key: &str) -> PathBuf {
-            self.spool_dir(key).join("meta.json.tmp")
-        }
-
-        fn record(&self, event: CompletionEvent) {
-            self.events
-                .lock()
-                .expect("completion event log mutex poisoned")
-                .push(event);
-        }
-
-        fn write_sync(&self, metadata: &SpoolMetadata) -> Result<()> {
-            let spool_dir = self.spool_dir(&metadata.key);
-            fs::create_dir_all(&spool_dir).map_err(storage_error)?;
-
-            self.record(CompletionEvent::MetadataWrite);
-            let payload = serde_json::to_vec(metadata)
-                .map_err(|error| BobsError::SerializationError(error.to_string()))?;
-            let tmp_path = self.tmp_path(&metadata.key);
-            let meta_path = self.meta_path(&metadata.key);
-
-            {
-                let mut tmp = File::create(&tmp_path).map_err(storage_error)?;
-                tmp.write_all(&payload).map_err(storage_error)?;
-                self.record(CompletionEvent::MetadataTmpFdatasync);
-                tmp.sync_data().map_err(storage_error)?;
-            }
-
-            self.record(CompletionEvent::MetadataRename);
-            fs::rename(&tmp_path, &meta_path).map_err(storage_error)?;
-            self.record(CompletionEvent::MetadataDirectoryFsync);
-            File::open(&spool_dir)
-                .and_then(|dir| dir.sync_all())
-                .map_err(storage_error)?;
-            Ok(())
-        }
-
-        fn read_sync(&self, key: &str) -> Result<Option<SpoolMetadata>> {
-            match fs::read(self.meta_path(key)) {
-                Ok(bytes) => serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(|error| BobsError::SerializationError(error.to_string())),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(storage_error(error)),
-            }
-        }
-    }
-
-    impl MetadataStore for CountingMetadataStore {
-        async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
-            let store = self.clone();
-            let metadata = metadata.clone();
-            tokio::task::spawn_blocking(move || store.write_sync(&metadata))
-                .await
-                .map_err(|error| storage_error(io::Error::other(error)))?
-        }
-
-        async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
-            let store = self.clone();
-            let key = key.to_owned();
-            tokio::task::spawn_blocking(move || store.read_sync(&key))
-                .await
-                .map_err(|error| storage_error(io::Error::other(error)))?
-        }
-
-        async fn delete(&self, key: &str) -> Result<()> {
-            let meta_path = self.meta_path(key);
-            let tmp_path = self.tmp_path(key);
-            tokio::task::spawn_blocking(move || {
-                match fs::remove_file(meta_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(storage_error(error)),
-                }
-                match fs::remove_file(tmp_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(storage_error(error)),
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|error| storage_error(io::Error::other(error)))?
-        }
-
-        async fn scan(&self) -> Result<crate::metadata::MetadataDirectoryScan> {
-            Ok(crate::metadata::MetadataDirectoryScan::empty())
-        }
-    }
-
     #[derive(Clone, Copy)]
     enum MetadataGatePoint {
-        BeforeMarker,
-        AfterMarker,
+        BeforeComplete,
         AfterComplete,
     }
 
@@ -599,13 +382,10 @@ mod tests {
     impl MetadataStore for GatedMetadataStore {
         async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
             self.write_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            let gate_before = metadata.state == SpoolState::Completing
-                && matches!(self.point, MetadataGatePoint::BeforeMarker);
-            let gate_after = matches!(
-                (metadata.state.clone(), self.point),
-                (SpoolState::Completing, MetadataGatePoint::AfterMarker)
-                    | (SpoolState::Complete, MetadataGatePoint::AfterComplete)
-            );
+            let gate_before = metadata.state == SpoolState::Complete
+                && matches!(self.point, MetadataGatePoint::BeforeComplete);
+            let gate_after = metadata.state == SpoolState::Complete
+                && matches!(self.point, MetadataGatePoint::AfterComplete);
             if gate_before {
                 self.gate().await;
             }
@@ -674,127 +454,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct PostRenameFailOnceMetadataStore {
-        inner: SyncSidecarMetadataStore,
-        data_dir: PathBuf,
-        failed_once: Arc<AtomicBool>,
-    }
-
-    impl PostRenameFailOnceMetadataStore {
-        fn new(data_dir: impl Into<PathBuf>) -> Self {
-            let data_dir = data_dir.into();
-            Self {
-                inner: SyncSidecarMetadataStore::new(&data_dir),
-                data_dir,
-                failed_once: Arc::new(AtomicBool::new(false)),
-            }
-        }
-    }
-
-    impl MetadataStore for PostRenameFailOnceMetadataStore {
-        async fn write(&self, metadata: &SpoolMetadata) -> Result<()> {
-            if metadata.state == SpoolState::Complete
-                && !self.failed_once.swap(true, AtomicOrdering::SeqCst)
-            {
-                let metadata = metadata.clone();
-                let data_dir = self.data_dir.clone();
-                return tokio::task::spawn_blocking(move || {
-                    let spool_dir = data_dir.join(&metadata.key);
-                    let tmp_path = spool_dir.join("meta.json.tmp");
-                    let meta_path = spool_dir.join("meta.json");
-                    let payload = serde_json::to_vec(&metadata)
-                        .map_err(|error| BobsError::SerializationError(error.to_string()))?;
-                    {
-                        let mut tmp = File::create(&tmp_path).map_err(storage_error)?;
-                        tmp.write_all(&payload).map_err(storage_error)?;
-                        tmp.sync_data().map_err(storage_error)?;
-                    }
-                    fs::rename(&tmp_path, &meta_path).map_err(storage_error)?;
-                    Err(storage_error(io::Error::other(
-                        "injected directory fsync failure after metadata rename",
-                    )))
-                })
-                .await
-                .map_err(|error| storage_error(io::Error::other(error)))?;
-            }
-            self.inner.write(metadata).await
-        }
-
-        async fn read(&self, key: &str) -> Result<Option<SpoolMetadata>> {
-            self.inner.read(key).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<()> {
-            self.inner.delete(key).await
-        }
-
-        async fn scan(&self) -> Result<crate::metadata::MetadataDirectoryScan> {
-            self.inner.scan().await
-        }
-    }
-
-    #[derive(Clone)]
-    struct SyncFailingFileIO;
-
-    impl FileIO for SyncFailingFileIO {
-        type Handle = <TokioFileIO as FileIO>::Handle;
-
-        fn create(
-            path: &Path,
-        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
-            TokioFileIO::create(path)
-        }
-
-        fn open(
-            path: &Path,
-        ) -> impl std::future::Future<Output = std::io::Result<Self::Handle>> + Send {
-            TokioFileIO::open(path)
-        }
-
-        fn file_size(
-            handle: &Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<u64>> + Send {
-            TokioFileIO::file_size(handle)
-        }
-
-        fn write_at(
-            handle: &Self::Handle,
-            offset: u64,
-            data: Bytes,
-        ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send {
-            TokioFileIO::write_at(handle, offset, data)
-        }
-
-        fn read_at(
-            handle: &Self::Handle,
-            offset: u64,
-            len: usize,
-        ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + Send {
-            TokioFileIO::read_at(handle, offset, len)
-        }
-
-        async fn sync_data(_handle: &Self::Handle) -> std::io::Result<()> {
-            Err(std::io::Error::other("injected sync failure"))
-        }
-
-        fn sync_directory(
-            path: &Path,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::sync_directory(path)
-        }
-
-        fn close(
-            handle: Self::Handle,
-        ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::close(handle)
-        }
-
-        fn remove(path: &Path) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-            TokioFileIO::remove(path)
-        }
-    }
-
     async fn make_spool(dir: &std::path::Path, page_size: usize) -> Arc<Spool<TokioFileIO>> {
         let spool_dir = dir.join("test-key");
         tokio::fs::create_dir_all(&spool_dir)
@@ -852,55 +511,6 @@ mod tests {
             .expect("metadata exists")
     }
 
-    async fn make_sync_failing_spool(
-        dir: &std::path::Path,
-        page_size: usize,
-    ) -> Arc<Spool<SyncFailingFileIO>> {
-        let spool_dir = dir.join("test-key");
-        tokio::fs::create_dir_all(&spool_dir)
-            .await
-            .expect("create spool dir");
-        let path = spool_dir.join("spool.dat");
-        let metadata_store = SyncSidecarMetadataStore::new(dir);
-        let handle = SyncFailingFileIO::create(&path)
-            .await
-            .expect("create spool file");
-        let meta = SpoolMetadata {
-            key: "test-key".to_string(),
-            content_type: None,
-            content_encoding: None,
-            state: SpoolState::Writing,
-            write_locked: false,
-            created_at: 0,
-            last_write_at: 0,
-            last_read_at: None,
-            readable_at: None,
-            page_size: page_size as u64,
-            total_bytes_written: 0,
-            total_pages: 0,
-            final_page_size: None,
-            data_path: path,
-            labels: HashMap::new(),
-            integrity: None,
-            integrity_failure: None,
-        };
-        metadata_store
-            .write(&meta)
-            .await
-            .expect("insert initial metadata");
-
-        Arc::new(Spool::new(
-            meta,
-            handle,
-            page_size,
-            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                page_size * 256,
-            ))),
-            metadata_store,
-            Arc::new(crate::metrics::BobsMetrics::new(false)),
-        ))
-    }
-
     async fn make_fail_first_metadata_spool(
         dir: &std::path::Path,
         page_size: usize,
@@ -932,54 +542,6 @@ mod tests {
             integrity_failure: None,
         };
         metadata_store
-            .write(&meta)
-            .await
-            .expect("insert initial metadata");
-
-        Arc::new(Spool::new(
-            meta,
-            handle,
-            page_size,
-            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                page_size * 256,
-            ))),
-            metadata_store,
-            Arc::new(crate::metrics::BobsMetrics::new(false)),
-        ))
-    }
-
-    async fn make_post_rename_failing_spool(
-        dir: &std::path::Path,
-        page_size: usize,
-    ) -> Arc<Spool<TokioFileIO, PostRenameFailOnceMetadataStore>> {
-        let spool_dir = dir.join("test-key");
-        tokio::fs::create_dir_all(&spool_dir)
-            .await
-            .expect("create spool dir");
-        let path = spool_dir.join("spool.dat");
-        let initial_store = SyncSidecarMetadataStore::new(dir);
-        let metadata_store = PostRenameFailOnceMetadataStore::new(dir);
-        let handle = TokioFileIO::create(&path).await.expect("create spool file");
-        let meta = SpoolMetadata {
-            key: "test-key".to_string(),
-            content_type: None,
-            content_encoding: None,
-            state: SpoolState::Writing,
-            write_locked: false,
-            created_at: 0,
-            last_write_at: 0,
-            last_read_at: None,
-            readable_at: None,
-            page_size: page_size as u64,
-            total_bytes_written: 0,
-            total_pages: 0,
-            final_page_size: None,
-            data_path: path,
-            labels: HashMap::new(),
-            integrity: None,
-            integrity_failure: None,
-        };
-        initial_store
             .write(&meta)
             .await
             .expect("insert initial metadata");
@@ -1098,69 +660,6 @@ mod tests {
         ))
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-    fn explicit_test_ring_pool_options(shard_count: usize) -> RingPoolOptions {
-        RingPoolOptions {
-            shard_count,
-            queue_capacity: 1024,
-            driver_name_prefix: "bobs-complete-routing-test".to_owned(),
-        }
-    }
-
-    async fn make_counting_completion_spool(
-        dir: &std::path::Path,
-        page_size: usize,
-        events: CompletionEventLog,
-    ) -> Arc<Spool<CompletionCountingFileIO, CountingMetadataStore>> {
-        let spool_dir = dir.join("test-key");
-        tokio::fs::create_dir_all(&spool_dir)
-            .await
-            .expect("create spool dir");
-        let path = spool_dir.join("spool.dat");
-        let metadata_store = CountingMetadataStore::new(dir, Arc::clone(&events));
-        let handle = CompletionCountingFileIO::create(&path)
-            .await
-            .expect("create spool file");
-        let meta = SpoolMetadata {
-            key: "test-key".to_string(),
-            content_type: None,
-            content_encoding: None,
-            state: SpoolState::Writing,
-            write_locked: false,
-            created_at: 0,
-            last_write_at: 0,
-            last_read_at: None,
-            readable_at: None,
-            page_size: page_size as u64,
-            total_bytes_written: 0,
-            total_pages: 0,
-            final_page_size: None,
-            data_path: path,
-            labels: HashMap::new(),
-            integrity: None,
-            integrity_failure: None,
-        };
-        metadata_store
-            .write(&meta)
-            .await
-            .expect("insert initial metadata");
-        events
-            .lock()
-            .expect("completion event log mutex poisoned")
-            .clear();
-
-        Arc::new(Spool::new(
-            meta,
-            handle,
-            page_size,
-            Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                page_size * 256,
-            ))),
-            metadata_store,
-            Arc::new(crate::metrics::BobsMetrics::new(false)),
-        ))
-    }
-
     async fn wait_for_detached_completion(spool: &Arc<Spool<TokioFileIO, GatedMetadataStore>>) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let _guard = spool.lifecycle_lock.lock().await;
@@ -1200,10 +699,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_abort_before_and_while_marker_persistence_cannot_cancel_completion() {
+    async fn caller_abort_during_complete_persistence_cannot_cancel_completion() {
         for (point, expected_durable_state) in [
-            (MetadataGatePoint::BeforeMarker, SpoolState::Writing),
-            (MetadataGatePoint::AfterMarker, SpoolState::Completing),
+            (MetadataGatePoint::BeforeComplete, SpoolState::Writing),
+            (MetadataGatePoint::AfterComplete, SpoolState::Complete),
         ] {
             let dir = tempdir().expect("create tempdir");
             let (spool, reached, release) = make_gated_spool(dir.path(), 4096, point).await;
@@ -1236,7 +735,7 @@ mod tests {
     async fn completion_burst_is_backpressured_before_spawning_owned_tasks() {
         let dir = tempdir().expect("create tempdir");
         let (spool, reached, release) =
-            make_gated_spool(dir.path(), 4096, MetadataGatePoint::BeforeMarker).await;
+            make_gated_spool(dir.path(), 4096, MetadataGatePoint::BeforeComplete).await;
         let data = Bytes::from_static(b"single-flight-completion");
         spool.write(0, data.clone()).await.expect("write succeeds");
 
@@ -1245,7 +744,7 @@ mod tests {
         let first = tokio::spawn(async move { first_spool.complete(Some(expected_size)).await });
         tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
             .await
-            .expect("first completion reached marker gate");
+            .expect("first completion reached metadata gate");
 
         const BURST: usize = 64;
         let mut waiters = Vec::with_capacity(BURST);
@@ -1264,7 +763,7 @@ mod tests {
                 .write_calls
                 .load(AtomicOrdering::SeqCst),
             2,
-            "only the initial sidecar and active marker attempt may start"
+            "only the initial sidecar and active Complete attempt may start"
         );
         assert_eq!(
             spool.metadata_store.read_calls.load(AtomicOrdering::SeqCst),
@@ -1310,10 +809,9 @@ mod tests {
                 .metadata_store
                 .write_calls
                 .load(AtomicOrdering::SeqCst),
-            3,
-            "one marker and one Complete commit follow the initial sidecar"
+            2,
+            "one Complete commit follows the initial sidecar"
         );
-
         spool
             .complete(Some(expected_size))
             .await
@@ -1518,206 +1016,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_orders_one_data_sync_and_two_metadata_commits() {
-        let dir = tempdir().expect("create tempdir");
-        let events = Arc::new(StdMutex::new(Vec::new()));
-        let spool = make_counting_completion_spool(dir.path(), 4096, Arc::clone(&events)).await;
-        set_completion_event_log(Some(Arc::clone(&events)));
-
-        let data = vec![0xA5u8; 6000];
-        spool
-            .write(0, bytes::Bytes::copy_from_slice(&data))
-            .await
-            .expect("write succeeds");
-
-        spool
-            .complete(Some(data.len() as u64))
-            .await
-            .expect("complete succeeds");
-        spool
-            .complete(Some(data.len() as u64))
-            .await
-            .expect("second complete is idempotent");
-        set_completion_event_log(None);
-
-        let got = events
-            .lock()
-            .expect("completion event log mutex poisoned")
-            .clone();
-        let expected = vec![
-            CompletionEvent::DataFileSyncData,
-            CompletionEvent::MetadataWrite,
-            CompletionEvent::MetadataTmpFdatasync,
-            CompletionEvent::MetadataRename,
-            CompletionEvent::MetadataDirectoryFsync,
-            CompletionEvent::MetadataWrite,
-            CompletionEvent::MetadataTmpFdatasync,
-            CompletionEvent::MetadataRename,
-            CompletionEvent::MetadataDirectoryFsync,
-        ];
-        assert_eq!(
-            got, expected,
-            "completion must sync spool.dat, then commit Completing and Complete metadata"
-        );
-        assert_eq!(
-            got.iter()
-                .filter(|event| matches!(event, CompletionEvent::DataFileSyncData))
-                .count(),
-            1,
-            "complete must not issue extra data-file sync_data calls"
-        );
-        assert_eq!(
-            got.iter()
-                .filter(|event| matches!(event, CompletionEvent::MetadataWrite))
-                .count(),
-            2,
-            "complete must commit one recovery marker and one final sidecar"
-        );
-
-        #[cfg(all(target_os = "linux", not(feature = "tokio-fileio-fallback")))]
-        {
-            let routed_dir = tempdir().expect("create routed tempdir");
-            let pool = Arc::new(
-                RingPool::new_for_test(explicit_test_ring_pool_options(4))
-                    .expect("complete routing test ring pool should start"),
-            );
-            let _override = scoped_test_ring_pool_override(Arc::clone(&pool));
-            let metadata_store = UringSidecarMetadataStore::new(routed_dir.path());
-            let key = "test-key".to_string();
-            let spool_dir = routed_dir.path().join(&key);
-            tokio::fs::create_dir_all(&spool_dir)
-                .await
-                .expect("create routed spool dir");
-            let path = spool_dir.join("spool.dat");
-            let handle = UringFileIO::create(&path)
-                .await
-                .expect("create routed spool file");
-            let meta = SpoolMetadata {
-                key: key.clone(),
-                content_type: None,
-                content_encoding: None,
-                state: SpoolState::Writing,
-                write_locked: false,
-                created_at: 0,
-                last_write_at: 0,
-                last_read_at: None,
-                readable_at: None,
-                page_size: 4096,
-                total_bytes_written: 0,
-                total_pages: 0,
-                final_page_size: None,
-                data_path: path,
-                labels: HashMap::new(),
-                integrity: None,
-                integrity_failure: None,
-            };
-            metadata_store
-                .write(&meta)
-                .await
-                .expect("insert routed initial metadata");
-            let routed_spool = Arc::new(Spool::<UringFileIO, UringSidecarMetadataStore>::new(
-                meta,
-                handle,
-                4096,
-                Arc::new(tokio::sync::Mutex::new(crate::spool::PageCache::new(
-                    4096 * 256,
-                ))),
-                metadata_store,
-                Arc::new(crate::metrics::BobsMetrics::new(false)),
-            ));
-            routed_spool
-                .write(0, bytes::Bytes::copy_from_slice(&data))
-                .await
-                .expect("routed write succeeds");
-
-            pool.clear_routing_events();
-            routed_spool
-                .complete(Some(data.len() as u64))
-                .await
-                .expect("routed complete succeeds");
-            routed_spool
-                .complete(Some(data.len() as u64))
-                .await
-                .expect("routed second complete is idempotent");
-
-            let complete_events: Vec<_> = pool
-                .routing_events()
-                .into_iter()
-                .filter(|event| {
-                    event.routed_key == key
-                        && matches!(
-                            event.operation_kind,
-                            RingPoolOperationKind::DataSync | RingPoolOperationKind::MetadataCommit
-                        )
-                })
-                .collect();
-            assert_eq!(
-                complete_events.len(),
-                3,
-                "routed complete must enqueue one data sync and two metadata commits"
-            );
-            assert_eq!(
-                complete_events[0].operation_kind,
-                RingPoolOperationKind::DataSync
-            );
-            assert_eq!(
-                complete_events[1].operation_kind,
-                RingPoolOperationKind::MetadataCommit
-            );
-            assert_eq!(
-                complete_events[2].operation_kind,
-                RingPoolOperationKind::MetadataCommit
-            );
-            assert!(
-                complete_events
-                    .windows(2)
-                    .all(|pair| pair[0].ring_index == pair[1].ring_index),
-                "complete data sync and both metadata commits for one spool must use the same shard"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_complete_does_not_publish_final_partial_page_if_sync_data_fails() {
-        let dir = tempdir().expect("create tempdir");
-        let spool = make_sync_failing_spool(dir.path(), 4096).await;
-        let partial_data = vec![0xE6u8; 333];
-
-        spool
-            .write(0, bytes::Bytes::copy_from_slice(&partial_data))
-            .await
-            .expect("write succeeds");
-
-        let result = spool.complete(Some(partial_data.len() as u64)).await;
-        assert!(matches!(result, Err(BobsError::IoError(_))));
-
-        {
-            let cache = spool.page_cache.lock().await;
-            assert!(
-                cache.get(&spool.key, 0).is_none(),
-                "final partial page must not be published before sync succeeds"
-            );
-        }
-
-        let meta = spool.metadata.lock().await;
-        assert_eq!(meta.state, SpoolState::Completing);
-        assert_eq!(meta.total_pages, 0);
-        assert_eq!(meta.final_page_size, None);
-        drop(meta);
-        assert!(matches!(
-            spool
-                .write(partial_data.len() as u64, Bytes::from_static(b"tail"))
-                .await,
-            Err(BobsError::InvalidState { .. })
-        ));
-
-        let persisted = persisted_metadata(&spool).await;
-        assert_eq!(persisted.state, SpoolState::Writing);
-        assert_eq!(persisted.total_pages, 0);
-        assert_eq!(persisted.final_page_size, None);
-    }
-
-    #[tokio::test]
     async fn test_complete_with_partial_page_survives_restart() {
         let dir = tempdir().expect("create tempdir");
         let data_dir = dir.path().join("data");
@@ -1870,24 +1168,18 @@ mod tests {
 
         {
             let meta = spool.metadata.lock().await;
-            assert_eq!(meta.state, SpoolState::Completing);
+            assert_eq!(meta.state, SpoolState::Writing);
             assert_eq!(meta.total_pages, 0);
             assert_eq!(meta.final_page_size, None);
         }
-        assert!(matches!(
-            spool
-                .write(data.len() as u64, Bytes::from_static(b"tail"))
-                .await,
-            Err(BobsError::InvalidState { .. })
-        ));
         {
             let cache = spool.page_cache.lock().await;
             assert!(cache.get(&spool.key, 0).is_none());
         }
         let persisted = persisted_metadata(&spool).await;
-        assert_eq!(persisted.state, SpoolState::Completing);
-        assert_eq!(persisted.total_pages, 1);
-        assert_eq!(persisted.final_page_size, Some(data.len() as u64));
+        assert_eq!(persisted.state, SpoolState::Writing);
+        assert_eq!(persisted.total_pages, 0);
+        assert_eq!(persisted.final_page_size, None);
 
         spool
             .complete(Some(data.len() as u64))
@@ -1898,68 +1190,6 @@ mod tests {
         assert_eq!(persisted.state, SpoolState::Complete);
         assert_eq!(persisted.total_pages, 1);
         assert_eq!(persisted.final_page_size, Some(data.len() as u64));
-    }
-
-    #[tokio::test]
-    async fn post_rename_complete_error_is_fail_stop_and_retryable_without_hidden_tail() {
-        let dir = tempdir().expect("create tempdir");
-        let spool = make_post_rename_failing_spool(dir.path(), 4096).await;
-        let data = Bytes::from_static(b"exact acknowledged bytes");
-
-        spool.write(0, data.clone()).await.expect("write succeeds");
-        let error = spool
-            .complete(Some(data.len() as u64))
-            .await
-            .expect_err("post-rename directory fsync error is reported");
-        assert!(matches!(error, BobsError::StorageError(_)));
-        assert_eq!(
-            spool.metadata.lock().await.state,
-            SpoolState::Completing,
-            "indeterminate completion must reject subsequent writes"
-        );
-        assert!(matches!(
-            spool
-                .write(
-                    data.len() as u64,
-                    Bytes::from_static(b"unacknowledged-tail")
-                )
-                .await,
-            Err(BobsError::InvalidState { .. })
-        ));
-
-        let published = persisted_metadata(&spool).await;
-        assert_eq!(published.state, SpoolState::Complete);
-        assert_eq!(published.total_bytes_written, data.len() as u64);
-        assert_eq!(
-            tokio::fs::read(dir.path().join("test-key/spool.dat"))
-                .await
-                .expect("read data after failed complete"),
-            data.as_ref()
-        );
-
-        spool
-            .complete(Some(data.len() as u64))
-            .await
-            .expect("same-process complete retry succeeds");
-        assert_eq!(spool.metadata.lock().await.state, SpoolState::Complete);
-
-        let recovered = SpoolManager::<TokioFileIO>::new(dir.path(), 4096, 16 * 4096, 8)
-            .expect("recovery manager init");
-        recovered.recover().await.expect("recovery succeeds");
-        let recovered_spool = recovered
-            .get_spool("test-key")
-            .expect("published complete spool recovers");
-        let recovered_page = recovered_spool
-            .read_page_for_test(0)
-            .await
-            .expect("read recovered page")
-            .expect("recovered page exists");
-        assert_eq!(recovered_page.as_ref(), data.as_ref());
-        assert!(recovered_spool
-            .read_page_for_test(1)
-            .await
-            .expect("read recovered EOF")
-            .is_none());
     }
 
     #[tokio::test]

@@ -738,12 +738,6 @@ mod tests {
             .expect("newer frame advances activity");
         assert_eq!(spool.metadata.lock().await.last_write_at, 11);
 
-        spool.metadata.lock().await.state = SpoolState::Completing;
-        assert!(matches!(
-            spool.refresh_write_activity(12).await,
-            Err(BobsError::InvalidState { .. })
-        ));
-
         spool.metadata.lock().await.state = SpoolState::Complete;
         assert!(matches!(
             spool.refresh_write_activity(12).await,
