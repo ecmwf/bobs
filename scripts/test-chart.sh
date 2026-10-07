@@ -75,7 +75,7 @@ helm lint "$chart" --strict --values "$chart/tests/forwarded-prefix-values.yaml"
 "$chart/tests/chart-contract-render.sh"
 
 helm template bobs "$chart" "${common_values[@]}" >"$tmpdir/default.yaml"
-assert_contains "image: \"eccr.ecmwf.int/bobs/bobs:${app_version}\"" "$tmpdir/default.yaml"
+assert_contains "image: \"eccr.ecmwf.int/polytope/bobs:${app_version}\"" "$tmpdir/default.yaml"
 assert_contains 'value: "info"' "$tmpdir/default.yaml"
 assert_contains 'max_live_spools: 256' "$tmpdir/default.yaml"
 assert_contains 'max_spool_bytes: 8589934592' "$tmpdir/default.yaml"
