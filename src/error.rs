@@ -39,6 +39,9 @@ pub enum BobsError {
     #[error("range not satisfiable: {reason}")]
     RangeNotSatisfiable { total: Option<u64>, reason: String },
 
+    #[error("result lost due to a storage failure: {key}")]
+    ResultLost { key: String },
+
     #[error("configuration error: {0}")]
     ConfigurationError(String),
 

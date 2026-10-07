@@ -203,6 +203,8 @@ where
             final_page_size: None,
             data_path,
             labels,
+            integrity: None,
+            integrity_failure: None,
         };
 
         let durability_result = async {
@@ -837,7 +839,7 @@ where
                 continue;
             }
 
-            let meta = match self.metadata_store.read(&name).await {
+            let mut meta = match self.metadata_store.read(&name).await {
                 Ok(Some(meta)) => meta,
                 Ok(None) => {
                     tracing::warn!(key = %name, "recovery: indexed sidecar disappeared; leaving directory intact");
@@ -905,9 +907,22 @@ where
             let file_metadata = match F::symlink_metadata(&canonical_data_path).await {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::warn!(key = %name, "recovery: canonical data file missing; leaving spool intact and continuing scan");
-                    rejected_count += 1;
-                    continue;
+                    if meta.state == SpoolState::Complete && meta.integrity.is_some() {
+                        meta.integrity_failure =
+                            Some("integrity check failed after storage failure".to_string());
+                        self.metadata_store.write(&meta).await?;
+                        let handle = F::create(&canonical_data_path)
+                            .await
+                            .map_err(BobsError::IoError)?;
+                        F::close(handle).await.map_err(BobsError::IoError)?;
+                        F::symlink_metadata(&canonical_data_path)
+                            .await
+                            .map_err(BobsError::IoError)?
+                    } else {
+                        tracing::warn!(key = %name, "recovery: canonical data file missing; leaving spool intact and continuing scan");
+                        rejected_count += 1;
+                        continue;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(key = %name, error = %error, "recovery: canonical payload metadata preflight failed; leaving spool intact and continuing scan");
@@ -1501,6 +1516,7 @@ fn prepare_recovery_candidate(
             };
         }
     };
+
     // Active Writing must preserve its historical offsets. Reject an unsupported
     // stride before even inspecting the payload, so it cannot drive a sparse-tail
     // read or allocation. Terminal states are validated arithmetically and then
@@ -1572,11 +1588,17 @@ fn prepare_recovery_candidate(
             }
         };
         if file_size < expected_bytes {
-            return RecoveryMetadataDisposition::Cleanup {
-                reason: format!(
-                    "completed data file has {file_size} bytes but requires {expected_bytes}"
-                ),
-            };
+            if meta.integrity.is_some() {
+                meta.integrity_failure =
+                    Some("integrity check failed after storage failure".to_string());
+                metadata_needs_persist = true;
+            } else {
+                return RecoveryMetadataDisposition::Cleanup {
+                    reason: format!(
+                        "completed data file has {file_size} bytes but requires {expected_bytes}"
+                    ),
+                };
+            }
         }
     }
 
@@ -2928,6 +2950,8 @@ mod tests {
             final_page_size,
             data_path: data_dir.join(key).join("spool.dat"),
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         }
     }
 

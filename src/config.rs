@@ -82,6 +82,11 @@ pub struct Config {
     /// Flush spool data and metadata across crash-durability boundaries.
     /// Disable only for explicitly ephemeral deployments where restart data loss is acceptable.
     pub fsync_enabled: bool,
+    /// Completed objects no larger than this are verified before response headers.
+    pub verify_before_send_bytes: u64,
+    /// Delay before best-effort background sync when foreground fsync is disabled.
+    /// Zero disables background sync.
+    pub async_sync_delay_ms: u64,
     pub writer_inactivity_timeout_secs: u64,
     /// Expose the CPU profiler on the main HTTP listener. Disabled by default.
     pub enable_pprof: bool,
@@ -154,6 +159,8 @@ impl Default for Config {
             max_spool_bytes: DEFAULT_MAX_SPOOL_BYTES,
             create_admission_timeout_ms: 5000,
             fsync_enabled: true,
+            verify_before_send_bytes: 4 * 1024 * 1024,
+            async_sync_delay_ms: 500,
             writer_inactivity_timeout_secs: 300,
             enable_pprof: false,
             read_idle_ttl_secs: 600,

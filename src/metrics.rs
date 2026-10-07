@@ -153,6 +153,7 @@ struct InnerMetrics {
     spools_created: Counter<u64>,
     spools_completed: Counter<u64>,
     spools_deleted: Counter<u64>,
+    integrity_failures: Counter<u64>,
 
     // Spool operation durations
     create_duration: Histogram<f64>,
@@ -228,6 +229,10 @@ impl BobsMetrics {
             spools_deleted: meter
                 .u64_counter("bobs.spools.deleted")
                 .with_description("Total spools deleted")
+                .build(),
+            integrity_failures: meter
+                .u64_counter("bobs.integrity.failures")
+                .with_description("Completed spools quarantined after integrity failure")
                 .build(),
             create_duration: meter
                 .f64_histogram("bobs.create.duration")
@@ -348,6 +353,15 @@ impl BobsMetrics {
         if let Some(inner) = &self.inner {
             let attrs = Self::caller_attrs(labels);
             inner.spools_completed.add(1, &attrs);
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn record_integrity_failure(&self, labels: &HashMap<String, String>) {
+        #[cfg(feature = "telemetry")]
+        if let Some(inner) = &self.inner {
+            let attrs = Self::caller_attrs(labels);
+            inner.integrity_failures.add(1, &attrs);
         }
     }
 

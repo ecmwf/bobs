@@ -5,7 +5,7 @@
 use crate::error::{BobsError, Result};
 use crate::io::FileIO;
 use crate::metrics;
-use crate::spool::types::SpoolState;
+use crate::spool::types::{IntegrityMetadata, SpoolState};
 use crate::time::now_secs;
 use std::sync::Arc;
 
@@ -109,6 +109,18 @@ where
                 marker.final_page_size = Some(page_data.len() as u64);
             }
             marker.readable_at.get_or_insert_with(now_secs);
+            let integrity = {
+                let checksum = self
+                    .integrity_hasher
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (checksum.1 == marker.total_bytes_written).then(|| IntegrityMetadata {
+                    algorithm: "xxh3-64".to_string(),
+                    length: checksum.1,
+                    checksum: checksum.0.digest(),
+                })
+            };
+            marker.integrity = integrity;
             let mut candidate = marker.clone();
             candidate.state = SpoolState::Complete;
             let total_size = candidate.total_bytes_written;
@@ -807,6 +819,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         metadata_store
             .write(&meta)
@@ -867,6 +881,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         metadata_store
             .write(&meta)
@@ -912,6 +928,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         metadata_store
             .write(&meta)
@@ -958,6 +976,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         initial_store
             .write(&meta)
@@ -1008,6 +1028,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         metadata_store
             .write(&meta)
@@ -1056,6 +1078,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         metadata_store
             .write(&meta)
@@ -1113,6 +1137,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         metadata_store
             .write(&meta)
@@ -1582,6 +1608,8 @@ mod tests {
                 final_page_size: None,
                 data_path: path,
                 labels: HashMap::new(),
+                integrity: None,
+                integrity_failure: None,
             };
             metadata_store
                 .write(&meta)

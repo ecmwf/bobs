@@ -246,6 +246,12 @@ impl MetadataStore for UringSidecarMetadataStore {
         store.delete(key).await
     }
 
+    async fn sync(&self, key: &str) -> Result<()> {
+        SyncSidecarMetadataStore::new_with_fsync(&self.data_dir, true)
+            .sync(key)
+            .await
+    }
+
     async fn scan(&self) -> Result<MetadataDirectoryScan> {
         let store = self.sync_store();
         store.scan().await
@@ -617,6 +623,8 @@ mod tests {
             final_page_size: if generation == 0 { None } else { Some(4096) },
             data_path: PathBuf::from(format!("/tmp/sidecar-test-key.{generation}.data")),
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         }
     }
 

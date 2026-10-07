@@ -105,6 +105,15 @@ where
             )));
         }
 
+        {
+            let mut checksum = self
+                .integrity_hasher
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            checksum.0.update(&data);
+            checksum.1 += data.len() as u64;
+        }
+
         let mut cursor = 0;
         let mut completed_pages = Vec::new();
 
@@ -334,6 +343,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         metadata_store
             .write(&meta)

@@ -24,6 +24,14 @@ impl SpoolState {
     }
 }
 
+/// Integrity record committed atomically with terminal spool metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityMetadata {
+    pub algorithm: String,
+    pub length: u64,
+    pub checksum: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SpoolMetadata {
     pub key: String,
@@ -48,6 +56,12 @@ pub struct SpoolMetadata {
     /// Bobs does not interpret these — they are pass-through dimensions.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Present for spools created by integrity-aware BOBS versions.
+    #[serde(default)]
+    pub integrity: Option<IntegrityMetadata>,
+    /// Persisted quarantine marker. A quarantined result is never served again.
+    #[serde(default)]
+    pub integrity_failure: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +95,10 @@ struct PersistedSpoolMetadata {
     data_path: PathBuf,
     #[serde(default)]
     labels: HashMap<String, String>,
+    #[serde(default)]
+    integrity: Option<IntegrityMetadata>,
+    #[serde(default)]
+    integrity_failure: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SpoolMetadata {
@@ -121,6 +139,8 @@ impl<'de> Deserialize<'de> for SpoolMetadata {
             },
             data_path: persisted.data_path,
             labels: persisted.labels,
+            integrity: persisted.integrity,
+            integrity_failure: persisted.integrity_failure,
         })
     }
 }

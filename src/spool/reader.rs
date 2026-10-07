@@ -23,6 +23,118 @@ where
         self.reader_count.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Read immutable completed data directly from the backing file, bypassing the
+    /// page cache so crash-induced disk damage cannot be hidden by stale RAM.
+    pub async fn read_integrity_chunk(
+        &self,
+        offset: u64,
+        len: usize,
+        response_permit: &ReadResponsePermit<F>,
+    ) -> Result<Bytes> {
+        let handle = self.acquire_file_handle(response_permit).await?;
+        read_exact_at::<F>(&handle, offset, len, "verifying completed spool data")
+            .await
+            .map_err(BobsError::IoError)
+    }
+
+    /// Verify the complete immutable object once per process before serving it.
+    pub async fn verify_integrity(&self, response_permit: &ReadResponsePermit<F>) -> Result<()> {
+        if self.integrity_verified.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let integrity = {
+            let meta = self.metadata.lock().await;
+            if meta.integrity_failure.is_some() {
+                return Err(BobsError::ResultLost {
+                    key: self.key.clone(),
+                });
+            }
+            meta.integrity.clone()
+        };
+        let Some(integrity) = integrity else {
+            return Ok(());
+        };
+        if integrity.algorithm != "xxh3-64" {
+            return self
+                .quarantine_integrity_failure("unsupported checksum algorithm")
+                .await;
+        }
+
+        let handle = match self.acquire_file_handle(response_permit).await {
+            Ok(handle) => handle,
+            Err(_) => return self.quarantine_integrity_failure("data file missing").await,
+        };
+        let actual_size = match F::file_size(&handle).await {
+            Ok(size) => size,
+            Err(_) => {
+                return self
+                    .quarantine_integrity_failure("data file unavailable")
+                    .await
+            }
+        };
+        if actual_size != integrity.length {
+            return self.quarantine_integrity_failure("length mismatch").await;
+        }
+
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        let mut offset = 0_u64;
+        while offset < integrity.length {
+            let len = (integrity.length - offset).min(self.page_size as u64) as usize;
+            let bytes =
+                match read_exact_at::<F>(&handle, offset, len, "verifying completed spool data")
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return self
+                            .quarantine_integrity_failure("short or unreadable data file")
+                            .await
+                    }
+                };
+            hasher.update(&bytes);
+            offset += bytes.len() as u64;
+        }
+        if hasher.digest() != integrity.checksum {
+            return self.quarantine_integrity_failure("checksum mismatch").await;
+        }
+        self.integrity_verified.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn mark_integrity_verified(&self) {
+        self.integrity_verified.store(true, Ordering::Release);
+    }
+
+    pub async fn quarantine_integrity_failure(&self, detail: &str) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let snapshot = {
+            let mut meta = self.metadata.lock().await;
+            if meta.integrity_failure.is_none() {
+                meta.integrity_failure =
+                    Some("integrity check failed after storage failure".to_string());
+            }
+            meta.clone()
+        };
+        if let Err(error) = self.persist_metadata(&snapshot).await {
+            tracing::error!(
+                "event.name" = "bobs.spool.integrity_quarantine_persist_failed",
+                "bobs.spool.key" = %self.key,
+                error = %error,
+                "failed to persist integrity quarantine"
+            );
+        }
+        self.metrics.record_integrity_failure(&snapshot.labels);
+        tracing::error!(
+            "event.name" = "bobs.spool.integrity_failed",
+            "bobs.spool.key" = %self.key,
+            reason = detail,
+            "completed spool failed integrity verification"
+        );
+        Err(BobsError::ResultLost {
+            key: self.key.clone(),
+        })
+    }
+
     /// Returns a completed page by index, or None if the spool is complete and
     /// no such page exists. Only returns full pages (or the final partial page
     /// after complete) — never the in-progress write buffer.
@@ -268,6 +380,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
 
         Spool::new(
@@ -314,6 +428,8 @@ mod tests {
             final_page_size: None,
             data_path: path,
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
 
         metadata_store
@@ -449,6 +565,8 @@ mod tests {
             final_page_size: None,
             data_path: dir.path().join("spool.dat"),
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         };
         let spool = Arc::new(Spool::<BlockingReadFileIO>::new(
             metadata,

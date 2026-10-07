@@ -118,6 +118,11 @@ pub trait MetadataStore: Sync {
     fn delete(&self, key: &str) -> impl Future<Output = Result<()>> + Send;
     /// Start one bounded top-level data-directory scan without reading sidecar payloads.
     fn scan(&self) -> impl Future<Output = Result<MetadataDirectoryScan>> + Send;
+    /// Force the already-committed sidecar and containing directories to stable storage.
+    /// Used by delayed best-effort sync when foreground fsync is disabled.
+    fn sync(&self, _key: &str) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Whether crash-durability sync boundaries are enabled for this store.
     fn fsync_enabled(&self) -> bool {
         true
@@ -341,6 +346,15 @@ impl SyncSidecarMetadataStore {
 
         Ok(())
     }
+    fn sync_entry_sync(&self, key: &str) -> Result<()> {
+        let spool_dir = self.spool_dir(key);
+        File::open(self.meta_path(key))
+            .and_then(|file| file.sync_all())
+            .map_err(storage_error)?;
+        (self.sync_directory)(&spool_dir).map_err(storage_error)?;
+        (self.sync_directory)(&self.data_dir).map_err(storage_error)?;
+        Ok(())
+    }
 }
 
 impl MetadataStore for SyncSidecarMetadataStore {
@@ -360,6 +374,12 @@ impl MetadataStore for SyncSidecarMetadataStore {
         let store = self.clone();
         let key = key.to_owned();
         run_blocking(move || store.delete_sync(&key)).await
+    }
+
+    async fn sync(&self, key: &str) -> Result<()> {
+        let store = self.clone();
+        let key = key.to_owned();
+        run_blocking(move || store.sync_entry_sync(&key)).await
     }
 
     async fn scan(&self) -> Result<MetadataDirectoryScan> {
@@ -930,6 +950,8 @@ mod tests {
             final_page_size: if generation == 0 { None } else { Some(4096) },
             data_path: PathBuf::from(format!("/tmp/sidecar-test-key.{generation}.data")),
             labels: HashMap::new(),
+            integrity: None,
+            integrity_failure: None,
         }
     }
 

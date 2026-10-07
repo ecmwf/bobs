@@ -438,7 +438,7 @@ async fn complete_spool<F, M>(
     body: Bytes,
 ) -> std::result::Result<Response, ApiError>
 where
-    F: FileIO,
+    F: FileIO + 'static,
     M: MetadataStore + Clone + Send + Sync + 'static,
 {
     let job_id = extract_job_id(&headers);
@@ -464,6 +464,21 @@ where
         );
         complete_result.map_err(ApiError)?;
         state.metrics.record_spool_completed(&labels);
+        if !state.config.fsync_enabled && state.config.async_sync_delay_ms > 0 {
+            let sync_spool = Arc::clone(&spool);
+            let delay = Duration::from_millis(state.config.async_sync_delay_ms);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Err(error) = sync_spool.sync_completed().await {
+                    tracing::warn!(
+                        "event.name" = "bobs.spool.async_sync_failed",
+                        "bobs.spool.key" = %sync_spool.key,
+                        error = %error,
+                        "best-effort delayed spool sync failed"
+                    );
+                }
+            });
+        }
         let meta = spool.metadata.lock().await;
         if let Some(job_id) = &job_id {
             tracing::info!("event.name" = "bobs.spool.completed", "request.id" = %job_id, "bobs.spool.key" = %key, expected_size = ?req.expected_size, bytes = meta.total_bytes_written, outcome = "success", "spool completed");
@@ -501,6 +516,7 @@ struct ReadMetadata {
     complete_size: Option<u64>,
     total_bytes_written: u64,
     servable_bytes: u64,
+    integrity: Option<crate::spool::IntegrityMetadata>,
 }
 
 struct ResolvedReadRange {
@@ -801,6 +817,9 @@ where
             if meta.state == crate::spool::SpoolState::Deleting {
                 return Err(ApiError(BobsError::SpoolNotFound { key: key.clone() }));
             }
+            if meta.integrity_failure.is_some() {
+                return Err(ApiError(BobsError::ResultLost { key: key.clone() }));
+            }
             if !meta.state.is_readable() || (meta.state == crate::spool::SpoolState::Writing && meta.write_locked) {
                 return Err(ApiError(BobsError::SpoolLocked));
             }
@@ -847,6 +866,7 @@ where
                 complete_size,
                 total_bytes_written: meta.total_bytes_written,
                 servable_bytes,
+                integrity: is_complete.then(|| meta.integrity.clone()).flatten(),
             }
         };
         let range = resolve_read_range(request_range, &metadata).map_err(ApiError)?;
@@ -855,12 +875,129 @@ where
         let response_range = ResolvedReadRange { start, end, follow };
         tracing::info!("event.name" = "bobs.spool.read.started", "bobs.spool.key" = %key, range = %raw_range, start = start, end = ?end, follow = follow, outcome = "success", "spool read started");
 
+        // Follow-mode reads that began while a live writer was active intentionally
+        // bypass verification: they consume bytes from the running process before a
+        // crash boundary exists. Completed objects with integrity metadata are checked.
+        let mut verified_permit = None;
+        if let Some(integrity) = metadata.integrity.clone() {
+            if integrity.length != metadata.total_bytes_written {
+                spool
+                    .quarantine_integrity_failure("metadata length mismatch")
+                    .await
+                    .map_err(ApiError)?;
+            }
+            let is_full_object = start == 0 && end == Some(integrity.length);
+            if integrity.length <= state.config.verify_before_send_bytes || !is_full_object {
+                let verification = async {
+                    let permit = spool.acquire_read_response_permit().await?;
+                    spool.verify_integrity(&permit).await?;
+                    Ok::<_, BobsError>(permit)
+                };
+                match tokio::time::timeout(long_poll_timeout, verification).await {
+                    Ok(Ok(permit)) => verified_permit = Some(permit),
+                    Ok(Err(error)) => return Err(ApiError(error)),
+                    Err(_) => return Ok(long_poll_redirect(&key, &headers)),
+                }
+            } else {
+                let permit = spool
+                    .acquire_read_response_permit()
+                    .await
+                    .map_err(ApiError)?;
+                let first_len = integrity.length.min(page_size) as usize;
+                let first_chunk = match spool
+                    .read_integrity_chunk(0, first_len, &permit)
+                    .await
+                {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        spool
+                            .quarantine_integrity_failure("missing or short data file")
+                            .await
+                            .map_err(ApiError)?;
+                        unreachable!("quarantine always returns result_lost")
+                    }
+                };
+                lease.response_permit = Some(permit);
+                let stream_spool = Arc::clone(&spool);
+                let stream_metrics = Arc::clone(&state.metrics);
+                let stream_labels = read_labels.clone();
+                let stream = stream! {
+                    let mut lease = lease;
+                    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                    hasher.update(&first_chunk);
+                    let mut offset = first_chunk.len() as u64;
+                    let mut pending = first_chunk;
+                    while offset < integrity.length {
+                        let len = (integrity.length - offset).min(page_size) as usize;
+                        let response_permit = lease
+                            .response_permit
+                            .as_ref()
+                            .expect("verified stream retains read admission");
+                        let next = match stream_spool
+                            .read_integrity_chunk(offset, len, response_permit)
+                            .await
+                        {
+                            Ok(chunk) => chunk,
+                            Err(_) => {
+                                let error = stream_spool
+                                    .quarantine_integrity_failure("missing or short data file")
+                                    .await
+                                    .expect_err("quarantine returns result_lost");
+                                yield Err::<Bytes, BobsError>(error);
+                                return;
+                            }
+                        };
+                        hasher.update(&next);
+                        offset += next.len() as u64;
+                        lease.bytes_served += pending.len() as u64;
+                        yield Ok::<Bytes, BobsError>(pending);
+                        pending = next;
+                    }
+                    if offset != integrity.length || hasher.digest() != integrity.checksum {
+                        let error = stream_spool
+                            .quarantine_integrity_failure("checksum or length mismatch")
+                            .await
+                            .expect_err("quarantine returns result_lost");
+                        // The final buffered chunk is deliberately withheld, leaving
+                        // Content-Length unfulfilled so the client observes truncation.
+                        yield Err::<Bytes, BobsError>(error);
+                        return;
+                    }
+                    stream_spool.mark_integrity_verified();
+                    stream_spool
+                        .mark_contiguous_response_complete_and_maybe_fully_read(0, integrity.length)
+                        .await;
+                    lease.bytes_served += pending.len() as u64;
+                    lease.duration_recorded = true;
+                    stream_metrics.record_read_bytes(&stream_labels, read_mode, integrity.length);
+                    stream_metrics.record_read_duration(
+                        &stream_labels,
+                        read_mode,
+                        crate::metrics::outcome::SUCCESS,
+                        read_start.elapsed().as_secs_f64(),
+                    );
+                    yield Ok::<Bytes, BobsError>(pending);
+                };
+                let mut response = Body::from_stream(stream).into_response();
+                *response.status_mut() = if follow {
+                    StatusCode::OK
+                } else {
+                    StatusCode::PARTIAL_CONTENT
+                };
+                apply_read_response_headers(&mut response, &metadata, &response_range, &key)?;
+                return Ok(response);
+            }
+        }
+
     // Acquire response-buffer admission and pre-fetch the first page before
     // committing to a streaming response. The timeout covers both queueing and
     // long-polling; every error/redirect path drops any acquired permit.
     let first_page_idx = start / page_size;
     let first_read = async {
-        let permit = spool.acquire_read_response_permit().await?;
+        let permit = match verified_permit {
+            Some(permit) => permit,
+            None => spool.acquire_read_response_permit().await?,
+        };
         let page = spool.read_page(first_page_idx, &permit).await?;
         Ok::<_, BobsError>((page, permit))
     };
@@ -1227,6 +1364,10 @@ where
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
 }
 
 struct ApiError(BobsError);
@@ -1246,16 +1387,19 @@ impl IntoResponse for ApiError {
             BobsError::SpoolLocked => StatusCode::LOCKED,
             BobsError::SpoolClosed => StatusCode::CONFLICT,
             BobsError::InvalidState { .. } => StatusCode::CONFLICT,
+            BobsError::ResultLost { .. } => StatusCode::GONE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        let mut response = (
-            status,
-            Json(ErrorResponse {
-                error: self.0.to_string(),
-            }),
-        )
-            .into_response();
+        let (error, reason, key) = match &self.0 {
+            BobsError::ResultLost { key } => (
+                "result_lost".to_string(),
+                Some("integrity check failed after storage failure".to_string()),
+                Some(key.clone()),
+            ),
+            error => (error.to_string(), None, None),
+        };
+        let mut response = (status, Json(ErrorResponse { error, reason, key })).into_response();
         if let BobsError::RangeNotSatisfiable { total, .. } = &self.0 {
             let value = total
                 .map(|total| format!("bytes */{total}"))
@@ -1296,6 +1440,8 @@ mod tests {
             max_spool_bytes: 1024 * 1024,
             create_admission_timeout_ms: 100,
             fsync_enabled: true,
+            verify_before_send_bytes: 4 * 1024 * 1024,
+            async_sync_delay_ms: 500,
             enable_pprof: false,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 600,
@@ -1327,6 +1473,8 @@ mod tests {
             max_spool_bytes: 1024 * 1024,
             create_admission_timeout_ms: 100,
             fsync_enabled: true,
+            verify_before_send_bytes: 4 * 1024 * 1024,
+            async_sync_delay_ms: 500,
             enable_pprof: false,
             writer_inactivity_timeout_secs: 300,
             read_idle_ttl_secs: 2,
@@ -4438,5 +4586,258 @@ mod tests {
         assert_eq!(state.manager.active_read_responses(), 0);
         assert_eq!(state.manager.active_read_response_permits(), 0);
         assert_eq!(state.manager.read_response_available_permits(), 2);
+    }
+
+    #[derive(Clone, Copy)]
+    enum CrashDamage {
+        Truncate,
+        ZeroFill,
+        StaleSameLength,
+        Missing,
+    }
+
+    async fn assert_small_crash_damage_is_gone(damage: CrashDamage) {
+        let (app, state) = app_with_state().await;
+        let original = Bytes::from(vec![0x5a; 1024]);
+        let (key, spool) = complete_disk_fixture(&state, original).await;
+        spool.close_file_handle();
+        match damage {
+            CrashDamage::Truncate => {
+                let file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&spool.data_path)
+                    .await
+                    .expect("open data for truncation");
+                file.set_len(511).await.expect("truncate data");
+            }
+            CrashDamage::ZeroFill => {
+                tokio::fs::write(&spool.data_path, vec![0_u8; 1024])
+                    .await
+                    .expect("zero data");
+            }
+            CrashDamage::StaleSameLength => {
+                tokio::fs::write(&spool.data_path, vec![0xa5_u8; 1024])
+                    .await
+                    .expect("replace data with stale bytes");
+            }
+            CrashDamage::Missing => {
+                tokio::fs::remove_file(&spool.data_path)
+                    .await
+                    .expect("remove data file");
+            }
+        }
+
+        let response = app
+            .clone()
+            .oneshot(read_request(&key))
+            .await
+            .expect("read response");
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect 410")
+                .to_bytes(),
+        )
+        .expect("410 JSON");
+        assert_eq!(body["error"], "result_lost");
+        assert_eq!(body["key"], key);
+
+        let persisted = spool
+            .metadata_store
+            .read(&key)
+            .await
+            .expect("read quarantine metadata")
+            .expect("quarantine metadata exists");
+        assert!(persisted.integrity_failure.is_some());
+        let second = app
+            .oneshot(read_request(&key))
+            .await
+            .expect("second read response");
+        assert_eq!(second.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn completed_small_spools_detect_post_crash_damage_and_persist_quarantine() {
+        for damage in [
+            CrashDamage::Truncate,
+            CrashDamage::ZeroFill,
+            CrashDamage::StaleSameLength,
+            CrashDamage::Missing,
+        ] {
+            assert_small_crash_damage_is_gone(damage).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fsync_disabled_schedules_delayed_best_effort_sync() {
+        let (app, state) = app_with_config(|config| {
+            config.fsync_enabled = false;
+            config.async_sync_delay_ms = 1;
+        })
+        .await;
+        let key = write_and_complete(&app, b"sync me".to_vec()).await;
+        let spool = state.manager.get_spool(&key).expect("completed spool");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while spool.async_sync_count.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delayed sync should run");
+        assert_eq!(spool.async_sync_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn zero_async_sync_delay_disables_background_sync() {
+        let (app, state) = app_with_config(|config| {
+            config.fsync_enabled = false;
+            config.async_sync_delay_ms = 0;
+        })
+        .await;
+        let key = write_and_complete(&app, b"do not sync".to_vec()).await;
+        let spool = state.manager.get_spool(&key).expect("completed spool");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(spool.async_sync_count.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn corrupted_large_spool_aborts_without_completing_content_length() {
+        let (app, state) = app_with_config(|config| {
+            config.page_size = 4096;
+            config.verify_before_send_bytes = 1;
+        })
+        .await;
+        let original = Bytes::from(vec![0x37; 8192]);
+        let (key, spool) = complete_disk_fixture(&state, original).await;
+        spool.close_file_handle();
+        let mut damaged = vec![0x37; 8192];
+        damaged[5000] ^= 0xff;
+        tokio::fs::write(&spool.data_path, damaged)
+            .await
+            .expect("write stale large data");
+
+        let response = app
+            .clone()
+            .oneshot(read_request(&key))
+            .await
+            .expect("large read response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_LENGTH],
+            "8192"
+        );
+        assert!(
+            response.into_body().collect().await.is_err(),
+            "corrupted large transfer must abort before its final buffered chunk"
+        );
+        let second = app
+            .oneshot(read_request(&key))
+            .await
+            .expect("quarantined read response");
+        assert_eq!(second.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_damaged_complete_spools_as_result_lost() {
+        for damage in [
+            CrashDamage::Truncate,
+            CrashDamage::ZeroFill,
+            CrashDamage::StaleSameLength,
+            CrashDamage::Missing,
+        ] {
+            let (app, state) = app_with_state().await;
+            let (key, spool) = complete_disk_fixture(&state, Bytes::from(vec![0x6d; 1024])).await;
+            let data_path = spool.data_path.clone();
+            let config = Arc::clone(&state.config);
+            spool.close_file_handle();
+            match damage {
+                CrashDamage::Truncate => {
+                    let file = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&data_path)
+                        .await
+                        .expect("open recovered truncation fixture");
+                    file.set_len(400).await.expect("truncate recovered fixture");
+                }
+                CrashDamage::ZeroFill => {
+                    tokio::fs::write(&data_path, vec![0_u8; 1024])
+                        .await
+                        .expect("zero recovered fixture");
+                }
+                CrashDamage::StaleSameLength => {
+                    tokio::fs::write(&data_path, vec![0x9a_u8; 1024])
+                        .await
+                        .expect("stale recovered fixture");
+                }
+                CrashDamage::Missing => {
+                    tokio::fs::remove_file(&data_path)
+                        .await
+                        .expect("remove recovered fixture");
+                }
+            }
+            drop(spool);
+            drop(app);
+            drop(state);
+
+            let mut manager =
+                SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+                    DefaultMetadataStore::new(&config.data_dir),
+                    &config.data_dir,
+                    config.page_size,
+                    config.max_cache_bytes,
+                    config.max_live_spools,
+                )
+                .expect("restart manager");
+            let metrics = Arc::new(BobsMetrics::new(false));
+            manager.set_metrics(Arc::clone(&metrics));
+            manager.recover().await.expect("restart recovery");
+            let restarted = Arc::new(AppState {
+                manager: Arc::new(manager),
+                config,
+                hostname: "bobs-0".into(),
+                ordinal: "0".into(),
+                internal_base_url: "http://bobs-0:3000/api/v1".into(),
+                metrics,
+            });
+            let restarted_app =
+                router::<DefaultFileIO, DefaultMetadataStore>().with_state(restarted);
+            let response = restarted_app
+                .oneshot(read_request(&key))
+                .await
+                .expect("restarted read response");
+            assert_eq!(response.status(), StatusCode::GONE);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_complete_spool_without_integrity_metadata_is_still_served() {
+        let (app, state) = app_with_state().await;
+        let expected = Bytes::from_static(b"legacy payload");
+        let (key, spool) = complete_disk_fixture(&state, expected.clone()).await;
+        let snapshot = {
+            let mut metadata = spool.metadata.lock().await;
+            metadata.integrity = None;
+            metadata.clone()
+        };
+        spool
+            .persist_metadata(&snapshot)
+            .await
+            .expect("persist legacy sidecar");
+
+        let response = app
+            .oneshot(read_request(&key))
+            .await
+            .expect("legacy read response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect legacy body")
+            .to_bytes();
+        assert_eq!(body, expected);
     }
 }

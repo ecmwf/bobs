@@ -132,6 +132,8 @@ Range behavior:
 
 In follow mode, BOBS streams pages as they become visible. If no first page arrives within `long_poll_timeout_ms`, BOBS may issue a `307 Temporary Redirect` to the same `/api/v1/read/{key}` URL for long-poll refresh. If the timeout occurs after bytes have started streaming, BOBS aborts the transfer with a response-body error rather than redirecting or returning a clean end of stream.
 
+Completed spools created by integrity-aware versions are checked against the XXH3-64 checksum and exact length committed with `Complete`. Small payloads and partial ranges are verified before response headers. Large full-object reads hash while streaming and retain the final chunk until verification succeeds. Follow reads that began against a live writer are exempt because they consume bytes from the same running process before a storage-crash boundary.
+
 **Response Headers**:
 
 - `Accept-Ranges: bytes`: Advertises byte-range support.
@@ -161,6 +163,7 @@ curl http://localhost:3000/api/v1/read/YOUR_KEY -H "Range: bytes=1048576-"
 - `400 Bad Request`: Invalid or unsupported range syntax.
 - `416 Range Not Satisfiable`: Range cannot be served; `Content-Range` reports the known total or `*`.
 - `423 Locked`: Spool was created with `write_locked: true` and is not yet complete.
+- `410 Gone`: The completed result failed integrity verification after a storage failure. The JSON body is `{"error":"result_lost","reason":"integrity check failed after storage failure","key":"..."}`. If corruption is found after a large body has started, BOBS aborts the transfer without satisfying `Content-Length`; subsequent reads return this 410 response.
 
 ---
 
