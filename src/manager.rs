@@ -258,12 +258,12 @@ where
     async fn cleanup_failed_creation(&self, key: &str, handle: Option<F::Handle>) {
         if let Some(handle) = handle {
             if let Err(error) = F::close(handle).await {
-                tracing::warn!(key = %key, error = %error, "failed to close data file while rolling back spool creation");
+                tracing::warn!(request.id = request_id_for_key(key).as_deref(), key = %key, error = %error, "failed to close data file while rolling back spool creation");
             }
         }
 
         if let Err(error) = self.metadata_store.delete(key).await {
-            tracing::warn!(key = %key, error = %error, "failed to remove sidecar while rolling back spool creation");
+            tracing::warn!(request.id = request_id_for_key(key).as_deref(), key = %key, error = %error, "failed to remove sidecar while rolling back spool creation");
         }
 
         let spool_dir = self.data_dir.join(key);
@@ -271,13 +271,13 @@ where
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                tracing::warn!(key = %key, error = %error, "failed to remove spool directory while rolling back creation");
+                tracing::warn!(request.id = request_id_for_key(key).as_deref(), key = %key, error = %error, "failed to remove spool directory while rolling back creation");
             }
         }
 
         if self.metadata_store.fsync_enabled() {
             if let Err(error) = F::sync_directory(&self.data_dir).await {
-                tracing::warn!(key = %key, error = %error, "failed to sync data directory while rolling back spool creation");
+                tracing::warn!(request.id = request_id_for_key(key).as_deref(), key = %key, error = %error, "failed to sync data directory while rolling back spool creation");
             }
         }
     }
@@ -577,8 +577,11 @@ where
             outcome = tracing::field::Empty,
             error = tracing::field::Empty,
         );
-        if let Some(job_id) = job_id {
-            deletion_span.record("request.id", job_id);
+        if let Some(request_id) = job_id
+            .map(str::to_owned)
+            .or_else(|| request_id_for_key(key))
+        {
+            deletion_span.record("request.id", request_id.as_str());
         }
         match result {
             Ok(()) => {
@@ -624,10 +627,10 @@ where
         let result = self.delete_spool_locked(key, &spool).await;
         match &result {
             Ok(()) => {
-                tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "success", "spool deleted");
+                tracing::info!(request.id = request_id_for_key(key).as_deref(), "event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "success", "spool deleted");
             }
             Err(error) => {
-                tracing::error!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
+                tracing::error!(request.id = request_id_for_key(key).as_deref(), "event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = reason.as_str(), outcome = "error", error = %error, "spool deletion failed");
             }
         }
         result.map(|()| Some(labels))
@@ -804,7 +807,7 @@ where
                     match tokio::fs::remove_dir(&entry_path).await {
                         Ok(()) => {
                             orphan_deleted += 1;
-                            tracing::debug!(orphan = %name, "recovery: removed empty pre-marker spool directory; parent sync pending");
+                            tracing::debug!(request.id = request_id_for_key(&name).as_deref(), orphan = %name, "recovery: removed empty pre-marker spool directory; parent sync pending");
                         }
                         Err(error)
                             if matches!(
@@ -814,24 +817,24 @@ where
                             ) =>
                         {
                             if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
-                                tracing::warn!(orphan = %name, "recovery: preserving non-empty spool-key directory without spool markers");
+                                tracing::warn!(request.id = request_id_for_key(&name).as_deref(), orphan = %name, "recovery: preserving non-empty spool-key directory without spool markers");
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(orphan = %name, error = %error, "recovery: failed to inspect/remove empty pre-marker spool directory");
+                            tracing::warn!(request.id = request_id_for_key(&name).as_deref(), orphan = %name, error = %error, "recovery: failed to inspect/remove empty pre-marker spool directory");
                         }
                     }
                     continue;
                 }
 
-                tracing::warn!(orphan = %name, "removing orphan spool directory");
+                tracing::warn!(request.id = request_id_for_key(&name).as_deref(), orphan = %name, "removing orphan spool directory");
                 match self.remove_spool_directory_durably(&name).await {
                     Ok(()) => {
                         orphan_deleted += 1;
-                        tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
+                        tracing::info!(request.id = request_id_for_key(&name).as_deref(), "event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Orphan.as_str(), outcome = "success", "orphan spool deleted during recovery");
                     }
                     Err(error) => {
-                        tracing::warn!(orphan = %name, error = %error, "failed to durably remove orphan spool directory");
+                        tracing::warn!(request.id = request_id_for_key(&name).as_deref(), orphan = %name, error = %error, "failed to durably remove orphan spool directory");
                     }
                 }
                 continue;
@@ -840,7 +843,7 @@ where
             let meta = match self.metadata_store.read(&name).await {
                 Ok(Some(meta)) => meta,
                 Ok(None) => {
-                    tracing::warn!(key = %name, "recovery: indexed sidecar disappeared; leaving directory intact");
+                    tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, "recovery: indexed sidecar disappeared; leaving directory intact");
                     rejected_count += 1;
                     continue;
                 }
@@ -848,6 +851,7 @@ where
                 | Err(error @ BobsError::MetadataUnknownField { .. }) => {
                     tracing::warn!(
                         "event.name" = "bobs.recovery.sidecar_quarantined",
+                        request.id = request_id_for_key(&name).as_deref(),
                         key = %name,
                         error = %error,
                         "recovery: unsupported sidecar left intact and unavailable"
@@ -856,28 +860,28 @@ where
                     continue;
                 }
                 Err(error @ BobsError::SerializationError(_)) => {
-                    tracing::warn!(key = %name, error = %error, "recovery: corrupt sidecar metadata, discarding affected spool directory");
+                    tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, error = %error, "recovery: corrupt sidecar metadata, discarding affected spool directory");
                     self.metadata_store.delete(&name).await?;
                     self.remove_spool_directory_durably(&name).await?;
                     stale_count += 1;
                     corrupt_deleted += 1;
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+                    tracing::info!(request.id = request_id_for_key(&name).as_deref(), "event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                     continue;
                 }
                 Err(error) => {
-                    tracing::warn!(key = %name, error = %error, "recovery: sidecar read failed; leaving affected spool intact and unavailable");
+                    tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, error = %error, "recovery: sidecar read failed; leaving affected spool intact and unavailable");
                     rejected_count += 1;
                     continue;
                 }
             };
 
             if meta.key != name {
-                tracing::warn!(directory_key = %name, metadata_key = %meta.key, "recovery: sidecar key does not match directory, discarding");
+                tracing::warn!(request.id = request_id_for_key(&name).as_deref(), directory_key = %name, metadata_key = %meta.key, "recovery: sidecar key does not match directory, discarding");
                 self.metadata_store.delete(&name).await?;
                 self.remove_spool_directory_durably(&name).await?;
                 stale_count += 1;
                 corrupt_deleted += 1;
-                tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+                tracing::info!(request.id = request_id_for_key(&name).as_deref(), "event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                 continue;
             }
 
@@ -891,12 +895,12 @@ where
                 } else {
                     "incomplete Deleting transition"
                 };
-                tracing::warn!(key = %name, reason, "recovery: discarding unrecoverable spool directory");
+                tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, reason, "recovery: discarding unrecoverable spool directory");
                 self.metadata_store.delete(&name).await?;
                 self.remove_spool_directory_durably(&name).await?;
                 stale_count += 1;
                 corrupt_deleted += 1;
-                tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+                tracing::info!(request.id = request_id_for_key(&name).as_deref(), "event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                 continue;
             }
 
@@ -905,12 +909,12 @@ where
             let file_metadata = match F::symlink_metadata(&canonical_data_path).await {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::warn!(key = %name, "recovery: canonical data file missing; leaving spool intact and continuing scan");
+                    tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, "recovery: canonical data file missing; leaving spool intact and continuing scan");
                     rejected_count += 1;
                     continue;
                 }
                 Err(error) => {
-                    tracing::warn!(key = %name, error = %error, "recovery: canonical payload metadata preflight failed; leaving spool intact and continuing scan");
+                    tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, error = %error, "recovery: canonical payload metadata preflight failed; leaving spool intact and continuing scan");
                     rejected_count += 1;
                     continue;
                 }
@@ -921,7 +925,7 @@ where
                 } else {
                     "canonical data file is not a regular file"
                 };
-                tracing::warn!(key = %name, reason, "recovery: candidate left intact and unavailable");
+                tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, reason, "recovery: candidate left intact and unavailable");
                 rejected_count += 1;
                 continue;
             }
@@ -941,7 +945,7 @@ where
                     let handle = match F::open(&canonical_data_path).await {
                         Ok(handle) => handle,
                         Err(error) => {
-                            tracing::warn!(key = %name, error = %error, "recovery: canonical payload open preflight failed; leaving spool intact and continuing scan");
+                            tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, error = %error, "recovery: canonical payload open preflight failed; leaving spool intact and continuing scan");
                             rejected_count += 1;
                             continue;
                         }
@@ -949,7 +953,7 @@ where
                     let opened_file_size = match F::file_size(&handle).await {
                         Ok(file_size) => file_size,
                         Err(error) => {
-                            tracing::warn!(key = %name, error = %error, "recovery: opened payload metadata preflight failed; leaving spool intact and continuing scan");
+                            tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, error = %error, "recovery: opened payload metadata preflight failed; leaving spool intact and continuing scan");
                             close_recovery_handle::<F>(
                                 &name,
                                 Some(handle),
@@ -961,7 +965,7 @@ where
                         }
                     };
                     if opened_file_size != preflight_file_size {
-                        tracing::warn!(key = %name, preflight_file_size, opened_file_size, "recovery: canonical payload size changed during preflight; leaving spool intact and continuing scan");
+                        tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, preflight_file_size, opened_file_size, "recovery: canonical payload size changed during preflight; leaving spool intact and continuing scan");
                         close_recovery_handle::<F>(&name, Some(handle), "size-raced preflight")
                             .await;
                         rejected_count += 1;
@@ -1010,15 +1014,15 @@ where
                     }
                 }
                 RecoveryMetadataDisposition::Cleanup { reason } => {
-                    tracing::warn!(key = %name, reason = %reason, "recovery: discarding unrecoverable spool directory");
+                    tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, reason = %reason, "recovery: discarding unrecoverable spool directory");
                     self.metadata_store.delete(&name).await?;
                     self.remove_spool_directory_durably(&name).await?;
                     stale_count += 1;
                     corrupt_deleted += 1;
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+                    tracing::info!(request.id = request_id_for_key(&name).as_deref(), "event.name" = "bobs.spool.deleted", "bobs.spool.key" = %name, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                 }
                 RecoveryMetadataDisposition::Preserve { reason } => {
-                    tracing::warn!(key = %name, reason = %reason, "recovery: candidate left intact and unavailable");
+                    tracing::warn!(request.id = request_id_for_key(&name).as_deref(), key = %name, reason = %reason, "recovery: candidate left intact and unavailable");
                     rejected_count += 1;
                 }
             }
@@ -1043,14 +1047,14 @@ where
             let meta = match self.metadata_store.read(&key).await {
                 Ok(Some(meta)) if meta.key == key => meta,
                 Ok(Some(meta)) => {
-                    tracing::warn!(directory_key = %key, metadata_key = %meta.key, "recovery: selected sidecar key changed; leaving it intact and unavailable");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), directory_key = %key, metadata_key = %meta.key, "recovery: selected sidecar key changed; leaving it intact and unavailable");
                     close_recovery_handle::<F>(&key, preflight_handle.take(), "rejected preflight")
                         .await;
                     rejected_count += 1;
                     continue;
                 }
                 Ok(None) => {
-                    tracing::warn!(key = %key, "recovery: selected sidecar disappeared; leaving directory intact");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, "recovery: selected sidecar disappeared; leaving directory intact");
                     close_recovery_handle::<F>(
                         &key,
                         preflight_handle.take(),
@@ -1061,7 +1065,7 @@ where
                     continue;
                 }
                 Err(error) => {
-                    tracing::warn!(key = %key, error = %error, "recovery: selected sidecar changed or became unreadable; leaving it intact and trying the next candidate");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, error = %error, "recovery: selected sidecar changed or became unreadable; leaving it intact and trying the next candidate");
                     close_recovery_handle::<F>(
                         &key,
                         preflight_handle.take(),
@@ -1082,7 +1086,7 @@ where
             {
                 Ok(file_size) => file_size,
                 Err(error) => {
-                    tracing::warn!(key = %key, error = %error, "recovery: selected canonical payload metadata check failed; leaving spool intact and trying the next candidate");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, error = %error, "recovery: selected canonical payload metadata check failed; leaving spool intact and trying the next candidate");
                     close_recovery_handle::<F>(
                         &key,
                         preflight_handle.take(),
@@ -1102,7 +1106,7 @@ where
             ) {
                 RecoveryMetadataDisposition::Candidate(prepared) => *prepared,
                 RecoveryMetadataDisposition::Cleanup { reason } => {
-                    tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unrecoverable; discarding it and trying the next candidate");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, reason = %reason, "recovery: selected candidate became unrecoverable; discarding it and trying the next candidate");
                     close_recovery_handle::<F>(
                         &key,
                         preflight_handle.take(),
@@ -1113,11 +1117,11 @@ where
                     self.remove_spool_directory_durably(&key).await?;
                     stale_count += 1;
                     corrupt_deleted += 1;
-                    tracing::info!("event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
+                    tracing::info!(request.id = request_id_for_key(&key).as_deref(), "event.name" = "bobs.spool.deleted", "bobs.spool.key" = %key, reason = DeleteReason::Corrupt.as_str(), outcome = "success", "spool deleted during recovery");
                     continue;
                 }
                 RecoveryMetadataDisposition::Preserve { reason } => {
-                    tracing::warn!(key = %key, reason = %reason, "recovery: selected candidate became unsafe; leaving it intact and trying the next candidate");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, reason = %reason, "recovery: selected candidate became unsafe; leaving it intact and trying the next candidate");
                     close_recovery_handle::<F>(&key, preflight_handle.take(), "unsafe preflight")
                         .await;
                     rejected_count += 1;
@@ -1137,7 +1141,7 @@ where
             let spool_page_size = migration.page_size;
 
             if file_size != preflight_file_size {
-                tracing::warn!(key = %key, preflight_file_size, file_size, "recovery: canonical payload size changed after preflight; leaving spool intact and trying the next candidate");
+                tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, preflight_file_size, file_size, "recovery: canonical payload size changed after preflight; leaving spool intact and trying the next candidate");
                 close_recovery_handle::<F>(&key, preflight_handle.take(), "size-raced preflight")
                     .await;
                 rejected_count += 1;
@@ -1147,7 +1151,7 @@ where
             let permit = match Arc::clone(&self.admission).try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    tracing::warn!(key = %key, "recovery: admission permit unavailable before configured bound");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, "recovery: admission permit unavailable before configured bound");
                     close_recovery_handle::<F>(
                         &key,
                         preflight_handle.take(),
@@ -1169,7 +1173,7 @@ where
                 match F::open(&canonical_data_path).await {
                     Ok(reopened) => handle = Some(reopened),
                     Err(error) => {
-                        tracing::warn!(key = %key, error = %error, "recovery: active payload changed after terminal preflight; leaving spool intact");
+                        tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, error = %error, "recovery: active payload changed after terminal preflight; leaving spool intact");
                         rejected_count += 1;
                         drop(permit);
                         continue;
@@ -1179,7 +1183,7 @@ where
 
             let trailing_partial = if trailing_partial_len > 0 {
                 let Some(active_handle) = handle.as_ref() else {
-                    tracing::warn!(key = %key, "recovery: active candidate lost its retained payload handle");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, "recovery: active candidate lost its retained payload handle");
                     rejected_count += 1;
                     drop(permit);
                     continue;
@@ -1194,7 +1198,7 @@ where
                 {
                     Ok(partial) => Some(partial),
                     Err(error) => {
-                        tracing::warn!(key = %key, error = %error, "recovery: failed to validate trailing partial page; leaving spool intact and trying the next candidate");
+                        tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, error = %error, "recovery: failed to validate trailing partial page; leaving spool intact and trying the next candidate");
                         close_recovery_handle::<F>(&key, handle.take(), "rejected active data")
                             .await;
                         rejected_count += 1;
@@ -1208,17 +1212,17 @@ where
 
             if metadata_needs_persist {
                 if data_path_migrated {
-                    tracing::info!(key = %key, data_path = %meta.data_path.display(), "recovery: atomically migrating stale payload path metadata to the canonical local spool");
+                    tracing::info!(request.id = request_id_for_key(&key).as_deref(), key = %key, data_path = %meta.data_path.display(), "recovery: atomically migrating stale payload path metadata to the canonical local spool");
                 }
                 if migration.write_locked_salvage {
-                    tracing::warn!(key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating WriteLocked spool to bounded Complete salvage; further writes are rejected, reads and idempotent completion remain available");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating WriteLocked spool to bounded Complete salvage; further writes are rejected, reads and idempotent completion remain available");
                 } else if migration.legacy_writing_salvage {
-                    tracing::warn!(key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating zero-page legacy Writing spool to bounded Complete salvage; exact durable bytes remain readable and further writes are rejected");
+                    tracing::warn!(request.id = request_id_for_key(&key).as_deref(), key = %key, page_size = spool_page_size, file_size = file_size, "recovery: atomically migrating zero-page legacy Writing spool to bounded Complete salvage; exact durable bytes remain readable and further writes are rejected");
                 } else if migration.persist {
-                    tracing::info!(key = %key, page_size = spool_page_size, "recovery: atomically resegmenting terminal or legacy sidecar metadata");
+                    tracing::info!(request.id = request_id_for_key(&key).as_deref(), key = %key, page_size = spool_page_size, "recovery: atomically resegmenting terminal or legacy sidecar metadata");
                 }
                 if finalized_completing {
-                    tracing::info!(key = %key, total_bytes = meta.total_bytes_written, total_pages = meta.total_pages, "recovery: finalizing durable Completing marker");
+                    tracing::info!(request.id = request_id_for_key(&key).as_deref(), key = %key, total_bytes = meta.total_bytes_written, total_pages = meta.total_pages, "recovery: finalizing durable Completing marker");
                 }
                 if let Err(error) = self.metadata_store.write(&meta).await {
                     close_recovery_handle::<F>(&key, handle.take(), "metadata persistence failure")
@@ -1358,7 +1362,7 @@ async fn close_recovery_handle<F: FileIO>(
 ) {
     if let Some(handle) = handle {
         if let Err(error) = F::close(handle).await {
-            tracing::warn!(key = %key, error = %error, context, "recovery: failed to close payload handle");
+            tracing::warn!(request.id = request_id_for_key(key).as_deref(), key = %key, error = %error, context, "recovery: failed to close payload handle");
         }
     }
 }
@@ -1949,6 +1953,12 @@ struct InProgressProgress {
 /// touches recognised keys, so unrelated operator directories are left alone.
 pub(crate) fn is_recognised_spool_key(name: &str) -> bool {
     uuid::Uuid::parse_str(name).is_ok() || is_request_id_key(name)
+}
+
+/// The request ID a spool key stands for, for log correlation: the canonical
+/// (lower-case) key when it is a request ID, `None` for anonymous UUID spools.
+pub(crate) fn request_id_for_key(key: &str) -> Option<String> {
+    is_request_id_key(key).then(|| key.to_ascii_lowercase())
 }
 
 /// True for a 26-character Crockford base32 request ID. Validation is
@@ -2712,6 +2722,65 @@ mod tests {
         assert!(!is_recognised_spool_key("not-a-key"));
         assert!(!is_request_id_key("0123456789abcdefghjkmnpqr")); // 25 chars
         assert!(!is_request_id_key("0123456789abcdefghijklmnop")); // i, l, o excluded
+    }
+
+    #[test]
+    fn request_id_for_key_canonicalizes_and_skips_uuids() {
+        assert_eq!(
+            request_id_for_key("0123456789ABCDEFGHJKMNPQRS").as_deref(),
+            Some("0123456789abcdefghjkmnpqrs")
+        );
+        assert_eq!(request_id_for_key(&uuid::Uuid::new_v4().to_string()), None);
+        assert_eq!(request_id_for_key("not-a-key"), None);
+    }
+
+    #[tokio::test]
+    async fn ttl_deletes_log_request_id_for_request_keyed_spools() {
+        const REQUEST_KEY: &str = "0123456789abcdefghjkmnpqrs";
+        let (subscriber, logs) = {
+            let _env = crate::observability::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: serialised by ENV_LOCK.
+            unsafe { std::env::set_var("RUST_LOG", "info") };
+            crate::observability::capturing_subscriber("bobs")
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempdir().expect("create tempdir");
+        let data_dir = dir.path().join("data");
+        let manager = SpoolManager::<TokioFileIO>::new(&data_dir, 4096, 16 * 4096, 256)
+            .expect("manager init");
+        manager
+            .create_spool(REQUEST_KEY.into(), None, None, false, HashMap::new())
+            .await
+            .expect("create request-keyed spool");
+        let anonymous = uuid::Uuid::new_v4().to_string();
+        manager
+            .create_spool(anonymous.clone(), None, None, false, HashMap::new())
+            .await
+            .expect("create anonymous spool");
+
+        for key in [REQUEST_KEY, anonymous.as_str()] {
+            manager
+                .delete_spool_with_reason_if(key, DeleteReason::Ttl, |_, _| true)
+                .await
+                .expect("ttl delete")
+                .expect("candidate still current");
+        }
+
+        let deletes = logs.events_named("bobs.spool.deleted");
+        let request_id_of = |key: &str| {
+            deletes
+                .iter()
+                .find(|e| e["attributes"]["bobs.spool.key"] == key)
+                .unwrap_or_else(|| panic!("no delete event for {key}: {}", logs.raw()))
+                ["attributes"]
+                .get("request.id")
+                .cloned()
+        };
+        assert_eq!(request_id_of(REQUEST_KEY), Some(REQUEST_KEY.into()));
+        assert_eq!(request_id_of(&anonymous), None);
     }
 
     #[tokio::test]

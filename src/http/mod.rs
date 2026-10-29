@@ -45,8 +45,13 @@ fn request_span(
         offset = tracing::field::Empty,
         range = tracing::field::Empty,
     );
-    if let Some(job_id) = job_id {
-        span.record("request.id", job_id);
+    // Fall back to the spool key (the request ID for request-keyed spools) for
+    // callers that don't send the header, e.g. end-user reads.
+    if let Some(request_id) = job_id
+        .map(str::to_owned)
+        .or_else(|| key.and_then(crate::manager::request_id_for_key))
+    {
+        span.record("request.id", request_id.as_str());
     }
     if let Some(key) = key {
         span.record("bobs.spool.key", key);
@@ -882,7 +887,9 @@ where
         }
     };
 
-    let stream_job_id = job_id.clone();
+    let stream_job_id = job_id
+        .clone()
+        .or_else(|| crate::manager::request_id_for_key(&key));
     let stream_key = key.clone();
     let stream_range = raw_range.clone();
     let stream_metrics = Arc::clone(&state.metrics);
@@ -930,7 +937,7 @@ where
                     }
                     Err(_) => {
                         outcome = crate::metrics::outcome::TIMEOUT;
-                        tracing::warn!("event.name" = "bobs.spool.read.timeout", "bobs.spool.key" = %stream_key, range = %stream_range, start = start, end = ?end, follow = follow, bytes = bytes_served, outcome = "error", "spool read timed out mid-stream");
+                        tracing::warn!("event.name" = "bobs.spool.read.timeout", request.id = stream_job_id.as_deref(), "bobs.spool.key" = %stream_key, range = %stream_range, start = start, end = ?end, follow = follow, bytes = bytes_served, outcome = "error", "spool read timed out mid-stream");
                         lease.duration_recorded = true;
                         stream_metrics.record_read_bytes(&stream_labels, stream_mode, bytes_served);
                         stream_metrics.record_read_duration(&stream_labels, stream_mode, outcome, read_start.elapsed().as_secs_f64());
