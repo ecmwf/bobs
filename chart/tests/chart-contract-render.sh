@@ -382,3 +382,19 @@ assert_contains 'containerPort: 4322' "$tmp_dir/metrics-ports.yaml"
 assert_template_rejects metrics-port-collision \
 	'config.metrics.port must differ from config.port when metrics are enabled' \
 	--set config.port=4321 --set config.metrics.enabled=true --set config.metrics.port=4321
+
+helm template bobs "$chart_dir" "${common_values[@]}" \
+	--show-only templates/statefulset.yaml >"$tmp_dir/extra-env-default.yaml"
+if grep -Fq MALLOC_MMAP_THRESHOLD_ "$tmp_dir/extra-env-default.yaml"; then
+	printf 'Expected no extraEnv entries by default\n' >&2
+	exit 1
+fi
+helm template bobs "$chart_dir" "${common_values[@]}" \
+	--show-only templates/statefulset.yaml \
+	--set 'extraEnv[0].name=MALLOC_MMAP_THRESHOLD_' \
+	--set-string 'extraEnv[0].value=1048576' \
+	>"$tmp_dir/extra-env.yaml"
+assert_contains 'name: MALLOC_MMAP_THRESHOLD_' "$tmp_dir/extra-env.yaml"
+assert_contains 'value: "1048576"' "$tmp_dir/extra-env.yaml"
+assert_contains 'name: RUST_LOG' "$tmp_dir/extra-env.yaml"
+assert_schema_rejects extra-env-missing-name --set 'extraEnv[0].value=x'

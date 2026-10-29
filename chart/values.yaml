@@ -96,6 +96,15 @@ internalBaseUrlTemplate: ""
 # tracing-subscriber filter used by the BOBS process.
 rustLog: info
 
+# Extra environment variables for the BOBS container, as standard Kubernetes
+# EnvVar entries (name/value or name/valueFrom), appended after the built-in
+# ones. Changing them rolls the StatefulSet.
+# Example: stop glibc from retaining freed page-sized buffers in its arenas.
+# extraEnv:
+#   - name: MALLOC_MMAP_THRESHOLD_
+#     value: "1048576"
+extraEnv: []
+
 observability:
   # deployment.environment OTel resource attribute.
   # If set, injects BOBS_DEPLOYMENT_ENV directly; otherwise reads from a

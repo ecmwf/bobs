@@ -77,6 +77,9 @@ spec:
               # {{- include "bobs.deploymentEnvEntry" . | nindent 14 }}
             - name: BOBS_INTERNAL_BASE_URL_TEMPLATE
               # {{- include "bobs.internalBaseUrlEntry" . | nindent 14 }}
+            # {{- with .Values.extraEnv }}
+            # {{- toYaml . | nindent 12 }}
+            # {{- end }}
           command: ["bobs"]
           args: ["/etc/bobs/config.yaml"]
           ports:
