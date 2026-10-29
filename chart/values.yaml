@@ -99,7 +99,8 @@ rustLog: info
 # Extra environment variables for the BOBS container, as standard Kubernetes
 # EnvVar entries (name/value or name/valueFrom), appended after the built-in
 # ones. Changing them rolls the StatefulSet.
-# Example: stop glibc from retaining freed page-sized buffers in its arenas.
+# Example: stop glibc from retaining freed page-sized buffers in its arenas;
+# see "Memory behaviour and the glibc allocator" in docs/src/configuration.md.
 # extraEnv:
 #   - name: MALLOC_MMAP_THRESHOLD_
 #     value: "1048576"

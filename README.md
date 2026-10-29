@@ -158,8 +158,8 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `host` | `0.0.0.0` | Address to listen on. |
 | `port` | `3000` | Port to listen on. |
 | `data_dir` | `./data` | Directory for storing spool files. |
-| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of individual data pages. Valid range `1..=67108864` (64 MiB), no larger than `max_spool_bytes`. In-progress readers see a page only once it is full; `/api/v1/complete/{key}` publishes the final partial page. |
-| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO budget for bounded cache-owned page allocations across all spools, excluding allocator overhead, and the source for `max(1, floor(max_cache_bytes / page_size))` weighted read-response permits held through response-body lifetime. Cache admission may copy solely to avoid retaining an oversized frame backing; disabled caching and pages rejected for exceeding the cap do not make that isolation copy. `0` still admits one bounded disk-backed response. |
+| `page_size` | binary: `16777216` (16 MiB); chart: `4096` (4 KiB) | Size of individual data pages. Valid range `1..=67108864` (64 MiB), no larger than `max_spool_bytes`. In-progress readers see a page only once it is full; `/api/v1/complete/{key}` publishes the final partial page. Per-request memory scales with it; see the memory section of the Configuration docs. |
+| `max_cache_bytes` | binary: `268435456` (256 MiB); chart: `1048576` (1 MiB) | Global FIFO budget for bounded cache-owned page allocations across all spools, excluding allocator overhead, and the source for `max(1, floor(max_cache_bytes / page_size))` weighted read-response permits held through response-body lifetime. Cache admission may copy solely to avoid retaining an oversized frame backing; disabled caching and pages rejected for exceeding the cap do not make that isolation copy. `0` still admits one bounded disk-backed response. The cache adds up to this many resident bytes per pod on top of per-request buffers. |
 | `max_live_spools` | binary: derived as `max(1, max_cache_bytes / page_size)` (`16`); chart: explicit `256` | Admission limit for the first-read cache phase and startup recovery. Valid range: `1..=65536`. Omitted values derive from effective page/cache settings; explicit values are preserved. Recovery no-follow open-preflights candidate payloads, uses a preferred summary and handle set whose capacity is exactly this limit, and closes displaced or excess handles without payload reads or sidecar rewrites. Failed preflights leave the spool intact and the scan continues. Proven full-object coverage frees a live spool's cache and admission slot while leaving it readable from disk. |
 | `max_spool_bytes` | `8589934592` (8 GiB) | Maximum accepted size of one spool; must be at least `page_size`. An upload that crosses the limit returns `413` after the partial spool is durably deleted. |
 | `create_admission_timeout_ms` | `5000` | Maximum `/api/v1/create` admission wait before `503 Service Unavailable`. |
@@ -250,6 +250,13 @@ location snippet; community ingress-nginx renders one Ingress per replica with a
 matching `nginx.ingress.kubernetes.io/x-forwarded-prefix`. Setting
 `ingress.forwardedPrefix.enabled: false` while ingress is enabled is rejected rather
 than rendering a broken redirect contract.
+
+`extraEnv` appends standard Kubernetes `EnvVar` entries to the container
+environment (empty by default; changing it rolls the StatefulSet). With large
+`page_size` values, glibc `malloc` can retain freed page-sized buffers and grow
+resident memory until the pod is OOM-killed; setting `MALLOC_MMAP_THRESHOLD_` to
+`1048576` through `extraEnv` mitigates it. See "Memory behaviour and the glibc
+allocator" in the Configuration docs for symptoms, diagnosis, and trade-offs.
 
 Validate chart changes with Helm and `kubeconform` v0.8.0:
 
