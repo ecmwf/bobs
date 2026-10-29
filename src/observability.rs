@@ -459,13 +459,14 @@ pub mod test_helper {
     }
 }
 
+/// Serialises tests that read or mutate process-wide env (e.g. `RUST_LOG`).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Mutex as StdMutex;
-
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn observability_formatter_shape_span_fields_and_redaction() {

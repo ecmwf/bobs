@@ -146,11 +146,11 @@ where
                         .record_spool_deleted(&labels, candidate.reason);
                 }
                 Ok(None) => {
-                    tracing::debug!(%key, "cleanup candidate invalidated by lifecycle activity");
+                    tracing::debug!(%key, request.id = crate::manager::request_id_for_key(&key).as_deref(), "cleanup candidate invalidated by lifecycle activity");
                 }
                 Err(err) => {
                     failed_delete += 1;
-                    tracing::debug!(%key, error = %err, "cleanup delete failed");
+                    tracing::debug!(%key, request.id = crate::manager::request_id_for_key(&key).as_deref(), error = %err, "cleanup delete failed");
                 }
             }
         }

@@ -233,6 +233,72 @@ async fn observability_no_header_flow_succeeds_without_job_id() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn observability_headerless_requests_on_request_keyed_spool_carry_request_id() {
+    let (subscriber, logs) = with_rust_log(Some("debug"), || {
+        bobs::observability::capturing_subscriber("bobs")
+    });
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let app = app().await;
+    let (app, key) = create(app, Some(VALID_JOB_ID), "application/octet-stream").await;
+    assert_eq!(key, VALID_JOB_ID);
+    let _app = write_complete_read_delete(app, &key, None).await;
+    for name in [
+        "bobs.spool.write.completed",
+        "bobs.spool.completed",
+        "bobs.spool.read.started",
+        "bobs.spool.read.completed",
+        "bobs.spool.deleted",
+    ] {
+        let events = logs.events_named(name);
+        assert!(!events.is_empty(), "no {name} events: {}", logs.raw());
+        assert!(
+            events
+                .iter()
+                .all(|event| event["attributes"]["request.id"] == VALID_JOB_ID),
+            "missing request.id on {name}: {}",
+            logs.raw()
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn observability_recovery_orphan_sweep_logs_request_id() {
+    const ORPHAN_KEY: &str = "zzzzzzzzzzzzzzzzzzzzzzzzzz";
+    let (subscriber, logs) = with_rust_log(Some("info"), || {
+        bobs::observability::capturing_subscriber("bobs")
+    });
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let data_dir = tempdir().expect("tempdir").keep().join("data");
+    for name in [ORPHAN_KEY.to_string(), uuid::Uuid::new_v4().to_string()] {
+        let orphan_dir = data_dir.join(&name);
+        std::fs::create_dir_all(&orphan_dir).expect("create orphan dir");
+        std::fs::write(orphan_dir.join("spool.dat"), b"orphan").expect("write orphan data");
+    }
+    let manager = SpoolManager::<DefaultFileIO, DefaultMetadataStore>::with_metadata_store(
+        DefaultMetadataStore::new(&data_dir),
+        &data_dir,
+        4096,
+        65536,
+        256,
+    )
+    .expect("manager");
+    manager.recover().await.expect("recover");
+
+    let deletes = logs.events_named("bobs.spool.deleted");
+    assert_eq!(deletes.len(), 2, "{}", logs.raw());
+    for event in deletes {
+        let attrs = &event["attributes"];
+        assert_eq!(attrs["reason"], "orphan");
+        if attrs["bobs.spool.key"] == ORPHAN_KEY {
+            assert_eq!(attrs["request.id"], ORPHAN_KEY, "{}", logs.raw());
+        } else {
+            assert!(attrs.get("request.id").is_none(), "{}", logs.raw());
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn observability_header_validation_and_redaction() {
     let (subscriber, logs) =
         with_rust_log(None, || bobs::observability::capturing_subscriber("bobs"));
