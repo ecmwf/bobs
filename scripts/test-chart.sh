@@ -86,6 +86,13 @@ assert_contains 'whenScaled: Delete' "$tmpdir/default.yaml"
 assert_contains '- ReadWriteOnce' "$tmpdir/default.yaml"
 assert_contains 'volumeMode: Filesystem' "$tmpdir/default.yaml"
 assert_not_contains 'volumeDevices:' "$tmpdir/default.yaml"
+assert_contains '- name: MALLOC_MMAP_THRESHOLD_' "$tmpdir/default.yaml"
+assert_contains 'value: "1048576"' "$tmpdir/default.yaml"
+
+helm template bobs "$chart" "${common_values[@]}" --set mallocMmapThreshold=null >"$tmpdir/malloc-unset.yaml"
+assert_not_contains 'MALLOC_MMAP_THRESHOLD_' "$tmpdir/malloc-unset.yaml"
+assert_schema_rejects malloc-threshold-high --set mallocMmapThreshold=40000000
+assert_schema_rejects malloc-threshold-zero --set mallocMmapThreshold=0
 
 helm template bobs "$chart" "${common_values[@]}" \
   --set global.imageRegistry=registry.example.com/team \

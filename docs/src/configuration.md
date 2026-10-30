@@ -74,15 +74,15 @@ The StatefulSet pod template's `checksum/config` annotation is a deterministic S
 
 ## Helm extra environment variables
 
-`extraEnv` is a list of standard Kubernetes `EnvVar` entries (`name` plus `value` or `valueFrom`) appended after the chart's built-in container environment variables. It is empty by default, and changing it rolls the StatefulSet. It is the supported way to set process-level variables such as glibc malloc tunables without forking the chart:
+The chart sets `MALLOC_MMAP_THRESHOLD_` from `mallocMmapThreshold` (default `1048576`; an integer from 1 to `33554432`, or `null` to leave the variable unset); see [Memory behaviour](#memory-behaviour).
+
+`extraEnv` is a list of standard Kubernetes `EnvVar` entries (`name` plus `value` or `valueFrom`) appended after the chart's built-in container environment variables. It is empty by default, and changing it rolls the StatefulSet. Use it to set other process-level variables without forking the chart:
 
 ```yaml
 extraEnv:
-  - name: MALLOC_MMAP_THRESHOLD_
-    value: "1048576"
+  - name: RUST_BACKTRACE
+    value: "1"
 ```
-
-See [Memory behaviour](#memory-behaviour) for when this particular setting is useful.
 
 ## Helm ingress and shutdown settings
 
@@ -181,12 +181,10 @@ Resident memory is the page cache (at most `max_cache_bytes`), in-flight request
 
 **Per-request buffers.** In-flight memory scales with `page_size` and with the chunk size the producer sends: roughly 1-2 pages per concurrent upload (measured 23-34 MB at 16 MiB pages and 12-23 MB at 4 MiB pages with HTTP/2 uploads, lowest with 1 MiB producer chunks) and one page per in-flight read response, of which there are at most `max(1, floor(max_cache_bytes / page_size))`. A full cache costs about `max_cache_bytes` resident. Size container limits from upload concurrency times per-upload memory, plus read permits times `page_size`, plus `max_cache_bytes`, plus headroom for the allocator.
 
-**glibc allocator retention.** With large pages (the official image is Debian/glibc), page-sized buffers are allocated and freed on every request. After the first free of an `mmap`ed chunk, glibc raises its dynamic `mmap` threshold to that size, so later page buffers come from the heap and per-thread arenas, where freed memory is not returned to the OS. Resident anonymous memory then ratchets up with request churn rather than with live data (it shows as `RssAnon` and as `[heap]` plus many resident 64 MiB anonymous mappings in `/proc/<pid>/smaps`, and does not fall when spools are deleted). Set `MALLOC_MMAP_THRESHOLD_=1048576` (any value below `page_size`, at most `33554432`) in the process environment; this disables the dynamic threshold so page buffers keep using `mmap` and are unmapped on free, at the cost of an `mmap`/`munmap` per allocation of 1 MiB or more. In the Helm chart, use [`extraEnv`](#helm-extra-environment-variables):
+**glibc allocator retention.** With large pages (the official image is Debian/glibc), page-sized buffers are allocated and freed on every request. After the first free of an `mmap`ed chunk, glibc raises its dynamic `mmap` threshold to that size, so later page buffers come from the heap and per-thread arenas, where freed memory is not returned to the OS. Resident anonymous memory then ratchets up with request churn rather than with live data (it shows as `RssAnon` and as `[heap]` plus many resident 64 MiB anonymous mappings in `/proc/<pid>/smaps`, and does not fall when spools are deleted). Set `MALLOC_MMAP_THRESHOLD_=1048576` (any value below `page_size`, at most `33554432`) in the process environment; this disables the dynamic threshold so page buffers keep using `mmap` and are unmapped on free, at the cost of an `mmap`/`munmap` per allocation of 1 MiB or more. The Helm chart sets `MALLOC_MMAP_THRESHOLD_=1048576` by default through `mallocMmapThreshold` (see [Helm extra environment variables](#helm-extra-environment-variables)):
 
 ```yaml
-extraEnv:
-  - name: MALLOC_MMAP_THRESHOLD_
-    value: "1048576"
+mallocMmapThreshold: 1048576
 ```
 
 The chart's default 4 KiB `page_size` is below glibc's initial threshold, so this matters for deployments that raise `page_size`. Even with the variable set, expect some tens of MB of retained memory after heavy churn, more with producers that send chunks below 1 MiB.

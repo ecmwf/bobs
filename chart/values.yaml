@@ -96,14 +96,19 @@ internalBaseUrlTemplate: ""
 # tracing-subscriber filter used by the BOBS process.
 rustLog: info
 
+# MALLOC_MMAP_THRESHOLD_ for the BOBS container. The image is glibc; fixing the
+# threshold keeps allocations of at least this size on mmap, so freed page
+# buffers are returned to the OS instead of staying resident in the heap.
+# Must be below config.page_size to matter and at most 33554432. Set to null to
+# not set the variable.
+mallocMmapThreshold: 1048576
+
 # Extra environment variables for the BOBS container, as standard Kubernetes
 # EnvVar entries (name/value or name/valueFrom), appended after the built-in
 # ones. Changing them rolls the StatefulSet.
-# Example: stop glibc from retaining freed page-sized buffers in its arenas;
-# see "Memory behaviour and the glibc allocator" in docs/src/configuration.md.
 # extraEnv:
-#   - name: MALLOC_MMAP_THRESHOLD_
-#     value: "1048576"
+#   - name: RUST_BACKTRACE
+#     value: "1"
 extraEnv: []
 
 observability:

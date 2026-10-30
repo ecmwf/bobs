@@ -251,12 +251,12 @@ matching `nginx.ingress.kubernetes.io/x-forwarded-prefix`. Setting
 `ingress.forwardedPrefix.enabled: false` while ingress is enabled is rejected rather
 than rendering a broken redirect contract.
 
-`extraEnv` appends standard Kubernetes `EnvVar` entries to the container
-environment (empty by default; changing it rolls the StatefulSet). With large
-`page_size` values, glibc `malloc` can retain freed page-sized buffers and grow
-resident memory until the pod is OOM-killed; setting `MALLOC_MMAP_THRESHOLD_` to
-`1048576` through `extraEnv` mitigates it. See "Memory behaviour" in the
-Configuration docs.
+With large `page_size` values, glibc `malloc` can retain freed page-sized buffers
+and grow resident memory until the pod is OOM-killed; the chart sets
+`MALLOC_MMAP_THRESHOLD_=1048576` by default (`mallocMmapThreshold`; `null`
+disables it) to mitigate this. See "Memory behaviour" in the Configuration docs.
+`extraEnv` appends other standard Kubernetes `EnvVar` entries to the container
+environment (empty by default; changing it rolls the StatefulSet).
 
 Validate chart changes with Helm and `kubeconform` v0.8.0:
 
