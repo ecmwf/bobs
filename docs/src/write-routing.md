@@ -31,13 +31,13 @@ PUT /api/v1/create
 → 201 Created
 {
   "key":       "550e8400-e29b-41d4-a716-446655440000",
-  "read_url":  "https://example.com/download-2/550e8400-e29b-41d4-a716-446655440000",
-  "write_url": "http://release-bobs-2:3000/api/v1"
+  "read_url":  "https://bobs.example.com/download-2/550e8400-e29b-41d4-a716-446655440000",
+  "write_url": "http://release-bobs-2.release-bobs-svc:3000/api/v1"
 }
 ```
 
 - `key` — the spool identifier; embed it in all subsequent requests.
-- `read_url` — the public URL through which consumers can stream the spool once writing begins. It is an opaque download link; the BOBS internal `/api/v1/read/{key}` endpoint is not part of this public URL.
+- `read_url` — always `https://{host_prefix}.{domain}/{route_name}-{ordinal}/{key}`, the public URL through which consumers can stream the spool once writing begins. It is an opaque download link; the BOBS internal `/api/v1/read/{key}` endpoint is not part of this public URL.
 - `write_url` — the **per-pod internal base URL** of the owning pod. Clients must use this URL as the base for all write and complete calls.
 
 The handling pod selects the validated request ID or generates a fallback UUIDv4 key, creates the spool directory and initial `meta.json` sidecar, and returns its resolved `internal_base_url` as `write_url`. No network calls are made to other pods during `/api/v1/create`.
@@ -73,15 +73,15 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://release-bobs-{ordinal}.release-bobs-svc:3
 
 The literal placeholder `{ordinal}` (single braces) is **not** expanded by Helm — it is replaced at runtime by the BOBS process itself.
 
-On startup BOBS reads this variable, substitutes its own ordinal to derive `internal_base_url`, and fails fast with a clear error if the variable is absent or empty. It logs the resolved value:
+On startup BOBS reads this variable, substitutes its own ordinal (the digits after the last `-` in `HOSTNAME`) for every `{ordinal}` to derive `internal_base_url`, and fails fast with a clear error if the variable is absent or empty. It logs the resolved value as the `internal_base_url` attribute of the structured `startup.config.loaded` ("configuration loaded") event, alongside `public_base`:
 
 ```
-INFO internal_base_url = http://release-bobs-2.release-bobs-svc:3000/api/v1
+event.name=startup.config.loaded internal_base_url=http://release-bobs-2.release-bobs-svc:3000/api/v1
 ```
 
 The chart injects the variable automatically into the StatefulSet. No per-replica manual configuration is required.
 
-By default, the chart addresses each pod through its StatefulSet DNS name and managed `<fullname>-svc` headless Service. `headlessService.name` overrides that governing Service name. If `headlessService.enabled` is `false`, the name is required and must refer to an existing external headless Service. This does not change the per-replica Services used as ingress backends.
+By default, the chart addresses each pod through its StatefulSet DNS name and managed `<fullname>-svc` headless Service, on port `service.port`. Because a headless Service does no port translation, `service.port` must equal `config.port` (both default to 3000) or `internalBaseUrlTemplate` must be overridden. `headlessService.name` overrides that governing Service name. If `headlessService.enabled` is `false`, the name is required and must refer to an existing external headless Service. This does not change the per-replica Services used as ingress backends.
 
 ---
 
@@ -92,7 +92,7 @@ If the owning pod dies while a write is in progress:
 1. The worker receives an HTTP error on the next `/api/v1/write/{key}/{offset}` call.
 2. The worker abandons that spool and retries from `/api/v1/create` on a surviving pod.
 3. The orphan remains in `Writing` state on the failed pod's PVC.
-4. After restart, recovery reconstructs in-progress byte state from `spool.dat`; cleanup reaps the spool after `writer_inactivity_timeout_secs` (default 300).
+4. After restart, recovery reconstructs in-progress byte state from `spool.dat`; cleanup reaps the spool after `writer_inactivity_timeout_secs` (default 300). An orphaned `WriteLocked` spool is instead salvaged on recovery as a bounded `Complete` object: it accepts no more writes and its bytes become readable.
 
 No manual intervention or cross-pod coordination is needed.
 

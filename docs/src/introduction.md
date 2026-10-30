@@ -22,5 +22,4 @@ BOBS provides a high-performance, temporary storage layer that:
 
 BOBS is designed for containerized environments, specifically Kubernetes. 
 - **K8s Pods**: Typically deployed as a set of pods with local persistent volumes for high-speed I/O.
-- **DNS Routing**: Clients use DNS to route requests to specific BOBS instances.
-- **preferLocal**: In multi-node setups, routing logic often prefers local pods to minimize latency between the producer and the buffer.
+- **Pod ownership**: The pod that handles `create` owns the spool. Writers are sent to that pod through the `write_url` returned by create (an in-cluster, per-pod DNS name behind the StatefulSet's headless Service); readers use the public `read_url`, where the ingress routes the per-pod path prefix `/{route_name}-{ordinal}/` to the owning pod. See [Write Routing](write-routing.md).

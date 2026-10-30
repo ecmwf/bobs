@@ -16,7 +16,7 @@ The `bobs-benchmark` binary drives complete BOBS object lifecycles directly over
 
 Use it to validate BOBS itself before adding Polytope, ingress, or other clients to the path. Start local, then repeat the same workload from a container or Kubernetes pod.
 
-Persistence expectations for this benchmark match the BOBS contract: each object is stored as `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json`. Before `/api/v1/complete/{key}`, recovery across a BOBS restart reconstructs in-progress byte state from `spool.dat`; node or storage crash durability is not promised. `/api/v1/write/{key}/{offset}` appends accepted bytes through the kernel/file handle before returning but does not force them to stable storage with `sync_data()`. Full pages become reader-visible as they fill; a trailing partial page remains hidden until it fills or completion finalizes it. Completion is an owned durability transaction that survives caller cancellation: BOBS syncs `spool.dat`, atomically commits an exact-layout `Completing` recovery marker, then atomically commits `Complete`.
+Persistence expectations for this benchmark match the BOBS contract: each object is stored as `<data_dir>/<key>/spool.dat` plus `<data_dir>/<key>/meta.json`. Before `/api/v1/complete/{key}`, recovery across a BOBS restart reconstructs in-progress byte state from `spool.dat`; node or storage crash durability is not promised. `/api/v1/write/{key}/{offset}` appends accepted bytes through the kernel/file handle before returning but does not force them to stable storage with `sync_data()`. Full pages become reader-visible as they fill; a trailing partial page remains hidden until it fills or completion finalizes it. Completion is an owned durability transaction that survives caller cancellation: BOBS (with the default `fsync_enabled: true`) syncs `spool.dat`, atomically commits an exact-layout `Completing` recovery marker, then atomically commits `Complete`.
 
 > Plain HTTP only: this first benchmark implementation accepts `http://` BOBS endpoints. `https://` support requires an approved dependency or feature change.
 
@@ -196,7 +196,7 @@ For each config, start BOBS with that file and run the same benchmark command, c
 
 Container validation checks the packaged binary, container networking, and whether the runtime permits the default Linux `io_uring` backend.
 
-The default backend requires Linux 5.11+ because it submits `io_uring` operations against raw file descriptors, and it requires access to the `io_uring_setup` syscall. If the policy blocks `io_uring_setup`, use an io_uring-capable seccomp/sysctl policy or a `tokio-fileio-fallback` build. On this development host, validation showed:
+The default backend requires Linux 5.11+ because it submits `io_uring` `RenameAt`/`UnlinkAt` operations (added in 5.11), and it requires access to the `io_uring_setup` syscall. If the policy blocks `io_uring_setup`, use an io_uring-capable seccomp/sysctl policy or a `tokio-fileio-fallback` build. On this development host, validation showed:
 
 ```text
 host io_uring_setup: allowed
@@ -287,7 +287,7 @@ Important summary fields:
 
 - `total_objects`, `successes`, `failures`: workload size and final outcome counts.
 - `total_bytes_written`, `total_bytes_read`: successful object bytes only; failed objects are excluded from throughput byte totals.
-- `wall_ms`, `wall_mib_s`: whole benchmark wall-clock duration and read throughput over that full window.
+- `wall_ms`, `wall_mib_s`: whole-process wall-clock duration (it includes the `--start-delay-ms` idle barrier wait, so a large start delay deflates `wall_mib_s`) and bytes read over that full window. Prefer the `*_active_*` fields for throughput.
 - `write_active_ms`, `write_active_mib_s`: aggregate write throughput over the active write window, from earliest write start to latest write end.
 - `read_active_ms`, `read_active_mib_s`: aggregate read throughput over the active read window.
 - `read_mib_per_reader_second`: sum of successful read bytes divided by summed per-object read time.
@@ -301,7 +301,7 @@ To extract the summary from logs:
 grep '^SUMMARY:' benchmark.log | tail -n1 | sed 's/^SUMMARY://'
 ```
 
-Optional file outputs, if supported by the binary version you are running:
+Stdout also carries a human-readable `objects=... successes=... failures=... bytes_read=... wall_mib_s=...` line before `SUMMARY:`. The process exits `0` when no object failed, `1` on any failure or setup error, and `2` on invalid arguments. Optional file outputs (`--summary-json` writes pretty JSON, `--results-jsonl` one result per line):
 
 ```bash
 bobs-benchmark \
@@ -336,7 +336,14 @@ kubectl logs <bobs-pod> | grep '<bobs-key>'
 grep 'ordinal=2 ' benchmark.log
 ```
 
-If `configured_ordinal` and `response_ordinal` disagree, the benchmark emits an `object_error` event with `error=ordinal_mismatch`. Treat that as a routing or read URL generation issue before comparing throughput numbers.
+If `configured_ordinal` and `response_ordinal` disagree, the benchmark emits an `object_error` event with `error=ordinal_mismatch` (the object is still counted as a success). Treat that as a routing or read URL generation issue before comparing throughput numbers.
+
+## How the benchmark behaves
+
+- Every object runs as its own concurrent task. All tasks wait on a shared barrier of `--start-delay-ms`, then run their lifecycles at once; there is no concurrency cap, so `--objects 32` means 32 simultaneous lifecycles.
+- Every request goes to the configured endpoint. The `read_url` and `write_url` returned by create are not used for traffic; `read_url` is parsed only to extract the response ordinal.
+- The read is `GET /api/v1/read/{key}` with `Range: bytes=0-<size-1>`, issued after `complete` returns, so it exercises `mode=range` (never follow mode) and `wait_to_read` is close to zero. Only the byte count is verified, not content. Write payloads repeat the byte `object_index % 251`.
+- Defaults when a flag is omitted: 1 object, 1 MiB object size, 1 MiB chunk size, `--start-delay-ms 1000`, `--connect-timeout-ms 10000`, `--request-timeout-ms 300000`. `--log-chunks` adds per-chunk event lines.
 
 ## Cleanup notes
 
