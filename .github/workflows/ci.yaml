@@ -21,17 +21,11 @@ concurrency:
 
 jobs:
   # ── Change detection ─────────────────────────────────────────────────────
-  # Determines which areas of the repo were touched so downstream jobs can
-  # be skipped when their inputs haven't changed.
-  #
-  # INVARIANT (why the publish jobs below can safely trust these outputs):
-  # a release is driven by the version-tag gate, but the gate's rules force a
-  # matching source change, so the path filters always agree with it:
-  #   - a code+image release requires a Cargo.toml bump  ⇒ `code`  == true
-  #   - any chart release requires a chart/Chart.yaml bump ⇒ `chart` == true
-  #   - a code bump without a chart bump is a hard gate error
-  # So whenever the gate says publish_image/publish_chart == true, the
-  # corresponding build-and-test / lint-chart job is guaranteed to have run.
+  # Determines which areas of the repo were touched so build-and-test and
+  # lint-chart can be skipped when their inputs haven't changed. The publish
+  # gate below overrides these filters: when a release is due, the
+  # corresponding build/lint job runs regardless of what this push touched,
+  # so a release never depends on being in the same push as its version bump.
   detect-changes:
     runs-on: ubuntu-latest
     permissions:
@@ -96,8 +90,13 @@ jobs:
         run: cargo audit
 
   build-and-test:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.code == 'true'
+    needs: [detect-changes, gate]
+    # gate is skipped on pull requests (empty outputs), so PRs use the path
+    # filter alone; on main a pending image release always runs the tests.
+    if: >-
+      !cancelled() &&
+      needs.detect-changes.result == 'success' &&
+      (needs.detect-changes.outputs.code == 'true' || needs.gate.outputs.publish_image == 'true')
     runs-on: ubuntu-latest
     env:
       # Cheaper compiles: skip incremental (useless on fresh runners) and drop
@@ -126,15 +125,15 @@ jobs:
         run: cargo test --locked --features tokio-fileio-fallback
 
   # ── Publish gate ───────────────────────────────────────────────────────────
-  # On push to main, decide what (if anything) needs publishing.
-  #
-  # Releases are recorded by a {CHART_VERSION}.dev0 git tag (the ".dev0"
-  # suffix keeps the tag inside the org tag-protection ruleset's *.devN
-  # exemption — see the release-tag job).  Four cases:
-  #   - both tags exist                       → nothing to do, skip
-  #   - cargo tag missing, chart tag present  → code bumped without chart bump → ERROR
-  #   - both tags missing                     → code+chart release (versions must match)
-  #   - cargo tag present, chart tag missing  → chart-only release
+  # On push to main, decide what (if anything) needs publishing. The registry
+  # is the source of truth (scripts/gate.sh): is image <cargo_version> there,
+  # is chart <chart_version> there? Four cases:
+  #   - both published                         → nothing to do, skip
+  #   - image missing, chart published         → code bumped without chart bump → ERROR
+  #   - both missing                           → code+chart release (versions must match)
+  #   - image published, chart missing         → chart-only release (Cargo.toml unchanged)
+  # A release that was not fully published is therefore retried on every push
+  # until it is, and the git tag created afterwards is only a marker.
   gate:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -148,20 +147,25 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2   # gate.sh compares Cargo.toml with HEAD~1
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.20.0
 
       - name: Decide what to publish
         id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: bash scripts/gate.sh
 
   # ── Image publish (code+chart releases only) ──────────────────────────────
   publish-image:
     needs: [checks, build-and-test, gate]
-    # No always(): if build-and-test is skipped this job skips too. That is
-    # safe because publish_image == true implies a Cargo.toml bump, which the
-    # `code` path filter always catches, so build-and-test always runs here.
-    if: needs.gate.outputs.publish_image == 'true'
+    if: >-
+      !cancelled() &&
+      needs.gate.outputs.publish_image == 'true' &&
+      needs.checks.result == 'success' &&
+      needs.build-and-test.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -184,6 +188,15 @@ jobs:
           chmod +x skaffold
           sudo mv skaffold /usr/local/bin/skaffold
 
+      - name: Refuse to overwrite a published image
+        env:
+          VERSION: ${{ needs.gate.outputs.cargo_version }}
+        run: |
+          if docker manifest inspect "eccr.ecmwf.int/bobs/bobs:${VERSION}" >/dev/null 2>&1; then
+            echo "::error::image eccr.ecmwf.int/bobs/bobs:${VERSION} already exists; bump Cargo.toml instead of overwriting it"
+            exit 1
+          fi
+
       - name: Build and push
         env:
           FIXED_TAG: ${{ needs.gate.outputs.cargo_version }}
@@ -203,8 +216,11 @@ jobs:
 
   # ── Chart lint ────────────────────────────────────────────────────────────
   lint-chart:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.chart == 'true'
+    needs: [detect-changes, gate]
+    if: >-
+      !cancelled() &&
+      needs.detect-changes.result == 'success' &&
+      (needs.detect-changes.outputs.chart == 'true' || needs.gate.outputs.publish_chart == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -236,17 +252,17 @@ jobs:
         run: ./scripts/test-chart.sh
 
   # ── Chart publish (code+chart and chart-only releases) ────────────────────
-  # lint-chart requires 'success' (not 'skipped'): a chart release always
-  # bumps chart/Chart.yaml so the `chart` path filter always runs lint-chart.
+  # On a code+chart release the image must have been pushed in this run; on a
+  # chart-only release publish-image is skipped by design.
   publish-chart:
     needs: [checks, build-and-test, gate, lint-chart, publish-image]
     if: >-
-      always() &&
+      !cancelled() &&
       needs.gate.outputs.publish_chart == 'true' &&
       needs.checks.result == 'success' &&
       needs.lint-chart.result == 'success' &&
       (needs.build-and-test.result == 'success' || needs.build-and-test.result == 'skipped') &&
-      (needs.publish-image.result == 'success' || needs.publish-image.result == 'skipped')
+      (needs.gate.outputs.publish_image != 'true' || needs.publish-image.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -272,6 +288,15 @@ jobs:
             --username "${HELM_REGISTRY_USERNAME}" \
             --password-stdin
 
+      - name: Refuse to overwrite a published chart
+        env:
+          VERSION: ${{ needs.gate.outputs.chart_version }}
+        run: |
+          if helm show chart oci://eccr.ecmwf.int/bobs/bobs-chart --version "${VERSION}" >/dev/null 2>&1; then
+            echo "::error::chart bobs-chart ${VERSION} already exists; bump chart/Chart.yaml version instead of overwriting it"
+            exit 1
+          fi
+
       - name: Push chart
         env:
           VERSION: ${{ needs.gate.outputs.chart_version }}
@@ -283,16 +308,16 @@ jobs:
           echo "- **Chart**: \`oci://eccr.ecmwf.int/bobs/bobs-chart:${{ needs.gate.outputs.chart_version }}\`" >> "${GITHUB_STEP_SUMMARY}"
 
   # ── Release tag ────────────────────────────────────────────────────────────
-  # Created after all publish jobs succeed or are intentionally skipped.
-  # Uses the chart version with a ".dev0" suffix (X.X.X.dev0) as the shared
-  # release tag; on a code+chart release the X.X.X part equals the Cargo
-  # version (enforced by the gate).  The suffix is required because the org
-  # tag-protection ruleset only exempts *.devN tags from its creation block —
-  # a bare X.X.X tag would be rejected for the Actions token.
+  # A marker only: created after the publish jobs succeed, never consulted by
+  # the gate. Uses the chart version with a ".dev0" suffix (X.X.X.dev0); on a
+  # code+chart release the X.X.X part equals the Cargo version (enforced by
+  # the gate). The suffix is required because the org tag-protection ruleset
+  # only exempts *.devN tags from its creation block — a bare X.X.X tag would
+  # be rejected for the Actions token.
   release-tag:
     needs: [gate, publish-image, publish-chart]
     if: >-
-      always() &&
+      !cancelled() &&
       needs.gate.result == 'success' &&
       (needs.gate.outputs.publish_image != 'true' || needs.publish-image.result == 'success') &&
       (needs.gate.outputs.publish_chart != 'true' || needs.publish-chart.result == 'success') &&
