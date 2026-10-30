@@ -145,7 +145,7 @@ For direct BOBS throughput validation, see the mdBook page: `docs/src/standalone
 
 ## Configuration
 
-BOBS reads an optional YAML file. Missing fields use the binary defaults below, but startup requires non-empty `host_prefix`, `domain`, and `route_name` values plus the routing environment variables shown in Quick Start.
+BOBS reads a YAML file given as its first argument. Missing fields use the binary defaults below, but startup requires non-empty `host_prefix`, `domain`, and `route_name` values (there is no environment override, so a config file is effectively required) plus the routing environment variables shown in Quick Start. Unknown keys are silently ignored.
 
 ```bash
 HOSTNAME=bobs-0 \
@@ -177,9 +177,9 @@ BOBS_INTERNAL_BASE_URL_TEMPLATE=http://localhost:3000/api/v1 \
 | `host_prefix` | `""` | External download host prefix used to build `read_url`; must be set. |
 | `domain` | `""` | External download domain used to build `read_url`; must be set. |
 | `route_name` | `""` | External download route prefix used to build `read_url`; must be set. The chart restricts it to one 1-63 character segment containing ASCII letters, digits, `_`, or `-`, starting and ending with an alphanumeric character. |
-| `metrics.enabled` | `false` | Enables the Prometheus metrics endpoint in builds with the `telemetry` feature. |
+| `metrics.enabled` | `false` | Enables the Prometheus metrics endpoint; requires a build with the `telemetry` feature. |
 | `metrics.bind_address` | `127.0.0.1` | Metrics endpoint bind address. |
-| `metrics.port` | `9464` | Metrics listener port. When metrics are enabled, it must differ from the main HTTP `port`; startup rejects a conflict before either listener binds. |
+| `metrics.port` | `9464` | Metrics listener port. In builds with the `telemetry` feature and `metrics.enabled: true`, it must differ from the main HTTP `port`; startup rejects a conflict before either listener binds. |
 | `metrics.allowed_labels` | `[]` | Caller label keys allowed as metric attributes. Empty allows all keys. |
 | `metrics.max_label_value_length` | `128` | Maximum label-value byte length; longer values are truncated. |
 

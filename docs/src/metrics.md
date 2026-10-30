@@ -30,7 +30,7 @@ metrics:
 ```
 
 When `metrics.enabled` is `false` (the default), all metric operations are
-no-ops and no provider is installed, regardless of the build feature.
+no-ops and no provider is installed, regardless of the build feature. The reverse is silent: `metrics.enabled: true` in a build without `--features telemetry` logs no warning and simply exports nothing.
 
 ## Scrape endpoint
 
@@ -41,6 +41,8 @@ Content-Type: text/plain; version=0.0.4
 
 ### Sample Kubernetes scrape config
 
+The chart's own supported path is the ServiceMonitor it renders; the plain Prometheus config below is for setups without the Prometheus Operator. Chart pods carry the `app.kubernetes.io/name` label (not `app`) and declare both an `http` and a `metrics` container port, so the config keeps only the `metrics` port to avoid duplicate targets.
+
 ```yaml
 scrape_configs:
   - job_name: bobs
@@ -48,8 +50,11 @@ scrape_configs:
     kubernetes_sd_configs:
       - role: pod
     relabel_configs:
-      - source_labels: [__meta_kubernetes_pod_label_app]
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
         regex: bobs
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: metrics
         action: keep
       - source_labels: [__address__]
         regex: (.+):\d+
@@ -63,11 +68,11 @@ scrape_configs:
 - Resource attributes (`service_name`, `service_instance_id`, `service_version`,
   `deployment_environment`, `k8s_pod_name`, SDK info) are emitted as the
   exporter-generated `target_info` gauge, not repeated on every series.
-- Caller-provided labels (e.g. `collection`) pass through subject to
-  `allowed_labels` and `max_label_value_length` filtering.
-- `reason`: deletion reason — `client`, `idle_ttl`, `full_read_ttl`, `writer_timeout`.
-- `mode`: read mode — `follow` (stream until completion), `range` (bounded HTTP range read).
-- `outcome`: read outcome — `success`, `error`, `timeout`, `client_gone`.
+- Caller-provided labels (e.g. `collection`) come from the `labels` object of the `PUT /api/v1/create` body. They are filtered once at create time by `allowed_labels` and `max_label_value_length`, stored in the spool's metadata and reused for every later metric of that spool. Callers should not use `reason`, `mode`, `outcome`, `state` or `status` as label keys; they are not reserved and would collide with the built-in attributes.
+- The exporter also emits an `otel_scope_info{otel_scope_name="bobs"}` series.
+- `reason`: deletion reason — `client`, `idle_ttl`, `full_read_ttl`, `writer_timeout`, `delete_retry` (cleanup retrying a spool already in `Deleting`). Deletions of oversize uploads (`413`) are not counted in `bobs.spools.deleted`.
+- `mode`: read mode — `follow` (no `Range` header; stream until completion), `range` (any request carrying a `Range` header, including open-ended and suffix ranges).
+- `outcome`: on read durations, `success`, `error`, `timeout` or `client_gone`; on create, complete and write durations, only `success` or `error`.
 - `state`: active spool state — `writing`, `write_locked`, `complete`.
 - `status`: startup recovery snapshot — `configured`, `recovered`, or `quarantined`.
 
@@ -81,10 +86,10 @@ as `_bucket`/`_sum`/`_count` series; duration histograms also receive a
 | --- | --- | --- | --- | --- |
 | `bobs.spools.created` | `bobs_spools_created_total` | Counter | caller labels, `otel_scope_name` | Spools successfully created via `PUT /api/v1/create`. |
 | `bobs.spools.completed` | `bobs_spools_completed_total` | Counter | caller labels, `otel_scope_name` | Spools successfully finalized via `POST /api/v1/complete/{key}`. |
-| `bobs.spools.deleted` | `bobs_spools_deleted_total` | Counter | caller labels, `reason`, `otel_scope_name` | Spools deleted by explicit client request or cleanup. |
+| `bobs.spools.deleted` | `bobs_spools_deleted_total` | Counter | caller labels, `reason`, `otel_scope_name` | Spools deleted by explicit client request or cleanup (not oversize-upload removal). |
 | `bobs.create.duration` | `bobs_create_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `outcome`, `otel_scope_name` | Wall time for the create handler, including admission wait, spool file creation, and initial metadata commit. |
 | `bobs.complete.duration` | `bobs_complete_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `outcome`, `otel_scope_name` | Wall time for the complete request to flush and finalize a spool. |
-| `bobs.write.bytes` | `bobs_write_bytes_total` | Counter | caller labels, `otel_scope_name` | Bytes written into spools. Recorded after each write batch completes. |
+| `bobs.write.bytes` | `bobs_write_bytes_total` | Counter | caller labels, `otel_scope_name` | Bytes written into spools. Recorded once per successful write request after its body is fully consumed; bytes of a failed or partial write are not counted. |
 | `bobs.write.duration` | `bobs_write_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `outcome`, `otel_scope_name` | Wall time for a write handler to receive and append a streaming write body. |
 | `bobs.read.bytes` | `bobs_read_bytes_total` | Counter | caller labels, `mode`, `otel_scope_name` | Bytes served from spools to clients. |
 | `bobs.read.duration` | `bobs_read_duration_seconds_bucket`, `_sum`, `_count` | Histogram | caller labels, `mode`, `outcome`, `otel_scope_name` | Wall time for a read stream from acquisition to final outcome. |
@@ -115,4 +120,4 @@ metrics:
 
 With `allowed_labels` set, any caller label not in the list is silently dropped.
 With `max_label_value_length` set, values longer than the limit are truncated to
-that many bytes before recording.
+at most that many bytes (backed off to a UTF-8 character boundary, so the result can be slightly shorter) before recording.

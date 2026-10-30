@@ -34,8 +34,9 @@ see CI gate logic below.
 
 ## CI gate logic
 
-The CI (`feat/ci-publish-workflows`, eventually `main`) has two release paths,
-decided at push time by `scripts/test-gate.sh` logic in the `gate` job:
+The CI (`.github/workflows/ci.yaml`, on pull requests and pushes to `main`) has two
+release paths, decided at push time by `scripts/gate.sh` in the `gate` job
+(`scripts/test-gate.sh` is the local test harness for it):
 
 | State | Outcome |
 |---|---|
