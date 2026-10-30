@@ -165,6 +165,17 @@ Page size changes streaming behaviour:
 
 See the standalone benchmark guide for page-size comparison commands.
 
+## Restart behaviour and admission slots
+
+Every spool found on disk at startup is a recovery candidate. Up to `max_live_spools` of them (the most recently active first) are recovered and each takes an admission slot, whether or not it had already been fully read before the restart: read state is not persisted, so recovered spools are treated as unread and their idle clocks restart at recovery. While all slots are held, `/api/v1/create` returns `503` after `create_admission_timeout_ms`. The slots free when each spool is fully read, or after `read_idle_ttl_secs` of read inactivity, so a pod that recovers `max_live_spools` spools can reject creates for up to `read_idle_ttl_secs` and then free them all at once. Recovered spools stay readable throughout.
+
+Practical consequences:
+
+- Keep `max_live_spools` comfortably above the number of spools a pod typically holds on disk (live spools, including recently fully read ones that are waiting out `full_read_complete_ttl_secs`, plus any quarantined or stale spools left in the data directory), or a restart (including a rolling update) can leave a pod unable to accept creates.
+- A shorter `read_idle_ttl_secs` shortens that window but also deletes never-read and idle partly-read results sooner.
+- `/api/v1/health` does not reflect admission state, so a pod in this state still passes its readiness probe and keeps receiving creates through the Service; clients should retry a `503` on `/api/v1/create`.
+- `max_live_spools` bounds admission slots, not memory: live spools are disk-backed.
+
 ## Memory behaviour and the glibc allocator
 
 **Symptom.** With large pages, resident memory of a BOBS process can climb with request churn until the container memory limit is reached and the pod is OOM-killed, even though little live data is held. It does not track the number of live spools or the amount of spool data: live spools are disk-backed, `max_live_spools` bounds admission slots rather than memory, and the page cache is bounded separately by `max_cache_bytes`.
@@ -196,4 +207,4 @@ This has not yet been validated on a real cluster. It applies only to glibc-base
 - `MALLOC_ARENA_MAX=2` reduced the benchmark's resting RSS to about 0.7 GiB but did not remove the retention.
 - jemalloc via `LD_PRELOAD` gave about 0.39 GiB (0.24 GiB at idle) in the benchmark. Building BOBS with jemalloc or mimalloc as the global allocator, pooling page buffers, or choosing a smaller `page_size` are other options that were considered but are not implemented or recommended here.
 
-**Per-request memory rule of thumb.** In-flight memory scales with `page_size`. In the same benchmark, peak memory was about 33 MB per concurrent upload+download pair at 16 MiB pages with the cache off, about 9.5 MB at 4 MiB, and about 3.7 MB at 1 MiB; a write-only upload cost about 21 MB at 16 MiB. The page cache adds up to `max_cache_bytes` of resident memory per pod on top. Size container memory limits from concurrency times per-request memory plus `max_cache_bytes`, and add headroom for allocator overhead.
+**Per-request memory rule of thumb.** In-flight memory scales with `page_size` and with the size of the chunks the producer sends. In a local benchmark with HTTP/2 uploads (the protocol the Polytope workers use) and the cache off, peak memory was about 23-34 MB per concurrent upload at 16 MiB pages and about 12-23 MB at 4 MiB pages, depending on the producer chunk size (lowest with 1 MiB chunks). Earlier HTTP/1.1 runs measured about 21 MB per upload at 16 MiB. The page cache adds resident memory on top: a full `max_cache_bytes` cache costs about the same amount again (about 259 MiB for 256 MiB, at both 16 MiB and 4 MiB pages), but pages are inserted on write only and a full read releases them, so the cache usually holds only recent unread data. Size container memory limits from concurrency times per-request memory plus `max_cache_bytes`, and add headroom for allocator overhead. With `MALLOC_MMAP_THRESHOLD_` set, the same benchmark still showed roughly 60-70 MB of retained memory after heavy upload churn and more with producers that send chunks below 1 MiB; a long soak has not been measured.
