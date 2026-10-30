@@ -146,7 +146,9 @@ where
         // population is only an optimisation; skip it rather than wait on a busy
         // cache. Disk reads reconstruct the page exactly.
         if let Some(page_data) = partial_page {
-            buf.clear();
+            // Replace rather than clear: `clear` keeps the allocation, which would
+            // pin up to one page of heap per completed spool until deletion.
+            *buf = bytes::BytesMut::new();
             if let Ok(mut cache) = self.page_cache.try_lock() {
                 cache.insert(&self.key, partial_page_idx, page_data);
             }
@@ -1417,6 +1419,28 @@ mod tests {
         let page = cache.get(&spool.key, 0).expect("partial page cached");
         assert_eq!(page.len(), 1000);
         assert_eq!(page.as_ref(), partial_data.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_complete_releases_partial_page_staging_allocation() {
+        let dir = tempdir().expect("create tempdir");
+        let spool = make_spool(dir.path(), 4096).await;
+
+        spool
+            .write(0, Bytes::from(vec![0xABu8; 1000]))
+            .await
+            .expect("write partial page");
+        assert!(spool.write_buffer.lock().await.capacity() >= 1000);
+
+        spool.complete(None).await.expect("complete succeeds");
+
+        let buf = spool.write_buffer.lock().await;
+        assert!(buf.is_empty());
+        assert_eq!(
+            buf.capacity(),
+            0,
+            "completed spool must not retain its partial-page staging allocation"
+        );
     }
 
     #[tokio::test]
