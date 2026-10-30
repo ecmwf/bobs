@@ -77,6 +77,11 @@ spec:
               # {{- include "bobs.deploymentEnvEntry" . | nindent 14 }}
             - name: BOBS_INTERNAL_BASE_URL_TEMPLATE
               # {{- include "bobs.internalBaseUrlEntry" . | nindent 14 }}
+            # {{- if .Values.mallocMmapThreshold }}
+            - name: MALLOC_MMAP_THRESHOLD_
+              # prettier-ignore
+              value: {{ .Values.mallocMmapThreshold | int64 | quote }}
+            # {{- end }}
             # {{- with .Values.extraEnv }}
             # {{- toYaml . | nindent 12 }}
             # {{- end }}
