@@ -255,8 +255,8 @@ than rendering a broken redirect contract.
 environment (empty by default; changing it rolls the StatefulSet). With large
 `page_size` values, glibc `malloc` can retain freed page-sized buffers and grow
 resident memory until the pod is OOM-killed; setting `MALLOC_MMAP_THRESHOLD_` to
-`1048576` through `extraEnv` mitigates it. See "Memory behaviour and the glibc
-allocator" in the Configuration docs for symptoms, diagnosis, and trade-offs.
+`1048576` through `extraEnv` mitigates it. See "Memory behaviour" in the
+Configuration docs.
 
 Validate chart changes with Helm and `kubeconform` v0.8.0:
 

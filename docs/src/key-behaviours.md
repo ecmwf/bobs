@@ -18,7 +18,7 @@ Larger pages such as 1 MiB, 4 MiB, or 16 MiB may improve throughput, but they al
 
 Read response memory is admitted separately from live-spool admission. The manager permits `max(1, floor(max_cache_bytes / page_size))` configured-page responses at once and retains each permit until the client body is consumed or dropped. Slow clients therefore queue instead of retaining one additional page buffer each. After first-read admission is released, a cache-miss response also strongly retains any lazily reopened payload handle; the manager keeps only a weak reference so concurrent admitted responses can share one handle without repeated reads accumulating descriptors. Recovery resegments, salvages, or quarantines persisted layouts before admission, so recovered pages are never wider than the current configured page size. With caching disabled, one response remains admitted so disk-backed reads still stream with bounded page memory.
 
-Per-request buffers scale with `page_size`, and with large pages glibc `malloc` can retain freed buffers so resident memory grows with request churn rather than with live spools. See [Memory behaviour and the glibc allocator](configuration.md#memory-behaviour-and-the-glibc-allocator) for diagnosis and the `MALLOC_MMAP_THRESHOLD_` mitigation.
+Per-request buffers scale with `page_size`, and with large pages glibc `malloc` can retain freed buffers so resident memory grows with request churn. See [Memory behaviour](configuration.md#memory-behaviour) for sizing and the `MALLOC_MMAP_THRESHOLD_` mitigation.
 
 ### 2. Long-poll with Timeout
 
